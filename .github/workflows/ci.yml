@@ -223,7 +223,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             xvfb openbox xdotool xclip x11-utils sway wtype wl-clipboard grim \
-            imagemagick tesseract-ocr fonts-dejavu-core mesa-vulkan-drivers mesa-utils libxkbcommon-x11-0 libwayland-bin
+            imagemagick tesseract-ocr fonts-dejavu-core fonts-noto-cjk mesa-vulkan-drivers mesa-utils libxkbcommon-x11-0 libwayland-bin
 
       - name: Stage optimized desktop candidate
         id: desktop-install
@@ -241,7 +241,7 @@ jobs:
         if: always()
         run: |
           mkdir -p native-smoke-artifacts
-          { uname -a; rustc -Vv; dpkg-query -W xvfb sway wtype wl-clipboard libvulkan1 mesa-vulkan-drivers fonts-dejavu-core openbox tesseract-ocr; fc-match monospace; git rev-parse HEAD; sha256sum target/release/ember; } > native-smoke-artifacts/environment.txt
+          { uname -a; rustc -Vv; dpkg-query -W xvfb sway wtype wl-clipboard libvulkan1 mesa-vulkan-drivers fonts-dejavu-core fonts-noto-cjk openbox tesseract-ocr; fc-match monospace; git rev-parse HEAD; sha256sum target/release/ember; } > native-smoke-artifacts/environment.txt
 
       - name: Gate X11 installed release interactions
         if: steps.desktop-install.outcome == 'success'
@@ -276,6 +276,32 @@ jobs:
                 status=1
               fi
             done
+          done
+          exit "$status"
+
+      - name: Build compositor IME Return helper
+        id: desktop-ime
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ember-ime"
+          wayland-scanner client-header scripts/protocols/input-method-unstable-v2.xml "$RUNNER_TEMP/ember-ime/input-method-unstable-v2-client-protocol.h"
+          wayland-scanner private-code scripts/protocols/input-method-unstable-v2.xml "$RUNNER_TEMP/ember-ime/protocol.c"
+          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client xkbcommon) -I"$RUNNER_TEMP/ember-ime" scripts/native-ime-return.c "$RUNNER_TEMP/ember-ime/protocol.c" $(pkg-config --libs wayland-client xkbcommon) -o "$RUNNER_TEMP/ember-ime/native-ime-return"
+
+      - name: Gate native composing Return in each terminal mode
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' && steps.desktop-ime.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          status=0
+          for mode in normal block chat; do
+            if ! python3 scripts/native-ime-return-smoke.py \
+              --runner scripts/native-desktop-smoke.py \
+              --ime-client "$RUNNER_TEMP/ember-ime/native-ime-return" \
+              --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
+              --mode "$mode" --output "native-smoke-artifacts/ime-return-$mode"; then
+              status=1
+            fi
           done
           exit "$status"
 
