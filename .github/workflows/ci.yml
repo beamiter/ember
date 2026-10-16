@@ -283,6 +283,7 @@ jobs:
         id: desktop-ime
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
         run: |
+          python3 scripts/test-native-ime-keyboard.py
           mkdir -p "$RUNNER_TEMP/ember-ime"
           wayland-scanner client-header scripts/protocols/input-method-unstable-v2.xml "$RUNNER_TEMP/ember-ime/input-method-unstable-v2-client-protocol.h"
           wayland-scanner private-code scripts/protocols/input-method-unstable-v2.xml "$RUNNER_TEMP/ember-ime/protocol.c"

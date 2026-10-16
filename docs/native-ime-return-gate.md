@@ -28,3 +28,29 @@ coverage is not live mode-switch coverage. X11 XIM, real-device IME toggles,
 visual preedit, live switching, scaling and the remaining clipboard matrix stay
 open acceptance items. No application event injection or production test mode
 is used, and no user display or clipboard is accessed.
+
+## Owned keyboard readiness and cancellation
+
+The composition keyboard is one long-lived official wtype process. Its exact
+argument vector is frozen by socket-free tests: 250 ms startup, public Shift
+modifier mask 1 then 0, empty stdin barrier, exactly one Return, then a long
+hold terminated by the driver. Startup sleep alone is not readiness. Only this
+synthetic client's WAYLAND_DEBUG log is enabled; the parser requires the same
+keyboard object's modifier press/release, its following sync request, and that
+exact callback's done event. Partial lines, missing releases, wrong or stale
+callbacks and an early key event do not satisfy readiness. Raw PTY bytes must
+be empty both before and after readiness.
+
+The stdin pipe receives no bytes. Its EOF is released once only after the
+preedit marker and a fresh zero-byte check. The same keyboard stays alive
+through commit and Return release. On failure before that point, cleanup
+terminates and reaps the process before closing stdin, so cancellation cannot
+accidentally release Return. The initial seat-presence keyboard is separate
+and never sends its delayed key; both owned processes are tracked for cleanup.
+
+This targets a proven missing-keymap fixture setup failure, consistent with
+no active live keyboard after the previous short-lived wtype process exited.
+The diagnostic artifact reported active text input, no protocol error, and no
+keymap before any preedit or composition Return was sent. Sway 1.9's public
+modifier handler selects the sending keyboard as active. No application
+keyboard routing or ownership guard is changed.

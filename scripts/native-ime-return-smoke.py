@@ -23,6 +23,10 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     smoke = module.Smoke(args.binary.resolve(strict=True), 'wayland', out)
     smoke.env['EMBER_SMOKE_CAPTURE'] = str(Path(__file__).with_name('native-ime-pty-capture.py').resolve())
+    keyboard_spec = importlib.util.spec_from_file_location('ime_keyboard', Path(__file__).with_name('native-ime-keyboard.py'))
+    keyboard_module = importlib.util.module_from_spec(keyboard_spec)
+    keyboard_spec.loader.exec_module(keyboard_module)
+    keyboard = None
     result = {'status': 'running', 'mode': args.mode,
               'binary_sha256': hashlib.sha256(smoke.binary.read_bytes()).hexdigest(),
               'helper_sha256': hashlib.sha256(args.ime_client.resolve(strict=True).read_bytes()).hexdigest(),
@@ -50,6 +54,12 @@ def main():
         time.sleep(2)
         identity = smoke.command('ime-ready')
         capture = smoke.raw_start('ime-return-' + args.mode)
+        assert (capture / 'live.bin').read_bytes() == b'', 'Bytes before keyboard readiness'
+        keyboard = keyboard_module.CompositionKeyboard(smoke)
+        module.wait_for(keyboard.ready, 'owned keyboard Shift release roundtrip')
+        assert (capture / 'live.bin').read_bytes() == b'', 'Modifier readiness leaked PTY bytes'
+        result['keyboard_arguments'] = keyboard_module.KEYBOARD_ARGS
+        result['modifier_roundtrip_verified'] = True
         (control / 'start').touch()
         wait_ime_marker('preedit', 'genuine compositor preedit')
         time.sleep(0.5)
@@ -57,7 +67,7 @@ def main():
         preedit = (capture / 'live.bin').read_bytes()
         assert preedit == b'', ('preedit leaked terminal bytes', preedit.hex())
         (capture / 'preedit.bin').write_bytes(preedit)
-        smoke.key('Return')
+        keyboard.release_return(control / 'preedit', capture)
         wait_ime_marker('committed', 'native composition Return consumed and grab released')
         expected = '你'.encode()
         module.wait_for(lambda: (capture / 'live.bin').read_bytes() == expected, 'commit text reaches PTY without CR')
@@ -66,6 +76,8 @@ def main():
         (control / 'finish').touch()
         ime.wait(timeout=5)
         assert ime.returncode == 0
+        assert keyboard.process.poll() is None, 'Keyboard must stay alive through commit/release'
+        keyboard.stop()
         assert smoke.command('ime-input-resumed') == identity
         lines = smoke.transcript.read_text().splitlines()
         assert len(lines) == 2 and [line.split(':', 1)[0] for line in lines] == ['ime-ready', 'ime-input-resumed'], lines
@@ -86,7 +98,11 @@ def main():
             result['helper_exit_code_before_cleanup'] = ime.poll()
         (out / 'result.json').write_text(json.dumps(result, indent=2))
         try:
-            smoke.close()
+            try:
+                if keyboard is not None:
+                    keyboard.stop()
+            finally:
+                smoke.close()
         except Exception as error:
             result.update(status='fail', cleanup_error=str(error))
             (out / 'result.json').write_text(json.dumps(result, indent=2))
