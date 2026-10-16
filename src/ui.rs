@@ -1005,7 +1005,7 @@ fn companion_status_region(
 }
 
 const BLOCK_CARD_NORMAL_GAP: f32 = 2.0;
-const BLOCK_CARD_COMPACT_GAP: f32 = 0.5;
+const BLOCK_CARD_COMPACT_GAP: f32 = 1.0;
 const BLOCK_CARD_NORMAL_RADIUS: u8 = 10;
 const BLOCK_CARD_COMPACT_RADIUS: u8 = 6;
 
@@ -9119,6 +9119,42 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_block_cards_share_four_and_two_pixel_seams_at_every_font_scale() {
+        for line_height in [8.0, 14.0, 20.0, 32.0, 48.0] {
+            for (compact, expected) in [(false, 4.0), (true, 2.0)] {
+                let content = egui::Rect::from_min_size(
+                    egui::pos2(10.0, 0.0),
+                    egui::vec2(640.0, line_height * 8.0),
+                );
+                let span = crate::block_mode::VisibleBlockSpan {
+                    record_index: 0,
+                    first_row: 0,
+                    last_row: 2,
+                    starts_in_viewport: true,
+                    ends_in_viewport: true,
+                };
+                let first = block_card_geometry(content, span, line_height, compact, true).unwrap();
+                let second = block_card_geometry(
+                    content,
+                    crate::block_mode::VisibleBlockSpan {
+                        record_index: 1,
+                        first_row: 3,
+                        last_row: 5,
+                        ..span
+                    },
+                    line_height,
+                    compact,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(second.rect.top() - first.rect.bottom(), expected);
+                assert_eq!(first.rect.left(), content.left());
+                assert_eq!(first.rect.right(), content.right());
+            }
+        }
+    }
+
+    #[test]
     fn card_geometry_preserves_real_edges_and_seals_only_visible_live_targets() {
         let content = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 200.0));
         let open_tail = crate::block_mode::VisibleBlockSpan {
@@ -9170,7 +9206,7 @@ mod tests {
         let compact = block_card_geometry(content, clipped_top, 20.0, true, true)
             .expect("compact clipped card");
         assert_eq!(compact.rect.top(), content.top());
-        assert_eq!(compact.rect.bottom(), 59.5);
+        assert_eq!(compact.rect.bottom(), 59.0);
         assert_eq!(compact.rounding.nw, 0);
         assert_eq!(compact.rounding.se, BLOCK_CARD_COMPACT_RADIUS);
     }
