@@ -48,3 +48,20 @@ the driver verifies those exact bindings before removing them. The same real
 keyboard chords and strict Bash PID/TTY pane oracle remain in use. Users whose
 window manager grabs these chords must resolve that desktop shortcut conflict;
 this fixture does not certify behavior under a competing global grab.
+
+## Find clipboard ownership stage
+
+Each live mode runs a same-mode raw foreground PTY clipboard positive control,
+then Find-field Ctrl+V and Ctrl+Shift+V tests. Each Find case must receive zero
+PTY bytes, including its close operation. UI paste/select/copy is independently
+verified with a distinct marker per case, clearing the field first, and replacing
+the original clipboard with a distinct decoy before Copy
+and requiring the copied marker to replace it. Byte files, expected values,
+Bash parent PID/TTY, UI readback, and screenshots are retained. These checks
+cover Find only; task/settings focus, cross-frame modifiers, focus loss, image
+MIME, repeated paste, latency, scaling and IME remain separate requirements.
+
+X11 readiness probes retry only within the original 30-second monotonic startup
+budget. Each xdpyinfo call is capped by the remaining budget (at most three
+seconds), timeout/exit diagnostics are retained, and an exited owned Xvfb fails
+immediately. No application launch or input action is retried by this helper.

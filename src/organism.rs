@@ -18,9 +18,22 @@ pub const INPUT_RETREAT: Duration = Duration::from_millis(900);
 pub const FULL_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 pub const CALM_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(900);
 
-/// Automatic is an explicit Calm fallback until the platform adapter exists.
+/// Automatic keeps the Calm fallback when no reduced-motion preference is known.
 pub fn resolved_motion(value: Option<OrganismMotion>) -> OrganismMotion {
-    value.unwrap_or(OrganismMotion::Calm)
+    resolved_motion_with_system(value, false)
+}
+
+/// Host-only mapping until the terminals share a coordinated policy API.
+/// Explicit choices win; reducing Automatic suppresses periodic animation.
+pub fn resolved_motion_with_system(
+    value: Option<OrganismMotion>,
+    reduce_motion: bool,
+) -> OrganismMotion {
+    value.unwrap_or(if reduce_motion {
+        OrganismMotion::Static
+    } else {
+        OrganismMotion::Calm
+    })
 }
 
 /// Immutable input from the owner adapter. Defaults fail closed.
@@ -171,6 +184,44 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn automatic_system_preference_and_explicit_choices_share_policy() {
+        for reduced in [false, true] {
+            assert_eq!(
+                resolved_motion_with_system(None, reduced),
+                if reduced {
+                    OrganismMotion::Static
+                } else {
+                    OrganismMotion::Calm
+                }
+            );
+            for explicit in [
+                OrganismMotion::Full,
+                OrganismMotion::Calm,
+                OrganismMotion::Static,
+            ] {
+                assert_eq!(
+                    resolved_motion_with_system(Some(explicit), reduced),
+                    explicit
+                );
+            }
+            let policy = PresentationPolicy {
+                motion: Some(resolved_motion_with_system(None, reduced)),
+                ..visible_policy()
+            };
+            for seconds in [1, 10, 60, 3600] {
+                assert_eq!(
+                    policy.next_wake_after(Duration::from_secs(seconds)),
+                    if reduced {
+                        None
+                    } else {
+                        Some(CALM_HEARTBEAT_INTERVAL)
+                    }
+                );
+            }
+        }
     }
 
     #[test]

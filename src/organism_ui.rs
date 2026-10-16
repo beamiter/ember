@@ -794,7 +794,51 @@ impl AgentPulseTracker {
     }
 }
 
+fn system_motion_id() -> egui::Id {
+    egui::Id::new("organism_system_reduced_motion")
+}
+
+fn publish_system_motion(state: &std::sync::atomic::AtomicBool, next: bool) -> bool {
+    state.swap(next, Ordering::AcqRel) != next
+}
+
+/// One subscription per window, created on its UI thread and canceled on drop.
+/// The callback coalesces state; it never touches command/life/owner state.
+#[derive(Default)]
+struct SystemMotion {
+    reduced: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    subscription: Option<mundy::Subscription>,
+}
+
+impl SystemMotion {
+    fn reduced(&self) -> bool {
+        self.reduced.load(Ordering::Acquire)
+    }
+
+    fn connect(&mut self, ctx: &egui::Context) {
+        if self.subscription.is_some() {
+            return;
+        }
+        let reduced = self.reduced.clone();
+        let ctx = ctx.clone();
+        self.subscription = Some(mundy::Preferences::subscribe(
+            mundy::Interest::ReducedMotion,
+            move |preferences| {
+                let next = preferences.reduced_motion.is_reduce();
+                if publish_system_motion(&reduced, next) {
+                    // eframe may deliver one old delayed repaint. This immediate
+                    // frame re-evaluates existing policy and never rearms animation
+                    // for reduced Automatic; no cancellation API is assumed.
+                    ctx.request_repaint();
+                }
+            },
+        ));
+    }
+}
+
 pub struct OrganismHost {
+    system_motion: SystemMotion,
+
     agent_pulses: AgentPulseTracker,
     born: Instant,
     life: WindowLife,
@@ -832,6 +876,7 @@ pub struct OrganismHost {
 impl Default for OrganismHost {
     fn default() -> Self {
         Self {
+            system_motion: SystemMotion::default(),
             agent_pulses: Default::default(),
             born: Instant::now(),
             life: WindowLife::new_at(Duration::ZERO),
@@ -869,6 +914,10 @@ impl Default for OrganismHost {
 }
 
 impl OrganismHost {
+    fn motion(&self, choice: Option<OrganismMotion>) -> OrganismMotion {
+        crate::organism::resolved_motion_with_system(choice, self.system_motion.reduced())
+    }
+
     fn configure_bridge(&mut self, active: bool) {
         if self.bridge_mode != active {
             self.bridge.reset();
@@ -958,7 +1007,7 @@ impl OrganismHost {
         if !config.ascii_organism_enabled {
             return Err("Enable ASCII Organism before saying hello");
         }
-        if resolved_motion(config.ascii_organism_motion) == OrganismMotion::Static {
+        if self.motion(config.ascii_organism_motion) == OrganismMotion::Static {
             return Err("Choose Full or Calm to say hello");
         }
         if target.is_none() || target != self.owner.as_deref() || !self.presentable {
@@ -969,7 +1018,7 @@ impl OrganismHost {
             focused_owner: true,
             local: true,
             alternate_screen: false,
-            motion: config.ascii_organism_motion,
+            motion: Some(self.motion(config.ascii_organism_motion)),
             last_input: self.last_input,
         };
         if self.running || !policy.inline_visible(now) {
@@ -1231,10 +1280,10 @@ impl OrganismHost {
             focused_owner: interactive && self.owner.is_some(),
             local: true,
             alternate_screen: false,
-            motion: config.ascii_organism_motion,
+            motion: Some(self.motion(config.ascii_organism_motion)),
             last_input: self.last_input,
         };
-        let full = resolved_motion(config.ascii_organism_motion) == OrganismMotion::Full;
+        let full = self.motion(config.ascii_organism_motion) == OrganismMotion::Full;
         let frame = if full {
             now.as_millis() as u64 / 100
         } else {
@@ -1494,8 +1543,7 @@ impl OrganismHost {
                         base_context: context,
                         activity: self.activity,
                         hard_eligible: interactive
-                            && resolved_motion(config.ascii_organism_motion)
-                                != OrganismMotion::Static,
+                            && self.motion(config.ascii_organism_motion) != OrganismMotion::Static,
                         hover_available: self.native_surface_rect.is_some(),
                         pointer_inside: self.pointer_inside,
                     },
@@ -1563,7 +1611,7 @@ impl OrganismHost {
         } else {
             font_size.min(inner.height() / 1.2)
         };
-        let full = resolved_motion(config.ascii_organism_motion) == OrganismMotion::Full;
+        let full = self.motion(config.ascii_organism_motion) == OrganismMotion::Full;
         let frame = if live && full {
             now.as_millis() as u64 / 100
         } else {
@@ -1764,7 +1812,7 @@ impl OrganismHost {
             focused_owner: eligible,
             local: true,
             alternate_screen: false,
-            motion: config.ascii_organism_motion,
+            motion: Some(self.motion(config.ascii_organism_motion)),
             last_input: self.last_input,
         };
         if !policy.inline_visible(now) {
@@ -1783,7 +1831,7 @@ impl OrganismHost {
                 false,
             );
         }
-        let full = resolved_motion(config.ascii_organism_motion) == OrganismMotion::Full;
+        let full = self.motion(config.ascii_organism_motion) == OrganismMotion::Full;
         if !config.ascii_organism_expanded || !full {
             self.bridge.reset();
         }
@@ -2124,13 +2172,17 @@ impl crate::TerminalApp {
     }
 
     pub(crate) fn prepare_organism(&mut self, ctx: &egui::Context) {
+        self.organism.system_motion.connect(ctx);
+        ctx.data_mut(|data| {
+            data.insert_temp(system_motion_id(), self.organism.system_motion.reduced())
+        });
         self.sync_organism_agent();
         self.organism.configure_bridge(
             self.config.ascii_organism_expanded
-                && resolved_motion(self.config.ascii_organism_motion) == OrganismMotion::Full,
+                && self.organism.motion(self.config.ascii_organism_motion) == OrganismMotion::Full,
         );
         let rhythm_enabled =
-            resolved_motion(self.config.ascii_organism_motion) != OrganismMotion::Static;
+            self.organism.motion(self.config.ascii_organism_motion) != OrganismMotion::Static;
         if self.organism.rhythm_enabled != rhythm_enabled {
             self.organism.watch.reset();
         }
@@ -2602,6 +2654,12 @@ impl PreviewUi {
     }
 
     pub fn show(&mut self, ui: &mut Ui, motion: Option<OrganismMotion>) {
+        let reduced = ui
+            .ctx()
+            .data(|data| data.get_temp::<bool>(system_motion_id()).unwrap_or(false));
+        let motion = Some(crate::organism::resolved_motion_with_system(
+            motion, reduced,
+        ));
         let (focused, occluded) = ui.ctx().input(|input| {
             let viewport = input.viewport();
             (
@@ -2793,6 +2851,84 @@ fn preview_next_wake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_motion_coalesces_duplicates_and_keeps_explicit_choices() {
+        let host = OrganismHost::default();
+        assert_eq!(host.motion(None), OrganismMotion::Calm);
+        assert!(!publish_system_motion(&host.system_motion.reduced, false));
+        assert!(publish_system_motion(&host.system_motion.reduced, true));
+        assert!(!publish_system_motion(&host.system_motion.reduced, true));
+        assert_eq!(host.motion(None), OrganismMotion::Static);
+        for choice in [
+            OrganismMotion::Full,
+            OrganismMotion::Calm,
+            OrganismMotion::Static,
+        ] {
+            assert_eq!(host.motion(Some(choice)), choice);
+        }
+        assert!(publish_system_motion(&host.system_motion.reduced, false));
+        assert_eq!(host.motion(None), OrganismMotion::Calm);
+    }
+
+    #[test]
+    fn system_motion_transition_preserves_completion_and_stops_animation_wakes() {
+        let mut host = OrganismHost::default();
+        host.owner = Some("local".into());
+        host.cursor = Some((42, false));
+        host.reaction_status = "completed successfully".into();
+        host.reaction_until = Duration::from_secs(12);
+        let now = Duration::from_secs(10);
+        let policy = |motion| PresentationPolicy {
+            enabled: true,
+            focused_owner: true,
+            local: true,
+            motion: Some(motion),
+            ..Default::default()
+        };
+        assert_eq!(
+            next_host_wake(policy(host.motion(None)), now, host.reaction_until, false),
+            Some(Duration::from_millis(900))
+        );
+        assert!(publish_system_motion(&host.system_motion.reduced, true));
+        // Completion is still shown until its existing bounded expiry; no heartbeat.
+        assert_eq!(
+            next_host_wake(policy(host.motion(None)), now, host.reaction_until, false),
+            Some(Duration::from_secs(2))
+        );
+        for elapsed in [12, 13, 60, 3600] {
+            assert_eq!(
+                next_host_wake(
+                    policy(host.motion(None)),
+                    Duration::from_secs(elapsed),
+                    host.reaction_until,
+                    false
+                ),
+                None
+            );
+        }
+        assert_eq!(host.cursor, Some((42, false)));
+        assert_eq!(host.owner.as_deref(), Some("local"));
+        assert_eq!(host.reaction_status, "completed successfully");
+        for mut hidden in [policy(host.motion(None)); 4].into_iter().enumerate() {
+            match hidden.0 {
+                0 => hidden.1.enabled = false,
+                1 => hidden.1.focused_owner = false,
+                2 => hidden.1.local = false,
+                _ => hidden.1.alternate_screen = true,
+            }
+            assert_eq!(
+                next_host_wake(hidden.1, now, host.reaction_until, false),
+                None
+            );
+        }
+        publish_system_motion(&host.system_motion.reduced, false);
+        assert_eq!(host.cursor, Some((42, false)));
+        assert_eq!(
+            next_host_wake(policy(host.motion(None)), now, Duration::ZERO, false),
+            Some(Duration::from_millis(900))
+        );
+    }
 
     #[test]
     fn agent_lifecycle_edges_are_deduplicated_and_disabled_edges_are_consumed() {

@@ -86,8 +86,25 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         if self.backend == 'x11':
             self.env['DISPLAY'] = ':99'
             server = self.spawn(['Xvfb', ':99', '-screen', '0', '1280x900x24', '-nolisten', 'tcp'], 'xvfb')
-            wait_for(lambda: subprocess.run(['xdpyinfo'], env=self.env, stdout=subprocess.DEVNULL,
-                                            stderr=subprocess.DEVNULL, timeout=3).returncode == 0, 'X11 display')
+            deadline = time.monotonic() + 30
+            readiness = self.out / 'x11-readiness.jsonl'
+            def display_ready():
+                assert server.poll() is None, 'Xvfb exited before display readiness'
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                attempt = {'monotonic': time.monotonic()}
+                try:
+                    probe = subprocess.run(['xdpyinfo'], env=self.env, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.PIPE, text=True, timeout=min(3, remaining))
+                    attempt.update(returncode=probe.returncode, stderr=probe.stderr[:512])
+                except subprocess.TimeoutExpired:
+                    attempt['timeout'] = True
+                with readiness.open('a') as log:
+                    log.write(json.dumps(attempt) + '\n')
+                return attempt.get('returncode') == 0
+            # Only readiness probes may repeat; no app launch or input is retried.
+            wait_for(display_ready, 'X11 display within 30 seconds', timeout=30)
             assert server.poll() is None
             # Stock Openbox grabs Ctrl+Alt+Left/Right for desktop switching.
             # Keep the real Ember pane shortcuts; remove only those conflicting
@@ -296,6 +313,69 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         time.sleep(0.5)
         self.screenshot(new + '-live-switch')
 
+    def own_clipboard(self, payload, case):
+        log = open(self.out / ('clipboard-' + case + '.log'), 'w')
+        self.logs.append(log)
+        args = ['xclip', '-selection', 'clipboard', '-quiet'] if self.backend == 'x11' else ['wl-copy', '--foreground']
+        owner = subprocess.Popen(args, env=self.env, stdin=subprocess.PIPE, stdout=log, stderr=log)
+        self.processes.append(owner)
+        owner.stdin.write(payload.encode())
+        owner.stdin.close()
+        time.sleep(0.5)
+        assert self.read_clipboard() == payload.encode(), 'Clipboard owner readback mismatch'
+
+    def read_clipboard(self):
+        reader = ['xclip', '-selection', 'clipboard', '-o'] if self.backend == 'x11' else ['wl-paste', '--no-newline']
+        return self.run(reader, capture_output=True).stdout
+
+    def raw_start(self, case):
+        self.text('rawcheck ' + case)
+        self.key('Return')
+        out = self.out / 'raw-pty' / case
+        wait_for((out / 'ready').exists, 'real raw PTY collector ' + case)
+        return out
+
+    def raw_finish(self, out, identity, expected):
+        (out / 'expected.bin').write_bytes(expected)
+        (out / 'finish').touch()
+        wait_for((out / 'result.json').exists, 'raw capture completed ' + out.name)
+        result = json.loads((out / 'result.json').read_text())
+        assert result['status'] == 'pass', result
+        assert str(result['shell_pid']) + ':' + result['tty'] == identity, result
+        actual = (out / 'bytes.bin').read_bytes()
+        assert actual == expected, ('wrong raw PTY bytes', out.name, actual.hex(), expected.hex())
+        time.sleep(0.3)
+
+    def find_clipboard_ownership(self, identity, case):
+        payload = 'EMBERUI' + case.replace('-', '').upper()
+        # A zero-byte result is meaningful only with a same-mode positive control.
+        out = self.raw_start(case + '-clipboard-positive')
+        self.own_clipboard(payload, case + '-positive')
+        self.key('v', ('ctrl', 'shift'))
+        time.sleep(0.5)
+        self.raw_finish(out, identity, payload.encode())
+        for suffix, modifiers in [('ctrlv', ('ctrl',)), ('ctrlshiftv', ('ctrl', 'shift'))]:
+            label = case + '-find-' + suffix
+            payload = 'EMBERUI' + label.replace('-', '').upper()
+            out = self.raw_start(label)
+            self.key('f', ('ctrl', 'shift'))
+            time.sleep(0.3)
+            self.key('a', ('ctrl',))
+            self.key('BackSpace')
+            self.own_clipboard(payload, label)
+            self.key('v', modifiers)
+            self.screenshot(label + '-pasted')
+            self.key('a', ('ctrl',))
+            # Replace the source clipboard before Copy, so a stale source value
+            # cannot masquerade as successful UI paste/selection/copy.
+            self.own_clipboard('DECOY' + label, label + '-decoy')
+            self.key('c', ('ctrl',))
+            wait_for(lambda: self.read_clipboard() == payload.encode(), 'Find clipboard roundtrip ' + label)
+            (out / 'ui-readback.txt').write_bytes(self.read_clipboard())
+            self.key('Escape')
+            time.sleep(0.3)
+            self.raw_finish(out, identity, b'')
+
     def raw_punctuation_oracle(self, identity, case):
         self.text('rawcheck ' + case)
         self.key('Return')
@@ -326,11 +406,13 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         self.screenshot('normal-startup')
         identity = self.command('normal-typed')
         self.raw_punctuation_oracle(identity, 'normal')
+        self.find_clipboard_ownership(identity, 'initial-normal')
         assert self.command('normal-paste', paste=True) == identity
         old = 'normal'
         for mode in ('block', 'chat', 'normal'):
             self.switch_mode(old, mode)
             self.raw_punctuation_oracle(identity, mode + 'switch')
+            self.find_clipboard_ownership(identity, 'switched-' + mode)
             assert self.command(mode + '-switched') == identity, 'Mode switch replaced shell'
             assert self.command(mode + '-switched-paste', paste=True) == identity
             old = mode
@@ -351,7 +433,8 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         assert [line.split(':', 1)[0] for line in lines] == expected
         assert app.poll() is None, 'Application exited unexpectedly'
         return {'sentinels': len(lines), 'primary_identity': identity, 'split_identity': second,
-                'live_modes': ['normal', 'block', 'chat', 'normal']}
+                'live_modes': ['normal', 'block', 'chat', 'normal'],
+                'find_clipboard_zero_byte_cases': 8, 'clipboard_positive_controls': 4}
 
     def close(self):
         for proc in reversed(self.processes):
@@ -377,7 +460,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     result = {'backend': args.backend, 'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
               'excluded': ['IME composition', 'physical GPU', 'fractional scale and narrow window',
-              'selection/copy geometry', 'zero-byte UI clipboard ownership', 'clipboard latency']}
+              'selection/copy geometry', 'task/settings UI clipboard ownership and adversarial clipboard scenarios', 'clipboard latency']}
     smoke = Smoke(args.binary, args.backend, args.output)
     try:
         smoke.start_desktop()
