@@ -254,7 +254,7 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         result = self.run(['tesseract', str(self.out / (label + '.png')), 'stdout',
                            '--psm', '11', 'tsv'], capture_output=True, text=True)
         (self.out / (label + '.tsv')).write_text(result.stdout)
-        return [row for row in csv.DictReader(io.StringIO(result.stdout), delimiter='\t')
+        return [row for row in csv.DictReader(io.StringIO(result.stdout), delimiter='\t', quoting=csv.QUOTE_NONE)
                 if row['text'].strip()]
 
     def click_word(self, word, label):
