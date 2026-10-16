@@ -2873,11 +2873,13 @@ mod tests {
 
     #[test]
     fn system_motion_transition_preserves_completion_and_stops_animation_wakes() {
-        let mut host = OrganismHost::default();
-        host.owner = Some("local".into());
-        host.cursor = Some((42, false));
-        host.reaction_status = "completed successfully".into();
-        host.reaction_until = Duration::from_secs(12);
+        let host = OrganismHost {
+            owner: Some("local".into()),
+            cursor: Some((42, false)),
+            reaction_status: "completed successfully".into(),
+            reaction_until: Duration::from_secs(12),
+            ..Default::default()
+        };
         let now = Duration::from_secs(10);
         let policy = |motion| PresentationPolicy {
             enabled: true,
@@ -4483,7 +4485,7 @@ mod tests {
             .split_once("fn live_semantic_response(")
             .unwrap()
             .1
-            .split_once("pub struct OrganismHost")
+            .split_once("\nfn live_tooltip_allowed(")
             .unwrap()
             .0;
         assert!(!helper.contains("request_repaint"));
@@ -6833,3 +6835,7 @@ mod chat_offscreen_tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "organism_ui/system_motion_native_tests.rs"]
+mod system_motion_native_tests;

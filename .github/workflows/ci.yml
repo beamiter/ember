@@ -128,6 +128,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
+            dbus libglib2.0-bin python3-dbus python3-gi \
             pkg-config \
             libfontconfig1-dev \
             libwayland-dev \
@@ -172,6 +173,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Gate isolated native organism preference events
+        run: /usr/bin/python3 scripts/test-organism-system-motion.py
 
   release-build:
     name: Release build

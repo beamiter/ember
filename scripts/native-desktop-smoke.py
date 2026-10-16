@@ -266,16 +266,24 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             self.pointer_ack('done')
         time.sleep(0.3)
 
-    def words(self, label):
-        self.screenshot(label)
+    def words(self, label, psm=11, capture=True):
+        if capture:
+            self.screenshot(label)
         result = self.run(['tesseract', str(self.out / (label + '.png')), 'stdout',
-                           '--psm', '11', 'tsv'], capture_output=True, text=True)
-        (self.out / (label + '.tsv')).write_text(result.stdout)
+                           '--psm', str(psm), 'tsv'], capture_output=True, text=True)
+        suffix = '' if psm == 11 else '-psm' + str(psm)
+        (self.out / (label + suffix + '.tsv')).write_text(result.stdout)
         return [row for row in csv.DictReader(io.StringIO(result.stdout), delimiter='\t', quoting=csv.QUOTE_NONE)
                 if row['text'].strip()]
 
     def click_word(self, word, label):
         matches = [row for row in self.words(label) if row['text'].strip() == word]
+        if not matches:
+            # A second layout analysis of the SAME captured pixels can recover
+            # small buttons lost among dense terminal text. Never relax exact
+            # spelling/uniqueness or retry an input action.
+            matches = [row for row in self.words(label, psm=6, capture=False)
+                       if row['text'].strip() == word]
         assert len(matches) == 1, (word, matches)
         row = matches[0]
         self.click(int(row['left']) + int(row['width']) // 2,
