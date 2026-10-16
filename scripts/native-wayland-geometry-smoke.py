@@ -59,7 +59,20 @@ def main():
             raise RuntimeError('Requested output geometry not applied')
         smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = false\n')
         config_before = smoke.config.read_bytes()
-        smoke.app = smoke.spawn([str(binary)], 'ember')
+        (out / 'synthetic-config-before.toml').write_bytes(config_before)
+        result['config_before_sha256'] = hashlib.sha256(config_before).hexdigest()
+        # Child-only protocol trace for synthetic isolated geometry diagnosis.
+        # Preserve the failing resize order; do not enable tracing globally or
+        # for subsequent input helpers. No user display/config is involved.
+        previous_debug = smoke.env.get('WAYLAND_DEBUG')
+        smoke.env['WAYLAND_DEBUG'] = 'client'
+        try:
+            smoke.app = smoke.spawn([str(binary)], 'ember')
+        finally:
+            if previous_debug is None:
+                smoke.env.pop('WAYLAND_DEBUG', None)
+            else:
+                smoke.env['WAYLAND_DEBUG'] = previous_debug
         node = desktop.wait_for(smoke.app_window, 'owned Ember window')
         sway(smoke, f'[con_id={node}] border none')
         floating = args.window == 'narrow'
@@ -96,7 +109,10 @@ def main():
         time.sleep(0.3)
         if smoke.command('geometry-resumed') != identity:
             raise RuntimeError('Shell PID/TTY changed after navigation')
-        if smoke.config.read_bytes() != config_before:
+        config_after = smoke.config.read_bytes()
+        (out / 'synthetic-config-after.toml').write_bytes(config_after)
+        result['config_after_sha256'] = hashlib.sha256(config_after).hexdigest()
+        if config_after != config_before:
             raise RuntimeError('Navigation changed configuration')
         lines = smoke.transcript.read_text().splitlines()
         if lines != ['geometry-ready:' + identity, 'geometry-resumed:' + identity]:
