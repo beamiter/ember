@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "baseline_sha": "1c43338c0292f40fd294cb89d243bae356d64965",
+  "candidate_sha": "9607c1cd4c4f623ed383a7f1a7d7ebb07a22b5e7",
+  "driver_control_sha": "e4c292f10463e52fe7e74e808ca10fc4ab27729c",
+  "warmup_pairs": 5,
+  "measured_pairs": 240,
+  "budget_ms": 50,
+  "bootstrap_resamples": 10000,
+  "bootstrap_seed": 0,
+  "scope": "cumulative regression across 29 commits, not an E09-only causal experiment",
+  "endpoint": "first main statement to first post_rendering branch before window.set_visible(true)",
+  "overlay_sha256": "74c3daf63089139cf927db14a83f1979e071efda3791841d6a6ae942b701ebe8",
+  "legacy_helper_sha256": "19967416389d166f427aaa5b0337e31e8762dd4ca1d03b6d14cc1ef7661d620c",
+  "driver_files": {
+    "scripts/native-desktop-smoke.py": "15459be5d29042ab08ba7dd1fa67fdd4afd3799d33acbeb8c97446b384aad16f",
+    "scripts/native-pty-capture.py": "4d9b53092843e291ad09d16e72cd915df312185aa010291b098547e809db998e",
+    "scripts/native-pointer.c": "ead6106b6df0fb28c8eeaccc33a5894c5a05d227193e417144f30347bf5db38b",
+    "scripts/protocols/wlr-virtual-pointer-unstable-v1.xml": "7849f8c25b5104da9dc508301414331cdd3c8fa33daf08f85b67a8fcd6e2f0b8"
+  }
+}

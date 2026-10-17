@@ -1,52 +1,61 @@
 name: Session startup benchmark (temporary instrumented builds)
 on:
-  push:
-    branches: [master]
-    paths:
-      - .github/workflows/session-startup-benchmark.yml
-      - scripts/benchmark-session-startup.py
-      - tests/fixtures/session-startup/benchmark-overlay.patch
   workflow_dispatch:
-    inputs:
-      baseline_sha:
-        description: Exact uninstrumented baseline commit
-        required: true
-        default: 1c43338c0292f40fd294cb89d243bae356d64965
-      candidate_sha:
-        description: Exact reviewed E09 candidate commit
-        required: true
-        default: 60e70c4a24d52e41d173c4baf26bf06bf3bd1569
 permissions:
   contents: read
 jobs:
   paired-startup:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [x11, wayland]
     env:
       CARGO_BUILD_JOBS: 1
       CARGO_INCREMENTAL: 0
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      - name: Validate immutable refs
-        env:
-          BASELINE_SHA: ${{ inputs.baseline_sha || '1c43338c0292f40fd294cb89d243bae356d64965' }}
-          CANDIDATE_SHA: ${{ inputs.candidate_sha || '60e70c4a24d52e41d173c4baf26bf06bf3bd1569' }}
-        run: |
-          test "$BASELINE_SHA" = 1c43338c0292f40fd294cb89d243bae356d64965
-          test "$CANDIDATE_SHA" = 60e70c4a24d52e41d173c4baf26bf06bf3bd1569
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: control
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Verify and expose reviewed plan
+        id: plan
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, importlib.util, json, os
+          from pathlib import Path
+          root = Path('control')
+          for relative, expected in {
+              'scripts/benchmark-session-startup-plan.py': 'a85d2bf155d519745b605d2eef994a169838aaaada5267521d521baf25d0a610',
+              'tests/fixtures/session-startup/paired-plan.json': 'ee27af3af4ab05111d7bcf6ad11d524611bff5d7e38de89a781eaa3f8ced7533',
+          }.items():
+              assert hashlib.sha256((root / relative).read_bytes()).hexdigest() == expected, relative
+          spec = importlib.util.spec_from_file_location('bench', root / 'scripts/benchmark-session-startup-plan.py')
+          bench = importlib.util.module_from_spec(spec); spec.loader.exec_module(bench)
+          plan = bench.read_plan(root / 'tests/fixtures/session-startup/paired-plan.json')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              for name in ('baseline_sha', 'candidate_sha', 'driver_control_sha'):
+                  out.write(f'{name}={plan[name]}\n')
+          Path('benchmark-artifacts').mkdir()
+          Path('benchmark-artifacts/paired-plan.json').write_text(json.dumps(plan, indent=2))
+          PYTHON
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.baseline_sha || '1c43338c0292f40fd294cb89d243bae356d64965' }}
+          ref: ${{ steps.plan.outputs.baseline_sha }}
           path: baseline
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.candidate_sha || '60e70c4a24d52e41d173c4baf26bf06bf3bd1569' }}
+          ref: ${{ steps.plan.outputs.candidate_sha }}
           path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ steps.plan.outputs.driver_control_sha }}
+          path: driver-control
           persist-credentials: false
       - name: Install official build and desktop packages
         run: |
@@ -64,26 +73,30 @@ jobs:
             baseline -> target
             candidate -> target
           shared-key: session-startup-benchmark
+      - name: Check fixed-plan pure and static contracts
+        run: python3 control/scripts/test-session-startup-benchmark.py
       - name: Verify baseline and preserve identities before overlay
         env:
-          BASELINE_SHA: ${{ inputs.baseline_sha || '1c43338c0292f40fd294cb89d243bae356d64965' }}
-          CANDIDATE_SHA: ${{ inputs.candidate_sha || '60e70c4a24d52e41d173c4baf26bf06bf3bd1569' }}
+          BASELINE_SHA: ${{ steps.plan.outputs.baseline_sha }}
+          CANDIDATE_SHA: ${{ steps.plan.outputs.candidate_sha }}
         run: |
           test "$(git -C control rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git -C control status --porcelain)"
+          test "$(git -C driver-control rev-parse HEAD)" = "${{ steps.plan.outputs.driver_control_sha }}"
+          test -z "$(git -C driver-control status --porcelain)"
           printf '%s  %s\n' 19967416389d166f427aaa5b0337e31e8762dd4ca1d03b6d14cc1ef7661d620c control/scripts/benchmark-session-startup.py | sha256sum --check
           printf '%s  %s\n' 74c3daf63089139cf927db14a83f1979e071efda3791841d6a6ae942b701ebe8 control/tests/fixtures/session-startup/benchmark-overlay.patch | sha256sum --check
-          printf '%s  %s\n' 15459be5d29042ab08ba7dd1fa67fdd4afd3799d33acbeb8c97446b384aad16f control/scripts/native-desktop-smoke.py | sha256sum --check
-          printf '%s  %s\n' ead6106b6df0fb28c8eeaccc33a5894c5a05d227193e417144f30347bf5db38b control/scripts/native-pointer.c | sha256sum --check
-          printf '%s  %s\n' 7849f8c25b5104da9dc508301414331cdd3c8fa33daf08f85b67a8fcd6e2f0b8 control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml | sha256sum --check
-          printf '%s  %s\n' 4d9b53092843e291ad09d16e72cd915df312185aa010291b098547e809db998e control/scripts/native-pty-capture.py | sha256sum --check
+          printf '%s  %s\n' 15459be5d29042ab08ba7dd1fa67fdd4afd3799d33acbeb8c97446b384aad16f driver-control/scripts/native-desktop-smoke.py | sha256sum --check
+          printf '%s  %s\n' ead6106b6df0fb28c8eeaccc33a5894c5a05d227193e417144f30347bf5db38b driver-control/scripts/native-pointer.c | sha256sum --check
+          printf '%s  %s\n' 7849f8c25b5104da9dc508301414331cdd3c8fa33daf08f85b67a8fcd6e2f0b8 driver-control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml | sha256sum --check
+          printf '%s  %s\n' 4d9b53092843e291ad09d16e72cd915df312185aa010291b098547e809db998e driver-control/scripts/native-pty-capture.py | sha256sum --check
           test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
           test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
           test -z "$(git -C baseline status --porcelain)"
           test -z "$(git -C candidate status --porcelain)"
           cmp baseline/Cargo.lock candidate/Cargo.lock
           mkdir -p benchmark-artifacts
-          { uname -a; rustc -Vv; git -C control rev-parse HEAD; printf '%s\n' "$BASELINE_SHA" "$CANDIDATE_SHA"; sha256sum baseline/Cargo.lock candidate/Cargo.lock control/tests/fixtures/session-startup/benchmark-overlay.patch; } > benchmark-artifacts/source-identity.txt
+          { uname -a; lscpu; cat /etc/os-release; printf '%s %s\n' "$ImageOS" "$ImageVersion"; dpkg-query -W; rustc -Vv; git -C control rev-parse HEAD; printf '%s\n' "$BASELINE_SHA" "$CANDIDATE_SHA"; sha256sum baseline/Cargo.lock candidate/Cargo.lock control/tests/fixtures/session-startup/benchmark-overlay.patch; } > benchmark-artifacts/source-identity.txt
           for source in baseline candidate; do
             git -C "$source" apply --check "$GITHUB_WORKSPACE/control/tests/fixtures/session-startup/benchmark-overlay.patch"
           done
@@ -99,33 +112,24 @@ jobs:
       - name: Build compositor pointer prerequisite for shared desktop driver
         run: |
           mkdir -p "$RUNNER_TEMP/ember-pointer"
-          wayland-scanner client-header control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/wlr-virtual-pointer-unstable-v1-client-protocol.h"
-          wayland-scanner private-code control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/protocol.c"
-          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/ember-pointer" control/scripts/native-pointer.c "$RUNNER_TEMP/ember-pointer/protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/ember-pointer/native-pointer"
+          wayland-scanner client-header driver-control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/wlr-virtual-pointer-unstable-v1-client-protocol.h"
+          wayland-scanner private-code driver-control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/protocol.c"
+          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/ember-pointer" driver-control/scripts/native-pointer.c "$RUNNER_TEMP/ember-pointer/protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/ember-pointer/native-pointer"
           echo "EMBER_POINTER_HELPER=$RUNNER_TEMP/ember-pointer/native-pointer" >> "$GITHUB_ENV"
-      - name: Paired main-entry to first-painted-frame samples
-        env:
-          BASELINE_SHA: ${{ inputs.baseline_sha || '1c43338c0292f40fd294cb89d243bae356d64965' }}
-          CANDIDATE_SHA: ${{ inputs.candidate_sha || '60e70c4a24d52e41d173c4baf26bf06bf3bd1569' }}
+      - name: Fixed paired main-entry to pre-visibility first-frame samples
         run: |
-          overlay_sha=$(sha256sum control/tests/fixtures/session-startup/benchmark-overlay.patch | cut -d' ' -f1)
-          status=0
-          for backend in x11 wayland; do
-            if ! /usr/bin/python3 control/scripts/benchmark-session-startup.py \
-              --baseline "$RUNNER_TEMP/ember-benchmark-baseline" \
-              --candidate "$RUNNER_TEMP/ember-benchmark-candidate" \
-              --driver control/scripts/native-desktop-smoke.py --backend "$backend" \
-              --baseline-sha "$BASELINE_SHA" --candidate-sha "$CANDIDATE_SHA" \
-              --overlay-sha "$overlay_sha" --output "benchmark-artifacts/$backend"; then
-              status=1
-            fi
-          done
-          exit "$status"
+          /usr/bin/python3 control/scripts/benchmark-session-startup-plan.py \
+            --baseline "$RUNNER_TEMP/ember-benchmark-baseline" \
+            --candidate "$RUNNER_TEMP/ember-benchmark-candidate" \
+            --driver-root driver-control --backend "${{ matrix.backend }}" \
+            --plan control/tests/fixtures/session-startup/paired-plan.json \
+            --overlay control/tests/fixtures/session-startup/benchmark-overlay.patch \
+            --control-sha "$GITHUB_SHA" --output "benchmark-artifacts/${{ matrix.backend }}"
       - name: Preserve all timing and failure evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: ember-session-startup-benchmark-${{ github.run_id }}
+          name: ember-session-startup-benchmark-${{ github.run_id }}-${{ matrix.backend }}
           path: benchmark-artifacts
           if-no-files-found: error
           retention-days: 14
