@@ -302,6 +302,22 @@ jobs:
           done
           exit "$status"
 
+      - name: Independent E03 pixel observer pilot
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        timeout-minutes: 12
+        run: |
+          python3 scripts/test-native-block-search-observer-pilot.py
+          status=0
+          for scenario in raw snapshot; do
+            if ! /usr/bin/python3 scripts/native-block-search.py \
+              --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
+              --backend x11 --scenario "$scenario" --observer-pilot \
+              --output "native-smoke-artifacts/block-search-observer-pilot-$scenario"; then
+              status=1
+            fi
+          done
+          exit "$status"
+
       - name: Build compositor protocol pointer helper
         id: desktop-pointer
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}

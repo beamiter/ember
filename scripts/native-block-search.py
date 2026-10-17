@@ -80,12 +80,13 @@ def active_hit_claim(rows, token):
     return raw_hit_claim(rows, token)
 
 
-def validate_manifest(result, mode, record, identity):
+def validate_manifest(result, mode, record, identity, observer_pilot=False):
     count = {'raw': 100000, 'snapshot': 2000, 'flush': 256}[mode]
     expected = hashlib.sha256()
     for index in range(count):
-        expected.update(fixture.line(mode, index, record))
-    if (result.get('mode') != mode or result.get('record') != record or
+        expected.update(fixture.line(mode, index, record, observer_pilot))
+    if (result.get('observer_pilot', False) != observer_pilot or
+            result.get('mode') != mode or result.get('record') != record or
             result.get('lines') != count or result.get('bytes') != count * 97 or
             result.get('sha256') != expected.hexdigest()):
         raise RuntimeError('Emitter manifest differs from exact expected stream')
@@ -291,6 +292,8 @@ def main():
     parser.add_argument('--backend', choices=['x11'], default='x11')
     parser.add_argument('--scenario', choices=['raw', 'snapshot'], required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--observer-pilot', action='store_true',
+                        help='Independent preregistered pixel-observer experiment; not the legacy gate')
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     out = args.output.resolve()
@@ -301,7 +304,11 @@ def main():
                               'natural-limit Continue', 'continuous PTY contention',
                               'pane/query/reset/eviction/alternate-screen race matrix',
                               'keyboard final navigation', 'Wayland'])
-    smoke = SearchSmoke(binary, args.backend, out)
+    smoke_class = (load('e03_observer_pilot', 'native-block-search-observer-pilot.py').PilotSmoke
+                   if args.observer_pilot else SearchSmoke)
+    smoke = smoke_class(binary, args.backend, out)
+    if args.observer_pilot:
+        result['observer_pilot'] = 'preregistered experiment; legacy gate remains separate'
     try:
         log = open(out/'private-dbus.log', 'w'); smoke.logs.append(log)
         smoke.bus_daemon = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address=1'],

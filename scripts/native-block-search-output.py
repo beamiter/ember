@@ -14,7 +14,15 @@ SNAPSHOT_LINES = 2000
 SNAPSHOTS = 64
 
 
-def line(mode, index, record=0):
+PILOT_MARKERS = {
+    'raw': ('TARGET PAPAYA', 'NEIGHBOR PAPAYA'),
+    'snapshot': ('TARGET WALNUT', 'NEIGHBOR WALNUT'),
+}
+PILOT_COLUMN = 36
+PILOT_LIVE_MARKER = 'LATEST CEDAR'
+
+
+def line(mode, index, record=0, observer_pilot=False):
     if mode == 'raw':
         token = {16: 'E03EARLYHIT', 50000: 'E03MIDDLEHIT',
                  99950: 'E03LATEHIT'}.get(index, 'E03FILLER')
@@ -23,10 +31,14 @@ def line(mode, index, record=0):
     else:
         token = 'E03FLUSH'
     prefix = f'{token} ROW{index:06d} '
+    if observer_pilot and mode in PILOT_MARKERS and record == 0 and index in (16, 17):
+        prefix = prefix.ljust(PILOT_COLUMN) + PILOT_MARKERS[mode][index - 16] + '    '
+    elif observer_pilot and mode == 'flush' and record == 0 and index == 255:
+        prefix = prefix.ljust(PILOT_COLUMN) + PILOT_LIVE_MARKER + '    '
     return (prefix + '.' * (WIDTH - len(prefix)) + '\n').encode('ascii')
 
 
-def emit(mode, record, output, manifest, require_tty=True):
+def emit(mode, record, output, manifest, require_tty=True, observer_pilot=False):
     if mode not in ('raw', 'snapshot', 'flush') or not 0 <= record < SNAPSHOTS:
         raise ValueError('Invalid bounded fixture mode/record')
     tty = None
@@ -43,7 +55,7 @@ def emit(mode, record, output, manifest, require_tty=True):
     started = time.monotonic_ns()
     # Bounded output chunks; never construct a 100k-line string.
     for start in range(0, count, 128):
-        chunk = b''.join(line(mode, i, record) for i in range(start, min(start + 128, count)))
+        chunk = b''.join(line(mode, i, record, observer_pilot) for i in range(start, min(start + 128, count)))
         output.write(chunk)
         digest.update(chunk)
         total += len(chunk)
@@ -52,6 +64,8 @@ def emit(mode, record, output, manifest, require_tty=True):
                   sha256=digest.hexdigest(), started_ns=started,
                   finished_ns=time.monotonic_ns(), pid=os.getpid(),
                   shell_pid=os.getppid(), tty=tty, columns=columns)
+    if observer_pilot:
+        result['observer_pilot'] = True
     # Exclusive creation: repeating a command cannot masquerade as one action.
     with manifest.open('x') as stream:
         json.dump(result, stream, indent=2)
@@ -62,10 +76,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=['raw', 'snapshot', 'flush'])
     parser.add_argument('record', type=int, nargs='?', default=0)
+    parser.add_argument('--observer-pilot', action='store_true')
     args = parser.parse_args()
     root = Path(os.environ['EMBER_E03_FIXTURES'])
     emit(args.mode, args.record, sys.stdout.buffer,
-         root / f'{args.mode}-{args.record:02d}.json')
+         root / f'{args.mode}-{args.record:02d}.json', observer_pilot=args.observer_pilot)
 
 
 if __name__ == '__main__':
