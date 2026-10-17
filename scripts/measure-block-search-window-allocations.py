@@ -15,11 +15,16 @@ import tempfile
 root = Path(__file__).resolve().parent.parent
 source = (root / 'src/block_mode.rs').read_text()
 start = source.index('/// Owned newest-first source moved into the bounded index builder.')
-end = source.index("/// One record's precomputed original/lowercase text.", start)
-production = source[start:end]
+end = source.index("/// [`search_blocks`] result:", start)
+normalization_start = source.index('pub(crate) fn block_search_literal_scalar')
+normalization_end = source.index('/// Display clip for a hit', normalization_start)
+production = source[normalization_start:normalization_end] + source[start:end]
 test = (root / 'tests/block_search_window_memory.rs').read_text()
 support = test[:test.index('#[test]')]
 support = re.sub(r'use ember::block_mode::\{.*?\};\n', '', support, flags=re.S)
+boundary_start = test.index('    // The rejected boundary record')
+boundary_end = test.index('    // Exactly one test', boundary_start)
+boundary_checks = test[boundary_start:boundary_end].replace('ember::block_mode::', '')
 main = r'''
 fn main() {
     const BUDGET: usize = 4096;
@@ -52,6 +57,7 @@ fn main() {
     }
 }
 '''
+main = main.replace('    const BUDGET: usize = 4096;', boundary_checks + '\n    const BUDGET: usize = 4096;', 1)
 print('production_fragment_sha256=' + hashlib.sha256(production.encode()).hexdigest(), flush=True)
 print('Scope: exact production snapshot source/map allocation only; not full integration, RSS, worker or p95.', flush=True)
 with tempfile.TemporaryDirectory(prefix='ember-window-allocation-') as tmp:

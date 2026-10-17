@@ -119,11 +119,24 @@ fn production_window_allocations_do_not_scale_with_retained_history() {
     assert_eq!(map.get("new-raw"), Some(&900));
     assert_eq!(map.get("captured"), Some(&800));
     assert!(!map.contains_key("excluded-raw"));
+    // Normalization owns String capacity, which can exceed its text length.
+    // Derive the boundary from the actual production representation, never
+    // from measured total peak or a success-driven relaxed byte threshold.
+    let first_record =
+        ember::block_mode::CachedBlockSearchRecord::new("new-raw", Some("needle"), None);
+    let first_payload = first_record.record_id.capacity()
+        + first_record.command.as_ref().unwrap().capacity()
+        + first_record.command_lowercase.as_ref().unwrap().capacity();
     let cache_limit =
-        2 * std::mem::size_of::<ember::block_mode::CachedBlockSearchRecord>() + 7 + 6 + 6;
+        2 * std::mem::size_of::<ember::block_mode::CachedBlockSearchRecord>() + first_payload;
+    drop(first_record);
     let build = build_block_search_cache_cancellable(snapshot, cache_limit, || false).unwrap();
     assert_eq!(build.records.len(), 1);
     assert_eq!(build.records[0].record_id, "new-raw");
+    assert!(
+        build.older_not_indexed,
+        "second normalized record must remain excluded"
+    );
     let final_map = finalized_block_search_sequences(
         map,
         build.records.iter().map(|record| record.record_id.as_str()),
