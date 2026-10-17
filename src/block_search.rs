@@ -260,6 +260,14 @@ pub struct BlockSearchPendingWindow {
     pub worker: std::thread::JoinHandle<()>,
 }
 
+/// A vacant slot permits source capture; waiting retains single-flight admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockSearchWindowPoll {
+    Waiting,
+    Adopted,
+    Vacant,
+}
+
 impl BlockSearchPendingWindow {
     pub fn is_current(
         &self,
@@ -610,6 +618,80 @@ fn raw_earlier_label(
 }
 
 impl BlockSearchState {
+    /// Production snapshot completion/adoption path. Query-independent cache
+    /// work may survive a query edit; session/version/cursor/generation must not.
+    /// A queued message never releases admission before its worker exits.
+    pub fn poll_history_window(
+        &mut self,
+        session_id: &str,
+        record_version: BlockSearchRecordVersion,
+    ) -> BlockSearchWindowPoll {
+        use std::sync::atomic::Ordering;
+        let source_session = self
+            .history_pending
+            .as_ref()
+            .map(|pending| pending.session_id.as_str())
+            .or(self.session_id.as_deref());
+        if source_session.is_some_and(|id| id != session_id) {
+            self.history_before = None;
+            self.cancel_history_window();
+        }
+        if let Some(pending) = &self.history_pending {
+            let current = pending.is_current(
+                self.history_generation,
+                session_id,
+                record_version,
+                &self.history_before,
+            );
+            if !current {
+                pending.cancelled.store(true, Ordering::Relaxed);
+            }
+            // Cancellation alone cannot release the single-flight permit.
+            if !pending.worker.is_finished() {
+                return BlockSearchWindowPoll::Waiting;
+            }
+            let pending = self.history_pending.take().expect("checked pending");
+            if current {
+                if let Ok(Some(mut window)) = pending.receiver.try_recv() {
+                    let range = window
+                        .build
+                        .records
+                        .first()
+                        .zip(window.build.records.last())
+                        .and_then(|(first, last)| {
+                            Some((
+                                *window.sequences.get(&first.record_id)?,
+                                *window.sequences.get(&last.record_id)?,
+                            ))
+                        });
+                    window
+                        .unmapped
+                        .retain(|id| window.sequences.contains_key(id));
+                    window
+                        .unavailable
+                        .retain(|id| window.sequences.contains_key(id));
+                    window.raw_records.retain(|record| {
+                        window.sequences.get(&record.record_id) == Some(&record.sequence)
+                    });
+                    self.raw.cancel(true);
+                    self.raw.records = window.raw_records;
+                    self.cache = window.build.records;
+                    self.record_sequences = window.sequences;
+                    self.unmapped_output_records = window.unmapped;
+                    self.older_not_indexed = window.build.older_not_indexed;
+                    self.history_range = range;
+                    self.history_unavailable = window.unavailable.len();
+                    self.history_boundary_missing = window.boundary_missing;
+                    self.session_id = Some(session_id.to_owned());
+                    self.record_version = Some(record_version);
+                    self.query_error = None;
+                    return BlockSearchWindowPoll::Adopted;
+                }
+            }
+        }
+        BlockSearchWindowPoll::Vacant
+    }
+
     pub fn raw_operation_intent(&self) -> RawOperationIntent {
         RawOperationIntent {
             session: self.session_id.clone(),
@@ -1898,3 +1980,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "block_search/pending_tests.rs"]
+mod pending_tests;

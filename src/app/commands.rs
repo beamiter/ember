@@ -4403,72 +4403,13 @@ impl TerminalApp {
             atomic::{AtomicBool, Ordering},
             Arc,
         };
-        let source_session = self
+        match self
             .block_search
-            .history_pending
-            .as_ref()
-            .map(|pending| pending.session_id.as_str())
-            .or(self.block_search.session_id.as_deref());
-        if source_session.is_some_and(|id| id != session_id) {
-            self.block_search.history_before = None;
-            self.block_search.cancel_history_window();
-        }
-        if let Some(pending) = &self.block_search.history_pending {
-            let current = pending.is_current(
-                self.block_search.history_generation,
-                session_id,
-                record_version,
-                &self.block_search.history_before,
-            );
-            if !current {
-                pending.cancelled.store(true, Ordering::Relaxed);
-            }
-            // Cancellation alone cannot release the single-flight permit.
-            if !pending.worker.is_finished() {
-                return false;
-            }
-            let pending = self
-                .block_search
-                .history_pending
-                .take()
-                .expect("checked pending");
-            if current {
-                if let Ok(Some(mut window)) = pending.receiver.try_recv() {
-                    let range = window
-                        .build
-                        .records
-                        .first()
-                        .zip(window.build.records.last())
-                        .and_then(|(first, last)| {
-                            Some((
-                                *window.sequences.get(&first.record_id)?,
-                                *window.sequences.get(&last.record_id)?,
-                            ))
-                        });
-                    window
-                        .unmapped
-                        .retain(|id| window.sequences.contains_key(id));
-                    window
-                        .unavailable
-                        .retain(|id| window.sequences.contains_key(id));
-                    window.raw_records.retain(|record| {
-                        window.sequences.get(&record.record_id) == Some(&record.sequence)
-                    });
-                    self.block_search.raw.cancel(true);
-                    self.block_search.raw.records = window.raw_records;
-                    self.block_search.cache = window.build.records;
-                    self.block_search.record_sequences = window.sequences;
-                    self.block_search.unmapped_output_records = window.unmapped;
-                    self.block_search.older_not_indexed = window.build.older_not_indexed;
-                    self.block_search.history_range = range;
-                    self.block_search.history_unavailable = window.unavailable.len();
-                    self.block_search.history_boundary_missing = window.boundary_missing;
-                    self.block_search.session_id = Some(session_id.to_owned());
-                    self.block_search.record_version = Some(record_version);
-                    self.block_search.query_error = None;
-                    return true;
-                }
-            }
+            .poll_history_window(session_id, record_version)
+        {
+            crate::block_search::BlockSearchWindowPoll::Waiting => return false,
+            crate::block_search::BlockSearchWindowPoll::Adopted => return true,
+            crate::block_search::BlockSearchWindowPoll::Vacant => {}
         }
         let before = self.block_search.history_before.clone();
         let session = self.session_manager.get_active_session_mut();
