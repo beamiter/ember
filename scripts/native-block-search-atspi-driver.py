@@ -42,8 +42,9 @@ def snapshot_hit(tree, expected, line):
     found=public.controls(tree,expected)
     nodes={n['path']:n for n in tree['nodes']}
     picker=nodes[found['editor']['parent']]
+    if not public.selected(found,'Out'):raise RuntimeError('Result requires verified Out scope')
     pattern=r'Result ([1-9][0-9]*) of ([1-9][0-9]*); '+re.escape(line)+r'; output line [0-9]+ for .+'
-    matches=[n for n in tree['nodes'] if n['role']==43 and re.fullmatch(pattern,n['name'])]
+    matches=[n for n in tree['nodes'] if n['role']==62 and re.fullmatch(pattern,n['name'])]
     if not matches:raise MissingTarget('Missing exact snapshot result label')
     if len(matches)!=1:raise RuntimeError('Ambiguous exact snapshot result label')
     node=matches[0]
@@ -57,8 +58,51 @@ def snapshot_hit(tree, expected, line):
             or not public.state(node,30)
             or not public.inside(node.get('screen_extents',[]),picker['screen_extents'])):
         raise RuntimeError('Result not visibly bounded')
+    if not public.state(node,public.PRESSED):raise RuntimeError('Result is not the selected toggle')
     public.click_index(node)
     return node
+
+
+def raw_hit(tree, expected, phase):
+    """One fresh tree must co-observe exact retained-row identity and phase."""
+    found=public.controls(tree,expected);nodes={n['path']:n for n in tree['nodes']}
+    picker=nodes[found['editor']['parent']]
+    if not public.selected(found,'Out'):raise RuntimeError('Result requires verified Out scope')
+    pattern=r'Result ([1-9][0-9]*) of ([1-9][0-9]*); retained output; Retained row #([0-9]+) · literal match: '+re.escape(expected)
+    matches=[n for n in tree['nodes'] if n['role']==62 and re.fullmatch(pattern,n['name'])]
+    if not matches:raise MissingTarget('Missing exact raw result')
+    if len(matches)!=1:raise RuntimeError('Ambiguous exact raw result')
+    node=matches[0];match=re.fullmatch(pattern,node['name'])
+    if (node['parent']!=picker['path'] or int(match[1])>int(match[2])
+            or public.COMPONENT not in node['interfaces']
+            or not all(public.state(node,b) for b in (20,25,30))
+            or not public.inside(node.get('screen_extents',[]),picker['screen_extents'])):
+        raise RuntimeError('Raw result is not selected/visible in owned picker')
+    public.click_index(node)
+    forbidden={'active':('Continue this output','Restart this output'),
+               'stopped':('Stop search','Continue this output'),
+               'complete':('Stop search','Continue this output','Restart this output')}
+    if phase not in forbidden:raise RuntimeError('Unsupported raw phase')
+    if any(n['name'] in forbidden[phase] or (phase!='complete' and
+           'Complete for this retained output only' in n['name']) for n in tree['nodes']):
+        raise RuntimeError('Raw phase conflicts with other operation state')
+    if phase in ('active','stopped'):
+        control=action_button(tree,expected,'Stop search' if phase=='active' else 'Restart this output')
+    elif phase=='complete':
+        choices=[n for n in tree['nodes'] if n['parent']==picker['path'] and n['role']==29
+                 and public.TEXT in n['interfaces'] and n.get('text')==n['name']
+                 and re.fullmatch(r'Retained blocks #[0-9]+–#[0-9]+ · Block #[0-9]+: Complete for this retained output only; [0-9]+ chunks this window',n['name'])]
+        if not choices:raise MissingTarget('Missing exact completion status')
+        if len(choices)!=1:raise RuntimeError('Ambiguous completion status')
+        control=choices[0]
+        if (not all(public.state(control,b) for b in (25,30))
+                or not public.inside(control.get('screen_extents',[]),picker['screen_extents'])):
+            raise RuntimeError('Completion status not visibly bounded')
+    else:raise RuntimeError('Unsupported raw phase')
+    if phase!='active' and any(n['name']=='Stop search' for n in tree['nodes']):
+        raise RuntimeError('Raw activation while loading')
+    return {'hit':node,'phase_control':control,
+            'claim':{'token':expected,'retained_row':int(match[3]),'result_path':node['path']}}
 
 
 def evidence_identity(tree, expected, node):
@@ -91,7 +135,7 @@ def invoke_button(tree, expected, name):
 
 class Driver:
     def __init__(self, smoke, window):
-        self.smoke=smoke;self.window=window;self.expected='';self.owner=None;self.serial=0
+        self.smoke=smoke;self.window=window;self.expected='';self.owner=None;self.serial=0;self.raw_deadline=None
         self.out=smoke.out/'public-targeting';self.out.mkdir()
 
     def read(self, label):
@@ -216,9 +260,20 @@ class Driver:
         _,node=self.wait_evidence(lambda t:snapshot_hit(t,self.expected,line),label)
         return node
 
+    def raw_result(self, phase, label):
+        timeout=30
+        if phase=='active':
+            if self.raw_deadline is None:raise RuntimeError('No current raw operation deadline')
+            timeout=self.raw_deadline-time.monotonic()
+            if timeout<=0:raise RuntimeError('Raw operation 9.5-second budget exhausted')
+        _,result=self.wait_evidence(lambda t:raw_hit(t,self.expected,phase),label,timeout=timeout)
+        return result
+
     def button(self, name, label):
         allowed=('Search this retained output','Stop search','Restart this output','Earlier history')
         if name not in allowed:raise RuntimeError('Unapproved operation in bounded adapter')
         tree,_=self.wait_evidence(lambda t:action_button(t,self.expected,name),label)
+        if name in ('Search this retained output','Restart this output'):
+            self.raw_deadline=time.monotonic()+9.5
         result=invoke_button(tree,self.expected,name)
         self.event(event='public-button',label=label,**result)

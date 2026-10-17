@@ -261,5 +261,42 @@ class VisualTests(unittest.TestCase):
         self.assertNotIn(visual.PREEDIT_TOKEN, Path(__file__).with_name('native-ime-return-smoke.py').read_text())
 
 
+class SelectedLayoutTests(unittest.TestCase):
+    def test_presence_layout_never_trims_arrow_or_fuzzy_text(self):
+        for token,success in [('EMBERPREEDITMARKER',True),(' EMBERPREEDITMARKER',False),
+                              ('→EMBERPREEDITMARKER',False),('EMBERPREEDITMARKER ',False),
+                              ('EMBERPREEOITMARKER',False),('→',False)]:
+            with self.subTest(token=token),tempfile.TemporaryDirectory() as d:
+                smoke=Smoke(d);before=visual.snapshot(smoke,'before',None,False)
+                calls=[]
+                def words(label,**kwargs):
+                    calls.append(kwargs['psm'])
+                    return [smoke.anchor,word(' EMBERPREEDITMARKER' if kwargs['psm']==6 else token)]
+                smoke.words=words
+                if success:
+                    result=visual.snapshot(smoke,'during',before,True,token_psm=11)
+                    self.assertEqual(result['token_ocr_psm'],11)
+                else:
+                    with self.assertRaises(RuntimeError):visual.snapshot(smoke,'during',before,True,token_psm=11)
+                self.assertEqual(calls,[6,11])
+    def test_selected_layout_missing_baseline_absence_or_unsupported_rejected_before_capture(self):
+        for baseline,present,psm in [(None,True,11),({},False,11),({},True,7)]:
+            with tempfile.TemporaryDirectory() as d:
+                smoke=Smoke(d)
+                with self.assertRaises(RuntimeError):visual.snapshot(smoke,'bad',baseline,present,token_psm=psm)
+                self.assertEqual(smoke.captures,[])
+    def test_selected_presence_rejects_duplicate_moved_outside_or_mutated_evidence(self):
+        for case in ['duplicate','moved','outside','mutated','missing-anchor']:
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as d:
+                smoke=Smoke(d);before=visual.snapshot(smoke,'before',None,False)
+                def words(label,**kwargs):
+                    if kwargs['psm']==6:
+                        return ([word('other')] if case=='missing-anchor' else [smoke.anchor])+([word(visual.PREEDIT_TOKEN)] if case=='moved' else [])
+                    if case=='mutated':(smoke.out/(label+'.png')).write_bytes(b'changed')
+                    token=word(visual.PREEDIT_TOKEN,x=0 if case=='outside' else 16)
+                    return [smoke.anchor]+[token]*(2 if case=='duplicate' else 1)
+                smoke.words=words
+                with self.assertRaises(RuntimeError):visual.snapshot(smoke,'during',before,True,token_psm=11)
+
 if __name__ == '__main__':
     unittest.main()

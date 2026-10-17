@@ -132,20 +132,11 @@ class SearchSmoke(native.Smoke):
         raise RuntimeError(f'Missing rendered phrase {phrase!r}; see every captured observation')
 
     def wait_active_hit(self, token, name, timeout=15):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            rows = self.observe(name)
-            if exact_phrase(rows, 'Complete for this retained output only'):
-                raise RuntimeError('Scan completed before active-hit co-observation; case unproven')
-            try:
-                claim = active_hit_claim(rows, token)
-            except RuntimeError:
-                time.sleep(0.1)
-                continue
-            self.events.append(dict(event='active-hit-claim', claim=claim,
-                                    observation=self.sequence))
-            return rows, claim
-        raise RuntimeError('No same-observation active Stop plus stable raw hit; case unproven')
+        if token != self.public.expected:
+            raise RuntimeError('Active raw token differs from verified query')
+        result = self.public.raw_result('active', name)
+        self.events.append(dict(event='active-hit-claim', claim=result['claim']))
+        return result, result['claim']
 
     def click_phrase(self, phrase, name):
         self.public.button(phrase, name)  # Fresh exact label + immutable screenshot bracket.
@@ -182,18 +173,19 @@ class SearchSmoke(native.Smoke):
             assert exact_phrase(rows, token), 'Final viewport lacks exact target record token'
             assert not exact_phrase(rows, 'Latest'), 'Picker still open; final navigation unproven'
             return
-        rows = self.wait_phrase(token, 'hit-visible')
-        if expected_claim is not None:
-            assert raw_hit_claim(rows, token) == expected_claim, 'Activation claim changed after repaint'
-            assert not exact_phrase(rows, 'Stop search'), 'Activation attempted during loading'
-        if pointer:
-            # Query field can also contain token: row context disambiguates result.
-            phrase = f'literal match: {token}' if raw else f'{token} ROW{row:06d}'
-            self.click(*phrase_center(rows, phrase))
+        if raw:
+            if token != self.public.expected:raise RuntimeError('Raw query changed')
+            result = self.public.raw_result('stopped' if expected_claim is not None else 'complete', 'raw-hit-visible')
+            if expected_claim is not None:
+                assert result['claim'] == expected_claim, 'Activation claim changed after repaint'
+            if pointer:
+                x,y,width,height = result['hit']['screen_extents']
+                self.click(x + width // 2, y + height // 2)
+            else:
+                self.public.focus_query()
+                self.key('Return')
         else:
-            # Return focus to query without changing text, then activate selected hit.
-            self.public.focus_query()
-            self.key('Return')
+            raise RuntimeError('Unsupported exact search navigation fixture')
         # Query/result label alone is insufficient: require adjacent real output row
         # after picker closes. Unique neighboring row was never in its hit snippet.
         rows = self.wait_phrase(f'ROW{row + 1:06d}', 'final-output-navigation')
@@ -239,8 +231,8 @@ class SearchSmoke(native.Smoke):
             _, after_return = self.wait_active_hit('E03EARLYHIT', 'loading-return-rejected')
             assert after_return == claim, 'Loading Return replaced the visible hit identity'
             self.click_phrase('Stop search', 'stop-once')
-            stopped = self.wait_phrase('Restart this output', 'stopped-repaint')
-            assert raw_hit_claim(stopped, 'E03EARLYHIT') == claim, 'Stop changed verified hit identity'
+            stopped = self.public.raw_result('stopped', 'stopped-repaint')
+            assert stopped['claim'] == claim, 'Stop changed verified hit identity'
             # Positive control: the exact rejected hit becomes activatable after
             # Stop and a fresh screenshot, without replacing query or result.
             self.navigate('E03EARLYHIT', 16, pointer=True, raw=True, expected_claim=claim)

@@ -102,7 +102,7 @@ class Tests(unittest.TestCase):
   source=Path(p.__file__).read_text();self.assertNotIn('SetText(',source);self.assertNotIn('refresh_block_search_hits',source)
  def test_legacy_search_oracles_and_budget_remain(self):
   source=Path(p.__file__).with_name('native-block-search.py').read_text()
-  for text in ['active_hit_claim(rows, token)',"raw_hit_claim(stopped, 'E03EARLYHIT') == claim", "self.wait_active_hit('E03EARLYHIT', 'loading-return-rejected')", "'Complete for this retained output only'", "f'ROW{row + 1:06d}'", "'input p95 and presentation latency'",'self.memory_stop.wait(0.01)','for record in range(64)']:
+  for text in ['active_hit_claim(rows, token)',"stopped['claim'] == claim", "self.wait_active_hit('E03EARLYHIT', 'loading-return-rejected')", "'Complete for this retained output only'", "f'ROW{row + 1:06d}'", "'input p95 and presentation latency'",'self.memory_stop.wait(0.01)','for record in range(64)']:
    self.assertIn(text,source)
   self.assertNotIn('self.query_point',source);self.assertEqual(source.count('self.key(*BLOCK_SEARCH_CHORD)'),1)
 
@@ -112,6 +112,8 @@ class EvidenceTests(unittest.TestCase):
  button_tree=Tests.button_tree
  def result_tree(self):
   tree=self.button_tree();node=tree['nodes'][-1]
+  found=p.public.controls(tree,'E03DISCOVERY');found['All']['states'][0]&=~(1<<20);found['Out']['states'][0]|=1<<20
+  node['role']=62;node['states'][0]|=1<<20
   node['name']='Result 1 of 1; E03SNAPSHOT00 ROW000016 ....; output line 16 for e03emit snapshot 0'
   return tree
  def test_exact_result_excludes_query_and_fuzzy_or_other_record(self):
@@ -119,7 +121,7 @@ class EvidenceTests(unittest.TestCase):
   self.assertEqual(p.snapshot_hit(tree,'E03DISCOVERY',line)['path'],tree['nodes'][-1]['path'])
   for change in ['EO3SNAPSHOTOO ROW000016 ....','E03SNAPSHOT01 ROW000016 ....','E03SNAPSHOT00 ROW000017 ....','E03SNAPSHOT00']:
    with self.subTest(change=change),self.assertRaises(RuntimeError):p.snapshot_hit(tree,'E03DISCOVERY',change)
-  for key,value in [('role',79),('states',[0,0]),('screen_extents',[1000,1000,3,3]),('pid',99),('owner',':9.9'),('actions',[])]:
+  for key,value in [('role',79),('role',43),('states',[(1<<25)|(1<<30),0]),('states',[0,0]),('screen_extents',[1000,1000,3,3]),('pid',99),('owner',':9.9'),('actions',[])]:
    bad=copy.deepcopy(tree);bad['nodes'][-1][key]=value
    with self.subTest(key=key),self.assertRaises(RuntimeError):p.snapshot_hit(bad,'E03DISCOVERY',line)
  def test_duplicate_result_fails(self):
@@ -184,5 +186,68 @@ class EvidenceTests(unittest.TestCase):
    driver=self.driver(directory);driver.evidence=Mock(side_effect=RuntimeError('changed'))
    with patch.object(p,'invoke_button') as invoke,self.assertRaises(RuntimeError):driver.button('Stop search','stop')
    invoke.assert_not_called()
+
+class RawEvidenceTests(unittest.TestCase):
+ tree=Tests.tree
+ driver=Tests.driver
+ button_tree=Tests.button_tree
+ result_tree=EvidenceTests.result_tree
+ inert_evidence=EvidenceTests.inert_evidence
+ def raw_tree(self):
+  tree=self.result_tree();hit=tree['nodes'][-1]
+  hit['name']='Result 1 of 1; retained output; Retained row #18 · literal match: E03DISCOVERY'
+  stop=copy.deepcopy(hit);stop.update(path=hit['path']+'-stop',name='Stop search',role=43)
+  tree['nodes'][2]['children'].append(stop['path']);tree['nodes'].append(stop)
+  return tree
+ def test_same_tree_stop_exact_hit_and_stable_identity(self):
+  tree=self.raw_tree();got=p.raw_hit(tree,'E03DISCOVERY','active')
+  self.assertEqual(got['claim']['retained_row'],18)
+  for case in ['no-stop','no-hit','query-only','wrong-token','unselected','wrong-role','continue','foreign-owner','foreign-pid']:
+   bad=copy.deepcopy(tree);hit=bad['nodes'][-2];stop=bad['nodes'][-1]
+   if case=='no-stop':stop['name']='Search this retained output'
+   elif case=='no-hit':hit['name']='No matches'
+   elif case=='query-only':hit['name']='E03DISCOVERY';hit['role']=79
+   elif case=='wrong-token':hit['name']=hit['name'].replace('E03DISCOVERY','EO3DISCOVERY')
+   elif case=='unselected':hit['states'][0]&=~(1<<20)
+   elif case=='wrong-role':hit['role']=43
+   elif case=='continue':stop['name']='Continue this output'
+   elif case=='foreign-owner':hit['owner']=':9.9'
+   else:hit['pid']=99
+   with self.subTest(case=case),self.assertRaises(RuntimeError):p.raw_hit(bad,'E03DISCOVERY','active')
+ def test_stopped_and_completion_cannot_accept_loading_or_continue(self):
+  tree=self.raw_tree()
+  with self.assertRaises(RuntimeError):p.raw_hit(tree,'E03DISCOVERY','stopped')
+  tree['nodes'][-1]['name']='Restart this output'
+  self.assertEqual(p.raw_hit(tree,'E03DISCOVERY','stopped')['claim']['retained_row'],18)
+  tree['nodes'][-1]['name']='Continue this output'
+  with self.assertRaises(RuntimeError):p.raw_hit(tree,'E03DISCOVERY','stopped')
+  with self.assertRaises(RuntimeError):p.raw_hit(tree,'E03DISCOVERY','complete')
+ def test_stale_stop_plus_continue_or_completion_never_passes(self):
+  for label in ['Continue this output','Retained blocks #1–#6 · Block #2: Complete for this retained output only; 1 chunks this window']:
+   tree=self.raw_tree();extra=copy.deepcopy(tree['nodes'][-1]);extra['path']+='stale';extra['name']=label
+   tree['nodes'][2]['children'].append(extra['path']);tree['nodes'].append(extra)
+   with self.subTest(label=label),self.assertRaises(RuntimeError):p.raw_hit(tree,'E03DISCOVERY','active')
+ def test_exact_completion_text_and_stable_claim(self):
+  tree=self.raw_tree();node=tree['nodes'][-1]
+  node.update(name='Retained blocks #1–#6 · Block #2: Complete for this retained output only; 100 chunks this window',role=29)
+  node['interfaces'].append(p.public.TEXT);node['text']=node['name']
+  got=p.raw_hit(tree,'E03DISCOVERY','complete');self.assertEqual(got['claim']['retained_row'],18)
+  for text in ['Complete for this retained output only','Partial output: operation time limit; Continue this output']:
+   bad=copy.deepcopy(tree);bad['nodes'][-1].update(name=text,text=text)
+   with self.assertRaises(RuntimeError):p.raw_hit(bad,'E03DISCOVERY','complete')
+
+ def test_raw_budget_is_shared_from_action_not_reset_by_observation(self):
+  with tempfile.TemporaryDirectory() as d:
+   driver=self.driver(d);driver.raw_deadline=9.5;driver.wait_evidence=Mock(return_value=({},{}))
+   with patch.object(p.time,'monotonic',return_value=2):driver.raw_result('active','first')
+   self.assertEqual(driver.wait_evidence.call_args.kwargs['timeout'],7.5)
+   with patch.object(p.time,'monotonic',return_value=9.5),self.assertRaises(RuntimeError):driver.raw_result('active','late')
+   self.assertEqual(driver.wait_evidence.call_count,1)
+ def test_changed_retained_row_across_capture_rejected(self):
+  with tempfile.TemporaryDirectory() as d:
+   driver,unused=self.inert_evidence(d);tree=self.raw_tree();after=copy.deepcopy(tree)
+   after['nodes'][-2]['name']=after['nodes'][-2]['name'].replace('#18','#19')
+   driver.read=Mock(side_effect=[(tree,{}),(after,{})])
+   with self.assertRaisesRegex(RuntimeError,'changed'):driver.evidence(lambda t:p.raw_hit(t,driver.expected,'active'),'raw')
 
 if __name__=='__main__':unittest.main()

@@ -38,6 +38,8 @@ class FreshVisual:
         self.initial = None
         self.phase = 0
         self.view = None
+        # Destination mode selects layout before this cycle captures anything.
+        self.preedit_psm = 11 if mode == 'normal' else 6
 
     def snapshot(self, view, label, baseline, present):
         diagnostic = {'label': label, 'expected_token_present': present,
@@ -71,7 +73,8 @@ class FreshVisual:
             # Same-PNG alternate layout only for the ordered post-commit absence
             # check, after this cycle's own successful rendered preedit control.
             result = self.visual.snapshot(view, label, baseline, present,
-                                          health_fallback=self.phase == 1)
+                                          health_fallback=self.phase == 1,
+                                          token_psm=self.preedit_psm if self.phase == 0 else 6)
             self.phase += 1
             return result
         if self.used or label != 'ime-visual-before' or present:
@@ -95,7 +98,7 @@ class FreshVisual:
         (view.out / 'ime-health-handoff.json').write_text(json.dumps({
             'source_image': str(self.image), 'source_image_sha256': prior['image_sha256'],
             'source_rectangle': prior['rectangle'], 'source_anchor_box': prior['anchor_box'],
-            'mode': self.mode, 'identity': self.identity, 'initial_image_sha256': result['image_sha256'],
+            'mode': self.mode, 'identity': self.identity, 'preedit_ocr_psm': self.preedit_psm, 'initial_image_sha256': result['image_sha256'],
             'health_ocr_psm': result['health_ocr_psm']}, indent=2))
         return result
 

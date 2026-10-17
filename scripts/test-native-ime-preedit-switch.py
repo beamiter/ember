@@ -162,7 +162,7 @@ class HandoffTests(unittest.TestCase):
             view.rows=[view.anchor,fixture.word(fixture.visual.PREEDIT_TOKEN)]
             during=adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
             self.assertEqual(during['observed_token_count'],1)
-            self.assertEqual(view.word_calls[-1][1],{'psm':6,'capture':False})
+            self.assertEqual(view.word_calls[-1][1],{'psm':11,'capture':False})
 
     def test_validated_baseline_allows_same_png_psm11_only_after_zero_primary(self):
         with tempfile.TemporaryDirectory() as d:
@@ -229,6 +229,26 @@ class HandoffTests(unittest.TestCase):
         view.rows=[view.anchor,fixture.word(fixture.visual.PREEDIT_TOKEN)]
         return adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
 
+    def test_preedit_layout_chosen_by_destination_before_reading_ocr(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture,smoke,view,adapter,before=self.begin_cycle(d)
+            self.assertEqual(adapter.preedit_psm,11)
+            self.assertEqual(json.loads((view.out/'ime-health-handoff.json').read_text())['preedit_ocr_psm'],11)
+            def words(label,**kwargs):
+                view.word_calls.append((label,kwargs))
+                token=' EMBERPREEDITMARKER' if kwargs['psm']==6 else fixture.visual.PREEDIT_TOKEN
+                return [view.anchor,fixture.word(token,x=21)]
+            view.words=words
+            got=adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
+            self.assertEqual(got['token_ocr_psm'],11)
+            self.assertEqual(got['matches'][0]['text'],fixture.visual.PREEDIT_TOKEN)
+        for mode,layout in [('normal',11),('chat',6),('block',6)]:
+            with tempfile.TemporaryDirectory() as d:
+                fixture,smoke,source,view,segment,adapter=self.fixture(d)
+                segment['to']=mode
+                chosen=m.FreshVisual(fixture.visual,smoke,segment,segment['identity'],mode)
+                self.assertEqual(chosen.preedit_psm,layout)
+
     def test_post_commit_fallback_requires_successful_ordered_preedit(self):
         with tempfile.TemporaryDirectory() as d:
             fixture,smoke,view,adapter,before=self.begin_cycle(d)
@@ -260,7 +280,7 @@ class HandoffTests(unittest.TestCase):
             view.rows=[fixture.word(fixture.visual.PREEDIT_TOKEN)]
             with self.assertRaises(RuntimeError):adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
             self.assertEqual(adapter.phase,0)
-            self.assertEqual(view.word_calls[-1][1]['psm'],6)
+            self.assertEqual([call[1]['psm'] for call in view.word_calls[-2:]],[6,11])
             with self.assertRaises(RuntimeError):adapter.snapshot(view,'ime-commit-without-cr',before,False)
 
     def test_current_cycle_provenance_identity_and_mode_fail_closed(self):

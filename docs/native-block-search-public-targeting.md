@@ -39,9 +39,8 @@ fallback, cached rectangle, repeated action or private controller mutation.
 Raw/snapshot input size/digest/PTY identity, 100k rows, 64 retained snapshots,
 active-Stop plus retained-row claim, loading Return, explicit Stop, claim identity,
 Restart/Complete, pointer result activation, final neighboring output-row navigation,
-RSS sampling, polling timeouts and workflow 12-minute limit are unchanged. Raw
-result and coverage OCR stays strict; snapshot result selection uses the exact
-public Result Button label described below. Final real-output OCR stays strict. New evidence may reveal further fixture limitations;
+RSS sampling, polling timeouts and workflow 12-minute limit are unchanged. Exact public raw result/phase evidence and snapshot selected-result labels are
+described below. Final real-output OCR stays strict. New evidence may reveal further fixture limitations;
 this patch does not relax those oracles or certify any performance metric.
 
 The public-control probe and its zero-byte PTY test remain separate. The actual
@@ -58,7 +57,8 @@ agree across the screenshot. The PNG hash is checked again after the second
 read; image dimensions must contain the owned window. A same-label old image
 cannot be reused. Evidence JSON records the actual target and PNG hash.
 
-Snapshot navigation selects the unique public result Button whose label includes
+Snapshot navigation selects the unique selected public result ToggleButton (role
+62, pressed state), whose label includes
 the exact generated full output line and output-line context, excluding the query
 Entry. There is no O/0 substitution or fuzzy matching. Its fresh bounded target
 supplies pointer coordinates. Missing pre-capture targets can be observed until
@@ -67,7 +67,31 @@ across capture fails immediately. Every successful evidence bracket must finish
 inside the remaining budget.
 
 Raw retained-row hit identity, active Stop co-observation, rejected loading Return,
-Stop/Restart, completion claims and final neighboring real-output OCR remain
-unchanged. Terminal output is not available in the recorded accessibility tree;
+Stop/Restart and completion claims now use exact fresh public result/state evidence
+with the same immutable screenshot bracket. Final neighboring real-output OCR
+remains unchanged. Terminal output is not available in the recorded accessibility tree;
 final navigation still requires exact target token plus the real neighboring row
 in pixels. This change does not establish native acceptance or measure latency.
+
+
+## Fresh 5704 evidence correction (pending hosted acceptance)
+
+Actual hosted selected result nodes map to role62 ToggleButton, not role43
+PushButton. Both snapshot and raw selection require the exact full Result label,
+pressed state, Out scope, public click action, owner and visible picker bounds.
+Snapshot label retains the complete generated line and output-line context.
+
+Raw active evidence contains the exact selected retained-row result and Stop
+control in ONE fresh tree, both stable before/after one immutable screenshot.
+The claim includes token, retained-row number and result path. The same claim
+must survive loading Return and Stop. Stopped activation requires Restart and no
+Stop/Continue; completion requires exact generated coverage status, not a partial
+or natural-limit result. Contradictory Stop/Continue/Complete states fail closed.
+The active-observation deadline is shared from the original action and never
+reset by a new observation: 9.5 seconds, unchanged from the operation budget.
+No fuzzy OCR, query-only hit, cached target, input retry or budget extension.
+
+The 5704 run reached 92,160 of 100,000 raw row decodes before its 9.5-second
+operation limit. Full-completion feasibility at this workload remains unresolved;
+this change does not reduce the 100,000 rows or extend the budget. Final real
+neighboring-output OCR remains required and may expose a later fixture issue.

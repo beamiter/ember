@@ -65,7 +65,9 @@ def exact_matches(rows, rectangle, token=PREEDIT_TOKEN):
     return matches
 
 
-def snapshot(smoke, label, baseline, present, *, health_fallback=False):
+def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_psm=6):
+    if token_psm not in (6,11) or (token_psm==11 and (not present or baseline is None)):
+        raise RuntimeError('Alternate token layout requires a current-cycle presence baseline')
     def geometry(suffix):
         result = smoke.run(['swaymsg', '-t', 'get_tree', '-r'], capture_output=True, text=True)
         (smoke.out / (label + suffix + '-tree.json')).write_text(result.stdout)
@@ -90,6 +92,17 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False):
     image_sha256 = hashlib.sha256(image.read_bytes()).hexdigest()
     rows = smoke.words(label, psm=6, capture=False)
     validate_rows(rows)
+    # Layout is chosen by the caller before capture, never as a response to OCR
+    # content. Primary rows remain validated; only rendered presence may use 11.
+    token_rows = rows
+    if token_psm == 11:
+        token_rows = smoke.words(label, psm=11, capture=False)
+        validate_rows(token_rows)
+        primary_tokens = exact_matches(rows, rectangle)
+        selected_tokens = exact_matches(token_rows, rectangle)
+        if len(primary_tokens) > 1 or (primary_tokens and
+                [box(r) for r in primary_tokens] != [box(r) for r in selected_tokens]):
+            raise RuntimeError('Token layouts disagree on exact token geometry')
     anchors = exact_matches(rows, rectangle, HEALTH_ANCHOR)
     health_ocr_psm = 6
     if not anchors and health_fallback and baseline is not None:
@@ -109,12 +122,13 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False):
     anchor_box = box(anchors[0])
     if baseline is not None and anchor_box != baseline['anchor_box']:
         raise RuntimeError('OCR health anchor moved')
-    matches = exact_matches(rows, rectangle)
+    matches = exact_matches(token_rows, rectangle)
     if len(matches) != int(present):
         raise RuntimeError(f'Expected {int(present)} exact preedit token, observed {len(matches)}')
     result = {'rectangle': rectangle, 'anchor_box': anchor_box, 'image': str(image),
               'expected_token_count': int(present), 'observed_token_count': len(matches),
-              'matches': matches, 'image_sha256': image_sha256, 'health_ocr_psm': health_ocr_psm}
+              'matches': matches, 'image_sha256': image_sha256, 'health_ocr_psm': health_ocr_psm,
+              'token_ocr_psm': token_psm}
     (smoke.out / (label + '-visual.json')).write_text(json.dumps(result, indent=2))
     return result
 

@@ -105,11 +105,35 @@ submission sentinel. Do not describe this as an initial-handoff failure.
 FreshVisual now requires ordered current-cycle labels, the identical view/app,
 live PID and destination mode, and unchanged persisted initial PNG/JSON provenance.
 Only the post-commit absence snapshot following successful rendered preedit may
-opt into the existing same-PNG PSM11 health analysis. Presence still uses primary
-PSM6; both token counts and exact anchor position remain strict. No capture/input
+opt into the existing same-PNG PSM11 health analysis. Presence layout is now preselected by the fresh destination mode as described
+below; exact token counts and anchor position remain strict. No capture/input
 retry or pixel restoration tolerance is introduced. ime-fresh-visual-phase.json
 records the exact requested phase and failure for subsequent diagnosis.
 
 Offline replay of the original immutable failed image passes the repaired oracle
 and exact before/during/after pixel restoration. This does not retroactively pass
 the failed native run; fresh hosted completion remains required.
+
+
+## Fresh 5704 rendered-presence layout (pending hosted acceptance)
+
+The new run failed in fresh-after-chat-to-normal/ime-preedit-zero-bytes.png.
+Its yellow preedit marker is visibly present. Primary PSM6 merged the arrow/space
+into the token word; same immutable PNG PSM11 separates the exact marker at
+21,282,166,10. No post-commit frame exists for this fresh cycle.
+
+FreshVisual chooses its presence layout at construction, before current-cycle
+capture: PSM11 for destination normal, PSM6 for block/chat. The choice is recorded
+in the handoff, never triggered by matching or failing an observed string. Only
+ordered presence with verified current-cycle baseline may use alternate token
+layout. Primary rows and exact health anchor still must be valid. Exact primary
+tokens, if any, must agree with the selected layout's geometry; ambiguous,
+outside or inconsistent tokens fail. Selected layout must contain exactly one
+literal marker, without trimming, arrow removal, substitutions or fuzzy matching.
+The screenshot hash and normal current-cycle ownership/provenance checks still
+apply. Exact pixel restoration and PTY/CR checks are unchanged. Ordinary visual
+callers keep the default PSM6 token policy.
+
+Actual 5704 replay proves initial absence and rendered presence/pixel difference,
+not post-commit restoration or native completion. Original63 three-frame replay
+remains a separate regression check. Both native gates require fresh hosted proof.
