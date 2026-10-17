@@ -856,29 +856,6 @@ pub(crate) fn viewport_scroll_delta(
     }
 }
 
-pub(crate) fn ctrl_wheel_zoom_delta(events: &[egui::Event]) -> f32 {
-    let total: f32 = events
-        .iter()
-        .filter_map(|event| match event {
-            egui::Event::MouseWheel {
-                delta, modifiers, ..
-            } if modifiers.ctrl && !modifiers.alt => Some(delta.y),
-            _ => None,
-        })
-        .sum();
-
-    // `Iterator::sum::<f32>()` uses -0.0 as its empty-sum identity, and
-    // `(-0.0_f32).signum()` is -1.0. Calling `signum` directly would therefore
-    // zoom out once on every frame that contains no Ctrl+wheel input.
-    if total > 0.0 {
-        1.0
-    } else if total < 0.0 {
-        -1.0
-    } else {
-        0.0
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockSelectionKeyAction {
     Move(crate::block_mode::SelectStep),
@@ -1382,8 +1359,11 @@ impl TerminalApp {
             return;
         }
 
+        let old_main = self.config.font_size;
+        let old_ui = self.config.effective_ui_font_size();
         self.config.font_size = new_font_size;
-        self.font_size_accumulator = 0.0;
+        self.config_panel
+            .adopt_font_sizes(old_main, old_ui, &self.config);
         self.apply_font_size_change(ctx);
         self.schedule_config_save();
         self.set_status(format!("{action}: {:.0} pt", self.config.font_size));
@@ -2893,51 +2873,30 @@ impl TerminalApp {
         has_preedit
     }
 
-    /// 处理累积的 Ctrl+滚轮字体缩放。
+    /// Apply pointer-owned zoom after layout, independently of keyboard focus.
     pub fn handle_font_zoom(&mut self, ctx: &egui::Context) {
-        // Route Ctrl+wheel here for both single- and multi-pane layouts. The
-        // terminal scroll paths explicitly ignore the same events below.
-        // Keyboard zoom goes through configurable `font:*` commands instead.
-        self.font_size_accumulator += ctrl_wheel_zoom_delta(&self.frame_events);
-
-        // Step 1.5: 处理累积的Ctrl+滚轮字体缩放
-        // 检查是否有ctrl+scroll事件
-        let has_ctrl_scroll_this_frame = {
-            let ctrl_pressed = ctx.input(|i| i.modifiers.ctrl);
-            ctrl_pressed && self.frame_events.iter().any(|evt| {
-                matches!(evt, egui::Event::MouseWheel { modifiers, .. } if modifiers.ctrl)
-            })
-        };
-
-        // 如果有累积值，并且（滚轮事件停止 或 累积超过1.0），则应用变化
-        if self.font_size_accumulator.abs() > 0.0 {
-            let should_apply = !has_ctrl_scroll_this_frame // 滚轮停止
-                || self.font_size_accumulator.abs() >= 1.0; // 或累积超过1.0
-
-            if should_apply {
-                let steps = self.font_size_accumulator.floor() as i32;
-                if steps != 0 {
-                    let new_font_size =
-                        config::Config::clamp_font_size(self.config.font_size + steps as f32);
-
-                    if (new_font_size - self.config.font_size).abs() > 0.01 {
-                        self.config.font_size = new_font_size;
-                        self.apply_font_size_change(ctx);
-                        self.schedule_config_save();
-                    }
-
-                    // 保留小数部分
-                    self.font_size_accumulator -= steps as f32;
-                }
-
-                // 如果滚轮停止，清空累积器
-                if !has_ctrl_scroll_this_frame {
-                    self.font_size_accumulator = 0.0;
-                }
-            }
+        let [ui_delta, main_delta] = self
+            .font_zoom
+            .drain(|pos| crate::font_zoom::workspace_layer_at(ctx, pos));
+        let old_main = self.config.font_size;
+        let old_ui = self.config.effective_ui_font_size();
+        let new_ui = config::Config::clamp_font_size(old_ui + ui_delta);
+        let new_main = config::Config::clamp_font_size(self.config.font_size + main_delta);
+        let ui_changed = new_ui != old_ui;
+        let main_changed = new_main != self.config.font_size;
+        if ui_changed {
+            self.config.ui_font_size = Some(new_ui);
         }
-
-        self.had_ctrl_scroll_last_frame = has_ctrl_scroll_this_frame;
+        if main_changed {
+            self.config.font_size = new_main;
+            self.apply_font_size_change(ctx);
+        }
+        if ui_changed || main_changed {
+            self.config_panel
+                .adopt_font_sizes(old_main, old_ui, &self.config);
+            self.schedule_config_save();
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -4129,47 +4088,6 @@ mod tests {
                 "surface {index} must block terminal input"
             );
         }
-    }
-
-    #[test]
-    fn ctrl_wheel_is_classified_as_zoom_not_terminal_scroll() {
-        let zoom = egui::Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Point,
-            delta: egui::vec2(0.0, 12.0),
-            modifiers: egui::Modifiers::CTRL,
-            phase: egui::TouchPhase::Move,
-        };
-        let plain = egui::Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Point,
-            delta: egui::vec2(0.0, -20.0),
-            modifiers: egui::Modifiers::NONE,
-            phase: egui::TouchPhase::Move,
-        };
-        assert_eq!(ctrl_wheel_zoom_delta(&[zoom, plain]), 1.0);
-    }
-
-    #[test]
-    fn absent_or_balanced_ctrl_wheel_does_not_zoom() {
-        assert_eq!(ctrl_wheel_zoom_delta(&[]), 0.0);
-
-        let plain = egui::Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Line,
-            delta: egui::vec2(0.0, -1.0),
-            modifiers: egui::Modifiers::NONE,
-            phase: egui::TouchPhase::Move,
-        };
-        assert_eq!(ctrl_wheel_zoom_delta(&[plain]), 0.0);
-
-        let ctrl_wheel = |delta_y| egui::Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Line,
-            delta: egui::vec2(0.0, delta_y),
-            modifiers: egui::Modifiers::CTRL,
-            phase: egui::TouchPhase::Move,
-        };
-        assert_eq!(
-            ctrl_wheel_zoom_delta(&[ctrl_wheel(1.0), ctrl_wheel(-1.0)]),
-            0.0
-        );
     }
 
     #[test]

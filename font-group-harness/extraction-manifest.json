@@ -1,0 +1,123 @@
+{
+  "output": "font-group-harness/config_harness.rs",
+  "sources": [
+    {
+      "source": "src/config_panel.rs",
+      "marker": "pub enum ConfigTab {",
+      "sha256": "c7a76cb24713240d969e5264e4b1277107c99ced9b842a67579009ff23c8478e"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "struct RemoteHostDraft {",
+      "sha256": "79167ce4791449a847a18ca7252826c9eb592bc58578df89fcbe7c54398e9e55"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "impl RemoteHostDraft {",
+      "sha256": "6a732c13a656e839184313d0cc6f510c53256a98bcf603fd5bba4cefa26d2a3e"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "pub struct ConfigPanel {",
+      "sha256": "0bf8ca92f36c1271dd4a89664abc032d06d70acf0c7aabd69e4152bcf7e33da8"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "    pub fn new() -> Self {",
+      "sha256": "31bc56beda4933e7b46fd92fc85e491bd60900eb7f8f2e5d9298f191f3324bae"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "    pub fn adopt_font_sizes(",
+      "sha256": "0070eac5c46781fa317ccf1154e0b15bdb8e022000ceb9cd4072882150beeeb5"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "    pub fn sync_from_config(",
+      "sha256": "fded215fa42b6e619e4f14cd2b8c155a2ade50503a329c07432b023e91956e5c"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "    pub fn finish_save(",
+      "sha256": "160edeaebe59831d5f456f2ea97b137a15fa4a57f2b76957611c8c5e59459edf"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "    pub fn apply_to_config(",
+      "sha256": "cb01feef45db398221263d68a05e29ed4e5df44206759d797645c628e294bb0c"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "    pub fn close(",
+      "sha256": "03890a22a4db79af9f83abb533903e33a53dc2bd2721afa17928b4811906e5a7"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "    fn renew_remote_editor_epoch(",
+      "sha256": "5ba38ee25323784e2514114a66d635222be0038ab51ba62880e148aad3326310"
+    },
+    {
+      "source": "src/config_panel.rs",
+      "marker": "font group regression tests",
+      "sha256": "8881c2ae9e7bb68a26cef24304e29b72d7810a21b1c2dda7067e6376d9dd82e9"
+    },
+    {
+      "source": "src/sidebar.rs",
+      "marker": "pub enum SidebarView {",
+      "sha256": "8b228c5991292896a104ef2fd0e3756aab877edca7365796a264936c81934590"
+    },
+    {
+      "source": "src/terminal/mod.rs",
+      "marker": "pub fn clamp_terminal_dimensions(",
+      "sha256": "c02dbee2796fbd4b0aaa0c648100c4b459f3e230906e0075830ac10843f7c570"
+    },
+    {
+      "source": "src/config.rs",
+      "included_whole": true,
+      "sha256": "cea2a483fa3371235f80787dde96de98e339d8f5f956ab179d87c3af17ae69e1"
+    },
+    {
+      "source": "src/persistence_file.rs",
+      "included_whole": true,
+      "sha256": "93382273582d36747a0b785ef57584554ee9b59a051be4d5667aaa5d3a9c81d1"
+    },
+    {
+      "source": "src/app/input.rs",
+      "marker": "    pub fn handle_font_zoom(",
+      "sha256": "39873e6b3da76a82209ab101fe40b4bf9ed9f3c308cdd5a8e4bbe79b527854f9"
+    },
+    {
+      "source": "src/theme.rs",
+      "marker": "pub(crate) fn configure_workspace_text(",
+      "sha256": "8eaf91e779521487b7f29e02b703eaecdd580062556d5f323989cec879ccd1fc"
+    },
+    {
+      "source": "src/theme.rs",
+      "marker": "pub(crate) fn workspace_control_height(",
+      "sha256": "51a19bab9eb2ebce06f9a27340a6036c45b0d02040398f44c5d33e9c639dfbd1"
+    },
+    {
+      "source": "src/theme.rs",
+      "marker": "pub(crate) fn workspace_font_size(",
+      "sha256": "9d601467bdd93a0069c475022a36059ab8f24fafdb1b9ba292b7e11687ef0f0c"
+    }
+  ],
+  "stub_boundary": [
+    "remote host grammar/types",
+    "provider enum",
+    "update policy",
+    "spoofing checks",
+    "font scanning",
+    "organism preview storage",
+    "theme storage",
+    "unrelated defaults"
+  ],
+  "not_covered": [
+    "renderer rebuild and async save scheduling side effects",
+    "full app compile",
+    "native window/GPU rendering",
+    "remote/security behavior",
+    "real font scanning",
+    "hot-reload polling/controller"
+  ]
+}

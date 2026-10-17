@@ -331,11 +331,21 @@ The main configuration is `~/.config/ember/config.toml`. It is created after
 settings are saved. Hand-edited values are validated on startup and hot reload;
 unsafe dimensions and non-finite/out-of-range numeric values are normalized.
 
+Font sizes are independent: `ui_font_size` controls the sidebar and top bar;
+`font_size` controls terminal content in Normal, Block and Chat modes, including
+all split panes. Both use logical points, bounded to 8–72. Old configs that omit
+`ui_font_size` inherit their existing `font_size` once when loaded, preserving
+their appearance; subsequent zoom and settings saves keep the two sizes separate.
+Ctrl+mousewheel adjusts only the group under the pointer, regardless of keyboard
+focus. Floating windows and popups block zoom into the workspace beneath them.
+The existing font keyboard shortcuts continue to adjust main content.
+
 Example:
 
 ```toml
 font_family = "JetBrains Mono Nerd Font"
-font_size = 14.0
+font_size = 14.0              # main content
+ui_font_size = 14.0           # sidebar + top bar
 font_weight = 1.0
 line_spacing = 1.0
 padding = 2.0
@@ -978,7 +988,8 @@ Defaults include:
 | Resize pane divider | `Ctrl+Alt+Shift+Arrow` |
 | Zoom / restore focused pane | `Ctrl+Shift+Enter` / `Ctrl+Shift+Z` |
 | Equalize all pane dividers | Command palette: “Equalize Panes” |
-| Font size increase / decrease / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
+| Main-content font increase / decrease / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
+| Font size for the group under the pointer | `Ctrl+mousewheel` |
 | Window opacity increase / decrease | `Ctrl+Alt+=` / `Ctrl+Alt+-` |
 | Select all completed command blocks | `Ctrl+Shift+A` |
 | Reinput selected block commands (without running) | `Ctrl+Shift+I` |

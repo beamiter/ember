@@ -41,6 +41,30 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  font_groups:
+    name: Headless font groups
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Independent of the full/native test jobs: an unrelated gate failure must
+    # not skip the focused production-consumer and Settings regressions.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
+
+      - name: Cache headless font test dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          shared-key: font-groups
+          workspaces: font-group-harness -> target
+
+      - name: Test independent UI and main font groups
+        run: python3 font-group-harness/run.py
+
   shell:
     name: Installer scripts
     runs-on: ubuntu-latest

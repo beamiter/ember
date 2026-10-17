@@ -51,7 +51,7 @@ pub(crate) fn configure_popup_style(style: &mut egui::Style) {
     style.visuals.window_fill = style.visuals.panel_fill;
 }
 
-/// Workspace chrome uses the same egui logical points as TerminalRenderer.
+/// Apply one font group in egui logical points, scoped to the supplied style.
 /// Physical pixel scaling remains egui's responsibility; do not multiply by DPI.
 #[allow(dead_code)]
 pub(crate) fn configure_workspace_text(style: &mut egui::Style, size: f32) {
@@ -76,7 +76,7 @@ pub(crate) fn workspace_font_size(ui: &egui::Ui) -> f32 {
     egui::TextStyle::Body.resolve(ui.style()).size
 }
 
-/// Popup labels follow the configured terminal font without changing global UI typography.
+/// Popup labels follow their owning font group without changing global UI typography.
 #[allow(dead_code)] // Shared with the binary popup builders.
 pub(crate) fn configure_popup_text(ui: &mut egui::Ui, size: f32) {
     let font = egui::FontId::monospace(crate::config::Config::clamp_font_size(size));

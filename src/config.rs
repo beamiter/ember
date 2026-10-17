@@ -215,8 +215,15 @@ pub struct Config {
     #[serde(default = "default_remote_hosts")]
     pub remote_hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
 
+    /// Main-content text size in egui logical points.
     #[serde(default = "default_font_size")]
     pub font_size: f32,
+
+    /// Sidebar and top-bar text size in egui logical points. Old configs omit
+    /// this key; normalization captures their main-content size once so later
+    /// changes to either group remain independent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_font_size: Option<f32>,
 
     #[serde(default = "default_font_family")]
     pub font_family: String,
@@ -660,6 +667,7 @@ impl Default for Config {
             preferred_fix_provider: default_preferred_fix_provider(),
             remote_hosts: default_remote_hosts(),
             font_size: default_font_size(),
+            ui_font_size: Some(default_font_size()),
             font_family: default_font_family(),
             font_weight: default_font_weight(),
             font_sharpness: default_font_sharpness(),
@@ -934,6 +942,16 @@ impl Config {
         size.clamp(8.0, 72.0)
     }
 
+    /// Runtime UI size. Legacy inheritance happens only during normalization,
+    /// never here: changing the main-content size must not also zoom chrome.
+    pub fn effective_ui_font_size(&self) -> f32 {
+        Self::clamp_font_size(
+            self.ui_font_size
+                .filter(|size| size.is_finite())
+                .unwrap_or(DEFAULT_FONT_SIZE),
+        )
+    }
+
     /// Normalize values loaded from hand-edited TOML before any renderer,
     /// window or terminal allocation sees them. Returns human-readable notes
     /// for diagnostics; valid configurations produce an empty list.
@@ -964,6 +982,20 @@ impl Config {
         }
 
         normalize_f32!(font_size, 8.0, 72.0, default_font_size());
+        if let Some(size) = self.ui_font_size {
+            let normalized = finite_or(size, default_font_size()).clamp(8.0, 72.0);
+            if normalized != size {
+                warnings.push(format!(
+                    "ui_font_size={} is outside the supported range; using {}",
+                    size, normalized
+                ));
+            }
+            self.ui_font_size = Some(normalized);
+        } else {
+            // Materialize the legacy size before any independent zoom occurs.
+            // Saving then records both groups, including for old config files.
+            self.ui_font_size = Some(self.font_size);
+        }
         normalize_f32!(font_weight, 0.5, 2.0, default_font_weight());
         normalize_f32!(font_sharpness, 0.5, 2.0, default_font_sharpness());
         normalize_f32!(padding, 0.0, 20.0, default_padding());
@@ -1444,6 +1476,137 @@ fn valid_config_path(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_groups_default_to_the_existing_size() {
+        let defaults = Config::default();
+        assert_eq!(defaults.font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(defaults.ui_font_size, Some(DEFAULT_FONT_SIZE));
+        assert_eq!(defaults.effective_ui_font_size(), DEFAULT_FONT_SIZE);
+
+        let mut omitted: Config = toml::from_str("").unwrap();
+        assert_eq!(omitted.ui_font_size, None);
+        assert!(omitted.normalize().is_empty());
+        assert_eq!(omitted.ui_font_size, Some(DEFAULT_FONT_SIZE));
+    }
+
+    #[test]
+    fn legacy_font_size_is_captured_once_before_main_content_zoom() {
+        let path = std::path::Path::new("synthetic-config.toml");
+        for (legacy, expected) in [(5.0, 8.0), (22.0, 22.0), (99.0, 72.0)] {
+            let revision =
+                FileRevision::from_bytes(format!("font_size = {legacy:.1}\n").as_bytes());
+            let mut config = Config::from_revision(path, &revision).unwrap();
+            assert_eq!(config.font_size, expected);
+            assert_eq!(config.ui_font_size, Some(expected));
+
+            config.font_size = 30.0;
+            assert!(config.normalize().is_empty());
+            assert_eq!(config.effective_ui_font_size(), expected);
+            let encoded = toml::to_string_pretty(&config).unwrap();
+            assert!(encoded.contains("ui_font_size = "));
+            let reloaded =
+                Config::from_revision(path, &FileRevision::from_bytes(encoded.as_bytes())).unwrap();
+            assert_eq!(reloaded.font_size, 30.0);
+            assert_eq!(reloaded.effective_ui_font_size(), expected);
+        }
+    }
+
+    #[test]
+    fn ui_font_size_changes_round_trip_without_changing_main_content() {
+        let mut config: Config = toml::from_str("font_size = 19.0\nui_font_size = 13.0\n").unwrap();
+        assert!(config.normalize().is_empty());
+        assert_eq!(config.effective_ui_font_size(), 13.0);
+        config.ui_font_size = Some(26.0);
+        assert!(config.normalize().is_empty());
+        assert_eq!(config.font_size, 19.0);
+
+        let toml_copy: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let json_copy: Config =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        for copy in [toml_copy, json_copy] {
+            assert_eq!(copy.font_size, 19.0);
+            assert_eq!(copy.ui_font_size, Some(26.0));
+        }
+    }
+
+    #[test]
+    fn font_groups_survive_atomic_save_and_reload_after_legacy_migration() {
+        let root = std::env::temp_dir().join(format!(
+            "ember-font-groups-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &root,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let path = root.join("config.toml");
+        write_private(&path, b"font_size = 23.0\n");
+        let reload = || {
+            let revision = crate::persistence_file::read_revision(&path, MAX_CONFIG_BYTES).unwrap();
+            Config::from_revision(&path, &revision).unwrap()
+        };
+
+        let mut config = reload();
+        config.font_size = 31.0;
+        config.save_path(&path).unwrap();
+        let mut reloaded = reload();
+        assert_eq!(reloaded.font_size, 31.0);
+        assert_eq!(reloaded.ui_font_size, Some(23.0));
+
+        reloaded.ui_font_size = Some(17.0);
+        reloaded.save_path(&path).unwrap();
+        let reloaded = reload();
+        assert_eq!(reloaded.font_size, 31.0);
+        assert_eq!(reloaded.ui_font_size, Some(17.0));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ui_font_size_normalization_bounds_each_group_independently() {
+        for (value, expected) in [
+            (f32::NAN, DEFAULT_FONT_SIZE),
+            (f32::INFINITY, DEFAULT_FONT_SIZE),
+            (f32::NEG_INFINITY, DEFAULT_FONT_SIZE),
+            (-1.0, 8.0),
+            (8.0, 8.0),
+            (23.5, 23.5),
+            (72.0, 72.0),
+            (999.0, 72.0),
+        ] {
+            let mut config = Config {
+                font_size: 19.0,
+                ui_font_size: Some(value),
+                ..Config::default()
+            };
+            assert_eq!(config.effective_ui_font_size(), expected);
+            let warnings = config.normalize();
+            assert_eq!(warnings.is_empty(), value == expected);
+            assert_eq!(config.ui_font_size, Some(expected));
+            assert_eq!(config.font_size, 19.0);
+            assert!(config.normalize().is_empty());
+        }
+    }
+
+    #[test]
+    fn unresolved_ui_font_size_never_dynamically_tracks_main_content() {
+        let mut config = Config {
+            font_size: 30.0,
+            ui_font_size: None,
+            ..Config::default()
+        };
+        assert_eq!(config.effective_ui_font_size(), DEFAULT_FONT_SIZE);
+        config.font_size = 40.0;
+        assert_eq!(config.effective_ui_font_size(), DEFAULT_FONT_SIZE);
+        config.normalize();
+        assert_eq!(config.ui_font_size, Some(40.0));
+        config.font_size = 50.0;
+        assert_eq!(config.effective_ui_font_size(), 40.0);
+    }
 
     #[test]
     fn expanded_organism_defaults_visible_and_round_trips() {

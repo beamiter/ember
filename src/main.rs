@@ -19,6 +19,7 @@ mod debug_panel;
 mod execution_journal;
 mod fold_preview;
 mod font_file;
+mod font_zoom;
 mod gpu;
 mod help;
 mod history_persistence;
@@ -2787,8 +2788,7 @@ impl TerminalApp {
             alternate_scroll_wheel: jterm_core::wheel::WheelAccumulator::default(),
             terminal_mouse_capture: None,
             last_terminal_mouse_motion: None,
-            font_size_accumulator: 0.0,
-            had_ctrl_scroll_last_frame: false,
+            font_zoom: font_zoom::FontZoom::default(),
             frame_events: Vec::new(),
             paste_key_state: Default::default(),
             keyboard_input_buffer: Vec::new(),
@@ -3963,7 +3963,7 @@ impl TerminalApp {
                                         &mut fs_menu_action,
                                         paste_state,
                                         files_are_local,
-                                        self.config.font_size,
+                                        self.config.effective_ui_font_size(),
                                     );
                                 });
                                 files_popup_open |= root_resp.context_menu_opened();
@@ -4052,7 +4052,7 @@ impl TerminalApp {
                                         &mut fs_menu_action,
                                         paste_state,
                                         files_are_local,
-                                        self.config.font_size,
+                                        self.config.effective_ui_font_size(),
                                         indent_guide,
                                         1,
                                         &mut tree_row_rects,
@@ -4454,6 +4454,8 @@ impl TerminalApp {
 
         // 拖拽导入：面板矩形 + 行命中测试 + 悬停提示 + 落下分派。
         let panel_rect = panel_response.response.rect;
+        self.font_zoom
+            .register(panel_rect, root_ui.layer_id(), font_zoom::FontGroup::Ui);
         self.sidebar.width = panel_rect.width().clamp(160.0, 640.0);
         self.sidebar_drop_rect = (self.sidebar.view == sidebar::SidebarView::Files
             && !self.sidebar.current_dir.as_os_str().is_empty())
@@ -5433,10 +5435,11 @@ impl TerminalApp {
         // Update the already-created root as well as future floating surfaces.
         for visual_theme in [egui::Theme::Dark, egui::Theme::Light] {
             ctx.style_mut_of(visual_theme, |style| {
-                theme::configure_workspace_text(style, self.config.font_size)
+                theme::configure_workspace_text(style, self.config.effective_ui_font_size())
             });
         }
-        theme::configure_workspace_text(root_ui.style_mut(), self.config.font_size);
+        theme::configure_workspace_text(root_ui.style_mut(), self.config.effective_ui_font_size());
+        self.font_zoom.begin_layout();
 
         // Bars register their pane-promotion targets before CentralPanel runs.
         // They are frame-local geometry and must never survive a resize or a
@@ -5468,7 +5471,7 @@ impl TerminalApp {
         // 分配到容器边缘的完整范围 —— 因此顶栏横跨整个窗口，侧边栏落在其下方，
         // 而不是侧边栏贯穿到顶部。
         let mut close_requested = false;
-        egui::Panel::top("top_bar")
+        let top_bar = egui::Panel::top("top_bar")
             .frame(egui::Frame::NONE)
             .resizable(false)
             .show(root_ui, |ui| {
@@ -5483,6 +5486,11 @@ impl TerminalApp {
                     self.render_sidebar_mode_top_bar(ui, ctx);
                 }
             });
+        self.font_zoom.register(
+            top_bar.response.rect,
+            root_ui.layer_id(),
+            font_zoom::FontGroup::Ui,
+        );
         if close_requested {
             return;
         }
@@ -5502,14 +5510,21 @@ impl TerminalApp {
         // 侧边栏：在顶栏之后声明，占据顶栏下方区域的左侧。
         self.render_sidebar(root_ui);
 
-        egui::CentralPanel::default()
+        let main_panel = egui::CentralPanel::default()
             .frame(frame)
             .show(root_ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
+                theme::configure_workspace_text(ui.style_mut(), self.config.font_size);
                 self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);
             });
 
+        self.font_zoom.register(
+            main_panel.response.rect,
+            root_ui.layer_id(),
+            font_zoom::FontGroup::Main,
+        );
         self.render_floating_panels(ctx);
+        self.handle_font_zoom(ctx);
     }
 
     // adjust_frame_budget moved to app::rendering module
@@ -5533,6 +5548,9 @@ impl eframe::App for TerminalApp {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Remove Ctrl+wheel before egui creates global zoom or scroll velocity.
+        self.font_zoom
+            .collect(&mut raw_input.events, raw_input.focused);
         // 记录最近一次指针位置：落下的拖放帧不一定带 PointerMoved。
         for event in &raw_input.events {
             match event {
@@ -5924,10 +5942,6 @@ impl eframe::App for TerminalApp {
         } else {
             self.handle_ime_events(ctx)
         };
-
-        if !ui_input_blocked {
-            self.handle_font_zoom(ctx);
-        }
 
         // Step 2: 处理快捷键 - 使用可配置的快捷键系统。
         // 命令面板与帮助面板也通过 Command 派发，确保按键会被消费且

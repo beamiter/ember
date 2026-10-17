@@ -119,6 +119,7 @@ pub struct ConfigPanel {
     active_tab: ConfigTab,
     // 编辑中的临时值
     edit_font_size: f32,
+    edit_ui_font_size: f32,
     edit_font_weight: f32,
     edit_line_spacing: f32,
     edit_padding: f32,
@@ -198,7 +199,8 @@ impl ConfigPanel {
             is_open: false,
             active_tab: ConfigTab::Font,
             edit_opacity: 1.0,
-            edit_font_size: 14.0,
+            edit_font_size: crate::config::DEFAULT_FONT_SIZE,
+            edit_ui_font_size: crate::config::DEFAULT_FONT_SIZE,
             edit_font_weight: 0.85,
             edit_line_spacing: 1.3,
             edit_padding: 2.0,
@@ -283,6 +285,17 @@ impl ConfigPanel {
         }
     }
 
+    /// Keep live zoom changes from being reverted by an already-open Settings
+    /// panel, without replacing either font size the user is actively editing.
+    pub fn adopt_font_sizes(&mut self, old_main: f32, old_ui: f32, config: &Config) {
+        if self.edit_font_size == old_main {
+            self.edit_font_size = config.font_size;
+        }
+        if self.edit_ui_font_size == old_ui {
+            self.edit_ui_font_size = config.effective_ui_font_size();
+        }
+    }
+
     pub fn open(&mut self, config: &Config) {
         self.is_open = true;
         self.sync_from_config(config);
@@ -309,6 +322,7 @@ impl ConfigPanel {
         self.renew_remote_editor_epoch();
         self.has_changes = false;
         self.edit_font_size = config.font_size;
+        self.edit_ui_font_size = config.effective_ui_font_size();
         self.edit_font_weight = config.font_weight;
         self.edit_line_spacing = config.line_spacing;
         self.edit_padding = config.padding;
@@ -375,6 +389,7 @@ impl ConfigPanel {
     /// Apply all buffered edit values to the given Config.
     pub fn apply_to_config(&self, config: &mut Config) {
         config.font_size = self.edit_font_size;
+        config.ui_font_size = Some(self.edit_ui_font_size);
         config.font_weight = self.edit_font_weight;
         config.line_spacing = self.edit_line_spacing;
         config.padding = self.edit_padding;
@@ -570,7 +585,7 @@ impl ConfigPanel {
         ui.separator();
 
         ui.horizontal(|ui| {
-            ui.label("Size:");
+            ui.label("Main content size:");
             if ui
                 .add(
                     egui::Slider::new(&mut self.edit_font_size, 8.0..=72.0)
@@ -582,8 +597,24 @@ impl ConfigPanel {
                 // Just mark as changed, don't apply yet
                 self.has_changes = true;
             }
-            ui.label("px");
+            ui.label("pt");
         });
+
+        ui.horizontal(|ui| {
+            ui.label("Sidebar / top bar size:");
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.edit_ui_font_size, 8.0..=72.0)
+                        .step_by(1.0)
+                        .show_value(true),
+                )
+                .changed()
+            {
+                self.has_changes = true;
+            }
+            ui.label("pt");
+        });
+        ui.small("The two sizes are independent. Save applies your changes.");
 
         ui.horizontal(|ui| {
             ui.label("Weight:");
@@ -2044,6 +2075,120 @@ fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool 
 mod tests {
     use super::{organism_motion_explanation, ConfigPanel, RemoteHostDraft};
     use crate::config::{Config, OrganismMotion};
+
+    #[test]
+    fn font_group_drafts_apply_independently_and_survive_reopening() {
+        let mut config = Config {
+            font_size: 20.0,
+            ui_font_size: Some(13.0),
+            ..Config::default()
+        };
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&config);
+        assert_eq!(panel.edit_font_size, 20.0);
+        assert_eq!(panel.edit_ui_font_size, 13.0);
+
+        panel.edit_font_size = 27.0;
+        assert_eq!(config.font_size, 20.0, "draft changes wait for Save");
+        panel.apply_to_config(&mut config);
+        assert_eq!(config.font_size, 27.0);
+        assert_eq!(config.ui_font_size, Some(13.0));
+
+        panel.edit_ui_font_size = 18.0;
+        panel.apply_to_config(&mut config);
+        assert_eq!(config.font_size, 27.0);
+        assert_eq!(config.ui_font_size, Some(18.0));
+        assert_eq!(config.font_weight, Config::default().font_weight);
+
+        let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        panel.finish_save(&reloaded, true);
+        assert!(!panel.has_changes);
+        panel.edit_font_size = 60.0;
+        panel.edit_ui_font_size = 40.0;
+        panel.close();
+        panel.sync_from_config(&reloaded);
+        assert_eq!(panel.edit_font_size, 27.0);
+        assert_eq!(panel.edit_ui_font_size, 18.0);
+    }
+
+    #[test]
+    fn legacy_font_group_draft_retains_the_migrated_ui_size() {
+        let mut config: Config = toml::from_str("font_size = 21.0\n").unwrap();
+        config.normalize();
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&config);
+        assert_eq!(panel.edit_ui_font_size, 21.0);
+        panel.edit_font_size = 29.0;
+        panel.apply_to_config(&mut config);
+        assert_eq!(config.font_size, 29.0);
+        assert_eq!(config.ui_font_size, Some(21.0));
+    }
+
+    #[test]
+    fn live_font_group_changes_adopt_only_untouched_settings_fields() {
+        for edited_main in [false, true] {
+            for edited_ui in [false, true] {
+                let mut config = Config {
+                    font_size: 20.0,
+                    ui_font_size: Some(13.0),
+                    ..Config::default()
+                };
+                let mut panel = ConfigPanel::new();
+                panel.sync_from_config(&config);
+                if edited_main {
+                    panel.edit_font_size = 27.0;
+                }
+                if edited_ui {
+                    panel.edit_ui_font_size = 18.0;
+                }
+                panel.has_changes = edited_main || edited_ui;
+                panel.edit_font_family = "unsaved font choice".to_string();
+                config.font_size = 21.0;
+                config.ui_font_size = Some(14.0);
+                panel.adopt_font_sizes(20.0, 13.0, &config);
+                assert_eq!(panel.edit_font_size, if edited_main { 27.0 } else { 21.0 });
+                assert_eq!(panel.edit_ui_font_size, if edited_ui { 18.0 } else { 14.0 });
+                assert_eq!(panel.has_changes, edited_main || edited_ui);
+                assert_eq!(panel.edit_font_family, "unsaved font choice");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_sync_adopts_ui_only_reload_without_changing_main_size() {
+        let mut config = Config {
+            font_size: 20.0,
+            ui_font_size: Some(13.0),
+            ..Config::default()
+        };
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&config);
+        config.ui_font_size = Some(17.0);
+        panel.sync_from_config(&config);
+        assert_eq!(panel.edit_font_size, 20.0);
+        assert_eq!(panel.edit_ui_font_size, 17.0);
+        assert!(!panel.has_changes);
+    }
+
+    #[test]
+    fn font_group_drafts_survive_failed_save_and_reset_together() {
+        let mut config = Config::default();
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&config);
+        panel.edit_font_size = 24.0;
+        panel.edit_ui_font_size = 17.0;
+        panel.apply_to_config(&mut config);
+        panel.finish_save(&config, false);
+        assert!(panel.has_changes);
+        assert_eq!(panel.edit_font_size, 24.0);
+        assert_eq!(panel.edit_ui_font_size, 17.0);
+
+        panel.sync_from_config(&Config::default());
+        panel.apply_to_config(&mut config);
+        assert_eq!(config.font_size, crate::config::DEFAULT_FONT_SIZE);
+        assert_eq!(config.ui_font_size, Some(crate::config::DEFAULT_FONT_SIZE));
+        assert!(!panel.has_changes);
+    }
 
     #[test]
     fn failed_settings_save_preserves_raw_draft_and_widget_history() {

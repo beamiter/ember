@@ -411,11 +411,8 @@ pub struct TerminalApp {
     pub terminal_mouse_capture: Option<TerminalMouseCapture>,
     pub last_terminal_mouse_motion: Option<(String, usize, usize)>,
 
-    // Ctrl+滚轮字体缩放累积器
-    pub font_size_accumulator: f32,
-
-    // 上一帧是否有Ctrl+滚轮事件
-    pub had_ctrl_scroll_last_frame: bool,
+    /// Raw Ctrl+wheel samples routed using the current painted regions.
+    pub font_zoom: crate::font_zoom::FontZoom,
 
     // 每帧事件缓存，避免多次克隆
     pub frame_events: Vec<egui::Event>,

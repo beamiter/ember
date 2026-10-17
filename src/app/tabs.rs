@@ -855,7 +855,7 @@ impl TerminalApp {
                                                 marked_count,
                                                 &remote_entries,
                                                 &mut menu_action,
-                                                self.config.font_size,
+                                                self.config.effective_ui_font_size(),
                                             );
                                         });
                                 }
@@ -1284,7 +1284,7 @@ impl TerminalApp {
     /// Sidebar tab 模式下的精简顶部栏：仅含侧边栏 toggle(☰)，用于预留顶部空间，
     /// 避免用浮动按钮直接覆盖终端内容造成 UI 干扰。
     pub fn render_sidebar_mode_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let font_size = self.config.font_size;
+        let font_size = self.config.effective_ui_font_size();
         let tab_height = crate::theme::workspace_control_height(font_size) + 10.0;
         let tab_rect = egui::Rect::from_min_size(
             ui.cursor().left_top(),
@@ -1454,7 +1454,7 @@ impl TerminalApp {
     pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
         self.refresh_unseen_flags_for_visible_panes();
         let menu_snapshot = self.tab_menu_snapshot();
-        let font_size = self.config.font_size;
+        let font_size = self.config.effective_ui_font_size();
         let tab_height = crate::theme::workspace_control_height(font_size) + 10.0;
         let close_btn_size = font_size.max(14.0);
         let tab_rect = egui::Rect::from_min_size(
@@ -2040,7 +2040,7 @@ impl TerminalApp {
                                 marked_count_for_menu,
                                 &remote_entries_for_menu,
                                 &mut top_menu_action,
-                                self.config.font_size,
+                                self.config.effective_ui_font_size(),
                             );
                         });
                 }
