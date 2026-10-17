@@ -266,9 +266,10 @@ jobs:
         timeout-minutes: 12
         run: |
           python3 scripts/test-native-block-search.py
+          python3 scripts/test-native-block-search-atspi-driver.py
           status=0
           for scenario in raw snapshot; do
-            if ! python3 scripts/native-block-search.py \
+            if ! /usr/bin/python3 scripts/native-block-search.py \
               --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
               --backend x11 --scenario "$scenario" \
               --output "native-smoke-artifacts/block-search-$scenario"; then

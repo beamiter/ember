@@ -68,3 +68,27 @@ workflow. Build the new C observer against the already generated input-method
 protocol, and execute this stage with the same installed production binary.
 Failure output must be uploaded by the existing always-run artifact step.
 No publication is authorized by this document.
+
+## Fresh-control initial health provenance
+
+The active-preedit stage hands its immediately preceding successful transition's
+post-challenge visual evidence to the following fresh composition control. This
+is an optional adapter used only by this stage, not a change to ordinary initial
+mode or completed-composition fixtures. It requires the transition passed its
+final zero-byte collector and preserved shell identity. Source evidence must be
+the exact expected transition directory's after-challenge PNG and matching JSON;
+the PNG SHA256 and all saved visual fields must still match, with zero expected
+and observed preedit tokens and an empty match list.
+
+At the fresh control's initial absence snapshot, the same live application
+object/PID and persisted destination mode are checked. The visual oracle then
+requires the source's exact owned window identity/rectangle and anchor box in
+the new snapshot. It may use the existing same-PNG PSM11 health fallback only
+after zero PSM6 health anchors. Missing, duplicate, moved, stale, or mutated
+provenance and preedit token presence still fail. The adapter is single-use for
+this initial snapshot; later before/during/after comparisons use the fresh
+cycle's own images and existing strict pixel/byte oracles. No input retry or
+additional screenshot is introduced. A handoff artifact records source/current
+PNG hashes, owner geometry, mode, shell identity, and selected health OCR layout.
+
+This fixture repair does not retrospectively accept a failed hosted stage.

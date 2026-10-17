@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 import shlex
 import threading
+import subprocess
 import time
 
 
@@ -25,6 +26,7 @@ def load(name, filename):
 
 native = load('e03_desktop', 'native-desktop-smoke.py')
 fixture = load('e03_output', 'native-block-search-output.py')
+public = load('e03_public', 'native-block-search-atspi-driver.py')
 BLOCK_SEARCH_CHORD = ('g', ('ctrl', 'shift'))
 
 
@@ -55,46 +57,6 @@ def phrase_center(rows, phrase):
     top = min(int(r['top']) for r in part)
     bottom = max(int(r['top']) + int(r['height']) for r in part)
     return (left + right) // 2, (top + bottom) // 2
-
-
-def block_picker_controls(rows):
-    # OCR renders small Cmd/Out labels as cmd/out in the real X11 artifact.
-    # Normalize ASCII label case only; query/result/anchor matching stays exact.
-    found = {}
-    for label in ('scope', 'cmd', 'out', 'latest'):
-        matches = [r for r in rows if r['text'].isascii() and r['text'].lower() == label]
-        if len(matches) != 1:
-            return False
-        found[label] = matches[0]
-        rect = found[label]
-        if (int(rect['left']) < 0 or int(rect['top']) < 0
-                or int(rect['width']) <= 0 or int(rect['height']) <= 0
-                or int(rect['left']) + int(rect['width']) > 1280
-                or int(rect['top']) + int(rect['height']) > 900):
-            return None
-    scope, cmd, out, latest = (found[k] for k in ('scope', 'cmd', 'out', 'latest'))
-    x = lambda r: int(r['left'])
-    y = lambda r: int(r['top'])
-    line_height = max(int(r['height']) for r in (scope, cmd, out))
-    valid = (x(scope) < x(cmd) < x(out)
-            and max(y(r) for r in (scope, cmd, out))
-                - min(y(r) for r in (scope, cmd, out)) <= line_height
-            and y(latest) > max(y(r) + int(r['height']) for r in (scope, cmd, out))
-            and x(scope) <= x(latest) <= x(out) + int(out['width']))
-    return found if valid else None
-
-
-def block_picker_surface(rows):
-    return bool(block_picker_controls(rows))
-
-
-def output_scope_target(rows):
-    controls = block_picker_controls(rows)
-    if not controls:
-        raise RuntimeError('No fully validated Block Search surface for Out targeting')
-    out = controls['out']
-    return (int(out['left']) + int(out['width']) // 2,
-            int(out['top']) + int(out['height']) // 2)
 
 
 def raw_hit_claim(rows, token):
@@ -136,6 +98,9 @@ def validate_manifest(result, mode, record, identity):
 class SearchSmoke(native.Smoke):
     def __init__(self, binary, backend, out):
         super().__init__(binary, backend, out)
+        self.env = public.probe.child_environment(self.env)
+        self.bus_daemon = None
+        self.public = None
         self.sequence = 0
         self.events = []
         self.fixture_dir = out / 'fixtures'
@@ -183,20 +148,11 @@ class SearchSmoke(native.Smoke):
         raise RuntimeError('No same-observation active Stop plus stable raw hit; case unproven')
 
     def click_phrase(self, phrase, name):
-        rows = self.wait_phrase(phrase, name)
-        point = phrase_center(rows, phrase)
-        self.events.append(dict(event='explicit-click', phrase=phrase, point=point,
-                                monotonic_ns=time.monotonic_ns()))
-        self.click(*point)  # Once only. Observations may repeat, actions may not.
+        self.wait_phrase(phrase, name)  # Preserve existing visible-state oracle.
+        self.public.button(phrase, name)  # One exact public target/action only.
 
     def click_output_scope(self):
-        # One fresh full-screen observation proves surface and target together.
-        rows = self.observe('output-scope')
-        point = output_scope_target(rows)
-        self.events.append(dict(event='explicit-click', phrase='Out', point=point,
-                                observation=self.last_observation_label,
-                                monotonic_ns=time.monotonic_ns()))
-        self.click(*point)  # Exactly once; no fallback action or cached rectangle.
+        self.public.output_scope()
 
     def emit(self, mode, record=0):
         path = self.fixture_dir / f'{mode}-{record:02d}.json'
@@ -211,32 +167,8 @@ class SearchSmoke(native.Smoke):
         assert identity == self.identity, 'Fixture switched shell/pane unexpectedly'
 
     def open_find(self, query):
-        self.key(*BLOCK_SEARCH_CHORD)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if block_picker_surface(self.observe('block-picker-surface')):
-                break
-            time.sleep(0.1)
-        else:
-            raise RuntimeError('Block Search surface not proven; refusing query/input on generic Find')
-        self.key('a', ('ctrl',))
-        self.text(query)
-        # Positive field ownership oracle: copy actual selected UI text.
-        self.key('a', ('ctrl',))
-        self.own_clipboard('E03CLIPBOARDDECOY', f'query-{self.sequence}')
-        self.key('c', ('ctrl',))
-        native.wait_for(lambda: self.read_clipboard() == query.encode(), 'Find field readback')
-        self.key('Right')
-        rows = self.observe('query-field')
-        if not block_picker_surface(rows):
-            raise RuntimeError('Block Search surface lost before query field targeting')
-        try:
-            self.query_point = phrase_center(rows, query)
-        except RuntimeError:
-            # Alternate OCR layout of the SAME pixels, with exact spelling and
-            # uniqueness still mandatory. Never retry the chord or query input.
-            rows = self.words(self.last_observation_label, psm=6, capture=False)
-            self.query_point = phrase_center(rows, query)
+        self.key(*BLOCK_SEARCH_CHORD)  # Exactly once; never retry to focus.
+        self.public.query(query)
         self.click_output_scope()
 
     def navigate(self, token, row, pointer=False, raw=False, expected_claim=None):
@@ -250,7 +182,7 @@ class SearchSmoke(native.Smoke):
             self.click(*phrase_center(rows, phrase))
         else:
             # Return focus to query without changing text, then activate selected hit.
-            self.click(*self.query_point)
+            self.public.focus_query()
             self.key('Return')
         # Query/result label alone is insufficient: require adjacent real output row
         # after picker closes. Unique neighboring row was never in its hit snippet.
@@ -279,7 +211,8 @@ class SearchSmoke(native.Smoke):
                                'scrollback_lines = 160000\ncommand_history_max_entries = 1000\n'
                                'restore_session = false\n')
         self.app = self.spawn([str(self.binary)], 'ember')
-        native.wait_for(self.app_window, 'owned Ember window')
+        window = native.wait_for(self.app_window, 'owned Ember window')
+        self.public = public.Driver(self, window)
         self.sample_memory()
         time.sleep(2)
         self.identity = self.command('initial-shell')
@@ -290,7 +223,7 @@ class SearchSmoke(native.Smoke):
             self.click_phrase('Search this retained output', 'raw-start')
             # Native loading activation must stay open. This is an observable
             # adversary, not deterministic control of a particular worker boundary.
-            self.click(*self.query_point)
+            self.public.focus_query()
             _, claim = self.wait_active_hit('E03EARLYHIT', 'raw-loading-hit')
             self.key('Return')
             _, after_return = self.wait_active_hit('E03EARLYHIT', 'loading-return-rejected')
@@ -342,12 +275,24 @@ def main():
     result = dict(binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                   backend=args.backend, scenario=args.scenario,
                   exclusions=['input p95 and presentation latency', 'complete memory accounting',
-                              'AccessKit', 'natural-limit Continue', 'continuous PTY contention',
+                              'natural-limit Continue', 'continuous PTY contention',
                               'pane/query/reset/eviction/alternate-screen race matrix',
                               'keyboard final navigation', 'Wayland'])
     smoke = SearchSmoke(binary, args.backend, out)
     try:
+        log = open(out/'private-dbus.log', 'w'); smoke.logs.append(log)
+        smoke.bus_daemon = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address=1'],
+                                            env=smoke.env, stdout=log, stderr=log, start_new_session=True)
+        smoke.processes.append(smoke.bus_daemon)
+        def bus_ready():
+            if smoke.bus_daemon.poll() is not None: raise RuntimeError('Private D-Bus exited')
+            lines = (out/'private-dbus.log').read_text().splitlines()
+            return lines[0] if lines and lines[0].startswith('unix:') else None
+        smoke.env['DBUS_SESSION_BUS_ADDRESS'] = native.wait_for(bus_ready, 'private D-Bus')
         smoke.start_desktop()
+        smoke.run(['/usr/bin/python3', str(Path(public.probe.__file__).resolve()), '--enable', '--output', str(out/'enable.json')])
+        os.environ.clear(); os.environ.update(smoke.env)
+        result['activated_service_cleanup'] = 'unverified'
         result.update(smoke.exercise_search(args.scenario), status='pass')
     except Exception as error:
         result.update(status='fail', error=str(error))
@@ -358,7 +303,7 @@ def main():
         raise
     finally:
         try:
-            smoke.close()
+            public.probe.close_resources(smoke.bus_daemon, smoke)
         except Exception as error:
             result.update(status='fail', cleanup_error=str(error))
             raise

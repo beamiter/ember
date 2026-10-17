@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Hosted-only Settings switches with a real compositor preedit already active."""
 import argparse
+import copy
 import hashlib
 import json
 from pathlib import Path
 import subprocess
 import time
+import tomllib
 import importlib.util
 
 
@@ -20,6 +22,48 @@ def zero(capture, stage):
     actual = (capture / 'live.bin').read_bytes()
     if actual != b'':
         raise AssertionError(f'{stage}: premature PTY bytes {actual.hex()}')
+
+
+class FreshVisual:
+    """One initial health handoff from the immediately completed transition."""
+    def __init__(self, visual, smoke, segment, identity, mode):
+        if (segment.get('status') != 'pass' or segment.get('identity') != identity
+                or segment.get('to') != mode or segment.get('pty_bytes') != 0):
+            raise RuntimeError('Unverified transition health handoff')
+        self.visual, self.smoke = visual, smoke
+        self.identity, self.mode = identity, mode
+        self.prior = copy.deepcopy(segment['after_challenge_visual'])
+        self.image = smoke.out / f"preedit-{segment['from']}-to-{mode}" / 'after-challenge.png'
+        self.used = False
+
+    def snapshot(self, view, label, baseline, present):
+        if baseline is not None:
+            return self.visual.snapshot(view, label, baseline, present)
+        if self.used or label != 'ime-visual-before' or present:
+            raise RuntimeError('Health handoff only permits one initial absence snapshot')
+        self.used = True
+        prior = self.prior
+        if (self.smoke.app.poll() is not None or view.app is not self.smoke.app
+                or prior['rectangle']['pid'] != self.smoke.app.pid
+                or tomllib.loads(self.smoke.config.read_text()).get('terminal_mode') != self.mode):
+            raise RuntimeError('Health handoff app or mode changed')
+        if (Path(prior['image']) != self.image
+                or prior.get('expected_token_count') != 0
+                or prior.get('observed_token_count') != 0 or prior.get('matches') != []):
+            raise RuntimeError('Health handoff is not the verified absent-token image')
+        if (hashlib.sha256(self.image.read_bytes()).hexdigest() != prior['image_sha256']
+                or json.loads(self.image.with_name('after-challenge-visual.json').read_text()) != prior):
+            raise RuntimeError('Health handoff image or metadata provenance changed')
+        result = self.visual.snapshot(view, label, prior, False, health_fallback=True)
+        (view.out / 'ime-health-handoff.json').write_text(json.dumps({
+            'source_image': str(self.image), 'source_image_sha256': prior['image_sha256'],
+            'source_rectangle': prior['rectangle'], 'source_anchor_box': prior['anchor_box'],
+            'mode': self.mode, 'identity': self.identity, 'initial_image_sha256': result['image_sha256'],
+            'health_ocr_psm': result['health_ocr_psm']}, indent=2))
+        return result
+
+    def verify_restoration(self, *args):
+        return self.visual.verify_restoration(*args)
 
 
 def transition(smoke, module, live, visual, helper, identity, old, new, seat):
@@ -60,7 +104,7 @@ def transition(smoke, module, live, visual, helper, identity, old, new, seat):
         assert len(outcomes) == 1, 'Ambiguous native context outcome'
         time.sleep(0.5)
         zero(capture, 'late commit quarantine or abandoned context')
-        visual.snapshot(view, 'after-challenge', after, False, health_fallback=True)
+        verified_after = visual.snapshot(view, 'after-challenge', after, False, health_fallback=True)
         (control / 'finish').touch()
         ime.wait(timeout=5)
         assert ime.returncode == 0
@@ -68,7 +112,8 @@ def transition(smoke, module, live, visual, helper, identity, old, new, seat):
         # Observer has exited before finishing collector; its final drain sees
         # delayed PTY bytes too. This capture deliberately expects zero bytes.
         smoke.raw_finish(capture, identity, b'')
-        result.update(status='pass', native_outcome=outcomes[0], pty_bytes=0)
+        result.update(status='pass', native_outcome=outcomes[0], pty_bytes=0,
+                      after_challenge_visual=verified_after)
     except Exception as error:
         result.update(status='fail', error=str(error))
         raise
@@ -98,7 +143,8 @@ def exercise(smoke, module, live, keyboard, visual, observer, helper, seat):
         # permanently disable IME. Same shell, exact UTF-8, no composing CR.
         label = f'fresh-after-{old}-to-{new}'
         segment['fresh_composition'] = live.composition_cycle(
-            smoke, module, keyboard, visual, helper, identity, label, seat)
+            smoke, module, keyboard, FreshVisual(visual, smoke, segment, identity, new),
+            helper, identity, label, seat)
         results.append(segment)
     labels = ['preedit-switch-ready'] + [f'fresh-after-{a}-to-{b}-submitted'
                                          for a, b in zip(live.MODES, live.MODES[1:])]
