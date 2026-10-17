@@ -106,4 +106,83 @@ class Tests(unittest.TestCase):
    self.assertIn(text,source)
   self.assertNotIn('self.query_point',source);self.assertEqual(source.count('self.key(*BLOCK_SEARCH_CHORD)'),1)
 
+class EvidenceTests(unittest.TestCase):
+ tree=Tests.tree
+ driver=Tests.driver
+ button_tree=Tests.button_tree
+ def result_tree(self):
+  tree=self.button_tree();node=tree['nodes'][-1]
+  node['name']='Result 1 of 1; E03SNAPSHOT00 ROW000016 ....; output line 16 for e03emit snapshot 0'
+  return tree
+ def test_exact_result_excludes_query_and_fuzzy_or_other_record(self):
+  tree=self.result_tree();line='E03SNAPSHOT00 ROW000016 ....'
+  self.assertEqual(p.snapshot_hit(tree,'E03DISCOVERY',line)['path'],tree['nodes'][-1]['path'])
+  for change in ['EO3SNAPSHOTOO ROW000016 ....','E03SNAPSHOT01 ROW000016 ....','E03SNAPSHOT00 ROW000017 ....','E03SNAPSHOT00']:
+   with self.subTest(change=change),self.assertRaises(RuntimeError):p.snapshot_hit(tree,'E03DISCOVERY',change)
+  for key,value in [('role',79),('states',[0,0]),('screen_extents',[1000,1000,3,3]),('pid',99),('owner',':9.9'),('actions',[])]:
+   bad=copy.deepcopy(tree);bad['nodes'][-1][key]=value
+   with self.subTest(key=key),self.assertRaises(RuntimeError):p.snapshot_hit(bad,'E03DISCOVERY',line)
+ def test_duplicate_result_fails(self):
+  tree=self.result_tree();node=copy.deepcopy(tree['nodes'][-1]);node['path']+='dup'
+  tree['nodes'][2]['children'].append(node['path']);tree['nodes'].append(node)
+  with self.assertRaises(RuntimeError):p.snapshot_hit(tree,'E03DISCOVERY','E03SNAPSHOT00 ROW000016 ....')
+ def inert_evidence(self,directory):
+  driver=self.driver(directory);tree=self.button_tree()
+  driver.read=Mock(return_value=(tree,p.public.controls(tree,driver.expected)))
+  driver.smoke.run.return_value.stdout='1280 900'
+  def screenshot(label):(driver.smoke.out/(label+'.png')).write_bytes(b'immutable fixture')
+  driver.smoke.screenshot.side_effect=screenshot
+  return driver,tree
+ def test_evidence_brackets_exact_target_and_hash(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver,tree=self.inert_evidence(directory)
+   driver.evidence(lambda t:p.action_button(t,driver.expected,'Stop search'),'stop')
+   driver.smoke.screenshot.assert_called_once();self.assertEqual(driver.read.call_count,2)
+   record=json.loads(next(driver.out.glob('public-evidence*.json')).read_text())
+   self.assertTrue(record['after_verified']);self.assertEqual(record['image_sha256'],p.hashlib.sha256(b'immutable fixture').hexdigest())
+   with self.assertRaisesRegex(RuntimeError,'reuse'):driver.evidence(lambda t:p.action_button(t,driver.expected,'Stop search'),'stop')
+ def test_changed_target_geometry_text_owner_or_image_fails(self):
+  for case in ['bounds','text','owner','image','dimensions','offscreen']:
+   with self.subTest(case=case),tempfile.TemporaryDirectory() as directory:
+    driver,tree=self.inert_evidence(directory);after=copy.deepcopy(tree)
+    if case=='bounds':after['nodes'][-1]['screen_extents'][0]+=1
+    elif case=='text':after['nodes'][-1]['name']='Restart this output'
+    elif case=='owner':after['owner']=':99.99'
+    elif case=='dimensions':driver.smoke.run.return_value.stdout='1280 9001280 900'
+    elif case=='offscreen':driver.smoke.run.return_value.stdout='1 1'
+    calls=[0]
+    def read(label):
+     calls[0]+=1
+     if calls[0]==2:
+      if case=='image':next(driver.smoke.out.glob('*.png')).write_bytes(b'changed')
+      return after,{}
+     return tree,{}
+    driver.read.side_effect=read
+    with self.assertRaises(RuntimeError):driver.evidence(lambda t:p.action_button(t,driver.expected,'Stop search'),'stop')
+    self.assertEqual(list(driver.out.glob('public-evidence*.json')),[])
+ def test_late_evidence_is_rejected(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver,tree=self.inert_evidence(directory)
+   with patch.object(p.time,'monotonic',side_effect=[0,9]),self.assertRaisesRegex(RuntimeError,'deadline'):
+    driver.evidence(lambda t:p.action_button(t,driver.expected,'Stop search'),'stop')
+ def test_only_missing_before_capture_can_retry(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory);driver.evidence=Mock(side_effect=[p.MissingTarget('absent'),('tree','node')])
+   with patch.object(p.time,'sleep'):self.assertEqual(driver.wait_evidence(None,'wait'),('tree','node'))
+   self.assertEqual(driver.evidence.call_count,2)
+   driver.evidence=Mock(side_effect=RuntimeError('ambiguous'))
+   with self.assertRaisesRegex(RuntimeError,'ambiguous'):driver.wait_evidence(None,'wait')
+   self.assertEqual(driver.evidence.call_count,1)
+ def test_missing_after_capture_is_fatal_not_retryable(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver,tree=self.inert_evidence(directory);selector=Mock(side_effect=[tree['nodes'][-1],p.MissingTarget('gone')])
+   with self.assertRaisesRegex(RuntimeError,'disappeared') as caught:driver.evidence(selector,'gone')
+   self.assertNotIsInstance(caught.exception,p.MissingTarget)
+
+ def test_no_operation_on_failed_evidence(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory);driver.evidence=Mock(side_effect=RuntimeError('changed'))
+   with patch.object(p,'invoke_button') as invoke,self.assertRaises(RuntimeError):driver.button('Stop search','stop')
+   invoke.assert_not_called()
+
 if __name__=='__main__':unittest.main()

@@ -3,6 +3,7 @@
 import hashlib
 import importlib.util
 import json
+import re
 import time
 from pathlib import Path
 
@@ -16,12 +17,17 @@ public=load('public_control','native-block-search-atspi-interaction.py')
 probe=public.probe
 
 
+class MissingTarget(RuntimeError):
+    pass
+
+
 def action_button(tree, expected, name):
     found=public.controls(tree,expected)
     picker=found['editor']['parent']
     choices=[n for n in tree['nodes'] if n['parent']==picker and n['name']==name and n['role']==43]
+    if not choices:raise MissingTarget('Missing picker action: '+name)
     if len(choices)!=1:
-        raise RuntimeError('Missing or ambiguous picker action: '+name)
+        raise RuntimeError('Ambiguous picker action: '+name)
     node=choices[0]
     by_path={n['path']:n for n in tree['nodes']}
     if (public.COMPONENT not in node['interfaces'] or not public.state(node,25)
@@ -29,6 +35,38 @@ def action_button(tree, expected, name):
         raise RuntimeError('Picker action not visibly bounded')
     public.click_index(node)
     return node
+
+
+def snapshot_hit(tree, expected, line):
+    """Exact public result label, never the query field or a substring hit."""
+    found=public.controls(tree,expected)
+    nodes={n['path']:n for n in tree['nodes']}
+    picker=nodes[found['editor']['parent']]
+    pattern=r'Result ([1-9][0-9]*) of ([1-9][0-9]*); '+re.escape(line)+r'; output line [0-9]+ for .+'
+    matches=[n for n in tree['nodes'] if n['role']==43 and re.fullmatch(pattern,n['name'])]
+    if not matches:raise MissingTarget('Missing exact snapshot result label')
+    if len(matches)!=1:raise RuntimeError('Ambiguous exact snapshot result label')
+    node=matches[0]
+    match=re.fullmatch(pattern,node['name'])
+    if int(match[1])>int(match[2]):raise RuntimeError('Invalid result ordinal')
+    ancestor=node
+    while ancestor['path']!=picker['path']:
+        if ancestor['parent'] not in nodes:raise RuntimeError('Result outside picker')
+        ancestor=nodes[ancestor['parent']]
+    if (public.COMPONENT not in node['interfaces'] or not public.state(node,25)
+            or not public.state(node,30)
+            or not public.inside(node.get('screen_extents',[]),picker['screen_extents'])):
+        raise RuntimeError('Result not visibly bounded')
+    public.click_index(node)
+    return node
+
+
+def evidence_identity(tree, expected, node):
+    found=public.controls(tree,expected)
+    nodes={n['path']:n for n in tree['nodes']}
+    picker=nodes[found['editor']['parent']];window=nodes[picker['parent']]
+    return {'controls':public.control_identity(tree,found), 'window':window,
+            'picker_bounds':picker['screen_extents'], 'node':node}
 
 
 def invoke_button(tree, expected, name):
@@ -57,6 +95,7 @@ class Driver:
         self.out=smoke.out/'public-targeting';self.out.mkdir()
 
     def read(self, label):
+        if self.smoke.app.poll() is not None:raise RuntimeError('Owned application exited')
         if self.smoke.app_window()!=self.window:raise RuntimeError('Owned X11 window changed')
         self.serial+=1
         tree=probe.discovery(self.smoke.app.pid,self.out/f'{self.serial:04d}-{label}.json',self.expected)
@@ -130,9 +169,56 @@ class Driver:
         (self.out/(label+'.json')).write_text(json.dumps(record,indent=2))
         self.smoke.screenshot('public-query-'+str(self.serial))
 
+    def evidence(self, select, label, timeout=8):
+        """Fresh public tree / immutable pixels / public tree bracket."""
+        deadline=time.monotonic()+timeout
+        tree,_=self.read(label+'-evidence-before')
+        node=select(tree)
+        before=evidence_identity(tree,self.expected,node)
+        image_label=f'public-evidence-{self.serial:04d}-{label}'
+        image=self.smoke.out/(image_label+'.png')
+        if image.exists():raise RuntimeError('Refusing to reuse prior screenshot')
+        self.smoke.screenshot(image_label)
+        digest=hashlib.sha256(image.read_bytes()).hexdigest()
+        dimensions=self.smoke.run(['identify','-format','%w %h',str(image)],capture_output=True,text=True).stdout
+        if not re.fullmatch(r'[1-9][0-9]* [1-9][0-9]*',dimensions):
+            raise RuntimeError('Invalid screenshot dimensions')
+        width,height=map(int,dimensions.split())
+        if not public.inside(before['window']['screen_extents'],[0,0,width,height]):
+            raise RuntimeError('Owned window outside screenshot')
+        after_tree,_=self.read(label+'-evidence-after')
+        try:
+            after_node=select(after_tree)
+        except MissingTarget as error:
+            raise RuntimeError('Public target disappeared across screenshot') from error
+        if evidence_identity(after_tree,self.expected,after_node)!=before:
+            raise RuntimeError('Public evidence changed across screenshot')
+        if hashlib.sha256(image.read_bytes()).hexdigest()!=digest:
+            raise RuntimeError('Screenshot changed during public evidence')
+        if time.monotonic()>=deadline:raise RuntimeError('Public evidence deadline exhausted')
+        record=dict(label=label,pid=tree['pid'],owner=tree['owner'],window=self.window,
+                    image=str(image),image_sha256=digest,dimensions=[width,height],
+                    before=before,after_verified=True,oracle='exact public label; pixels retained separately')
+        (self.out/(image_label+'.json')).write_text(json.dumps(record,indent=2))
+        self.event(event='public-visible-evidence',label=label,image_sha256=digest)
+        return after_tree,after_node
+
+    def wait_evidence(self, select, label, timeout=30):
+        deadline=time.monotonic()+timeout
+        while time.monotonic()<deadline:
+            try:
+                return self.evidence(select,label,timeout=max(0,deadline-time.monotonic()))
+            except MissingTarget:
+                time.sleep(.1)
+        raise RuntimeError('Exact public target deadline exhausted: '+label)
+
+    def snapshot_result(self, line, label):
+        _,node=self.wait_evidence(lambda t:snapshot_hit(t,self.expected,line),label)
+        return node
+
     def button(self, name, label):
         allowed=('Search this retained output','Stop search','Restart this output','Earlier history')
         if name not in allowed:raise RuntimeError('Unapproved operation in bounded adapter')
-        tree,_=self.read(label+'-before')
+        tree,_=self.wait_evidence(lambda t:action_button(t,self.expected,name),label)
         result=invoke_button(tree,self.expected,name)
         self.event(event='public-button',label=label,**result)

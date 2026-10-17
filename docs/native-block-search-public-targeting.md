@@ -29,8 +29,8 @@ or requires a fresh opposing All/Cmd state, one public click and an observed Out
 Pressed response on the identical controls. No no-op is claimed as a transition.
 
 Search this retained output, Stop search, Restart this output and Earlier history
-remain the only permitted semantic operation names. The existing visible OCR
-precondition still runs; the target is then resolved freshly by exact name,
+remain the only permitted semantic operation names. Each target requires a fresh
+owned public-tree/screenshot/public-tree evidence bracket with exact name,
 PushButton role, public action name/index, same picker ancestry and current bounds.
 One public action is issued. A true response is recorded as pending the existing
 search oracle; it is never itself successful search evidence. There is no Latest
@@ -39,11 +39,35 @@ fallback, cached rectangle, repeated action or private controller mutation.
 Raw/snapshot input size/digest/PTY identity, 100k rows, 64 retained snapshots,
 active-Stop plus retained-row claim, loading Return, explicit Stop, claim identity,
 Restart/Complete, pointer result activation, final neighboring output-row navigation,
-RSS sampling, polling timeouts and workflow 12-minute limit are unchanged. Result
-and coverage OCR stays strict. New evidence may reveal further fixture limitations;
+RSS sampling, polling timeouts and workflow 12-minute limit are unchanged. Raw
+result and coverage OCR stays strict; snapshot result selection uses the exact
+public Result Button label described below. Final real-output OCR stays strict. New evidence may reveal further fixture limitations;
 this patch does not relax those oracles or certify any performance metric.
 
 The public-control probe and its zero-byte PTY test remain separate. The actual
 search gate must let its real synthetic emitters run normally. No production files
 are changed. Activated-service exit remains explicitly unverified; existing Smoke
 cleanup is always attempted even when group signaling fails.
+
+## Exact public visible-state evidence repair (pending hosted acceptance)
+
+Picker action selection now uses a fresh PID/bus/window-owned AT-SPI tree,
+followed by one screenshot and a second owned tree. Exact role/name/action,
+visible/showing states, picker/window bounds, target identity and bounds must
+agree across the screenshot. The PNG hash is checked again after the second
+read; image dimensions must contain the owned window. A same-label old image
+cannot be reused. Evidence JSON records the actual target and PNG hash.
+
+Snapshot navigation selects the unique public result Button whose label includes
+the exact generated full output line and output-line context, excluding the query
+Entry. There is no O/0 substitution or fuzzy matching. Its fresh bounded target
+supplies pointer coordinates. Missing pre-capture targets can be observed until
+the original 30-second budget; ambiguity, changed evidence or disappearance
+across capture fails immediately. Every successful evidence bracket must finish
+inside the remaining budget.
+
+Raw retained-row hit identity, active Stop co-observation, rejected loading Return,
+Stop/Restart, completion claims and final neighboring real-output OCR remain
+unchanged. Terminal output is not available in the recorded accessibility tree;
+final navigation still requires exact target token plus the real neighboring row
+in pixels. This change does not establish native acceptance or measure latency.

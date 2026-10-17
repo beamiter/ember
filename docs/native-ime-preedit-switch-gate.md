@@ -92,3 +92,24 @@ additional screenshot is introduced. A handoff artifact records source/current
 PNG hashes, owner geometry, mode, shell identity, and selected health OCR layout.
 
 This fixture repair does not retrospectively accept a failed hosted stage.
+
+## Current63 post-commit health repair (pending hosted acceptance)
+
+CI 38990885146 failed in fresh-after-chat-to-normal/ime-commit-without-cr.png,
+after this fresh cycle's initial health and rendered preedit had succeeded.
+Block-to-chat had completed. The third cycle had already committed exact UTF-8
+without CR before its final absence snapshot failed the primary OCR health anchor.
+It had not finished pixel restoration validation, final collector drain or the
+submission sentinel. Do not describe this as an initial-handoff failure.
+
+FreshVisual now requires ordered current-cycle labels, the identical view/app,
+live PID and destination mode, and unchanged persisted initial PNG/JSON provenance.
+Only the post-commit absence snapshot following successful rendered preedit may
+opt into the existing same-PNG PSM11 health analysis. Presence still uses primary
+PSM6; both token counts and exact anchor position remain strict. No capture/input
+retry or pixel restoration tolerance is introduced. ime-fresh-visual-phase.json
+records the exact requested phase and failure for subsequent diagnosis.
+
+Offline replay of the original immutable failed image passes the repaired oracle
+and exact before/during/after pixel restoration. This does not retroactively pass
+the failed native run; fresh hosted completion remains required.

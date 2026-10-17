@@ -25,7 +25,7 @@ def zero(capture, stage):
 
 
 class FreshVisual:
-    """One initial health handoff from the immediately completed transition."""
+    """Bounded fresh-cycle health handoff from the completed transition."""
     def __init__(self, visual, smoke, segment, identity, mode):
         if (segment.get('status') != 'pass' or segment.get('identity') != identity
                 or segment.get('to') != mode or segment.get('pty_bytes') != 0):
@@ -35,10 +35,45 @@ class FreshVisual:
         self.prior = copy.deepcopy(segment['after_challenge_visual'])
         self.image = smoke.out / f"preedit-{segment['from']}-to-{mode}" / 'after-challenge.png'
         self.used = False
+        self.initial = None
+        self.phase = 0
+        self.view = None
 
     def snapshot(self, view, label, baseline, present):
+        diagnostic = {'label': label, 'expected_token_present': present,
+                      'fresh_cycle_phase': self.phase, 'status': 'running'}
+        try:
+            result = self._snapshot(view, label, baseline, present)
+            diagnostic.update(status='pass', image_sha256=result['image_sha256'],
+                              health_ocr_psm=result['health_ocr_psm'])
+            return result
+        except Exception as error:
+            diagnostic.update(status='fail', error=str(error))
+            raise
+        finally:
+            (view.out / 'ime-fresh-visual-phase.json').write_text(json.dumps(diagnostic, indent=2))
+
+    def _snapshot(self, view, label, baseline, present):
         if baseline is not None:
-            return self.visual.snapshot(view, label, baseline, present)
+            expected = [('ime-preedit-zero-bytes', True), ('ime-commit-without-cr', False)]
+            if (self.initial is None or self.phase >= len(expected)
+                    or (label, present) != expected[self.phase] or baseline != self.initial
+                    or view is not self.view or view.app is not self.smoke.app
+                    or self.smoke.app.poll() is not None
+                    or baseline['rectangle']['pid'] != self.smoke.app.pid
+                    or tomllib.loads(self.smoke.config.read_text()).get('terminal_mode') != self.mode):
+                raise RuntimeError('Unverified fresh visual cycle')
+            image = Path(self.initial['image'])
+            if (image != view.out / 'ime-visual-before.png'
+                    or hashlib.sha256(image.read_bytes()).hexdigest() != self.initial['image_sha256']
+                    or json.loads(image.with_name('ime-visual-before-visual.json').read_text()) != self.initial):
+                raise RuntimeError('Fresh baseline provenance changed')
+            # Same-PNG alternate layout only for the ordered post-commit absence
+            # check, after this cycle's own successful rendered preedit control.
+            result = self.visual.snapshot(view, label, baseline, present,
+                                          health_fallback=self.phase == 1)
+            self.phase += 1
+            return result
         if self.used or label != 'ime-visual-before' or present:
             raise RuntimeError('Health handoff only permits one initial absence snapshot')
         self.used = True
@@ -55,6 +90,8 @@ class FreshVisual:
                 or json.loads(self.image.with_name('after-challenge-visual.json').read_text()) != prior):
             raise RuntimeError('Health handoff image or metadata provenance changed')
         result = self.visual.snapshot(view, label, prior, False, health_fallback=True)
+        self.initial = copy.deepcopy(result)
+        self.view = view
         (view.out / 'ime-health-handoff.json').write_text(json.dumps({
             'source_image': str(self.image), 'source_image_sha256': prior['image_sha256'],
             'source_rectangle': prior['rectangle'], 'source_anchor_box': prior['anchor_box'],

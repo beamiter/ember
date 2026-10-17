@@ -148,8 +148,7 @@ class SearchSmoke(native.Smoke):
         raise RuntimeError('No same-observation active Stop plus stable raw hit; case unproven')
 
     def click_phrase(self, phrase, name):
-        self.wait_phrase(phrase, name)  # Preserve existing visible-state oracle.
-        self.public.button(phrase, name)  # One exact public target/action only.
+        self.public.button(phrase, name)  # Fresh exact label + immutable screenshot bracket.
 
     def click_output_scope(self):
         self.public.output_scope()
@@ -172,6 +171,17 @@ class SearchSmoke(native.Smoke):
         self.click_output_scope()
 
     def navigate(self, token, row, pointer=False, raw=False, expected_claim=None):
+        if not raw and token == 'E03SNAPSHOT00':
+            line = fixture.line('snapshot', row, 0).decode().rstrip('\n')
+            node = self.public.snapshot_result(line, 'snapshot-hit-visible')
+            if not pointer:
+                raise RuntimeError('Snapshot fixture requires its verified pointer target')
+            x,y,width,height = node['screen_extents']
+            self.click(x + width // 2, y + height // 2)
+            rows = self.wait_phrase(f'ROW{row + 1:06d}', 'final-output-navigation')
+            assert exact_phrase(rows, token), 'Final viewport lacks exact target record token'
+            assert not exact_phrase(rows, 'Latest'), 'Picker still open; final navigation unproven'
+            return
         rows = self.wait_phrase(token, 'hit-visible')
         if expected_claim is not None:
             assert raw_hit_claim(rows, token) == expected_claim, 'Activation claim changed after repaint'
@@ -249,7 +259,6 @@ class SearchSmoke(native.Smoke):
             self.emit('flush')
             self.open_find('E03SNAPSHOT00')
             self.click_phrase('Earlier history', 'snapshot-earlier')
-            self.wait_phrase('E03SNAPSHOT00', 'early-snapshot-hit')
             self.navigate('E03SNAPSHOT00', 16, pointer=True)
         return dict(scenario=scenario, shell_identity=self.identity,
                     correctness='first-stage matrix only; see exclusions')

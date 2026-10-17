@@ -160,7 +160,7 @@ class HandoffTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'one initial'):
                 adapter.snapshot(view,'ime-visual-before',None,False)
             view.rows=[view.anchor,fixture.word(fixture.visual.PREEDIT_TOKEN)]
-            during=adapter.snapshot(view,'during',before,True)
+            during=adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
             self.assertEqual(during['observed_token_count'],1)
             self.assertEqual(view.word_calls[-1][1],{'psm':6,'capture':False})
 
@@ -219,5 +219,87 @@ class HandoffTests(unittest.TestCase):
                 else:view.rows=[view.anchor,fixture.word(fixture.visual.PREEDIT_TOKEN)]
                 with self.assertRaises(RuntimeError):adapter.snapshot(view,'ime-visual-before',None,False)
                 self.assertFalse((view.out/'ime-health-handoff.json').exists())
+
+    def begin_cycle(self, d):
+        fixture,smoke,source,view,segment,adapter=self.fixture(d)
+        before=adapter.snapshot(view,'ime-visual-before',None,False)
+        return fixture,smoke,view,adapter,before
+
+    def rendered_preedit(self, fixture, view, adapter, before):
+        view.rows=[view.anchor,fixture.word(fixture.visual.PREEDIT_TOKEN)]
+        return adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
+
+    def test_post_commit_fallback_requires_successful_ordered_preedit(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture,smoke,view,adapter,before=self.begin_cycle(d)
+            self.rendered_preedit(fixture,view,adapter,before)
+            def words(label,**kwargs):
+                view.word_calls.append((label,kwargs))
+                return [fixture.word('other')] if kwargs['psm']==6 else [view.anchor]
+            view.words=words
+            after=adapter.snapshot(view,'ime-commit-without-cr',before,False)
+            self.assertEqual(after['health_ocr_psm'],11)
+            self.assertEqual(view.captures,['ime-visual-before','ime-preedit-zero-bytes','ime-commit-without-cr'])
+            self.assertEqual(adapter.phase,2)
+            with self.assertRaises(RuntimeError):adapter.snapshot(view,'ime-commit-without-cr',before,False)
+
+    def test_reordered_mislabeled_or_wrong_presence_never_capture(self):
+        for label,present in [('ime-commit-without-cr',False),('during',True),
+                              ('ime-preedit-zero-bytes',False),('ime-visual-before',False)]:
+            with self.subTest(label=label,present=present),tempfile.TemporaryDirectory() as d:
+                fixture,smoke,view,adapter,before=self.begin_cycle(d)
+                with self.assertRaises(RuntimeError):adapter.snapshot(view,label,before,present)
+                self.assertEqual(view.captures,['ime-visual-before'])
+                self.assertEqual(adapter.phase,0)
+                proof=json.loads((view.out/'ime-fresh-visual-phase.json').read_text())
+                self.assertEqual((proof['status'],proof['label']),('fail',label))
+
+    def test_preedit_missing_primary_anchor_cannot_fallback_or_advance(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture,smoke,view,adapter,before=self.begin_cycle(d)
+            view.rows=[fixture.word(fixture.visual.PREEDIT_TOKEN)]
+            with self.assertRaises(RuntimeError):adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
+            self.assertEqual(adapter.phase,0)
+            self.assertEqual(view.word_calls[-1][1]['psm'],6)
+            with self.assertRaises(RuntimeError):adapter.snapshot(view,'ime-commit-without-cr',before,False)
+
+    def test_current_cycle_provenance_identity_and_mode_fail_closed(self):
+        for case in ['png','json','baseline','mode','pid','dead','view','app','missing-png','missing-json']:
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as d:
+                fixture,smoke,view,adapter,before=self.begin_cycle(d)
+                self.rendered_preedit(fixture,view,adapter,before)
+                image=view.out/'ime-visual-before.png';metadata=view.out/'ime-visual-before-visual.json'
+                if case=='png':image.write_bytes(b'corrupt')
+                elif case=='json':metadata.write_text('{}')
+                elif case=='baseline':before=dict(before,anchor_box={})
+                elif case=='mode':smoke.config.write_text('terminal_mode = "chat"')
+                elif case=='pid':smoke.app.pid+=1
+                elif case=='dead':smoke.app.poll=lambda:0
+                elif case=='view':view=copy.copy(view)
+                elif case=='app':view.app=SimpleNamespace(pid=42,poll=lambda:None)
+                elif case=='missing-png':image.unlink()
+                else:metadata.unlink()
+                with self.assertRaises((RuntimeError,FileNotFoundError)):
+                    adapter.snapshot(view,'ime-commit-without-cr',before,False)
+                self.assertEqual(adapter.phase,1)
+                self.assertEqual(view.captures,['ime-visual-before','ime-preedit-zero-bytes'])
+
+    def test_post_commit_does_not_accept_residual_tokens_or_bad_alternate_anchor(self):
+        for case in ['primary-token','alternate-token','duplicate','moved','missing','mutated-png']:
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as d:
+                fixture,smoke,view,adapter,before=self.begin_cycle(d)
+                self.rendered_preedit(fixture,view,adapter,before)
+                def words(label,**kwargs):
+                    if kwargs['psm']==6:
+                        return [fixture.word(fixture.visual.PREEDIT_TOKEN if case=='primary-token' else 'other')]
+                    if case=='alternate-token':return [view.anchor,fixture.word(fixture.visual.PREEDIT_TOKEN)]
+                    if case=='duplicate':return [view.anchor]*2
+                    if case=='moved':return [dict(view.anchor,left='16')]
+                    if case=='missing':return [fixture.word('other')]
+                    if case=='mutated-png':(view.out/(label+'.png')).write_bytes(b'changed')
+                    return [view.anchor]
+                view.words=words
+                with self.assertRaises(RuntimeError):adapter.snapshot(view,'ime-commit-without-cr',before,False)
+                self.assertEqual(adapter.phase,1)
 
 if __name__=='__main__':unittest.main()
