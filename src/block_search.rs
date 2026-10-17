@@ -588,6 +588,27 @@ pub struct BlockSearchState {
     pub(crate) bookmark_logical_b_claimed: bool,
 }
 
+// Automatic continuation belongs to the current operation. A transient worker
+// boundary must not offer a second user operation or move the adjacent Stop.
+fn raw_earlier_label(
+    active: bool,
+    restart: bool,
+    continuation: bool,
+    can_advance: bool,
+) -> &'static str {
+    if active {
+        "Searching this output"
+    } else if restart {
+        "Restart this output"
+    } else if continuation {
+        "Continue this output"
+    } else if can_advance {
+        "Search this retained output"
+    } else {
+        "Earlier history"
+    }
+}
+
 impl BlockSearchState {
     pub fn raw_operation_intent(&self) -> RawOperationIntent {
         RawOperationIntent {
@@ -648,20 +669,22 @@ impl BlockSearchState {
             && self.raw.can_advance()
     }
     pub fn can_search_earlier(&self) -> bool {
-        !self.is_loading()
+        !self
+            .raw
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.active)
+            && !self.is_loading()
             && self.query_error.is_none()
             && (self.raw_can_advance() || self.older_not_indexed)
     }
     pub fn earlier_label(&self) -> &'static str {
-        if self.raw.restart.is_some() {
-            "Restart this output"
-        } else if self.raw.continuation.is_some() {
-            "Continue this output"
-        } else if self.raw_can_advance() {
-            "Search this retained output"
-        } else {
-            "Earlier history"
-        }
+        raw_earlier_label(
+            self.raw.operation.as_ref().is_some_and(|op| op.active),
+            self.raw.restart.is_some(),
+            self.raw.continuation.is_some(),
+            self.raw_can_advance(),
+        )
     }
 
     /// Call after painting this result set. A loading/invalid set cannot
@@ -1198,6 +1221,69 @@ mod tests {
             line_text: String::new(),
             command_preview: String::new(),
         }
+    }
+
+    #[test]
+    fn active_operation_keeps_fixed_earlier_label_across_continuations() {
+        for restart in [false, true] {
+            for continuation in [false, true] {
+                for can_advance in [false, true] {
+                    assert_eq!(
+                        raw_earlier_label(true, restart, continuation, can_advance),
+                        "Searching this output"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            raw_earlier_label(false, false, true, true),
+            "Continue this output"
+        );
+        assert_eq!(
+            raw_earlier_label(false, true, true, true),
+            "Restart this output"
+        );
+        assert_eq!(
+            raw_earlier_label(false, false, false, true),
+            "Search this retained output"
+        );
+        assert_eq!(
+            raw_earlier_label(false, false, false, false),
+            "Earlier history"
+        );
+    }
+
+    #[test]
+    fn active_operation_rejects_earlier_even_between_worker_windows() {
+        let mut state = BlockSearchState {
+            query: "needle".into(),
+            older_not_indexed: true,
+            ..Default::default()
+        };
+        let record = BlockSearchHistoryCursor {
+            sequence: 1,
+            record_id: "record".into(),
+        };
+        state.raw.operation = Some(RawSearchOperation::new(
+            1,
+            state.raw_operation_intent(),
+            record,
+            RawOperationLimits::default(),
+            std::time::Instant::now(),
+        ));
+        assert!(
+            !state.is_loading(),
+            "simulate the gap between worker windows"
+        );
+        assert!(!state.can_search_earlier());
+        assert!(!state.request_earlier_history());
+        assert_eq!(state.earlier_label(), "Searching this output");
+        assert_eq!(state.raw.operation.as_ref().unwrap().generation, 1);
+        state.raw.operation.as_mut().unwrap().active = false;
+        assert!(
+            state.can_search_earlier(),
+            "idle history action is restored"
+        );
     }
 
     #[test]

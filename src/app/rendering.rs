@@ -1574,6 +1574,13 @@ fn block_search_bookmark_button(
     response
 }
 
+// Call only inside the result-content child Ui. Selectable Label widgets claim
+// primary pointer presses over text, preventing the encompassing result Button
+// from receiving them. The parent row and separate bookmark remain interactive.
+fn block_search_result_display_labels(ui: &mut egui::Ui) {
+    ui.style_mut().interaction.selectable_labels = false;
+}
+
 fn block_search_bookmark_owns_selection(response: &egui::Response) -> bool {
     response.has_focus()
         || (response.clicked() && !response.clicked_by(egui::PointerButton::Primary))
@@ -3822,6 +3829,7 @@ impl TerminalApp {
                                                 egui::Align::Center,
                                             )),
                                         |ui| {
+                                            block_search_result_display_labels(ui);
                                             let (marker, marker_color) = match hit.line_no {
                                                 Some(line_no) => (
                                                     if self.block_search.raw.displayed { "RAW".to_owned() } else { format!("L{line_no}") },
@@ -6848,6 +6856,102 @@ mod tests {
                 .focus,
             id.accesskit_id()
         );
+    }
+
+    #[test]
+    fn result_display_text_pointer_clicks_activate_parent_and_isolate_bookmark() {
+        use std::cell::Cell;
+
+        // Marker, main text and context must all activate the parent result;
+        // the separate bookmark and blank outside area must not.
+        for (target, passive) in (0..5)
+            .map(|target| (target, true))
+            .chain((0..3).map(|target| (target, false)))
+        {
+            let ctx = egui::Context::default();
+            let points = Cell::new([egui::Pos2::ZERO; 5]);
+            let result_clicked = Cell::new(false);
+            let bookmark_clicked = Cell::new(false);
+            let render = |ui: &mut egui::Ui| {
+                assert!(ui.style().interaction.selectable_labels);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(340.0, 72.0), egui::Sense::hover());
+                let row = egui::Rect::from_min_max(
+                    rect.min,
+                    egui::pos2(rect.right() - 40.0, rect.bottom()),
+                );
+                let bookmark =
+                    egui::Rect::from_min_max(egui::pos2(row.right(), rect.top()), rect.max);
+                let response = ui.interact(
+                    row,
+                    ui.make_persistent_id("actual-result-parent"),
+                    egui::Sense::click(),
+                );
+                let mut observed = [egui::Pos2::ZERO; 5];
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(row.shrink(2.0))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                    |ui| {
+                        if passive {
+                            block_search_result_display_labels(ui);
+                        }
+                        for (index, label) in ["L17", "E03SNAPSHOT00 ROW000016", "owner context"]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            observed[index] = ui.label(label).rect.center();
+                        }
+                    },
+                );
+                assert!(ui.style().interaction.selectable_labels);
+                let star = block_search_bookmark_button(
+                    ui,
+                    ui.make_persistent_id("separate-bookmark"),
+                    bookmark,
+                    false,
+                    "Bookmark result",
+                );
+                observed[3] = bookmark.center();
+                observed[4] = rect.right_bottom() + egui::vec2(20.0, 20.0);
+                points.set(observed);
+                result_clicked.set(block_search_result_render_activation(&response));
+                bookmark_clicked.set(star.clicked_by(egui::PointerButton::Primary));
+            };
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 180.0),
+                )),
+                ..Default::default()
+            };
+            let _ = run_frame(&ctx, input.clone(), render);
+            let _ = run_frame(&ctx, input.clone(), render);
+            let position = points.get()[target];
+            let mut moved = input.clone();
+            moved.events = vec![egui::Event::PointerMoved(position)];
+            let _ = run_frame(&ctx, moved, render);
+            for pressed in [true, false] {
+                let mut pointer = input.clone();
+                pointer.events = vec![egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }];
+                let _ = run_frame(&ctx, pointer, render);
+                if pressed {
+                    assert!(!result_clicked.get());
+                    assert!(!bookmark_clicked.get());
+                }
+            }
+            assert_eq!(
+                result_clicked.get(),
+                target < 3 && passive,
+                "target {target}, passive {passive}"
+            );
+            assert_eq!(bookmark_clicked.get(), target == 3, "target {target}");
+        }
     }
 
     #[test]
