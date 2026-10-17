@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 
 def load(name, filename):
@@ -40,6 +42,23 @@ def row(text, left=0, line=1, block=1):
 
 
 class Tests(unittest.TestCase):
+    def test_failed_ocr_diagnostic_cannot_pass_or_change_phrase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            smoke = object.__new__(driver.SearchSmoke)
+            smoke.out = Path(tmp)
+            smoke.app = SimpleNamespace(pid=42, poll=lambda: None)
+            smoke.public = SimpleNamespace(window='owned', owner=':1.2')
+            smoke.app_window = lambda: 'owned'
+            smoke.events = []
+            smoke.screenshot = lambda name: (smoke.out / (name + '.png')).write_bytes(b'pixels')
+            for tree in [dict(owner=':1.2', pid=42), dict(owner='foreign', pid=42)]:
+                with patch.object(driver.public.probe, 'discovery', return_value=tree):
+                    with self.assertRaisesRegex(RuntimeError, "Missing rendered phrase 'ROW000017'"):
+                        smoke.wait_phrase('ROW000017', 'final-output-navigation', timeout=0)
+            self.assertEqual(smoke.events[0]['event'], 'failed-body-diagnostic')
+            self.assertEqual(smoke.events[1]['event'], 'failed-body-diagnostic-error')
+            self.assertEqual(driver.exact_phrase([row('ROWO00017')], 'ROW000017'), [])
+
     def test_raw_real_size_and_bounded_emit(self):
         sink = BoundedSink()
         with tempfile.TemporaryDirectory() as tmp:

@@ -32,7 +32,7 @@ class Tests(unittest.TestCase):
 
     def tree(self):
         def node(path, **kw):
-            result = dict(path=path, name='', role=0, states=[0, 0],
+            result = dict(path=path, name='', description='', role=0, states=[0, 0],
                           interfaces=[], parent=p.ROOT, children=[], owner=':1.2', pid=42)
             result.update(kw)
             return result
@@ -44,6 +44,16 @@ class Tests(unittest.TestCase):
 
     def validate(self, nodes):
         return p.validate_tree(nodes, p.ROOT, ':1.2', 42)
+
+    def test_closed_picker_diagnostic_still_requires_owned_connected_tree(self):
+        nodes = self.tree()[:1]
+        nodes[0]['children'] = []
+        self.assertIsNone(p.validate_tree(nodes, p.ROOT, ':1.2', 42, None))
+        for field, value in [('pid', 43), ('owner', ':1.3'), ('parent', 'foreign')]:
+            bad = copy.deepcopy(nodes); bad[0][field] = value
+            with self.assertRaises(RuntimeError):
+                p.validate_tree(bad, p.ROOT, ':1.2', 42, None)
+        with self.assertRaises(RuntimeError): self.validate(nodes)
 
     def test_exact_tree_editor_and_scope_required(self):
         nodes = self.tree()
@@ -106,7 +116,7 @@ class Tests(unittest.TestCase):
             proxy.GetRole.return_value = node['role']
             proxy.GetState.return_value = node['states']
             proxy.GetChildren.return_value = [(node['owner'], x) for x in node['children']]
-            proxy.Get.side_effect = lambda iface, key, **kw: node['name'] if key == 'Name' else len(node['text'])
+            proxy.Get.side_effect = lambda iface, key, **kw: node['name'] if key == 'Name' else '' if key == 'Description' else len(node['text'])
             proxy.GetText.return_value = node.get('text', '')
             return proxy
         dbus = Mock(); dbus.SessionBus.return_value = bus

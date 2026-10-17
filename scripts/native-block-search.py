@@ -129,6 +129,28 @@ class SearchSmoke(native.Smoke):
             if exact_phrase(rows, phrase):
                 return rows
             time.sleep(0.1)
+        if name == 'final-output-navigation':
+            # Diagnostic only, AFTER the unchanged OCR deadline has failed.
+            # This cannot convert a failed native gate to a pass.
+            try:
+                window = self.app_window()
+                if window != self.public.window or self.app.poll() is not None:
+                    raise RuntimeError('Owned application/window changed before body diagnostic')
+                self.screenshot('failed-body-before')
+                before = self.out / 'failed-body-before.png'
+                tree = public.probe.discovery(self.app.pid, self.out / 'failed-body-tree.json', None)
+                self.screenshot('failed-body-after')
+                after = self.out / 'failed-body-after.png'
+                if tree['owner'] != self.public.owner or self.app_window() != window or self.app.poll() is not None:
+                    raise RuntimeError('Owned application/window changed during body diagnostic')
+                self.events.append(dict(event='failed-body-diagnostic',
+                    evidence='public render semantics; not compositor proof',
+                    owner=tree['owner'], pid=tree['pid'],
+                    before=before.name, after=after.name,
+                    before_sha256=hashlib.sha256(before.read_bytes()).hexdigest(),
+                    after_sha256=hashlib.sha256(after.read_bytes()).hexdigest()))
+            except Exception as error:
+                self.events.append(dict(event='failed-body-diagnostic-error', error=str(error)))
         raise RuntimeError(f'Missing rendered phrase {phrase!r}; see every captured observation')
 
     def wait_active_hit(self, token, name, timeout=15):

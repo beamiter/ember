@@ -1,3 +1,4 @@
+mod body_accessibility;
 pub(crate) mod chat;
 use crate::color;
 use crate::gpu;
@@ -5281,6 +5282,79 @@ impl TerminalRenderer {
                 });
         }
 
+        // Expose only the same final raw cells just submitted to the renderer.
+        // Withhold the entire surface under modal/picker input blocking, in alt
+        // screen/Chat, with graphics overlays, or with non-opaque presentation.
+        // This narrow public accessibility evidence does NOT certify pixels.
+        if ui
+            .ctx()
+            .accesskit_node_builder(response.id, |_| ())
+            .is_some()
+            && interaction_enabled
+            && !egui::Popup::is_any_open(ui.ctx())
+            && self.scroll_pixel_offset == 0.0
+            && terminal.preedit_text.is_empty()
+            && terminal.scroll_offset == initial_scroll_offset
+            && self.projected_scroll_request.is_none()
+            && !self.chat_mode
+            && !terminal.is_alt_buffer()
+            && self.opacity == 1.0
+            && terminal.kitty_graphics.get_placements().is_empty()
+            && !search_state.is_open
+        {
+            let clip = painter.clip_rect().intersect(content_rect);
+            for (row_index, cells) in grid.iter().enumerate().take(rows) {
+                if cursor_visible
+                    && terminal.is_projected_cursor_visible(&viewport)
+                    && cursor_pos.0 == row_index
+                {
+                    continue;
+                }
+                if viewport.row_kind(row_index) != Some(crate::terminal::ProjectedRowKind::Raw) {
+                    continue;
+                }
+                let Some(raw_row) = viewport
+                    .view_row_absolute(row_index)
+                    .and_then(|absolute| terminal.raw_row_id_at_absolute(absolute))
+                    .and_then(|id| id.get())
+                else {
+                    continue;
+                };
+                // No styled, hidden, wide, hyperlink or control-bearing cell is
+                // reinterpreted as plain text. The fixture uses plain ASCII.
+                if cells.iter().take(cols).any(|cell| {
+                    cell.flags != crate::terminal::StyleFlags::new()
+                        || cell.foreground != crate::terminal::Color::Default
+                        || cell.background != crate::terminal::Color::Default
+                        || cell.hyperlink_id != crate::terminal::HyperlinkId::NONE
+                        || !cell.character.is_ascii()
+                        || cell.character.is_ascii_control()
+                }) {
+                    continue;
+                }
+                let text: String = cells.iter().take(cols).map(|cell| cell.character).collect();
+                let text = text.trim_end_matches(' ');
+                if text.is_empty() {
+                    continue;
+                }
+                let (y, height) = snapped_span(content_rect.top(), row_index, line_height);
+                let (right, width) = snapped_span(content_rect.left(), text.len() - 1, char_width);
+                let row_rect = egui::Rect::from_min_max(
+                    egui::pos2(content_rect.left().round(), y),
+                    egui::pos2(right + width, y + height),
+                );
+                body_accessibility::row(
+                    ui,
+                    response.id,
+                    raw_row,
+                    viewport.key().grid_version,
+                    row_rect,
+                    clip,
+                    text,
+                );
+            }
+        }
+
         // Clear dirty region after rendering
         terminal.dirty_region.clear();
 
@@ -8424,6 +8498,106 @@ mod tests {
             assert!(rect.top() >= pane.top());
             assert!(rect.right() <= pane.right());
             assert!(rect.bottom() <= pane.bottom());
+        }
+    }
+
+    #[test]
+    fn visible_body_diagnostic_uses_production_renderer_and_withholds_blocked_frames() {
+        const TARGET: &str = "E03CAPTURED ROW000017";
+        fn render(
+            ctx: &egui::Context,
+            renderer: &mut TerminalRenderer,
+            terminal: &mut TerminalState,
+            enabled: bool,
+            search: &crate::search::SearchState,
+        ) -> egui::FullOutput {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    renderer.render(ui, terminal, enabled, false, search, &[], &None);
+                },
+            );
+            out.textures_delta.clear();
+            out
+        }
+        fn has_target(out: &egui::FullOutput) -> bool {
+            out.platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, n)| {
+                    n.value() == Some(TARGET)
+                        && n.description()
+                            .is_some_and(|d| d.starts_with("Terminal submitted raw row;"))
+                })
+        }
+        for mode in [
+            "blocked-picker-modal",
+            "offscreen",
+            "alternate",
+            "chat",
+            "opacity",
+            "smooth-scroll",
+            "nonfinite-scroll",
+            "preedit",
+            "popup",
+            "find",
+            "images",
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut renderer = TerminalRenderer::new(
+                14.0,
+                2.0,
+                1.0,
+                crate::config::ScrollbarVisibility::Auto,
+                crate::theme::Theme::default(),
+            );
+            renderer.gpu_rendering = false;
+            let mut terminal = TerminalState::new(64, 8);
+            terminal.process_input(format!("{TARGET}\r\n").as_bytes());
+            let mut search = crate::search::SearchState::default();
+            assert!(
+                has_target(&render(&ctx, &mut renderer, &mut terminal, true, &search)),
+                "{mode}: positive control"
+            );
+            match mode {
+                "offscreen" => terminal.process_input("later\r\n".repeat(100).as_bytes()),
+                "alternate" => terminal.process_input(b"\x1b[?1049hE03CAPTURED ROW000017\r\n"),
+                "chat" => renderer.chat_mode = true,
+                "opacity" => renderer.opacity = 0.5,
+                "smooth-scroll" => renderer.scroll_pixel_offset = 1.0,
+                "nonfinite-scroll" => renderer.scroll_pixel_offset = f32::NAN,
+                "preedit" => terminal.preedit_text = "composition".to_owned(),
+                "popup" => egui::Popup::open_id(&ctx, egui::Id::new("body-test-popup")),
+                "find" => search.is_open = true,
+                "images" => {
+                    terminal
+                        .kitty_graphics
+                        .parse_graphics_payload_at("Ga=T,f=32,s=1,v=1,i=17;AQIDBA==", 0, 0)
+                        .unwrap();
+                    assert!(!terminal.kitty_graphics.get_placements().is_empty());
+                }
+                _ => {}
+            }
+            assert!(
+                !has_target(&render(
+                    &ctx,
+                    &mut renderer,
+                    &mut terminal,
+                    mode != "blocked-picker-modal",
+                    &search
+                )),
+                "{mode}: stale or hidden body exposed"
+            );
         }
     }
 

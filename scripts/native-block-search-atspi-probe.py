@@ -54,6 +54,8 @@ def validate_tree(nodes, root, owner, pid, expected_text='E03DISCOVERY'):
         pending.extend((child, path) for child in node['children'])
     if len(visited) != len(nodes):
         raise RuntimeError('Disconnected tree')
+    if expected_text is None:
+        return None  # Owned, connected tree only; no picker assertion.
     names = [n['name'] for n in nodes]
     for label in ('Search scope: All', 'Search scope: Cmd', 'Search scope: Out'):
         if names.count(label) != 1:
@@ -133,6 +135,7 @@ def discovery(pid, output, expected_text='E03DISCOVERY'):
                 props = dbus.Interface(obj, 'org.freedesktop.DBus.Properties')
                 interfaces = list(map(str, accessible.GetInterfaces(timeout=3)))
                 node = dict(path=address[1], parent=parent, owner=owner, pid=pid, name=str(props.Get(ACCESSIBLE, 'Name', timeout=3)),
+                            description=str(props.Get(ACCESSIBLE, 'Description', timeout=3)),
                             role=int(accessible.GetRole(timeout=3)),
                             states=list(map(int, accessible.GetState(timeout=3))), interfaces=interfaces)
                 if 'org.a11y.atspi.Component' in interfaces:
