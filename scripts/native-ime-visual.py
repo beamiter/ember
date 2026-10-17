@@ -65,7 +65,7 @@ def exact_matches(rows, rectangle, token=PREEDIT_TOKEN):
     return matches
 
 
-def snapshot(smoke, label, baseline, present):
+def snapshot(smoke, label, baseline, present, *, health_fallback=False):
     def geometry(suffix):
         result = smoke.run(['swaymsg', '-t', 'get_tree', '-r'], capture_output=True, text=True)
         (smoke.out / (label + suffix + '-tree.json')).write_text(result.stdout)
@@ -87,9 +87,23 @@ def snapshot(smoke, label, baseline, present):
                            capture_output=True, text=True).stdout
     if dimensions != '1280 900':
         raise RuntimeError('Unexpected screenshot dimensions or image count')
+    image_sha256 = hashlib.sha256(image.read_bytes()).hexdigest()
     rows = smoke.words(label, psm=6, capture=False)
     validate_rows(rows)
     anchors = exact_matches(rows, rectangle, HEALTH_ANCHOR)
+    health_ocr_psm = 6
+    if not anchors and health_fallback and baseline is not None:
+        # One alternate layout of the SAME immutable PNG, never a recapture or
+        # an input retry. A known exact baseline box is required. Ambiguous or
+        # displaced primary anchors cannot fall through to another analysis.
+        alternate = smoke.words(label, psm=11, capture=False)
+        validate_rows(alternate)
+        anchors = exact_matches(alternate, rectangle, HEALTH_ANCHOR)
+        if len(exact_matches(alternate, rectangle)) != int(present):
+            raise RuntimeError('Alternate layout disagrees with preedit token count')
+        health_ocr_psm = 11
+    if hashlib.sha256(image.read_bytes()).hexdigest() != image_sha256:
+        raise RuntimeError('Screenshot changed during OCR analysis')
     if len(anchors) != 1:
         raise RuntimeError('Missing or ambiguous exact OCR health anchor')
     anchor_box = box(anchors[0])
@@ -100,7 +114,7 @@ def snapshot(smoke, label, baseline, present):
         raise RuntimeError(f'Expected {int(present)} exact preedit token, observed {len(matches)}')
     result = {'rectangle': rectangle, 'anchor_box': anchor_box, 'image': str(image),
               'expected_token_count': int(present), 'observed_token_count': len(matches),
-              'matches': matches}
+              'matches': matches, 'image_sha256': image_sha256, 'health_ocr_psm': health_ocr_psm}
     (smoke.out / (label + '-visual.json')).write_text(json.dumps(result, indent=2))
     return result
 

@@ -254,6 +254,13 @@ jobs:
           python3 scripts/test-native-block-search-atspi-probe.py
           /usr/bin/python3 scripts/native-block-search-atspi-probe.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --output native-smoke-artifacts/block-search-atspi-discovery
 
+      - name: Prove public Block Search controls on isolated X11
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        timeout-minutes: 4
+        run: |
+          python3 scripts/test-native-block-search-atspi-interaction.py
+          /usr/bin/python3 scripts/native-block-search-atspi-interaction.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --output native-smoke-artifacts/block-search-atspi-interaction
+
       - name: Gate real X11 bounded block-search correctness
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
         timeout-minutes: 12

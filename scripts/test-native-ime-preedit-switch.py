@@ -35,8 +35,9 @@ class Tests(unittest.TestCase):
         def switch(old,new):
             events.append('switch');assert (control/'preedit').exists()
             if inject=='switch':(capture/'live.bin').write_bytes(b'\r')
-        def snapshot(view,label,baseline,present):
+        def snapshot(view,label,baseline,present,**kwargs):
             events.append(label)
+            assert kwargs == ({'health_fallback': True} if label == 'after-challenge' else {})
             if inject==label:raise RuntimeError('visual failure')
             return {'rectangle':{'id':1,'pid':42,'rect':{}},'anchor_box':{},'observed_token_count':int(present)}
         def finish(path,identity,expected):

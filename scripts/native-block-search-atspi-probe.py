@@ -34,7 +34,7 @@ def validate_address(address, expected_bus):
     return bus, path
 
 
-def validate_tree(nodes, root, owner, pid):
+def validate_tree(nodes, root, owner, pid, expected_text='E03DISCOVERY'):
     # Entry is the public AT-SPI mapping for AccessKit TextInput (role 79).
     # GetState returns two uint32 bitfields; Editable is bit 7, not a list
     # of state enum values. EditableText mutation support is not required.
@@ -61,14 +61,14 @@ def validate_tree(nodes, root, owner, pid):
     editors = [n for n in nodes if 'org.a11y.atspi.Text' in n['interfaces']
                and n['role'] == 79 and len(n['states']) == 2
                and n['states'][0] & (1 << 7)
-               and n.get('text') == 'E03DISCOVERY']
+               and n.get('text') == expected_text]
     if len(editors) != 1:
         raise RuntimeError('Missing or ambiguous exact editable Entry')
     return editors[0]['path']
 
 
-def save_tree(nodes, root, owner, pid, output):
-    editor = validate_tree(nodes, root, owner, pid)
+def save_tree(nodes, root, owner, pid, output, expected_text='E03DISCOVERY'):
+    editor = validate_tree(nodes, root, owner, pid, expected_text)
     result = dict(pid=pid, owner=owner, root=root, nodes=nodes,
                   editor_path=editor,
                   picker_common_ancestor='unverified', focus_acceptance='unverified')
@@ -97,7 +97,7 @@ def close_resources(daemon, smoke):
         raise RuntimeError('; '.join(errors))
 
 
-def discovery(pid, output):
+def discovery(pid, output, expected_text='E03DISCOVERY'):
     import dbus  # Official system package, only loaded in isolated child.
     session = dbus.SessionBus()
     bus_proxy = dbus.Interface(session.get_object('org.a11y.Bus', '/org/a11y/bus'), 'org.a11y.Bus')
@@ -154,7 +154,7 @@ def discovery(pid, output):
                 queue.extend((a, address[1]) for a in children)
             if int(broker.GetConnectionUnixProcessID(owner, timeout=3)) != pid:
                 raise RuntimeError('Accessibility ownership changed')
-            return save_tree(nodes, root, owner, pid, output)
+            return save_tree(nodes, root, owner, pid, output, expected_text)
         except (RuntimeError, dbus.DBusException) as error:
             last_error = str(error)
             time.sleep(0.1)

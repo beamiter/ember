@@ -1,5 +1,6 @@
 """Socket-free snapshot orchestration and fail-closed pixel/ownership checks."""
 import copy
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -192,6 +193,67 @@ class VisualTests(unittest.TestCase):
         self.smoke.crop_bytes['during'] = self.smoke.crop_bytes['before']
         with self.assertRaises(RuntimeError):
             visual.verify_restoration(self.smoke, *lifecycle)
+
+    def fallback_fixture(self, primary, alternate, *, baseline=True, mutate=False):
+        before = self.capture(label='before') if baseline else None
+        self.smoke.captures.clear()
+        self.smoke.word_calls.clear()
+        def words(label, **kwargs):
+            self.smoke.word_calls.append((label, kwargs))
+            if kwargs['psm'] == 11:
+                if mutate:
+                    (self.smoke.out / (label + '.png')).write_bytes(b'changed')
+                return alternate
+            return primary
+        self.smoke.words = words
+        return before
+
+    def test_fallback_same_image_exact_anchor_and_hash(self):
+        before = self.fallback_fixture([word('healthy')], [self.smoke.anchor])
+        result = visual.snapshot(self.smoke, 'test', before, False, health_fallback=True)
+        self.assertEqual(result['health_ocr_psm'], 11)
+        self.assertEqual(result['anchor_box'], before['anchor_box'])
+        self.assertEqual(result['image_sha256'], hashlib.sha256(b'fixture').hexdigest())
+        self.assertEqual(self.smoke.captures, ['test'])
+        self.assertEqual(self.smoke.word_calls, [('test', {'psm': 6, 'capture': False}),
+                                               ('test', {'psm': 11, 'capture': False})])
+
+    def test_primary_success_does_not_consult_alternative(self):
+        before = self.fallback_fixture([self.smoke.anchor], [])
+        result = visual.snapshot(self.smoke, 'test', before, False, health_fallback=True)
+        self.assertEqual(result['health_ocr_psm'], 6)
+        self.assertEqual(len(self.smoke.word_calls), 1)
+
+    def test_primary_duplicate_wrong_box_or_missing_baseline_cannot_fallback(self):
+        for primary, baseline in [([self.smoke.anchor]*2, True),
+                                  ([dict(self.smoke.anchor, left='16')], True),
+                                  ([word('healthy')], False)]:
+            with self.subTest(primary=primary, baseline=baseline):
+                # Restore the fake's original words method before each baseline.
+                self.smoke.words = Smoke.words.__get__(self.smoke, Smoke)
+                before = self.fallback_fixture(primary, [self.smoke.anchor], baseline=baseline)
+                with self.assertRaises(RuntimeError):
+                    visual.snapshot(self.smoke, 'test', before, False, health_fallback=True)
+                self.assertEqual(len(self.smoke.word_calls), 1)
+
+    def test_fallback_missing_duplicate_wrong_box_and_outside_rejected(self):
+        for alternate in [[word('healthy')], [self.smoke.anchor]*2,
+                          [dict(self.smoke.anchor, left='16')],
+                          [dict(self.smoke.anchor, left='0')], []]:
+            with self.subTest(alternate=alternate):
+                self.smoke.words = Smoke.words.__get__(self.smoke, Smoke)
+                before = self.fallback_fixture([word('healthy')], alternate)
+                with self.assertRaises(RuntimeError):
+                    visual.snapshot(self.smoke, 'test', before, False, health_fallback=True)
+
+    def test_fallback_cannot_hide_token_or_changed_image(self):
+        for alternate, mutate in [([self.smoke.anchor,self.token], False),
+                                  ([self.smoke.anchor], True)]:
+            with self.subTest(mutate=mutate):
+                self.smoke.words = Smoke.words.__get__(self.smoke, Smoke)
+                before = self.fallback_fixture([word('healthy')], alternate, mutate=mutate)
+                with self.assertRaises(RuntimeError):
+                    visual.snapshot(self.smoke, 'test', before, False, health_fallback=True)
 
     def test_helper_and_visual_token_match(self):
         source = Path(__file__).with_name('native-ime-return.c').read_text()

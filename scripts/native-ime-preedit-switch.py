@@ -60,7 +60,7 @@ def transition(smoke, module, live, visual, helper, identity, old, new, seat):
         assert len(outcomes) == 1, 'Ambiguous native context outcome'
         time.sleep(0.5)
         zero(capture, 'late commit quarantine or abandoned context')
-        visual.snapshot(view, 'after-challenge', after, False)
+        visual.snapshot(view, 'after-challenge', after, False, health_fallback=True)
         (control / 'finish').touch()
         ime.wait(timeout=5)
         assert ime.returncode == 0
