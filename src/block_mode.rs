@@ -1096,6 +1096,48 @@ pub fn bounded_block_search_sources(
     }
 }
 
+/// Build sequence metadata from exactly the accepted newest-first source prefix.
+/// The lazy source iterator may produce one rejected boundary record, so neither
+/// its identity nor any older record is retained in the returned map. Sequences
+/// are paired by position before IDs are cloned from the actual accepted sources.
+/// No complete-history map or per-hit linear source lookup is needed.
+pub fn bounded_sequenced_block_search_sources(
+    sources_newest_first: impl IntoIterator<Item = (u64, BlockSearchSource)>,
+    max_bytes: usize,
+) -> (
+    BlockSearchSourceSnapshot,
+    std::collections::HashMap<String, u64>,
+) {
+    let mut sequences = Vec::new();
+    let snapshot = bounded_block_search_sources(
+        sources_newest_first.into_iter().map(|(sequence, source)| {
+            sequences.push(sequence);
+            source
+        }),
+        max_bytes,
+    );
+    let accepted = snapshot
+        .sources
+        .iter()
+        .zip(sequences)
+        .map(|(source, sequence)| (source.record_id.clone(), sequence))
+        .collect();
+    (snapshot, accepted)
+}
+
+/// Transfer only final-cache identities, preserving O(1) lookup and moving owned
+/// keys rather than cloning them. Dropping the source map releases its buckets;
+/// the caller must account for the bounded old/new bucket overlap during build.
+pub fn finalized_block_search_sequences<'a>(
+    mut source_sequences: std::collections::HashMap<String, u64>,
+    accepted_ids: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashMap<String, u64> {
+    accepted_ids
+        .into_iter()
+        .filter_map(|id| source_sequences.remove_entry(id))
+        .collect()
+}
+
 /// One record's precomputed original/lowercase text. The finished cache is
 /// oldest-first; searches scan it in reverse so caps retain recent hits.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

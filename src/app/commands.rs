@@ -4447,16 +4447,12 @@ impl TerminalApp {
                         });
                     window
                         .unmapped
-                        .retain(|id| window.build.records.iter().any(|r| &r.record_id == id));
+                        .retain(|id| window.sequences.contains_key(id));
                     window
                         .unavailable
-                        .retain(|id| window.build.records.iter().any(|r| &r.record_id == id));
-                    window.raw_records.retain(|r| {
-                        window
-                            .build
-                            .records
-                            .iter()
-                            .any(|c| c.record_id == r.record_id)
+                        .retain(|id| window.sequences.contains_key(id));
+                    window.raw_records.retain(|record| {
+                        window.sequences.get(&record.record_id) == Some(&record.sequence)
                     });
                     self.block_search.raw.cancel(true);
                     self.block_search.raw.records = window.raw_records;
@@ -4488,18 +4484,10 @@ impl TerminalApp {
                 .iter()
                 .any(|record| record.complete && cursor.matches_record(&record.id, record.sequence))
         });
-        let sequences = Arc::new(
-            terminal
-                .command_records()
-                .iter()
-                .filter(|record| record.complete)
-                .map(|record| (record.id.clone(), record.sequence))
-                .collect::<HashMap<_, _>>(),
-        );
         let mut unmapped = std::collections::HashSet::new();
         let unavailable = std::collections::HashSet::new();
         let mut raw_records = Vec::new();
-        let snapshot = crate::block_mode::bounded_block_search_sources(
+        let (snapshot, sequences) = crate::block_mode::bounded_sequenced_block_search_sources(
             terminal
                 .command_records()
                 .iter()
@@ -4525,14 +4513,21 @@ impl TerminalApp {
                             record_id: record.id.clone(),
                         });
                     }
-                    crate::block_mode::BlockSearchSource::new(
-                        record.id.clone(),
-                        record.command.clone(),
-                        block_search_output_source(&record.id, output, &mut unmapped),
+                    (
+                        record.sequence,
+                        crate::block_mode::BlockSearchSource::new(
+                            record.id.clone(),
+                            record.command.clone(),
+                            block_search_output_source(&record.id, output, &mut unmapped),
+                        ),
                     )
                 }),
             crate::block_mode::BLOCK_SEARCH_SOURCE_MAX_BYTES,
         );
+        // The bounded source iterator can inspect one rejected boundary record.
+        // Retain metadata only for the exact accepted IDs and sequence identities.
+        raw_records.retain(|record| sequences.get(&record.record_id) == Some(&record.sequence));
+        unmapped.retain(|id| sequences.contains_key(id));
         drop(terminal);
         // Old hits own their display text and keep selection/range visible.
         // Release only the obsolete normalized payload before the worker can
@@ -4548,13 +4543,26 @@ impl TerminalApp {
                 crate::block_mode::BLOCK_SEARCH_CACHE_MAX_BYTES,
                 || worker_cancelled.load(Ordering::Relaxed),
             )
-            .map(|build| BlockSearchWindow {
-                build,
-                sequences,
-                unmapped,
-                unavailable,
-                boundary_missing,
-                raw_records,
+            .map(|build| {
+                // Cache normalization can reject more sources. Publish one
+                // complete, consistently trimmed window, never a partial map.
+                let sequences = crate::block_mode::finalized_block_search_sequences(
+                    sequences,
+                    build.records.iter().map(|record| record.record_id.as_str()),
+                );
+                raw_records
+                    .retain(|record| sequences.get(&record.record_id) == Some(&record.sequence));
+                raw_records.shrink_to_fit();
+                unmapped.retain(|id| sequences.contains_key(id));
+                unmapped.shrink_to_fit();
+                BlockSearchWindow {
+                    build,
+                    sequences: Arc::new(sequences),
+                    unmapped,
+                    unavailable,
+                    boundary_missing,
+                    raw_records,
+                }
             });
             let _ = sender.send(result);
         });
