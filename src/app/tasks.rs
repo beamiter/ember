@@ -3315,7 +3315,7 @@ mod approval_navigation_tests {
             clip: egui::Rect::NOTHING,
             navigation_left: None,
         };
-        let output = ctx.run(
+        let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -3324,36 +3324,36 @@ mod approval_navigation_tests {
                 events,
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let mut navigation = native_approval_navigation(ui, task, view).or(stale);
-                    retain_approval_navigation(&mut navigation, Some(task), Some(view));
-                    let mut scroll = egui::ScrollArea::vertical()
-                        .id_salt("approval-headless-list")
-                        .animated(navigation.is_none());
-                    if let Some(offset) = offset {
-                        scroll = scroll.vertical_scroll_offset(offset);
-                    }
-                    let shown = scroll.show(ui, |ui| {
-                        ui.add_space(600.0); // Earlier task rows, not a provider fixture.
-                        render_native_codex_view(
-                            ui,
-                            task,
-                            AgentProvider::Codex,
-                            view,
-                            enabled,
-                            &mut result.action,
-                            &mut navigation,
-                        );
-                        ui.add_space(1600.0);
-                    });
-                    result.offset = shown.state.offset.y;
-                    result.clip = shown.inner_rect;
-                    result.navigation_left = navigation;
+            |ui| {
+                let mut navigation = native_approval_navigation(ui, task, view).or(stale);
+                retain_approval_navigation(&mut navigation, Some(task), Some(view));
+                let mut scroll = egui::ScrollArea::vertical()
+                    .id_salt("approval-headless-list")
+                    .animated(navigation.is_none());
+                if let Some(offset) = offset {
+                    scroll = scroll.vertical_scroll_offset(offset);
+                }
+                let shown = scroll.show(ui, |ui| {
+                    ui.add_space(600.0); // Earlier task rows, not a provider fixture.
+                    render_native_codex_view(
+                        ui,
+                        task,
+                        AgentProvider::Codex,
+                        view,
+                        enabled,
+                        &mut result.action,
+                        &mut navigation,
+                    );
+                    ui.add_space(1600.0);
                 });
+                result.offset = shown.state.offset.y;
+                result.clip = shown.inner_rect;
+                result.navigation_left = navigation;
             },
         );
-        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let _ = ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+        // This CPU-only harness deliberately has no renderer/texture consumer.
+        output.drop_without_applying_deltas();
         result
     }
 
