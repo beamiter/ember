@@ -9141,11 +9141,23 @@ fn chat_review_word_and_links_do_not_wrap_from_history_into_the_dock() {
     assert!(checked > 0);
 }
 
-#[test]
-fn shared_session_parity_corpus_uses_native_owner_and_projection() {
-    use jterm_core::session_parity::{chunks, fixtures, Completion, Expected, CHUNKINGS};
-    for fixture in fixtures() {
-        for chunking in CHUNKINGS {
+#[derive(Debug, PartialEq, Eq)]
+struct SessionParityIdentityMismatch {
+    fixture: String,
+    chunking: String,
+    checkpoint: usize,
+    field: String,
+    expected: String,
+    observed: String,
+}
+
+fn replay_shared_session_parity_corpus(
+    fixtures: Vec<jterm_core::session_parity::Fixture>,
+    chunkings: &[jterm_core::session_parity::Chunking],
+) -> Result<(), SessionParityIdentityMismatch> {
+    use jterm_core::session_parity::{chunks, Completion, Expected};
+    for fixture in fixtures {
+        for &chunking in chunkings {
             let mut terminal = TerminalState::new(80, 24);
             let mut completed = Vec::new();
             let mut identities = std::collections::HashMap::new();
@@ -9197,6 +9209,30 @@ fn shared_session_parity_corpus_uses_native_owner_and_projection() {
                     completed: completed.clone(),
                     running_id,
                 };
+                // Keep all non-identity checks strict: an unrelated setup/state
+                // failure must never satisfy the negative golden test.
+                let mut non_identity = observed.clone();
+                for (actual, wanted) in non_identity.completed.iter_mut().zip(&expected.completed) {
+                    actual.id.clone_from(&wanted.id);
+                }
+                assert_eq!(non_identity, expected, "{context}: non-identity fields");
+                for (index, (actual, wanted)) in observed
+                    .completed
+                    .iter()
+                    .zip(&expected.completed)
+                    .enumerate()
+                {
+                    if actual.id != wanted.id {
+                        return Err(SessionParityIdentityMismatch {
+                            fixture: fixture.id.clone(),
+                            chunking: format!("{chunking:?}"),
+                            checkpoint: step_index,
+                            field: format!("completed[{index}].id"),
+                            expected: wanted.id.clone(),
+                            observed: actual.id.clone(),
+                        });
+                    }
+                }
                 assert_eq!(observed, expected, "{context}");
                 for record in terminal.command_records() {
                     if let Some(previous) = identities.insert(record.id.clone(), record.sequence) {
@@ -9241,6 +9277,48 @@ fn shared_session_parity_corpus_uses_native_owner_and_projection() {
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn shared_session_parity_corpus_uses_native_owner_and_projection() {
+    use jterm_core::session_parity::{fixtures, CHUNKINGS};
+    replay_shared_session_parity_corpus(fixtures(), &CHUNKINGS)
+        .expect("production replay must match the unmodified shared corpus");
+}
+
+#[test]
+fn shared_session_parity_rejects_wrong_completion_identity_golden() {
+    use jterm_core::session_parity::{fixtures, CHUNKINGS};
+    let original = fixtures()
+        .into_iter()
+        .find(|fixture| fixture.id == "identity_dedup")
+        .expect("shared corpus must contain identity_dedup");
+    assert_eq!(original.steps[3].expected.completed.len(), 1);
+    assert_eq!(original.steps[3].expected.completed[0].id, "identity_dedup");
+    for chunking in CHUNKINGS {
+        // A passing control also exercises all later duplicate-D checkpoints.
+        replay_shared_session_parity_corpus(vec![original.clone()], &[chunking])
+            .expect("unmodified identity fixture must pass");
+        let mut mutated = original.clone();
+        mutated.steps[3].expected.completed[0].id = "unrelated".to_owned();
+        // Only a structured mismatch from the actual production replay counts.
+        // Panics, setup failures, and unrelated fields fail this test normally.
+        let mismatch = replay_shared_session_parity_corpus(vec![mutated], &[chunking])
+            .expect_err("the real replay must consume the mutated completion identity");
+        assert_eq!(
+            mismatch,
+            SessionParityIdentityMismatch {
+                fixture: "identity_dedup".to_owned(),
+                chunking: format!("{chunking:?}"),
+                checkpoint: 3,
+                field: "completed[0].id".to_owned(),
+                expected: "unrelated".to_owned(),
+                observed: "identity_dedup".to_owned(),
+            }
+        );
+    }
+    // This proves same-owner execution identity sensitivity, not cross-session routing.
 }
 
 #[test]
