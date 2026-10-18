@@ -257,9 +257,10 @@ fn render_native_codex_view(
     view: &CodexAppServerViewSnapshot,
     approvals_enabled: bool,
     pending: &mut Option<TaskSidebarAction>,
+    navigation: &mut Option<(TaskId, ApprovalId)>,
 ) {
     ui.group(|ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 egui::RichText::new(format!("Native {}", provider.display_name()))
                     .small()
@@ -272,7 +273,7 @@ fn render_native_codex_view(
             );
             if view.dropped_updates > 0 {
                 ui.label(
-                    egui::RichText::new(format!("· {} updates compacted", view.dropped_updates))
+                    egui::RichText::new(format!("· This turn: {} updates omitted or compacted", view.dropped_updates))
                         .small()
                         .weak(),
                 );
@@ -286,10 +287,12 @@ fn render_native_codex_view(
             }
         });
 
+        render_native_approvals(ui, task_id, view, approvals_enabled, pending, navigation);
+
         let history = visible_native_turn_history(view);
         if !history.is_empty() || view.dropped_turns > 0 {
             ui.separator();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
                     egui::RichText::new(format!("Completed turns ({})", history.len()))
                         .small()
@@ -298,7 +301,7 @@ fn render_native_codex_view(
                 if view.dropped_turns > 0 {
                     ui.label(
                         egui::RichText::new(format!(
-                            "· {} earlier turn(s) compacted",
+                            "· {} earlier completed turn(s) no longer retained (history count/size limit)",
                             view.dropped_turns
                         ))
                         .small()
@@ -309,118 +312,6 @@ fn render_native_codex_view(
             for turn in history {
                 render_native_turn_history(ui, task_id, turn);
             }
-        }
-
-        for approval in &view.pending_approvals {
-            ui.separator();
-            let kind = match approval.kind {
-                CodexAppServerApprovalKind::Command => "Command approval",
-                CodexAppServerApprovalKind::FileChange => "File-change approval",
-            };
-            ui.label(
-                egui::RichText::new(kind)
-                    .small()
-                    .strong()
-                    .color(ui.visuals().warn_fg_color),
-            );
-            if let Some(command) = approval.command.as_deref() {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(visible_bounded(command, MAX_NATIVE_ITEM_DISPLAY_BYTES))
-                        .small()
-                        .monospace(),
-                    )
-                    .wrap(),
-                );
-            }
-            if let Some(cwd) = approval.cwd.as_deref() {
-                ui.label(
-                    egui::RichText::new(format!("cwd · {cwd}"))
-                    .small()
-                    .monospace()
-                    .weak(),
-                );
-            }
-            if let Some(reason) = approval.reason.as_deref() {
-                ui.label(
-                    egui::RichText::new(visible_bounded(
-                        reason,
-                        MAX_NATIVE_ITEM_DISPLAY_BYTES,
-                    ))
-                    .small(),
-                );
-            }
-            if approval.kind == CodexAppServerApprovalKind::FileChange {
-                ui.label(
-                    egui::RichText::new("Exact patch requested by Codex")
-                        .small()
-                        .strong(),
-                );
-                egui::ScrollArea::vertical()
-                    .id_salt((
-                        "native-file-approval",
-                        task_id,
-                        view.displayed_turn_id,
-                        approval.id,
-                    ))
-                    .max_height(280.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for change in &approval.file_changes {
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · {}",
-                                    change.kind, change.path
-                                ))
-                                .small()
-                                .strong()
-                                .monospace(),
-                            );
-                            if let Some(move_path) = change.move_path.as_deref() {
-                                ui.label(
-                                    egui::RichText::new(format!("moves to · {move_path}"))
-                                        .small()
-                                        .monospace(),
-                                );
-                            }
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&change.diff).small().monospace(),
-                                )
-                                .wrap(),
-                            );
-                        }
-                    });
-            }
-            ui.label(
-                egui::RichText::new(
-                    "Allow is disabled: accepted provider actions cannot yet be bound to Ember's pinned workspace capability. Deny keeps the fixed workspace sandbox in force.",
-                )
-                .small()
-                .color(ui.visuals().warn_fg_color),
-            );
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        native_approval_can_allow(approval, approvals_enabled),
-                        egui::Button::new("Allow once"),
-                    )
-                    .on_hover_text("Approve only the exact patch displayed above")
-                    .on_disabled_hover_text(
-                        "Native approvals are display-and-deny only in this live session",
-                    )
-                    .clicked()
-                {
-                    *pending = Some(TaskSidebarAction::Approve(task_id, approval.id));
-                }
-                if ui
-                    .add_enabled(approvals_enabled, egui::Button::new("Deny"))
-                    .clicked()
-                {
-                    *pending = Some(TaskSidebarAction::Deny(task_id, approval.id));
-                }
-            });
         }
 
         if let Some(feedback) = view.displayed_follow_up_feedback.as_deref() {
@@ -507,6 +398,185 @@ fn render_native_codex_view(
     });
 }
 
+/// Navigation only: never stages an approval decision. The caller keeps this
+/// strip outside the task-list ScrollArea and discards the target each frame.
+fn native_approval_navigation(
+    ui: &mut egui::Ui,
+    task_id: TaskId,
+    view: &CodexAppServerViewSnapshot,
+) -> Option<(TaskId, ApprovalId)> {
+    let first = view.pending_approvals.first()?;
+    let mut target = None;
+    // Include the first approval in identity so a replaced request cannot
+    // inherit a pointer press that began on its predecessor's View button.
+    ui.push_id(("native-approval-navigation", task_id, first.id), |ui| {
+        ui.horizontal(|ui| {
+            let response = ui.button("View");
+            #[cfg(test)]
+            record_approval_rect(ui, task_id, first.id, "view", &response);
+            if response.clicked() {
+                target = Some((task_id, first.id));
+            }
+            ui.add(
+                egui::Label::new(format!(
+                    "Selected task: {} pending approval(s)",
+                    view.pending_approvals.len()
+                ))
+                .truncate(),
+            );
+        });
+    });
+    target
+}
+
+fn retain_approval_navigation(
+    navigation: &mut Option<(TaskId, ApprovalId)>,
+    selected: Option<TaskId>,
+    view: Option<&CodexAppServerViewSnapshot>,
+) {
+    if navigation.is_some_and(|(task, approval)| {
+        selected != Some(task)
+            || !view.is_some_and(|view| {
+                view.pending_approvals
+                    .iter()
+                    .any(|item| item.id == approval)
+            })
+    }) {
+        *navigation = None;
+    }
+}
+
+fn render_native_approvals(
+    ui: &mut egui::Ui,
+    task_id: TaskId,
+    view: &CodexAppServerViewSnapshot,
+    approvals_enabled: bool,
+    pending: &mut Option<TaskSidebarAction>,
+    navigation: &mut Option<(TaskId, ApprovalId)>,
+) {
+    for approval in &view.pending_approvals {
+        ui.push_id(("native-approval", task_id, approval.id), |ui| {
+            ui.separator();
+            let kind = match approval.kind {
+                CodexAppServerApprovalKind::Command => "Command approval",
+                CodexAppServerApprovalKind::FileChange => "File-change approval",
+            };
+            let heading = ui.label(
+                egui::RichText::new(kind)
+                    .small()
+                    .strong()
+                    .color(ui.visuals().warn_fg_color),
+            );
+            #[cfg(test)]
+            record_approval_rect(ui, task_id, approval.id, "heading", &heading);
+            if *navigation == Some((task_id, approval.id)) {
+                heading.scroll_to_me(Some(egui::Align::Min));
+                *navigation = None;
+            }
+            if let Some(command) = approval.command.as_deref() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(visible_bounded(command, MAX_NATIVE_ITEM_DISPLAY_BYTES))
+                        .small()
+                        .monospace(),
+                    )
+                    .wrap(),
+                );
+            }
+            if let Some(cwd) = approval.cwd.as_deref() {
+                ui.label(
+                    egui::RichText::new(format!("cwd · {cwd}"))
+                    .small()
+                    .monospace()
+                    .weak(),
+                );
+            }
+            if let Some(reason) = approval.reason.as_deref() {
+                ui.label(
+                    egui::RichText::new(visible_bounded(
+                        reason,
+                        MAX_NATIVE_ITEM_DISPLAY_BYTES,
+                    ))
+                    .small(),
+                );
+            }
+            if approval.kind == CodexAppServerApprovalKind::FileChange {
+                ui.label(
+                    egui::RichText::new("Exact patch requested by Codex")
+                        .small()
+                        .strong(),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt((
+                        "native-file-approval",
+                        task_id,
+                        view.displayed_turn_id,
+                        approval.id,
+                    ))
+                    .max_height(280.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for change in &approval.file_changes {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {}",
+                                    change.kind, change.path
+                                ))
+                                .small()
+                                .strong()
+                                .monospace(),
+                            );
+                            if let Some(move_path) = change.move_path.as_deref() {
+                                ui.label(
+                                    egui::RichText::new(format!("moves to · {move_path}"))
+                                        .small()
+                                        .monospace(),
+                                );
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&change.diff).small().monospace(),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    });
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Allow is disabled: accepted provider actions cannot yet be bound to Ember's pinned workspace capability. Deny keeps the fixed workspace sandbox in force.",
+                )
+                .small()
+                .color(ui.visuals().warn_fg_color),
+            );
+            ui.horizontal(|ui| {
+                let allow = ui
+                    .add_enabled(
+                        native_approval_can_allow(approval, approvals_enabled),
+                        egui::Button::new("Allow once"),
+                    )
+                    .on_hover_text("Approve only the exact patch displayed above")
+                    .on_disabled_hover_text(
+                        "Native approvals are display-and-deny only in this live session",
+                    )
+                    ;
+                #[cfg(test)]
+                record_approval_rect(ui, task_id, approval.id, "allow", &allow);
+                if allow.clicked() {
+                    *pending = Some(TaskSidebarAction::Approve(task_id, approval.id));
+                }
+                let deny = ui.add_enabled(approvals_enabled, egui::Button::new("Deny"));
+                #[cfg(test)]
+                record_approval_rect(ui, task_id, approval.id, "deny", &deny);
+                if deny.clicked() {
+                    *pending = Some(TaskSidebarAction::Deny(task_id, approval.id));
+                }
+            });
+        });
+    }
+}
+
 fn native_flat_turn_heading(view: &CodexAppServerViewSnapshot) -> Option<(&'static str, usize)> {
     let ordinal = view.displayed_turn_ordinal?;
     let kind = if view.completed_turns >= ordinal {
@@ -563,7 +633,7 @@ fn render_native_turn_history(
         if turn.dropped_updates > 0 {
             ui.label(
                 egui::RichText::new(format!(
-                    "{} update(s) compacted in this turn",
+                    "This completed turn: {} update(s) omitted or compacted",
                     turn.dropped_updates
                 ))
                 .small()
@@ -1220,9 +1290,20 @@ impl TerminalApp {
             return;
         }
 
+        let mut selected_native_view = self
+            .task_sidebar
+            .selected
+            .filter(|id| rows.iter().any(|row| row.id == *id))
+            .and_then(|id| self.agent_runtime.snapshot(id).map(|view| (id, view)));
+        let mut approval_navigation = selected_native_view
+            .as_ref()
+            .and_then(|(id, view)| native_approval_navigation(ui, *id, view));
         let mut pending = None;
         let native_ai_enabled = self.config.ai_enabled && self.config.ai_share_command_context;
         egui::ScrollArea::vertical()
+            // An explicit approval jump must not leave an animated numeric
+            // target that can outlive its exact task/request identity.
+            .animated(approval_navigation.is_none())
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for row in &rows {
@@ -1299,7 +1380,15 @@ impl TerminalApp {
                         if let Some(notice) = native_start_notice(row.provider) {
                             ui.label(egui::RichText::new(notice).small().color(egui::Color32::YELLOW));
                         }
-                        let native_view = self.agent_runtime.snapshot(row.id);
+                        // Reuse the strip snapshot for this task. If selection changed
+                        // during this frame, do not reuse another task's snapshot/target.
+                        let native_view = if selected_native_view.as_ref().is_some_and(|(id, _)| *id == row.id) {
+                            selected_native_view.take().map(|(_, view)| view)
+                        } else {
+                            self.agent_runtime.snapshot(row.id)
+                        };
+                        retain_approval_navigation(&mut approval_navigation,
+                            self.task_sidebar.selected.filter(|id| *id == row.id), native_view.as_ref());
                         let native_idle = row.status == TaskStatus::ReadyForReview
                             && row.has_active_agent_stream
                             && native_view
@@ -1525,6 +1614,7 @@ impl TerminalApp {
                                 self.agent_runtime.has_running(row.id)
                                     && row.has_active_agent_stream,
                                 &mut pending,
+                                &mut approval_navigation,
                             );
                         }
                         if native_idle {
@@ -3150,5 +3240,274 @@ mod creation_recovery_ui_tests {
             record.new_task().is_err(),
             "restart never recreates a registered task"
         );
+    }
+}
+
+#[cfg(test)]
+fn record_approval_rect(
+    ui: &egui::Ui,
+    task: TaskId,
+    approval: ApprovalId,
+    kind: &'static str,
+    response: &egui::Response,
+) {
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(("approval-test-rect", task, approval, kind)),
+            response.rect,
+        );
+    });
+}
+
+#[cfg(test)]
+mod approval_navigation_tests {
+    use super::*;
+
+    fn fixture() -> CodexAppServerViewSnapshot {
+        CodexAppServerViewSnapshot {
+            pending_approvals: vec![crate::agent::CodexAppServerApproval {
+                id: ApprovalId::new(),
+                kind: CodexAppServerApprovalKind::Command,
+                item_id: "presentation-only".into(),
+                command: Some("cargo test".into()),
+                cwd: None,
+                reason: None,
+                file_paths: Vec::new(),
+                file_changes: Vec::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn rect(
+        ctx: &egui::Context,
+        task: TaskId,
+        approval: ApprovalId,
+        kind: &'static str,
+    ) -> egui::Rect {
+        ctx.data(|data| {
+            data.get_temp(egui::Id::new(("approval-test-rect", task, approval, kind)))
+                .unwrap()
+        })
+    }
+
+    struct Frame {
+        action: Option<TaskSidebarAction>,
+        offset: f32,
+        clip: egui::Rect,
+        navigation_left: Option<(TaskId, ApprovalId)>,
+    }
+
+    // Calls the production navigation, full native renderer and guard logic.
+    // No TerminalApp construction, providers, sockets, PTYs or GUI backend.
+    fn frame(
+        ctx: &egui::Context,
+        task: TaskId,
+        view: &CodexAppServerViewSnapshot,
+        events: Vec<egui::Event>,
+        offset: Option<f32>,
+        enabled: bool,
+        stale: Option<(TaskId, ApprovalId)>,
+    ) -> Frame {
+        let mut result = Frame {
+            action: None,
+            offset: 0.0,
+            clip: egui::Rect::NOTHING,
+            navigation_left: None,
+        };
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(340.0, 440.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut navigation = native_approval_navigation(ui, task, view).or(stale);
+                    retain_approval_navigation(&mut navigation, Some(task), Some(view));
+                    let mut scroll = egui::ScrollArea::vertical()
+                        .id_salt("approval-headless-list")
+                        .animated(navigation.is_none());
+                    if let Some(offset) = offset {
+                        scroll = scroll.vertical_scroll_offset(offset);
+                    }
+                    let shown = scroll.show(ui, |ui| {
+                        ui.add_space(600.0); // Earlier task rows, not a provider fixture.
+                        render_native_codex_view(
+                            ui,
+                            task,
+                            AgentProvider::Codex,
+                            view,
+                            enabled,
+                            &mut result.action,
+                            &mut navigation,
+                        );
+                        ui.add_space(1600.0);
+                    });
+                    result.offset = shown.state.offset.y;
+                    result.clip = shown.inner_rect;
+                    result.navigation_left = navigation;
+                });
+            },
+        );
+        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        result
+    }
+
+    fn pointer(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn native_approval_view_click_navigates_without_deciding_and_streaming_does_not_scroll() {
+        let ctx = egui::Context::default();
+        let task = TaskId::new();
+        let mut view = fixture();
+        view.dropped_turns = 3;
+        view.dropped_updates = 7;
+        view.turn_history = Arc::from(
+            (1..=8)
+                .map(|ordinal| CodexAppServerTurnHistory {
+                    ordinal,
+                    local_turn_id: crate::agent::AgentTurnId::new(),
+                    follow_up_feedback: Some("history feedback".into()),
+                    agent_text: "Long historical output ".repeat(3000),
+                    agent_text_truncated: false,
+                    commands: Vec::new(),
+                    file_changes: Vec::new(),
+                    dropped_updates: 0,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let approval = view.pending_approvals[0].id;
+        for _ in 0..3 {
+            frame(&ctx, task, &view, vec![], Some(1300.0), true, None);
+        }
+        let pos = rect(&ctx, task, approval, "view").center();
+        assert!(pos.y < 80.0, "navigation must remain above the scroller");
+        frame(&ctx, task, &view, pointer(pos, true), None, true, None);
+        let clicked = frame(&ctx, task, &view, pointer(pos, false), None, true, None);
+        assert_eq!(clicked.action, None);
+        assert_eq!(clicked.navigation_left, None);
+        let settled = frame(&ctx, task, &view, vec![], None, true, None);
+        assert!(settled
+            .clip
+            .intersects(rect(&ctx, task, approval, "heading")));
+        let before = frame(&ctx, task, &view, vec![], Some(1000.0), true, None).offset;
+        view.agent_text = "Current output ".repeat(2000);
+        let after = frame(&ctx, task, &view, vec![], None, true, None);
+        assert!(
+            (after.offset - before).abs() < 1.0,
+            "output must not request a jump"
+        );
+        assert!(after.action.is_none());
+    }
+
+    #[test]
+    fn native_approval_buttons_keep_exact_authority_and_deny_only_guard() {
+        let ctx = egui::Context::default();
+        let task = TaskId::new();
+        let view = fixture();
+        let approval = view.pending_approvals[0].id;
+        for _ in 0..3 {
+            frame(&ctx, task, &view, vec![], Some(600.0), true, None);
+        }
+        let allow = rect(&ctx, task, approval, "allow").center();
+        frame(&ctx, task, &view, pointer(allow, true), None, true, None);
+        assert!(
+            frame(&ctx, task, &view, pointer(allow, false), None, true, None)
+                .action
+                .is_none()
+        );
+        let deny = rect(&ctx, task, approval, "deny").center();
+        frame(&ctx, task, &view, pointer(deny, true), None, true, None);
+        assert_eq!(
+            frame(&ctx, task, &view, pointer(deny, false), None, true, None).action,
+            Some(TaskSidebarAction::Deny(task, approval))
+        );
+        frame(&ctx, task, &view, pointer(deny, true), None, false, None);
+        assert!(
+            frame(&ctx, task, &view, pointer(deny, false), None, false, None)
+                .action
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_approval_pointer_release_cannot_retarget_changed_task_or_request() {
+        for change_task in [false, true] {
+            let ctx = egui::Context::default();
+            let task = TaskId::new();
+            let mut view = fixture();
+            let old = view.pending_approvals[0].id;
+            for _ in 0..3 {
+                frame(&ctx, task, &view, vec![], Some(600.0), true, None);
+            }
+            let pos = rect(&ctx, task, old, "deny").center();
+            frame(&ctx, task, &view, pointer(pos, true), None, true, None);
+            let next_task = if change_task { TaskId::new() } else { task };
+            if !change_task {
+                view.pending_approvals[0].id = ApprovalId::new();
+            }
+            assert!(frame(
+                &ctx,
+                next_task,
+                &view,
+                pointer(pos, false),
+                None,
+                true,
+                Some((task, old))
+            )
+            .action
+            .is_none());
+        }
+    }
+    #[test]
+    fn native_approval_navigation_discards_removed_hidden_and_replaced_targets() {
+        let task = TaskId::new();
+        let view = fixture();
+        let approval = view.pending_approvals[0].id;
+        for (selected, snapshot) in [(None, Some(&view)), (Some(task), None)] {
+            let mut target = Some((task, approval));
+            retain_approval_navigation(&mut target, selected, snapshot);
+            assert_eq!(target, None);
+        }
+        let replacement = fixture();
+        let mut target = Some((task, approval));
+        retain_approval_navigation(&mut target, Some(task), Some(&replacement));
+        assert_eq!(target, None);
+        let mut target = Some((task, approval));
+        retain_approval_navigation(&mut target, Some(task), Some(&view));
+        assert_eq!(target, Some((task, approval)));
+
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            frame(&ctx, task, &view, vec![], Some(1300.0), true, None);
+        }
+        let pos = rect(&ctx, task, approval, "view").center();
+        frame(&ctx, task, &view, pointer(pos, true), None, true, None);
+        let after = frame(
+            &ctx,
+            task,
+            &replacement,
+            pointer(pos, false),
+            None,
+            true,
+            None,
+        );
+        assert_eq!(after.navigation_left, None);
+        assert_eq!(after.action, None);
+        assert!((after.offset - 1300.0).abs() < 1.0);
     }
 }
