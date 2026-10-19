@@ -417,6 +417,12 @@ impl CommandPalette {
                 crate::keybindings::Command::BlockToggleBookmark,
             ),
             CommandInfo::new(
+                "Toggle Selected Block Collapse",
+                CommandCategory::Terminal,
+                "Collapse or expand output of the explicitly selected block in the active pane",
+                crate::keybindings::Command::BlockToggleCollapse,
+            ),
+            CommandInfo::new(
                 "Previous Block Bookmark",
                 CommandCategory::Terminal,
                 "Jump to the previous bookmarked block, wrapping at the start",
@@ -1033,6 +1039,17 @@ mod tests {
     }
 
     #[test]
+    fn selected_block_collapse_is_discoverable_by_output_action() {
+        let mut palette = CommandPalette::new();
+        palette.search_query = "collapse".to_owned();
+        palette.update_search_results();
+        assert!(palette.search_results.iter().any(|(entry, _)| {
+            entry.command == crate::keybindings::Command::BlockToggleCollapse
+                && entry.name == "Toggle Selected Block Collapse"
+        }));
+    }
+
+    #[test]
     fn test_command_palette_open() {
         let mut palette = CommandPalette::new();
         assert!(!palette.is_open);
@@ -1283,6 +1300,7 @@ mod tests {
             Command::BlockJumpNextFailed,
             Command::BlockSearchToggle,
             Command::BlockToggleBookmark,
+            Command::BlockToggleCollapse,
             Command::BlockJumpPrevBookmark,
             Command::BlockJumpNextBookmark,
             Command::FontIncrease,

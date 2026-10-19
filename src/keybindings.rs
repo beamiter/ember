@@ -84,6 +84,8 @@ pub enum Command {
     /// 跨块搜索选择器（命令文本 + 输出行的大小写不敏感子串匹配）。
     BlockSearchToggle,
     BlockToggleBookmark,
+    /// Toggle output collapse on the explicitly selected active-pane block.
+    BlockToggleCollapse,
     BlockJumpPrevBookmark,
     BlockJumpNextBookmark,
     /// 清除当前 pane 中所有已完成块（frost 的 `block:clear`；可撤销）。
@@ -202,6 +204,7 @@ impl std::fmt::Display for Command {
             Command::BlockJumpNextFailed => write!(f, "block:jump_next_failed"),
             Command::BlockSearchToggle => write!(f, "block:search"),
             Command::BlockToggleBookmark => write!(f, "block:toggle_bookmark"),
+            Command::BlockToggleCollapse => write!(f, "block:toggle_collapse"),
             Command::BlockJumpPrevBookmark => write!(f, "block:jump_prev_bookmark"),
             Command::BlockJumpNextBookmark => write!(f, "block:jump_next_bookmark"),
             Command::BlockClear => write!(f, "block:clear"),
@@ -291,6 +294,7 @@ impl std::str::FromStr for Command {
             "block:jump_next_failed" => Ok(Command::BlockJumpNextFailed),
             "block:search" => Ok(Command::BlockSearchToggle),
             "block:toggle_bookmark" => Ok(Command::BlockToggleBookmark),
+            "block:toggle_collapse" => Ok(Command::BlockToggleCollapse),
             "block:jump_prev_bookmark" => Ok(Command::BlockJumpPrevBookmark),
             "block:jump_next_bookmark" => Ok(Command::BlockJumpNextBookmark),
             "block:clear" => Ok(Command::BlockClear),
@@ -985,6 +989,23 @@ mod tests {
     }
 
     #[test]
+    fn selected_block_collapse_is_bindable_without_changing_defaults() {
+        let command: Command = "block:toggle_collapse".parse().unwrap();
+        assert_eq!(command, Command::BlockToggleCollapse);
+        assert_eq!(command.to_string(), "block:toggle_collapse");
+        let defaults = KeyBindings::default_bindings();
+        assert!(!defaults
+            .bindings
+            .values()
+            .any(|value| value == "block:toggle_collapse"));
+        let mut configured = KeyBindings::new();
+        configured
+            .bindings
+            .insert("alt+c".into(), command.to_string());
+        assert_eq!(configured.get_command("alt+c"), Some(command));
+    }
+
+    #[test]
     fn test_command_parse() {
         let cmd: Command = "session:new".parse().unwrap();
         assert_eq!(cmd, Command::SessionNew);
@@ -1025,6 +1046,7 @@ mod tests {
             Command::BlockJumpNextFailed,
             Command::BlockSearchToggle,
             Command::BlockToggleBookmark,
+            Command::BlockToggleCollapse,
             Command::BlockJumpPrevBookmark,
             Command::BlockJumpNextBookmark,
             Command::BlockClear,

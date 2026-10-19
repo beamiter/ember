@@ -882,15 +882,28 @@ fn copy_selection_route(has_terminal_text: bool, has_command_blocks: bool) -> Co
     }
 }
 
-fn contextual_block_shortcut_available(
+/// Decide whether a contextual command may dispatch, recording unavailable
+/// nonmodifier chords as deferred terminal input in the same operation. Keeping
+/// these decisions together prevents later commands/IME overtaking that input.
+fn contextual_block_shortcut_may_dispatch(
     command: &keybindings::Command,
-    has_completed_selection: bool,
+    has_target: bool,
+    key: egui::Key,
+    terminal_input_blocked: bool,
+    terminal_input_seen: &mut bool,
+    selection_postdates_terminal_input: &mut bool,
 ) -> bool {
-    !matches!(
+    let available = !matches!(
         command,
         keybindings::Command::BlockReinputSelectedCommands
             | keybindings::Command::BlockToggleBookmark
-    ) || has_completed_selection
+            | keybindings::Command::BlockToggleCollapse
+    ) || has_target;
+    if !available && !terminal_input_blocked && !crate::ui::is_modifier_only_key(key) {
+        *terminal_input_seen = true;
+        *selection_postdates_terminal_input = false;
+    }
+    available
 }
 
 fn ime_commit_can_queue_now(terminal_input_seen: bool, commit: &OrderedImeCommit) -> bool {
@@ -1502,6 +1515,7 @@ impl TerminalApp {
             keybindings::Command::BlockJumpNextFailed => self.block_jump_next_failed(),
             keybindings::Command::BlockSearchToggle => self.block_search_toggle(),
             keybindings::Command::BlockToggleBookmark => self.block_toggle_bookmark(),
+            keybindings::Command::BlockToggleCollapse => self.block_toggle_collapse(),
             keybindings::Command::BlockJumpPrevBookmark => {
                 self.block_jump_bookmark(crate::block_mode::SelectStep::Older)
             }
@@ -2594,9 +2608,19 @@ impl TerminalApp {
                     // older bytes when input blocking is recomputed below.
                     return OrderedPressOutcome::Ignored;
                 }
-                if !contextual_block_shortcut_available(
+                let has_contextual_target = if command == keybindings::Command::BlockToggleCollapse
+                {
+                    self.block_collapse_request().is_some()
+                } else {
+                    self.live_block_target().is_some()
+                };
+                if !contextual_block_shortcut_may_dispatch(
                     &command,
-                    self.live_block_target().is_some(),
+                    has_contextual_target,
+                    press.key,
+                    terminal_input_blocked,
+                    &mut terminal_input_seen,
+                    &mut selection_postdates_terminal_input,
                 ) {
                     // Contextual shortcuts with no immutable card target stay
                     // in frame_events for the terminal encoder. Command-palette
@@ -3579,6 +3603,269 @@ mod tests {
         assert!(!transformed_next_command_returns_to_bottom(false, false, 7));
     }
 
+    #[derive(Debug)]
+    struct ContextualShortcutTestRoute {
+        dispatched: Vec<keybindings::Command>,
+        queued_ime: Vec<String>,
+        terminal_input_seen: bool,
+        selection_postdates_input: bool,
+    }
+
+    // Use the production event ordering and atomic dispatch/barrier decision.
+    // Full handle_keybindings wiring is also checked by the source-bound harness.
+    fn contextual_shortcut_test_route(
+        events: &[egui::Event],
+        has_target: bool,
+        terminal_input_blocked: bool,
+    ) -> ContextualShortcutTestRoute {
+        let mut bindings = keybindings::KeyBindings::new();
+        for (key, command) in [
+            ("alt+c", "block:toggle_collapse"),
+            ("f6", "block:toggle_collapse"),
+            ("alt+b", "block:toggle_bookmark"),
+            ("alt+i", "block:reinput_selected_commands"),
+            ("ctrl+shift+p", "command_palette:toggle"),
+        ] {
+            bindings.bindings.insert(key.into(), command.into());
+        }
+        let batch = ordered_key_presses(events, &bindings);
+        let mut route = ContextualShortcutTestRoute {
+            dispatched: Vec::new(),
+            queued_ime: Vec::new(),
+            terminal_input_seen: false,
+            selection_postdates_input: true,
+        };
+        let dispatch = dispatch_ordered_key_presses(&batch.presses, |press| {
+            if !terminal_input_blocked {
+                for commit in &press.ime_commits_before {
+                    if ime_commit_can_queue_now(route.terminal_input_seen, commit) {
+                        route.queued_ime.push(commit.text.clone());
+                        route.selection_postdates_input = false;
+                    }
+                }
+                if press.terminal_input_before {
+                    route.terminal_input_seen = true;
+                    route.selection_postdates_input = false;
+                }
+            }
+            let Some(command) = &press.command else {
+                return OrderedPressOutcome::Ignored;
+            };
+            if route.terminal_input_seen
+                || !contextual_block_shortcut_may_dispatch(
+                    command,
+                    has_target,
+                    press.key,
+                    terminal_input_blocked,
+                    &mut route.terminal_input_seen,
+                    &mut route.selection_postdates_input,
+                )
+            {
+                return OrderedPressOutcome::Ignored;
+            }
+            route.dispatched.push(command.clone());
+            if *command == keybindings::Command::CommandPaletteToggle {
+                OrderedPressOutcome::ClaimRest
+            } else {
+                OrderedPressOutcome::Consumed
+            }
+        });
+        if !terminal_input_blocked && !dispatch.claimed_rest {
+            for commit in &batch.trailing_ime_commits {
+                if ime_commit_can_queue_now(route.terminal_input_seen, commit) {
+                    route.queued_ime.push(commit.text.clone());
+                    route.selection_postdates_input = false;
+                }
+            }
+        }
+        route
+    }
+
+    fn collapse_test_chord() -> Vec<egui::Event> {
+        vec![
+            key_press(egui::Key::C, egui::Modifiers::ALT),
+            egui::Event::Text("ç".into()),
+        ]
+    }
+
+    fn collapse_test_palette_chord() -> egui::Event {
+        key_press(egui::Key::P, egui::Modifiers::CTRL | egui::Modifiers::SHIFT)
+    }
+
+    #[test]
+    fn selected_block_collapse_invalid_batch_defers_later_modal_and_selection() {
+        for mut events in [
+            collapse_test_chord(),
+            vec![key_press(egui::Key::F6, egui::Modifiers::NONE)],
+        ] {
+            events.push(collapse_test_palette_chord());
+            let route = contextual_shortcut_test_route(&events, false, false);
+            assert!(route.dispatched.is_empty());
+            assert!(route.terminal_input_seen);
+            assert!(!route.selection_postdates_input);
+        }
+    }
+
+    #[test]
+    fn selected_block_collapse_invalid_batch_keeps_later_ime_deferred() {
+        for later_modal in [false, true] {
+            let mut events = collapse_test_chord();
+            events.push(egui::Event::Ime(egui::ImeEvent::Commit("中".into())));
+            if later_modal {
+                events.push(collapse_test_palette_chord());
+            }
+            let route = contextual_shortcut_test_route(&events, false, false);
+            assert!(route.dispatched.is_empty());
+            assert!(route.queued_ime.is_empty());
+            assert!(route.terminal_input_seen);
+            assert!(!route.selection_postdates_input);
+        }
+    }
+
+    #[test]
+    fn selected_block_collapse_valid_batch_allows_later_ime_or_modal() {
+        let mut events = collapse_test_chord();
+        events.push(egui::Event::Ime(egui::ImeEvent::Commit("中".into())));
+        let route = contextual_shortcut_test_route(&events, true, false);
+        assert_eq!(
+            route.dispatched,
+            vec![keybindings::Command::BlockToggleCollapse]
+        );
+        assert_eq!(route.queued_ime, vec!["中"]);
+        assert!(!route.terminal_input_seen);
+        let mut events = collapse_test_chord();
+        events.push(collapse_test_palette_chord());
+        let route = contextual_shortcut_test_route(&events, true, false);
+        assert_eq!(
+            route.dispatched,
+            vec![
+                keybindings::Command::BlockToggleCollapse,
+                keybindings::Command::CommandPaletteToggle
+            ]
+        );
+        assert!(!route.terminal_input_seen);
+        assert!(route.selection_postdates_input);
+    }
+
+    #[test]
+    fn selected_block_collapse_blocked_or_modifier_decision_leaves_barrier_unchanged() {
+        for key in [
+            egui::Key::C,
+            egui::Key::F6,
+            egui::Key::ShiftLeft,
+            egui::Key::ShiftRight,
+            egui::Key::ControlLeft,
+            egui::Key::ControlRight,
+            egui::Key::AltLeft,
+            egui::Key::AltRight,
+            egui::Key::SuperLeft,
+            egui::Key::SuperRight,
+        ] {
+            for blocked in [false, true] {
+                for old_seen in [false, true] {
+                    let mut seen = old_seen;
+                    let mut selection_postdates = true;
+                    assert!(!contextual_block_shortcut_may_dispatch(
+                        &keybindings::Command::BlockToggleCollapse,
+                        false,
+                        key,
+                        blocked,
+                        &mut seen,
+                        &mut selection_postdates,
+                    ));
+                    let should_defer = !blocked && !crate::ui::is_modifier_only_key(key);
+                    assert_eq!(seen, old_seen || should_defer);
+                    assert_eq!(selection_postdates, !should_defer);
+                }
+            }
+        }
+        let mut events = collapse_test_chord();
+        events.push(collapse_test_palette_chord());
+        let route = contextual_shortcut_test_route(&events, false, true);
+        assert_eq!(
+            route.dispatched,
+            vec![keybindings::Command::CommandPaletteToggle]
+        );
+        assert!(!route.terminal_input_seen);
+        assert!(route.selection_postdates_input);
+    }
+
+    #[test]
+    fn selected_block_collapse_batch_preserves_earlier_ime_and_defers_later_ime() {
+        let mut events = collapse_test_chord();
+        events.insert(0, egui::Event::Ime(egui::ImeEvent::Commit("先".into())));
+        events.push(egui::Event::Ime(egui::ImeEvent::Commit("后".into())));
+        let route = contextual_shortcut_test_route(&events, false, false);
+        assert_eq!(route.queued_ime, vec!["先"]);
+        assert!(route.dispatched.is_empty());
+        assert!(route.terminal_input_seen);
+    }
+
+    #[test]
+    fn selected_block_collapse_shared_contextual_decision_preserves_other_commands() {
+        for key in [egui::Key::B, egui::Key::I] {
+            let events = vec![
+                key_press(key, egui::Modifiers::ALT),
+                collapse_test_palette_chord(),
+            ];
+            let unavailable = contextual_shortcut_test_route(&events, false, false);
+            assert!(unavailable.dispatched.is_empty());
+            assert!(unavailable.terminal_input_seen);
+            let available = contextual_shortcut_test_route(&events, true, false);
+            assert_eq!(available.dispatched.len(), 2);
+            assert!(!available.terminal_input_seen);
+        }
+    }
+
+    #[test]
+    fn selected_block_collapse_chord_preserves_terminal_events_without_a_target() {
+        let mut bindings = keybindings::KeyBindings::new();
+        bindings
+            .bindings
+            .insert("alt+c".into(), "block:toggle_collapse".into());
+        let modifiers = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let original = vec![
+            key_press(egui::Key::C, modifiers),
+            egui::Event::Text("ç".into()),
+        ];
+        for has_target in [false, true] {
+            let mut events = original.clone();
+            let batch = ordered_key_presses(&events, &bindings);
+            let mut terminal_input_seen = false;
+            let mut selection_postdates_terminal_input = true;
+            let result = dispatch_ordered_key_presses(&batch.presses, |press| {
+                let command = press.command.as_ref().unwrap();
+                assert_eq!(*command, keybindings::Command::BlockToggleCollapse);
+                if contextual_block_shortcut_may_dispatch(
+                    command,
+                    has_target,
+                    press.key,
+                    false,
+                    &mut terminal_input_seen,
+                    &mut selection_postdates_terminal_input,
+                ) {
+                    OrderedPressOutcome::Consumed
+                } else {
+                    OrderedPressOutcome::Ignored
+                }
+            });
+            for (key, modifiers) in result.consumed {
+                consume_bound_key_event(&mut events, key, modifiers);
+            }
+            if has_target {
+                assert!(events.is_empty(), "handled chord must not leak paired text");
+            } else {
+                assert_eq!(
+                    events, original,
+                    "invalid target must leave normal/VTE input unchanged"
+                );
+            }
+        }
+    }
+
     #[test]
     fn copy_prefers_terminal_text_then_whole_blocks() {
         assert_eq!(
@@ -3590,18 +3877,6 @@ mod tests {
             CopySelectionRoute::CommandBlocks
         );
         assert_eq!(copy_selection_route(false, false), CopySelectionRoute::None);
-        assert!(!contextual_block_shortcut_available(
-            &keybindings::Command::BlockToggleBookmark,
-            false,
-        ));
-        assert!(!contextual_block_shortcut_available(
-            &keybindings::Command::BlockReinputSelectedCommands,
-            false,
-        ));
-        assert!(contextual_block_shortcut_available(
-            &keybindings::Command::BlockToggleBookmark,
-            true,
-        ));
     }
 
     fn key_press(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {

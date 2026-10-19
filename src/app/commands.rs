@@ -88,6 +88,39 @@ pub struct CommandTarget {
     pub execution_id: String,
 }
 
+/// Resolve a collapse request only from the active member of an explicit
+/// selection in the current primary-screen pane. Never fall back to a newer
+/// record or another session, even when the previous selection is still live.
+fn selected_block_collapse_request(
+    block_mode: bool,
+    selection: Option<&crate::block_mode::BlockSelection>,
+    active_session_id: &str,
+    terminal: &crate::terminal::TerminalState,
+    policy: &crate::terminal::ProjectionPolicy,
+) -> Option<(CommandTarget, bool)> {
+    if !block_mode || terminal.is_alt_buffer_active() {
+        return None;
+    }
+    let selection = selection.filter(|selection| {
+        selection.session_id == active_session_id
+            && selection.selected_ids.contains(&selection.active_id)
+    })?;
+    let record = terminal
+        .command_record(&selection.active_id)
+        .filter(|record| record.complete)?;
+    let collapse = !policy.is_collapsed(record.sequence);
+    if collapse && terminal.finished_output_range(record.sequence).is_none() {
+        return None;
+    }
+    Some((
+        CommandTarget {
+            session_id: active_session_id.to_owned(),
+            execution_id: record.id.clone(),
+        },
+        collapse,
+    ))
+}
+
 fn retained_record_version(
     records: &std::collections::VecDeque<crate::terminal::CommandRecord>,
 ) -> crate::block_search::RetainedRecordVersion {
@@ -1856,6 +1889,29 @@ impl TerminalApp {
                 self.block_set_output_collapsed(&target, false)
             }
         }
+    }
+
+    pub(super) fn block_collapse_request(&self) -> Option<(CommandTarget, bool)> {
+        let session = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())?;
+        selected_block_collapse_request(
+            self.config.command_cards_enabled(),
+            self.block_selection.as_ref(),
+            &session.metadata.session_id,
+            &session.terminal.lock(),
+            &session.projection_policy,
+        )
+    }
+
+    /// Palette and configured shortcuts share the mouse action's projection
+    /// mutation. Invalid selection is a no-op, including after a pane switch.
+    pub(crate) fn block_toggle_collapse(&mut self) {
+        let Some((target, collapsed)) = self.block_collapse_request() else {
+            return;
+        };
+        self.block_set_output_collapsed(&target, collapsed);
     }
 
     fn block_set_output_collapsed(&mut self, target: &CommandTarget, collapsed: bool) {
@@ -5949,6 +6005,191 @@ fn workflow_refusal_toast(refused: &[(std::path::PathBuf, String)]) -> Option<St
 
 #[cfg(test)]
 mod tests {
+    fn collapse_test_terminal() -> crate::terminal::TerminalState {
+        let mut terminal = crate::terminal::TerminalState::new(40, 10);
+        for id in ["older", "newer"] {
+            terminal.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07echo {id}\r\n\x1b]133;C;id={id}\x07{id} output\r\n\x1b]133;D;0;id={id}\x07"
+                )
+                .as_bytes(),
+            );
+            let sequence = terminal.command_record(id).unwrap().sequence;
+            assert!(terminal.finished_output_range(sequence).is_some());
+        }
+        terminal
+    }
+
+    #[test]
+    fn selected_block_collapse_toggles_only_the_active_range_member() {
+        let terminal = collapse_test_terminal();
+        let mut selection = crate::block_mode::BlockSelection::all(
+            "current".to_owned(),
+            vec!["older".to_owned(), "newer".to_owned()],
+        )
+        .unwrap();
+        selection.activate("older");
+        let original_selection = selection.clone();
+        let older = terminal.command_record("older").unwrap().sequence;
+        let newer = terminal.command_record("newer").unwrap().sequence;
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        assert!(policy.collapse(newer));
+        for expected_collapse in [true, false, true, false] {
+            let (target, collapse) = selected_block_collapse_request(
+                true,
+                Some(&selection),
+                "current",
+                &terminal,
+                &policy,
+            )
+            .unwrap();
+            assert_eq!(target.session_id, "current");
+            assert_eq!(target.execution_id, "older", "never use the latest block");
+            assert_eq!(collapse, expected_collapse);
+            if collapse {
+                assert!(policy.collapse(older));
+            } else {
+                assert!(policy.expand(older));
+            }
+            assert!(
+                policy.is_collapsed(newer),
+                "other selected blocks are untouched"
+            );
+            assert_eq!(selection, original_selection);
+        }
+    }
+
+    #[test]
+    fn selected_block_collapse_rejects_absent_stale_and_wrong_session_selections() {
+        let terminal = collapse_test_terminal();
+        let policy = crate::terminal::ProjectionPolicy::new();
+        let valid = crate::block_mode::BlockSelection::single("current".into(), "older".into());
+        assert!(
+            selected_block_collapse_request(true, None, "current", &terminal, &policy).is_none()
+        );
+        assert!(
+            selected_block_collapse_request(true, Some(&valid), "other", &terminal, &policy)
+                .is_none()
+        );
+        let mut invalid = valid.clone();
+        invalid.active_id = "evicted".into();
+        invalid.selected_ids = vec!["evicted".into()];
+        assert!(selected_block_collapse_request(
+            true,
+            Some(&invalid),
+            "current",
+            &terminal,
+            &policy
+        )
+        .is_none());
+        invalid = valid.clone();
+        invalid.selected_ids.clear();
+        assert!(selected_block_collapse_request(
+            true,
+            Some(&invalid),
+            "current",
+            &terminal,
+            &policy
+        )
+        .is_none());
+        invalid.selected_ids.push("newer".into());
+        assert!(selected_block_collapse_request(
+            true,
+            Some(&invalid),
+            "current",
+            &terminal,
+            &policy
+        )
+        .is_none());
+        assert_eq!(policy.collapsed_zone_ids().count(), 0);
+    }
+
+    #[test]
+    fn selected_block_collapse_leaves_normal_and_alternate_screen_input_alone() {
+        let mut terminal = collapse_test_terminal();
+        let policy = crate::terminal::ProjectionPolicy::new();
+        let selection = crate::block_mode::BlockSelection::single("current".into(), "older".into());
+        assert!(selected_block_collapse_request(
+            false,
+            Some(&selection),
+            "current",
+            &terminal,
+            &policy
+        )
+        .is_none());
+        terminal.process_input(b"\x1b[?1049h");
+        assert!(terminal.is_alt_buffer_active());
+        assert!(selected_block_collapse_request(
+            true,
+            Some(&selection),
+            "current",
+            &terminal,
+            &policy
+        )
+        .is_none());
+        terminal.process_input(b"\x1b[?1049l");
+        assert!(selected_block_collapse_request(
+            true,
+            Some(&selection),
+            "current",
+            &terminal,
+            &policy
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn selected_block_collapse_rejects_running_and_cleared_records() {
+        let mut terminal = collapse_test_terminal();
+        let policy = crate::terminal::ProjectionPolicy::new();
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07running\r\n\x1b]133;C;id=running\x07output",
+        );
+        let running = crate::block_mode::BlockSelection::single("current".into(), "running".into());
+        assert!(!terminal.command_record("running").unwrap().complete);
+        assert!(selected_block_collapse_request(
+            true,
+            Some(&running),
+            "current",
+            &terminal,
+            &policy
+        )
+        .is_none());
+        assert_eq!(terminal.clear_completed_blocks(), 2);
+        let stale = crate::block_mode::BlockSelection::single("current".into(), "older".into());
+        assert!(
+            selected_block_collapse_request(true, Some(&stale), "current", &terminal, &policy)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn selected_block_collapse_requires_output_only_when_collapsing() {
+        let mut terminal = crate::terminal::TerminalState::new(40, 5);
+        terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=empty\x07\x1b]133;D;0;id=empty\x07");
+        let record = terminal.command_record("empty").unwrap();
+        assert!(record.complete);
+        assert!(terminal.finished_output_range(record.sequence).is_none());
+        let selection = crate::block_mode::BlockSelection::single("current".into(), "empty".into());
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        assert!(selected_block_collapse_request(
+            true,
+            Some(&selection),
+            "current",
+            &terminal,
+            &policy
+        )
+        .is_none());
+        assert!(policy.collapse(record.sequence));
+        let (_, collapse) =
+            selected_block_collapse_request(true, Some(&selection), "current", &terminal, &policy)
+                .unwrap();
+        assert!(
+            !collapse,
+            "an existing collapse can still be expanded after output is unavailable"
+        );
+    }
+
     #[test]
     fn review_write_requires_both_prompt_metadata_and_foreground_ownership() {
         assert!(super::review_prompt_is_ready(true, true));

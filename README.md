@@ -998,6 +998,7 @@ Defaults include:
 | Previous / next failed block | `Ctrl+Shift+,` / `Ctrl+Shift+.` |
 | Toggle bookmark on the active completed block (or selected Block Search hit) | `Ctrl+Shift+B` |
 | Previous / next bookmarked block (wrapping) | `Ctrl+,` / `Ctrl+.` |
+| Collapse / expand selected block output | Command palette: “Toggle Selected Block Collapse”; bindable as `block:toggle_collapse` |
 | Search/filter completed command blocks | `Ctrl+Shift+G` |
 | Toggle Agent panel (per-command approval) | `Ctrl+Alt+G` |
 | Toggle AI chats library (read-only; nothing runs) | `Ctrl+Shift+Alt+A` |
@@ -1012,6 +1013,12 @@ and reports the resulting block count. `Enter` reinputs every selected real
 command in terminal order as editable bracketed-paste text, background-output
 blocks are skipped, and `Escape` clears the range. Enter continues to the child
 unchanged while a command or alternate-screen program owns the PTY.
+
+`block:toggle_collapse` affects only the active block in an explicit selection
+in the current pane. It leaves other selected blocks unchanged and does nothing
+without a retained completed selection, in normal mode, or on the alternate
+screen. It has no default shortcut; a custom binding remains terminal input
+when no valid collapse/expand target exists.
 
 Selection movement is deliberately minimal — it keeps the viewport where the
 reader left it whenever the target block header is already on screen. Clicking
