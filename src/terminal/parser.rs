@@ -331,6 +331,14 @@ impl super::TerminalState {
                     // Format: file://hostname/path (path is %-encoded).
                     // We accept either the full URL or a bare path.
                     self.current_working_dir = Self::decode_osc7_cwd(value);
+                    Self::observe_organism_directory(
+                        &mut self.organism_working_dir,
+                        if self.use_alt_buffer {
+                            None
+                        } else {
+                            self.current_working_dir.as_deref()
+                        },
+                    );
                     crate::debug_log!("[OSC7] cwd set to {:?}", self.current_working_dir);
                 } else if command == "8" {
                     // OSC 8 - Hyperlinks
@@ -2327,6 +2335,7 @@ impl super::TerminalState {
         self.watch.boundary();
         self.invalidate_search_scrollback_seals();
         self.use_alt_buffer = true;
+        self.organism_working_dir = None;
         // Retained cells keep their own keys, but an unterminated primary-screen
         // OSC 8 link must not arm alternate-screen text.
         self.current_hyperlink = HyperlinkId::NONE;

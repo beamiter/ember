@@ -99,6 +99,24 @@ hovering holds its position. Calm retains a still body. Static keeps only the
 status card and disables the live body, hover greetings and periodic animation.
 The shared organism model remains the source of poses, body language, reactions
 and attention. Memory stays volatile.
+Full motion also uses the shared breathing, blinking, grooming, greeting and
+celebration choreography. Native pose transitions begin from a body actually
+painted on the same surface; typing, source changes and reduced motion retire
+that transition. The three-row, twelve-column body envelope stays fixed, and
+an unfitting body does not schedule its own animation wake.
+
+Unresolved build/test failures now remain visible as a quiet vigil after the
+short error reaction. Repeated failures lower the posture, a successful rebuild
+keeps the recovered work company, and a confirmed successful push closes that
+loop. An unknown command outcome cannot resolve a failure. These work facts
+belong to the observed owner and working directory; changing either resets them.
+Changed prompt directory metadata also retires an old vigil after `cd`, before
+another command starts.
+Hover the compact or expanded status card to inspect the current behavior and
+the creature's qualitative state. Inspection does not spend a greeting or change
+its state. Compact chrome now names the current behavior even when space is too
+narrow for a complete explanation.
+
 Shell Agent work, review, completion and cancellation feed the same local life
 model. Repeated frames do not repeat a phase, and enabling the companion does
 not replay phases observed while it was disabled.

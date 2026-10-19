@@ -357,6 +357,7 @@ impl super::TerminalState {
             title_stack: Vec::new(),
             announced_jsh_session_id: None,
             current_working_dir: None,
+            organism_working_dir: None,
             global_bg: Color::Default,
             utf8_buf: [0; 4],
             utf8_len: 0,
@@ -2974,6 +2975,25 @@ impl super::TerminalState {
         }
     }
 
+    /// Store only a valid, bounded observation, before making another copy.
+    /// The parser calls this in wire order; no frame guesses which report won.
+    pub(super) fn observe_organism_directory(slot: &mut Option<String>, cwd: Option<&str>) {
+        let bounded = cwd.filter(|cwd| {
+            cwd.starts_with('/')
+                && cwd.len() <= 2048
+                && jterm_core::execution_journal::is_valid_jsh_cwd(cwd)
+        });
+        if slot.as_deref() != bounded {
+            *slot = bounded.map(str::to_owned);
+        }
+    }
+
+    pub fn organism_working_dir(&self) -> Option<&str> {
+        (!self.use_alt_buffer)
+            .then_some(self.organism_working_dir.as_deref())
+            .flatten()
+    }
+
     fn record_output_start(
         &mut self,
         id: Option<&str>,
@@ -3015,6 +3035,10 @@ impl super::TerminalState {
             // otherwise rebind an already-observed Start generation to output
             // that was captured for the first one.
             if !record.start_mark_seen {
+                Self::observe_organism_directory(
+                    &mut self.organism_working_dir,
+                    record.cwd.as_deref(),
+                );
                 self.watch.start(record.sequence);
                 record.session_id = start_identity.session_id;
                 record.seq = start_identity.seq;
@@ -3379,7 +3403,11 @@ impl super::TerminalState {
         // D's cwd is the post-command directory. It must not overwrite the
         // cwd captured at C, which is the authority for Retry/task provenance.
         self.apply_record_metadata(index, id, command, None, command_truncated);
-        if let Some(cwd_after) = cwd.and_then(Self::decode_osc_133_cwd) {
+        let cwd_after = cwd.and_then(Self::decode_osc_133_cwd);
+        if cwd.is_some() {
+            Self::observe_organism_directory(&mut self.organism_working_dir, cwd_after.as_deref());
+        }
+        if let Some(cwd_after) = cwd_after {
             if let Some(record) = self.command_records.get_mut(index) {
                 record.cwd_after = Some(cwd_after.clone());
             }

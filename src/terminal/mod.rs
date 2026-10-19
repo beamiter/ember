@@ -649,6 +649,10 @@ pub struct TerminalState {
     /// falls back to `/proc/<pid>/cwd`. Survives across shell PWD changes —
     /// each prompt re-emits OSC 7.
     pub current_working_dir: Option<String>,
+    /// Bounded companion-only directory evidence in parser wire order. A
+    /// first command Start can supersede an older OSC 7 without changing the
+    /// general shell cwd cache or history's command-start attribution.
+    organism_working_dir: Option<String>,
 
     // Global background color set by vim (CSI ... m)
     pub global_bg: Color,

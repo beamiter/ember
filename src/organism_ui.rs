@@ -11,9 +11,11 @@ use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
 use jterm_core::organism::{
-    AmbientMind, Behavior, BodyLanguage, RepoVigil, VisualTransition, WatchRhythm,
+    AmbientMind, Behavior, BodyLanguage, RepoVigil, Tone, VisualTransition, WatchRhythm,
 };
-use jterm_core::organism_daily::{behavior_explanation, GentleInteraction};
+use jterm_core::organism_daily::{
+    behavior_explanation, behavior_label, context_explanation, life_description, GentleInteraction,
+};
 use jterm_core::organism_live::{
     LiveActivityKnowledge, LiveAttention, LiveAttentionEvent, LiveAttentionInput,
     LiveAttentionOutcome, LiveAttentionRejection, LiveAttentionSnapshot,
@@ -199,10 +201,40 @@ impl NativePalette {
     fn body(self, behavior: Behavior) -> egui::Color32 {
         match behavior {
             Behavior::WatchCommand | Behavior::WatchSettled | Behavior::WatchAgent => self.active,
-            Behavior::Celebrate | Behavior::CelebrateBig | Behavior::RestAfterPush => self.success,
-            Behavior::InspectError | Behavior::SitNearError => self.error,
-            Behavior::UnknownOutcome => self.warning,
+            Behavior::Celebrate
+            | Behavior::CelebrateBig
+            | Behavior::RestAfterPush
+            | Behavior::GuardRecovery => self.success,
+            Behavior::InspectError
+            | Behavior::SitNearError
+            | Behavior::GuardFailure
+            | Behavior::GuardStuck => self.error,
+            Behavior::UnknownOutcome | Behavior::GuardCautious => self.warning,
             _ => self.quiet,
+        }
+    }
+
+    fn tone(self, tone: Tone) -> egui::Color32 {
+        match tone {
+            Tone::Quiet => self.quiet,
+            Tone::Active => self.active,
+            Tone::Success => self.success,
+            Tone::Error => self.error,
+            Tone::Warning => self.warning,
+        }
+    }
+
+    /// Unfinished work keeps its meaning after an immediate reaction settles,
+    /// with a softer border so repeated failures do not become more intrusive.
+    fn card_opacity(behavior: Behavior) -> (u8, u8) {
+        match behavior {
+            Behavior::WatchCommand | Behavior::WatchSettled | Behavior::WatchAgent => (18, 230),
+            Behavior::Celebrate | Behavior::CelebrateBig | Behavior::RestAfterPush => (20, 140),
+            Behavior::InspectError | Behavior::SitNearError => (26, 178),
+            Behavior::UnknownOutcome => (18, 158),
+            Behavior::GuardFailure | Behavior::GuardStuck => (12, 110),
+            Behavior::GuardRecovery | Behavior::GuardCautious => (9, 96),
+            _ => (9, 178),
         }
     }
 }
@@ -522,7 +554,12 @@ fn companion_text(
 }
 
 /// Preserve the body/control slots; details alone adapt to the available width.
-fn companion_details(ui: &Ui, rect: egui::Rect, status: impl Into<String>) {
+fn companion_details(
+    ui: &Ui,
+    rect: egui::Rect,
+    status: impl Into<String>,
+    status_color: egui::Color32,
+) {
     let row = |x: f32, y: f32, width: f32, height: f32| {
         egui::Rect::from_min_size(rect.min + egui::vec2(x, y), egui::vec2(width, height))
             .intersect(rect)
@@ -570,7 +607,7 @@ fn companion_details(ui: &Ui, rect: egui::Rect, status: impl Into<String>) {
         row(0.0, 22.0, rect.width(), 32.0),
         status,
         12.0,
-        ui.visuals().text_color(),
+        status_color,
         2,
     );
 }
@@ -712,7 +749,7 @@ fn live_status_text(context: RenderContext, frame: u64, width: f32) -> String {
             live_behavior_explanation(context)
         )
     } else {
-        format!("{:<12}  Volatile", glyph)
+        format!("{}  {}", glyph, behavior_label(context.behavior))
     }
 }
 
@@ -867,8 +904,12 @@ pub struct OrganismHost {
     native_surface_walking: bool,
     palette: NativePalette,
     reaction_status: String,
+    reaction_tone: Option<(Behavior, Tone)>,
     watch: WatchAdapter,
     bridge: PaintedBridge,
+    // The independent body and the classic footer submit different shapes.
+    // A pose painted by one surface cannot seed the other's transition.
+    native_bridge: PaintedBridge,
     bridge_mode: bool,
     rhythm_enabled: bool,
 }
@@ -905,8 +946,10 @@ impl Default for OrganismHost {
             native_surface_walking: false,
             palette: NativePalette::default(),
             reaction_status: "quiet · waiting for a real Block event".into(),
+            reaction_tone: None,
             watch: WatchAdapter::default(),
             bridge: PaintedBridge::default(),
+            native_bridge: PaintedBridge::default(),
             bridge_mode: false,
             rhythm_enabled: false,
         }
@@ -921,6 +964,7 @@ impl OrganismHost {
     fn configure_bridge(&mut self, active: bool) {
         if self.bridge_mode != active {
             self.bridge.reset();
+            self.native_bridge.reset();
         }
         self.bridge_mode = active;
     }
@@ -950,6 +994,7 @@ impl OrganismHost {
         }
         self.watch.reset();
         self.bridge.reset();
+        self.clear_native_surface();
         self.life
             .advance(now, false, false, CircadianPhase::Unlearned);
         self.attention.set_owner(owner.map(str::to_owned));
@@ -968,6 +1013,7 @@ impl OrganismHost {
         self.ambient.interrupt();
         self.context = PreviewPose::Calm.context();
         self.reaction_until = now;
+        self.reaction_tone = None;
     }
 
     fn cancel_attention(&mut self) {
@@ -1062,6 +1108,7 @@ impl OrganismHost {
             };
             self.watch.reset();
             self.bridge.reset();
+            self.native_bridge.reset();
             self.last_input = Some(now);
             self.owner_activity_at = now;
             self.life.note_input(now);
@@ -1218,6 +1265,37 @@ impl OrganismHost {
         }
     }
 
+    /// Wire-ordered idle directory evidence invalidates another work scope even
+    /// when `cd` has no following command Start. Treat metadata as a reason to
+    /// forget context, never as evidence that a command succeeded or failed.
+    fn observe_directory(&mut self, cwd: Option<&str>) {
+        if self.owner.is_none() || self.running {
+            return;
+        }
+        let bounded = cwd.filter(|cwd| cwd.starts_with('/') && cwd.len() <= 2048);
+        if bounded != self.work_context.as_deref()
+            || (bounded.is_none() && self.native.repo_vigil().is_active())
+        {
+            self.set_work_context(bounded);
+            self.ambient.interrupt();
+            self.bridge.reset();
+            self.native_bridge.reset();
+            if matches!(
+                self.context.behavior,
+                Behavior::GuardFailure
+                    | Behavior::GuardStuck
+                    | Behavior::GuardRecovery
+                    | Behavior::GuardCautious
+            ) {
+                self.context = RenderContext::new(
+                    Behavior::Idle,
+                    BodyLanguage::from_state(self.life.state()),
+                    false,
+                );
+            }
+        }
+    }
+
     fn finish(
         &mut self,
         pending: &PendingCommand,
@@ -1247,7 +1325,104 @@ impl OrganismHost {
             false,
         );
         self.reaction_status = reaction.description.clone();
+        self.reaction_tone = Some((reaction.behavior, reaction.tone));
         self.reaction_until = now + reaction.hold_duration();
+    }
+
+    /// A quiet completion can share the celebration pose without inheriting
+    /// its stronger default color. Only the current visible reaction owns its
+    /// tone; ambient poses, greetings and previews keep their own semantics.
+    fn presentation_color(
+        &self,
+        now: Duration,
+        display: RenderContext,
+        live: bool,
+    ) -> egui::Color32 {
+        if live
+            && !self.running
+            && now < self.reaction_until
+            && display.behavior == self.context.behavior
+        {
+            if let Some((behavior, tone)) = self.reaction_tone {
+                if behavior == display.behavior {
+                    return self.palette.tone(tone);
+                }
+            }
+        }
+        self.palette.body(display.behavior)
+    }
+
+    fn clear_native_surface(&mut self) {
+        self.native_surface_identity = None;
+        self.native_surface_rect = None;
+        self.native_surface_region = None;
+        self.native_surface_frame = None;
+        self.native_surface_walking = false;
+        self.native_bridge.reset();
+        self.pointer_inside = false;
+    }
+
+    /// A real unfinished build remains an intention between commands. No
+    /// output text, wall clock, filesystem lookup or new event enters the mind.
+    fn advance_ambient(&mut self, now: Duration, eligible: bool, dt: f32) {
+        if eligible && now >= self.reaction_until && !self.running {
+            let behavior = self.ambient.step(
+                self.life.state(),
+                self.owner_idle_for(now).as_secs_f32(),
+                dt,
+                self.native.repo_vigil(),
+            );
+            self.context = RenderContext::new(
+                behavior.display(),
+                BodyLanguage::from_state(self.life.state()),
+                false,
+            );
+        }
+    }
+
+    fn status_description(
+        &self,
+        now: Duration,
+        display: RenderContext,
+        live: bool,
+    ) -> std::borrow::Cow<'_, str> {
+        if !live {
+            "quiet · live reactions paused".into()
+        } else if self.running {
+            context_explanation(display).into()
+        } else if now < self.reaction_until && display.behavior == self.context.behavior {
+            self.reaction_status.as_str().into()
+        } else if self.native.repo_vigil() != RepoVigil::None && display.behavior != Behavior::Sleep
+        {
+            self.native.idle_reaction().description.into()
+        } else if self.cursor.is_none() && display.behavior == Behavior::Idle {
+            "quiet · waiting for a real Block event".into()
+        } else {
+            behavior_label(display.behavior).into()
+        }
+    }
+
+    /// Inspect the same final pose without changing attention or life state.
+    /// No command, path, output, score or inferred human emotion is exposed.
+    fn inspect_text(&self, display: RenderContext, live: bool) -> String {
+        if !live {
+            return "ASCII organism\nQuietly here. Live reactions are paused.\nMemory lasts for this window. No LLM.".into();
+        }
+        let work = if display.behavior == Behavior::Sleep && self.native.repo_vigil().is_active() {
+            format!(
+                "\nUnfinished work: {}.",
+                behavior_label(self.native.idle_reaction().behavior)
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "{}\n{}\nCreature state: {}{}\nMemory lasts for this window. No LLM.",
+            behavior_label(display.behavior),
+            context_explanation(display),
+            life_description(self.life.state()),
+            work,
+        )
     }
 
     /// Paint-only native overlay. The renderer supplies same-frame, proven
@@ -1265,13 +1440,10 @@ impl OrganismHost {
         interactive: bool,
     ) {
         if !config.command_cards_enabled() {
-            if self.native_surface_identity.take().is_some() {
+            if self.native_surface_identity.is_some() {
                 self.cancel_attention();
             }
-            self.native_surface_rect = None;
-            self.native_surface_region = None;
-            self.native_surface_frame = None;
-            self.native_surface_walking = false;
+            self.clear_native_surface();
             return;
         }
         let now = self.born.elapsed();
@@ -1308,12 +1480,7 @@ impl OrganismHost {
         });
         if surface.is_none() {
             self.cancel_attention();
-            self.native_surface_identity = None;
-            self.native_surface_rect = None;
-            self.native_surface_region = None;
-            self.native_surface_frame = None;
-            self.native_surface_walking = false;
-            self.pointer_inside = false;
+            self.clear_native_surface();
             return;
         }
         let (pointer, buttons_down, events) = ui.ctx().input(|input| {
@@ -1333,31 +1500,33 @@ impl OrganismHost {
                     .collect::<Vec<_>>(),
             )
         });
-        let palette = self.palette;
-        let layout = |context: RenderContext| {
+        let font = organism_font(ui, Config::clamp_font_size(config.font_size));
+        let layout = |context: RenderContext, frame: u64, color| {
             ui.painter().layout_no_wrap(
                 sprite_frame_with_context(context, frame).into_owned(),
-                organism_font(ui, config.font_size),
-                palette.body(context.behavior),
+                font.clone(),
+                color,
             )
         };
-        // Measure native text; neither terminal font scaling nor a narrower
-        // pane may silently clip a body over the input row.
-        let base_galley = layout(context);
         // Keep a measured twelve-column envelope across all shared ASCII poses.
         // This includes the reference 6x3 padding and 1px border on every side.
+        // Measure the fixed envelope once, then lay out only the final sprite.
+        // A future out-of-envelope pose fails closed at the final fit check.
         let envelope = ui.painter().layout_no_wrap(
             "MMMMMMMMMMMM\nMMMMMMMMMMMM\nMMMMMMMMMMMM".into(),
-            organism_font(ui, config.font_size),
+            font.clone(),
             self.palette.quiet,
         );
-        let size = envelope.size().max(base_galley.size()) + egui::vec2(14.0, 8.0);
+        let size = envelope.size() + egui::vec2(14.0, 8.0);
         let identity = surface
             .as_ref()
             .map(|(session, block, projection, _)| (session.clone(), block.clone(), *projection));
         let region = surface.as_ref().map(|(_, _, _, region)| *region);
         let geometry_changed =
             self.native_surface_identity != identity || self.native_surface_region != region;
+        if geometry_changed || !full {
+            self.native_bridge.reset();
+        }
         let previous = (!geometry_changed)
             .then_some(self.native_surface_rect)
             .flatten();
@@ -1435,12 +1604,28 @@ impl OrganismHost {
         if target.is_positive() {
             let mut display = snapshot.map_or(context, |value| value.presentation);
             display.walking = walking;
-            let galley = layout(display);
+            let color = self.presentation_color(now, display, true);
+            let greeting = snapshot.is_some_and(|value| value.active.is_some());
+            let plan = if full && !greeting {
+                Some(self.native_bridge.plan_at_cadence(
+                    now,
+                    display,
+                    frame,
+                    !self.owner_dormant(now),
+                ))
+            } else {
+                self.native_bridge.reset();
+                None
+            };
+            let galley = if let Some(plan) = plan.as_ref() {
+                layout(plan.context, plan.frame, color)
+            } else {
+                layout(display, frame, color)
+            };
             let inner = target.shrink2(egui::vec2(7.0, 4.0));
             if let Some((_, _, _, region)) = surface {
                 if galley.size().x <= inner.width() && galley.size().y <= inner.height() {
                     let painter = ui.painter().with_clip_rect(region);
-                    let color = self.palette.body(display.behavior);
                     let border = if snapshot.is_some_and(|value| value.candidate_visible)
                         || pointer.is_some_and(|point| target.contains(point))
                     {
@@ -1471,11 +1656,19 @@ impl OrganismHost {
                         egui::StrokeKind::Inside,
                     );
                     painter.galley(inner.min, galley, color);
+                    if let Some(plan) = plan {
+                        self.native_bridge.submitted(plan);
+                    }
                 } else {
                     self.cancel_attention();
                     self.native_surface_rect = None;
+                    self.native_surface_frame = None;
+                    self.native_surface_walking = false;
+                    self.native_bridge.reset();
                 }
             }
+        } else {
+            self.native_bridge.reset();
         }
         // Reconcile the same shared cadence as traditional chrome after this
         // native body has accepted/expired attention. A dormant Block/Chat
@@ -1491,7 +1684,7 @@ impl OrganismHost {
         now: Duration,
         snapshot: Option<LiveAttentionSnapshot>,
     ) -> Option<Duration> {
-        if !policy.body_visible(now) {
+        if !policy.body_visible(now) || self.native_surface_rect.is_none() {
             return None;
         }
         next_live_wake(
@@ -1554,7 +1747,7 @@ impl OrganismHost {
             context
         };
         let palette = self.palette;
-        let color = palette.body(display.behavior);
+        let color = self.presentation_color(now, display, live);
         let expanded = config.ascii_organism_expanded;
         let card = region.shrink2(egui::vec2(0.0, if expanded { 3.0 } else { 1.0 }));
         let clip = card.intersect(ui.clip_rect());
@@ -1562,13 +1755,7 @@ impl OrganismHost {
             return false;
         }
         let painter = ui.painter().with_clip_rect(clip);
-        let (fill_alpha, border_alpha) = match display.behavior {
-            Behavior::WatchCommand | Behavior::WatchSettled | Behavior::WatchAgent => (18, 230),
-            Behavior::Celebrate | Behavior::CelebrateBig | Behavior::RestAfterPush => (20, 140),
-            Behavior::InspectError | Behavior::SitNearError => (26, 178),
-            Behavior::UnknownOutcome => (18, 158),
-            _ => (9, 178),
-        };
+        let (fill_alpha, border_alpha) = NativePalette::card_opacity(display.behavior);
         painter.rect(
             card,
             6.0,
@@ -1642,14 +1829,25 @@ impl OrganismHost {
             line(
                 egui::Rect::from_min_max(inner.min, egui::pos2(text_right, inner.bottom())),
                 format!(
-                    "{}  ASCII organism · {}",
+                    "{}  {}",
                     sticky_glyph_with_context(display, frame),
-                    live_behavior_explanation(display)
+                    if live {
+                        behavior_label(display.behavior)
+                    } else {
+                        "ASCII organism · paused"
+                    },
                 ),
                 font_size,
                 color,
                 true,
             );
+            let semantic =
+                egui::Rect::from_min_max(inner.min, egui::pos2(text_right, inner.bottom()));
+            if let Some(response) = live_semantic_response(ui, semantic, display) {
+                if ui.input(|input| !input.pointer.any_down() && input.keys_down.is_empty()) {
+                    response.on_hover_text(self.inspect_text(display, live));
+                }
+            }
             return toggle;
         }
         let sprite = ui.painter().layout_no_wrap(
@@ -1725,36 +1923,21 @@ impl OrganismHost {
             palette.foreground,
             false,
         );
-        let status = if !live {
-            "quiet · live reactions paused".to_owned()
-        } else if self.running {
-            "watching · command active".to_owned()
-        } else if now < self.reaction_until {
-            self.reaction_status.clone()
-        } else if self.cursor.is_none() {
-            "quiet · waiting for a real Block event".to_owned()
-        } else {
-            "quiet · between commands".to_owned()
-        };
+        let status = self.status_description(now, display, live).into_owned();
         let status_color = match display.behavior {
             Behavior::Celebrate
             | Behavior::CelebrateBig
             | Behavior::RestAfterPush
             | Behavior::InspectError
-            | Behavior::SitNearError => color,
+            | Behavior::SitNearError
+            | Behavior::GuardFailure
+            | Behavior::GuardStuck
+            | Behavior::GuardRecovery
+            | Behavior::GuardCautious => color,
             _ => palette.foreground,
         };
         line(row(1.0), status, font_size, status_color, false);
-        let mut caption = live_behavior_explanation(display).into_owned();
-        if display.body_language.drowsy {
-            caption.push_str(" · sleepy");
-        }
-        if display.body_language.tense {
-            caption.push_str(" · subdued");
-        }
-        if display.body_language.listless {
-            caption.push_str(" · curious");
-        }
+        let mut caption = context_explanation(display).to_owned();
         if !wide {
             caption.push_str(" · volatile");
         }
@@ -1769,7 +1952,9 @@ impl OrganismHost {
         // the sole shared greeting target and never captures terminal input.
         let semantic = egui::Rect::from_min_max(inner.min, egui::pos2(text_right, inner.bottom()));
         if let Some(response) = live_semantic_response(ui, semantic, display) {
-            response.on_hover_text("ASCII organism · volatile memory · no LLM");
+            if ui.input(|input| !input.pointer.any_down() && input.keys_down.is_empty()) {
+                response.on_hover_text(self.inspect_text(display, live));
+            }
         }
         toggle
     }
@@ -1818,19 +2003,7 @@ impl OrganismHost {
         if !policy.inline_visible(now) {
             self.bridge.reset();
         }
-        if eligible && now >= self.reaction_until && !self.running {
-            let behavior = self.ambient.step(
-                self.life.state(),
-                self.owner_idle_for(now).as_secs_f32(),
-                dt,
-                RepoVigil::None,
-            );
-            self.context = RenderContext::new(
-                behavior.display(),
-                BodyLanguage::from_state(self.life.state()),
-                false,
-            );
-        }
+        self.advance_ambient(now, eligible, dt);
         let full = self.motion(config.ascii_organism_motion) == OrganismMotion::Full;
         if !config.ascii_organism_expanded || !full {
             self.bridge.reset();
@@ -1955,6 +2128,7 @@ impl OrganismHost {
                 if policy.inline_visible(now) {
                     let display =
                         attention_snapshot.map_or(context, |snapshot| snapshot.presentation);
+                    let color = self.presentation_color(now, display, true);
                     if attention_snapshot.is_some_and(|snapshot| snapshot.candidate_visible) {
                         if let Some(cue) = hover_cue_rect(hover_rect, ui.clip_rect()) {
                             ui.painter()
@@ -1970,7 +2144,7 @@ impl OrganismHost {
                             ui.ctx().input(|input| !input.keys_down.is_empty()),
                         ) {
                             // Native hover-delay redraw only; no organism timer.
-                            response.on_hover_text(live_semantic_text(display));
+                            response.on_hover_text(self.inspect_text(display, true));
                         }
                     }
                     if let Some(sprite) = sprite {
@@ -1993,7 +2167,7 @@ impl OrganismHost {
                                 egui::Align2::LEFT_TOP,
                                 sprite,
                                 egui::FontId::monospace(14.0),
-                                ui.visuals().text_color(),
+                                color,
                             );
                             if submitted_text_visible(text_rect, clip) {
                                 if let Some(plan) = plan {
@@ -2005,7 +2179,7 @@ impl OrganismHost {
                         }
                     }
                     if expanded {
-                        companion_details(ui, status_rect, live_behavior_explanation(display).into_owned());
+                        companion_details(ui, status_rect, self.status_description(now, display, true).into_owned(), color);
                     } else {
                         ui.painter()
                             .with_clip_rect(status_rect.intersect(ui.clip_rect()))
@@ -2014,7 +2188,7 @@ impl OrganismHost {
                                 egui::Align2::LEFT_CENTER,
                                 status,
                                 egui::TextStyle::Monospace.resolve(ui.style()),
-                                ui.visuals().text_color(),
+                                color,
                             );
                     }
                 } else {
@@ -2042,7 +2216,7 @@ impl OrganismHost {
                         );
                     }
                     if expanded {
-                        companion_details(ui, status_rect, "Quietly here. Live reactions are paused.");
+                        companion_details(ui, status_rect, "Quietly here. Live reactions are paused.", ui.visuals().text_color());
                     }
                 }
             });
@@ -2256,6 +2430,8 @@ impl crate::TerminalApp {
         );
         if allowed {
             self.organism.activity = activity;
+            self.organism
+                .observe_directory(terminal.organism_working_dir());
             let now = self.organism.born.elapsed();
             if self.organism.watch_visible(now) {
                 self.organism.watch.attach(now, terminal.watch_command());
@@ -3804,7 +3980,14 @@ mod tests {
                             screen_rect: Some(host_rect(640.0, 480.0)),
                             ..Default::default()
                         },
-                        |ui| companion_details(ui, details, status.clone()),
+                        |ui| {
+                            companion_details(
+                                ui,
+                                details,
+                                status.clone(),
+                                ui.visuals().text_color(),
+                            )
+                        },
                     );
                     output.textures_delta.clear();
                     let text: Vec<_> = output
@@ -3872,7 +4055,14 @@ mod tests {
                         screen_rect: Some(host_rect(640.0, 480.0)),
                         ..Default::default()
                     },
-                    |ui| companion_details(ui, rect, "Output activity resumed. Watching quietly."),
+                    |ui| {
+                        companion_details(
+                            ui,
+                            rect,
+                            "Output activity resumed. Watching quietly.",
+                            ui.visuals().text_color(),
+                        )
+                    },
                 );
                 output.textures_delta.clear();
                 for shape in &output.shapes {
@@ -4373,7 +4563,7 @@ mod tests {
             .unwrap();
         assert!(draw.contains("host_text(display, frame"));
         assert!(draw.contains("live_semantic_response(ui, rect, display)"));
-        assert!(draw.contains("response.on_hover_text(live_semantic_text(display))"));
+        assert!(draw.contains("response.on_hover_text(self.inspect_text(display, true))"));
     }
 
     #[test]
@@ -4480,7 +4670,7 @@ mod tests {
                     .find("live_semantic_response(ui, rect, display)")
                     .unwrap()
         );
-        assert!(draw.contains("response.on_hover_text(live_semantic_text(display))"));
+        assert!(draw.contains("response.on_hover_text(self.inspect_text(display, true))"));
         let helper = source
             .split_once("fn live_semantic_response(")
             .unwrap()
@@ -5818,7 +6008,10 @@ mod tests {
 
     #[test]
     fn native_body_greeting_restores_full_frames_then_returns_to_dormant_cadence() {
-        let host = OrganismHost::default();
+        let host = OrganismHost {
+            native_surface_rect: Some(host_rect(120.0, 80.0)),
+            ..OrganismHost::default()
+        };
         let owner = String::from("local");
         let mut attention = LiveAttention::default();
         attention.set_owner(Some(owner.clone()));
@@ -6839,3 +7032,7 @@ mod chat_offscreen_tests {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "organism_ui/system_motion_native_tests.rs"]
 mod system_motion_native_tests;
+
+#[cfg(test)]
+#[path = "organism_ui/evolution_tests.rs"]
+mod evolution_tests;
