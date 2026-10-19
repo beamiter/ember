@@ -6,13 +6,18 @@ use crate::session_persistence::{
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 
+mod recheck;
+use recheck::AsyncRecheck;
+
 pub(crate) struct SessionRecovery {
     pub open: bool,
     pub summary: Option<RepairSummary>,
     original: Option<Arc<[u8]>>,
     source: PathBuf,
     export_path: String,
-    notice: String,
+    export_notice: String,
+    recheck_notice: String,
+    recheck: AsyncRecheck,
     pending: Option<mpsc::Receiver<Result<String, String>>>,
 }
 
@@ -24,7 +29,9 @@ impl SessionRecovery {
             original,
             source: source.to_owned(),
             export_path: String::new(),
-            notice: String::new(),
+            export_notice: String::new(),
+            recheck_notice: String::new(),
+            recheck: AsyncRecheck::default(),
             pending: None,
         }
     }
@@ -71,16 +78,46 @@ impl SessionRecovery {
         }
     }
 
-    fn recheck(&mut self) {
-        let Some(original) = &self.original else {
+    fn recheck(&mut self, ctx: &egui::Context) {
+        if !self.open {
+            return;
+        }
+        let Some(original) = self.original.clone() else {
             return;
         };
-        // Deliberately retain the startup report. A later recheck is a preview,
-        // not evidence that any of the live sessions have been restored.
-        self.notice = match std::str::from_utf8(original).ok().and_then(|text| inspect_recovery(text).ok()) {
-            Some((snapshot, summary)) => format!("Recheck: {} session records readable; {} skipped; {} unavailable or invalid directories. Live sessions unchanged.", snapshot.sessions.len(), summary.skipped_sessions, summary.invalid_cwds.iter().filter(|value| **value).count()),
-            None => "Recheck: original metadata is still unreadable. Live sessions unchanged.".into(),
-        };
+        let ctx = ctx.clone();
+        match self.recheck.start(
+            move || recheck_notice(&original),
+            move || ctx.request_repaint(),
+        ) {
+            Ok(true) => {
+                self.recheck_notice =
+                    "Rechecking captured original metadata… Live sessions unchanged.".into()
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.recheck_notice =
+                    "Could not start metadata recheck. Live sessions unchanged.".into()
+            }
+        }
+    }
+
+    fn poll_recheck(&mut self) {
+        if let Some(result) = self.recheck.poll() {
+            self.recheck_notice =
+                crate::review_text::bound_toast_text(result.unwrap_or_else(|()| {
+                    "Metadata recheck stopped before reporting completion. Live sessions unchanged."
+                        .into()
+                }));
+        }
+    }
+
+    fn cancel_recheck(&mut self) {
+        if self.recheck.cancel() {
+            self.recheck_notice =
+                "Recheck result discarded because the summary was closed. Live sessions unchanged."
+                    .into();
+        }
     }
 
     fn start_export(&mut self, ctx: &egui::Context) {
@@ -93,7 +130,7 @@ impl SessionRecovery {
             || self.export_path.len() > 4096
             || self.export_path.chars().any(char::is_control)
         {
-            self.notice =
+            self.export_notice =
                 "Choose a new absolute local path, different from the original snapshot.".into();
             return;
         }
@@ -110,15 +147,19 @@ impl SessionRecovery {
     }
 
     pub fn show(&mut self, ctx: &egui::Context) {
+        if !self.open {
+            self.cancel_recheck();
+        }
+        self.poll_recheck();
         if let Some(receiver) = &self.pending {
             match receiver.try_recv() {
                 Ok(result) => {
-                    self.notice =
+                    self.export_notice =
                         crate::review_text::bound_toast_text(result.unwrap_or_else(|error| error));
                     self.pending = None;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.notice = "Export worker stopped before reporting completion. Check the chosen local file before trying again.".into();
+                    self.export_notice = "Export worker stopped before reporting completion. Check the chosen local file before trying again.".into();
                     self.pending = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -153,17 +194,30 @@ impl SessionRecovery {
                 }
                 ui.separator();
                 ui.label("Recheck only validates the captured original metadata. It does not run commands, replace live sessions, or write the snapshot.");
-                if ui.add_enabled(self.original.is_some(), egui::Button::new("Recheck original metadata")).clicked() { self.recheck(); }
+                if ui.add_enabled(self.original.is_some() && !self.recheck.is_busy(), egui::Button::new("Recheck original metadata")).clicked() { self.recheck(ctx); }
+                if self.recheck.is_busy() { ui.label("Metadata validation is running in the background."); }
+                if !self.recheck_notice.is_empty() { ui.label(&self.recheck_notice); }
                 ui.label("Export copies the captured original to a NEW local file. It may contain private names, paths, and other session data. Nothing is uploaded.");
                 ui.add(egui::TextEdit::singleline(&mut self.export_path).hint_text("New absolute export path").char_limit(4096));
                 if ui.add_enabled(self.original.is_some() && self.pending.is_none(), egui::Button::new("Export original locally")).clicked() { self.start_export(ctx); }
                 if self.original.is_none() { ui.label("Original export unavailable: startup could not safely read the file within its size and ownership limits."); }
                 if self.pending.is_some() { ui.label("Exporting…"); }
-                if !self.notice.is_empty() { ui.label(&self.notice); }
+                if !self.export_notice.is_empty() { ui.label(&self.export_notice); }
                 ui.label("Closing this summary keeps the original metadata available for this app session.");
                 dismiss = ui.button("Dismiss summary").clicked();
             });
         self.open = open && !dismiss;
+        if !self.open {
+            self.cancel_recheck();
+        }
+    }
+}
+
+fn recheck_notice(original: &[u8]) -> String {
+    // A later recheck is a preview, not evidence that live sessions were restored.
+    match std::str::from_utf8(original).ok().and_then(|text| inspect_recovery(text).ok()) {
+        Some((snapshot, summary)) => format!("Recheck: {} session records readable; {} skipped; {} unavailable or invalid directories. Live sessions unchanged.", snapshot.sessions.len(), summary.skipped_sessions, summary.invalid_cwds.iter().filter(|value| **value).count()),
+        None => "Recheck: original metadata is still unreadable. Live sessions unchanged.".into(),
     }
 }
 
@@ -209,6 +263,22 @@ mod tests {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
     }
+    fn finish_recheck(recovery: &mut SessionRecovery) {
+        let was_open = recovery.open;
+        recovery.open = true;
+        recovery.recheck(&egui::Context::default());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while recovery.recheck.is_busy() {
+            recovery.poll_recheck();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "local recheck timed out"
+            );
+            std::thread::yield_now();
+        }
+        recovery.open = was_open;
+    }
+
     fn fixture(count: usize) -> serde_json::Value {
         serde_json::json!({"version":4,"sessions":(0..count).map(|index| serde_json::json!({"name":format!("private-{index}"),"tags":[],"session_id":format!("session-{index}")})).collect::<Vec<_>>()})
     }
@@ -266,7 +336,7 @@ mod tests {
         // Simulate a subsequent normal save: export must still be the exact
         // bounded bytes captured at startup, not a freshly read replacement.
         crate::persistence_file::write_atomic(&path, b"replacement").unwrap();
-        recovery.recheck();
+        finish_recheck(&mut recovery);
         assert_eq!(report, recovery.summary);
         assert_eq!(recovery.original.as_deref().unwrap(), &bytes);
         assert!(!recovery.open);
@@ -305,10 +375,10 @@ mod tests {
         assert!(!diagnostic.contains("PRIVATE_SECRET_SENTINEL"));
         let mut recovery = recovery.unwrap();
         assert!(recovery.summary.is_none());
-        recovery.recheck();
-        assert!(!recovery.notice.contains("PRIVATE_SECRET_SENTINEL"));
+        finish_recheck(&mut recovery);
+        assert!(!recovery.recheck_notice.contains("PRIVATE_SECRET_SENTINEL"));
         assert_eq!(
-            recovery.notice,
+            recovery.recheck_notice,
             "Recheck: original metadata is still unreadable. Live sessions unchanged."
         );
         let ctx = egui::Context::default();
