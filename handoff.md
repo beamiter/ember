@@ -1,5 +1,38 @@
 # Engineering handoff
 
+## 2026-10-19 — selected-output workspace upgrade
+
+- Added `block:collapse_selected` / `block:expand_selected`, without default
+  key assignments. They are available from the palette, the workspace Actions
+  menu, wide workspace strips, and the identity-bound command review. The
+  existing `block:toggle_collapse` still targets only the active selection member.
+- Review output actions revalidate the complete terminal-sequence set before
+  mutating the projection. An expired member rejects the batch; a live retained
+  member without exact output ownership is skipped and counted. A batch advances
+  the policy revision once, keeps raw text/captured output, and leaves running
+  records, unrelated selections and alternate-screen applications alone.
+- Large/sparse reviews now merge stable sequences with the timeline in one
+  pass. Output ownership has a batch lookup instead of one timeline search per
+  block; unchanged review availability follows the output/policy revisions.
+  Command-copy availability no longer assembles a discarded clipboard payload.
+  The active record's escaped text is reused until its exact source changes,
+  including equal-length replacements and output-snapshot eviction.
+- Narrow reviews put the selection order in an expandable section, keeping
+  output visible alongside the Previous/Next controls. Counts distinguish
+  collapsed output, output that can collapse, and unavailable raw ranges.
+- Validation: 243 focused `block` tests passed, including 22 command-review
+  tests, production projection/anchor regressions, real egui/AccessKit button
+  dispatch, and width/height bounds. Additional targeted tests cover bulk
+  shortcut/IME ordering, atomic policy revision exhaustion, and replay guards.
+  Repository Rustfmt, `git diff --check`, and warning-denying Clippy for the
+  application and test targets passed. Real egui mesh captures at 360 px and
+  1000 px were inspected. This round has
+  not been exercised in a native desktop/GPU window.
+- Final integration pins both dependency entries and Cargo.lock to published
+  `jterm_core` `7685678048412b6353eb5b135a354e5b44b17c8b`. No unrelated lock
+  entries changed. `cargo check --locked --tests` and all 29 layout tests pass
+  against this revision, including nested directional focus and zoom retention.
+
 Updated: 2026-10-05 (upgrade round 197 — deferred wrap after editing)
 
 ## 2026-10-05 (right-margin editing)

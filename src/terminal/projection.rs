@@ -217,6 +217,32 @@ impl ProjectionPolicy {
         self.revision = revision;
         true
     }
+
+    /// Change an explicitly resolved batch as one projection transaction. A
+    /// repeated id is counted once, and revision exhaustion refuses the whole
+    /// batch instead of leaving a partially collapsed selection behind.
+    pub fn set_collapsed_batch(&mut self, zone_ids: &[u64], collapsed: bool) -> usize {
+        let targets = zone_ids.iter().copied().collect::<BTreeSet<_>>();
+        let changed = targets
+            .iter()
+            .filter(|id| self.collapsed.contains(id) != collapsed)
+            .count();
+        if changed == 0 {
+            return 0;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return 0;
+        };
+        for id in targets {
+            if collapsed {
+                self.collapsed.insert(id);
+            } else {
+                self.collapsed.remove(&id);
+            }
+        }
+        self.revision = revision;
+        changed
+    }
 }
 
 /// Allocation-free geometry for one retained physical terminal row.
@@ -2045,6 +2071,27 @@ mod tests {
         policy.revision = u64::MAX;
         assert!(!policy.collapse(8));
         assert!(!policy.is_collapsed(8));
+    }
+
+    #[test]
+    fn batch_collapse_is_one_idempotent_transaction_and_refuses_overflow_atomically() {
+        let mut policy = ProjectionPolicy::new();
+        policy.collapse(4);
+        let revision = policy.revision();
+        assert_eq!(policy.set_collapsed_batch(&[4, 6, 6, 8], true), 2);
+        assert_eq!(policy.revision(), revision + 1);
+        assert_eq!(
+            policy.collapsed_zone_ids().collect::<Vec<_>>(),
+            vec![4, 6, 8]
+        );
+        assert_eq!(policy.set_collapsed_batch(&[8, 6, 4], true), 0);
+        assert_eq!(policy.revision(), revision + 1);
+        assert_eq!(policy.set_collapsed_batch(&[6, 99, 6], false), 1);
+        assert_eq!(policy.revision(), revision + 2);
+        policy.revision = u64::MAX;
+        assert_eq!(policy.set_collapsed_batch(&[4, 8], false), 0);
+        assert_eq!(policy.set_collapsed_batch(&[12, 14], true), 0);
+        assert_eq!(policy.collapsed_zone_ids().collect::<Vec<_>>(), vec![4, 8]);
     }
 
     #[test]

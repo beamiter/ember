@@ -465,6 +465,13 @@ changing the terminal viewport height. Narrow panes move secondary actions into 
 - Review follows terminal-owned block identities. Evicted blocks cannot silently retarget
   a reused shell id; closing review preserves your position and restores its invoking
   block control when still present, falling back to terminal focus when unavailable
+- **Collapse selected output** and **Expand selected output** apply to the whole explicit
+  selection, including sparse selections and selections larger than the command-copy
+  limit. Review reports collapsed, available and unavailable output counts. The same
+  actions are in **Actions**, the command palette, and directly on wide workspace strips
+- Batch output actions revalidate every captured identity before one projection change.
+  A missing block rejects the whole batch; a retained block without exact output rows is
+  skipped and counted. Running blocks and full-screen applications keep their geometry
 - Commands and output show escaped control/bidi characters, explicit missing/truncated
   snapshot notices, and a 256 KiB display cap per text pane. Output is a retained snapshot,
   not a claim that every original byte is available
@@ -482,6 +489,12 @@ empty, failed, collapsed, multiple-selection and running states, plus dirty-prom
 unsafe, Unicode and copied-feedback reviews. Real egui action tests check clipboard output,
 focused Enter rejection and footer bounds. These CPU captures complement
 native window/GPU testing; they do not replace it.
+
+Large reviews resolve their ordered identities with one history scan. Clipboard previews
+validate command size without assembling discarded clipboard payloads, while the active
+command/output display reuses its escaped text until the exact retained source changes.
+Output-fold availability follows the terminal's ownership revision, so an unchanged
+review does not rescan every selected output range on every frame.
 
 Completed records use `jterm_core::block_contract` only after Ember has merged
 OSC 133 metadata with its bounded screen reconstruction. Card badges,
@@ -998,7 +1011,8 @@ Defaults include:
 | Previous / next failed block | `Ctrl+Shift+,` / `Ctrl+Shift+.` |
 | Toggle bookmark on the active completed block (or selected Block Search hit) | `Ctrl+Shift+B` |
 | Previous / next bookmarked block (wrapping) | `Ctrl+,` / `Ctrl+.` |
-| Collapse / expand selected block output | Command palette: “Toggle Selected Block Collapse”; bindable as `block:toggle_collapse` |
+| Toggle active selected block output | Command palette: “Toggle Selected Block Collapse”; bindable as `block:toggle_collapse` |
+| Collapse / expand all selected block outputs | Review / Actions / command palette; bindable as `block:collapse_selected` / `block:expand_selected` |
 | Search/filter completed command blocks | `Ctrl+Shift+G` |
 | Toggle Agent panel (per-command approval) | `Ctrl+Alt+G` |
 | Toggle AI chats library (read-only; nothing runs) | `Ctrl+Shift+Alt+A` |
@@ -1019,6 +1033,14 @@ in the current pane. It leaves other selected blocks unchanged and does nothing
 without a retained completed selection, in normal mode, or on the alternate
 screen. It has no default shortcut; a custom binding remains terminal input
 when no valid collapse/expand target exists.
+
+`block:collapse_selected` and `block:expand_selected` set a definite output state for
+every explicitly selected completed block in the current pane. They have no default
+shortcut and never enlarge the selection to the entire session. A custom binding stays
+terminal input when its requested action has no available target. The review controls
+also work while the prompt is dirty or busy, because organizing output does not send
+terminal input. `Enter` inside review continues to leave the prompt untouched; use the
+explicit output buttons or their focused `Space` activation.
 
 Selection movement is deliberately minimal — it keeps the viewport where the
 reader left it whenever the target block header is already on screen. Clicking

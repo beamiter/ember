@@ -769,6 +769,7 @@ struct BlockWorkspaceSnapshot {
     session_id: String,
     completed_count: usize,
     selected_count: usize,
+    selected_collapsed_count: usize,
     active_record_id: Option<String>,
     command_preview: String,
     status: String,
@@ -1026,6 +1027,24 @@ fn block_workspace_selection_menu(
         valid && (snapshot.collapsed || snapshot.collapse_available),
         "Collapse or expand exact retained output for the active block; terminal output is preserved",
         BlockWorkspaceAction::Target(if snapshot.collapsed { Target::ExpandOutput } else { Target::CollapseOutput }));
+    if snapshot.selected_count > 1 {
+        for (label, command, available, tooltip) in [
+            ("Collapse selected output", crate::keybindings::Command::BlockCollapseSelected,
+             snapshot.selected_collapsed_count < snapshot.selected_count,
+             "Collapse exact retained output for all selected blocks; unavailable output is skipped"),
+            ("Expand selected output", crate::keybindings::Command::BlockExpandSelected,
+             snapshot.selected_collapsed_count > 0,
+             "Expand all collapsed outputs in the selection; other blocks keep their state"),
+        ] {
+            block_workspace_menu_item(ui, focus, keybindings, action, label,
+                valid && available && !snapshot.alternate_screen, tooltip,
+                BlockWorkspaceAction::Command(command));
+        }
+        ui.weak(format!(
+            "{} of {} selected outputs collapsed",
+            snapshot.selected_collapsed_count, snapshot.selected_count
+        ));
+    }
     for (label, choice) in [
         ("Go to block start", Target::ScrollTop),
         ("Go to block end", Target::ScrollBottom),
@@ -1372,18 +1391,43 @@ fn draw_block_workspace(
             {
                 action = Some(BlockWorkspaceAction::Deselect);
             }
+            if inner.width() >= 800.0 {
+                for (label, command, available, tooltip) in [
+                    (
+                        "Collapse",
+                        Command::BlockCollapseSelected,
+                        snapshot.selected_collapsed_count < snapshot.selected_count,
+                        "Collapse selected output; retained command text and output are preserved",
+                    ),
+                    (
+                        "Expand",
+                        Command::BlockExpandSelected,
+                        snapshot.selected_collapsed_count > 0,
+                        "Expand selected output; other blocks keep their state",
+                    ),
+                ] {
+                    if block_workspace_control(ui, focus, label, valid && available, tooltip)
+                        .clicked()
+                    {
+                        action = Some(BlockWorkspaceAction::Command(command));
+                    }
+                }
+            }
             if roomy {
                 let status = if valid {
-                    snapshot.status.as_str()
+                    format!(
+                        "{} · {} collapsed",
+                        snapshot.status, snapshot.selected_collapsed_count
+                    )
                 } else {
-                    "Selection no longer retained"
+                    "Selection no longer retained".to_owned()
                 };
                 let color = if snapshot.failed {
                     ui.visuals().error_fg_color
                 } else {
                     ui.visuals().text_color()
                 };
-                ui.add(egui::Label::new(egui::RichText::new(status).color(color)).truncate())
+                ui.add(egui::Label::new(egui::RichText::new(&status).color(color)).truncate())
                     .on_hover_text(format!("{status}\n{}", snapshot.command_preview));
                 if inner.width() >= 960.0 {
                     ui.add(
@@ -2205,20 +2249,28 @@ impl TerminalApp {
         let selection = block_workspace_selection(self.block_selection.as_ref(), session_id);
         let records = terminal.command_records();
         let selected_count = selection.map_or(0, |selection| selection.selected_ids.len());
-        let retained_ids: std::collections::HashSet<&str> = records
-            .iter()
-            .filter(|record| record.complete)
-            .map(|record| record.id.as_str())
-            .collect();
+        let retained_records: std::collections::HashMap<&str, &crate::terminal::CommandRecord> =
+            records
+                .iter()
+                .filter(|record| record.complete)
+                .map(|record| (record.id.as_str(), record))
+                .collect();
         let active = selection
             .filter(|selection| {
                 selection
                     .selected_ids
                     .iter()
-                    .all(|id| retained_ids.contains(id.as_str()))
+                    .all(|id| retained_records.contains_key(id.as_str()))
             })
-            .and_then(|selection| terminal.command_record(&selection.active_id))
-            .filter(|record| record.complete);
+            .and_then(|selection| retained_records.get(selection.active_id.as_str()).copied());
+        let selected_collapsed_count = selection.map_or(0, |selection| {
+            selection
+                .selected_ids
+                .iter()
+                .filter_map(|id| retained_records.get(id.as_str()))
+                .filter(|record| session.projection_policy.is_collapsed(record.sequence))
+                .count()
+        });
         let running = records.back().filter(|record| {
             record.state == crate::terminal::CommandState::Running && !record.complete
         });
@@ -2245,8 +2297,9 @@ impl TerminalApp {
         let snapshot = BlockWorkspaceSnapshot {
             unseen_completed,
             session_id: session_id.clone(),
-            completed_count: retained_ids.len(),
+            completed_count: retained_records.len(),
             selected_count,
+            selected_collapsed_count,
             active_record_id: active.map(|record| record.id.clone()),
             command_preview: active
                 .and_then(|record| record.command.as_deref())
@@ -2279,7 +2332,7 @@ impl TerminalApp {
                 .pretty_bindings_for("block:search")
                 .join(" / "),
         };
-        drop(retained_ids);
+        drop(retained_records);
         drop(terminal);
         if snapshot.alternate_screen && self.block_chrome_owns_keyboard(ctx) {
             self.return_focus_to_terminal(ctx);

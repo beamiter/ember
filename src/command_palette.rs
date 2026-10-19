@@ -423,6 +423,18 @@ impl CommandPalette {
                 crate::keybindings::Command::BlockToggleCollapse,
             ),
             CommandInfo::new(
+                "Collapse Selected Block Outputs",
+                CommandCategory::Terminal,
+                "Collapse exact retained output for all selected completed blocks in the active pane",
+                crate::keybindings::Command::BlockCollapseSelected,
+            ),
+            CommandInfo::new(
+                "Expand Selected Block Outputs",
+                CommandCategory::Terminal,
+                "Expand output for all selected completed blocks in the active pane",
+                crate::keybindings::Command::BlockExpandSelected,
+            ),
+            CommandInfo::new(
                 "Previous Block Bookmark",
                 CommandCategory::Terminal,
                 "Jump to the previous bookmarked block, wrapping at the start",

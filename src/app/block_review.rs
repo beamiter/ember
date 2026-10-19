@@ -3,6 +3,8 @@
 use super::state::TerminalApp;
 use crate::terminal::{CommandRecord, TerminalState};
 use eframe::egui;
+use std::cell::RefCell;
+use std::sync::Arc;
 
 const MAX_REVIEW_COMMANDS: usize = 64;
 const MAX_REVIEW_COMMAND_BYTES: usize = 256 * 1024;
@@ -17,24 +19,32 @@ pub(crate) struct BlockReview {
     armed: bool,
     invoker: Option<egui::Id>,
     error: Option<String>,
+    text_cache: RefCell<ReviewTextCache>,
+    fold_cache: RefCell<Option<(u64, u64, ReviewFoldSummary)>>,
 }
 
 impl BlockReview {
-    fn capture(session_id: String, selected: &[String], terminal: &TerminalState) -> Option<Self> {
-        let sequences: Vec<_> = terminal
-            .command_records()
+    pub(super) fn capture(
+        session_id: String,
+        selected: &[String],
+        terminal: &TerminalState,
+    ) -> Option<Self> {
+        let selected_set = selected
             .iter()
-            .filter(|record| record.complete && selected.contains(&record.id))
-            .map(|record| record.sequence)
-            .collect();
-        if sequences.is_empty() || sequences.len() != selected.len() {
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        if selected_set.len() != selected.len() {
             return None;
         }
-        let records = terminal
+        let records: Vec<_> = terminal
             .command_records()
             .iter()
-            .filter(|record| sequences.contains(&record.sequence))
-            .collect::<Vec<_>>();
+            .filter(|record| record.complete && selected_set.contains(record.id.as_str()))
+            .collect();
+        if records.is_empty() || records.len() != selected.len() {
+            return None;
+        }
+        let sequences = records.iter().map(|record| record.sequence).collect();
         let mut bytes = 0usize;
         let bounded = records.len() <= MAX_REVIEW_COMMANDS
             && records.iter().all(|record| {
@@ -55,6 +65,8 @@ impl BlockReview {
             armed: false,
             invoker: None,
             error: None,
+            text_cache: RefCell::default(),
+            fold_cache: RefCell::default(),
         })
     }
 
@@ -63,11 +75,11 @@ impl BlockReview {
         terminal: &TerminalState,
         ids: &[String],
     ) -> bool {
-        self.copy_commands(terminal).is_ok()
-            && self.resolve(terminal).is_some_and(|records| {
-                records.len() == ids.len()
-                    && records.iter().zip(ids).all(|(record, id)| record.id == *id)
-            })
+        self.resolve(terminal).is_some_and(|records| {
+            self.command_copy_size(&records).is_ok()
+                && records.len() == ids.len()
+                && records.iter().zip(ids).all(|(record, id)| record.id == *id)
+        })
     }
 
     fn copy_commands(&self, terminal: &TerminalState) -> Result<String, &'static str> {
@@ -78,18 +90,38 @@ impl BlockReview {
         &self,
         records: impl Iterator<Item = &'a CommandRecord>,
     ) -> Result<String, &'static str> {
+        let records = self.resolve_from_records(records).ok_or(
+            "A reviewed block is no longer retained or its order changed. Close and review again; nothing copied.",
+        )?;
+        let bytes = self.command_copy_size(&records)?;
+        let mut text = String::with_capacity(bytes);
+        for command in records
+            .iter()
+            .filter_map(|record| record.command.as_deref())
+        {
+            if command.trim().is_empty() {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(command);
+        }
+        Ok(text)
+    }
+
+    // Validation is also used during painting. Do not build and throw away a
+    // 256 KiB clipboard payload on every unchanged review frame.
+    fn command_copy_size(&self, records: &[&CommandRecord]) -> Result<usize, &'static str> {
         let Some(commands) = &self.commands else {
             return Err("Review exceeds 64 blocks or 256 KiB of commands. Select a smaller range; nothing copied.");
         };
-        let records = records
-            .filter(|record| self.sequences.contains(&record.sequence))
-            .collect::<Vec<_>>();
         if records.len() != self.sequences.len() || commands.len() != records.len() {
             return Err(
                 "A reviewed block is no longer retained. Close and review again; nothing copied.",
             );
         }
-        let mut text = String::new();
+        let mut bytes = 0usize;
         for ((record, sequence), command) in records.iter().zip(&self.sequences).zip(commands) {
             if record.sequence != *sequence || record.command != *command {
                 return Err("Reviewed commands or their order changed. Close and review again; nothing copied.");
@@ -118,33 +150,176 @@ impl BlockReview {
                     "Exact command text is unavailable for part of the selection; nothing copied.",
                 );
             }
-            let added = command.len().saturating_add(usize::from(!text.is_empty()));
-            if added > MAX_REVIEW_COMMAND_BYTES.saturating_sub(text.len()) {
+            let added = command.len().saturating_add(usize::from(bytes != 0));
+            if added > MAX_REVIEW_COMMAND_BYTES.saturating_sub(bytes) {
                 return Err("Selected commands exceed the 256 KiB copy limit; nothing copied.");
             }
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(command);
+            bytes += added;
         }
-        if text.is_empty() {
+        if bytes == 0 {
             Err("These blocks contain no commands; nothing copied.")
         } else {
-            Ok(text)
+            Ok(bytes)
         }
     }
 
     fn resolve<'a>(&self, terminal: &'a TerminalState) -> Option<Vec<&'a CommandRecord>> {
-        self.sequences
-            .iter()
-            .map(|sequence| {
-                terminal
-                    .command_records()
-                    .iter()
-                    .find(|record| record.sequence == *sequence && record.complete)
-            })
-            .collect()
+        self.resolve_from_records(terminal.command_records().iter())
     }
+
+    /// Both lists use terminal-owned monotonic sequences. Merge once instead
+    /// of looking up every selected block from the beginning of the history.
+    fn resolve_from_records<'a>(
+        &self,
+        records: impl Iterator<Item = &'a CommandRecord>,
+    ) -> Option<Vec<&'a CommandRecord>> {
+        if self.sequences.is_empty() || self.sequences.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return None;
+        }
+        let mut resolved = Vec::with_capacity(self.sequences.len());
+        let mut targets = self.sequences.iter();
+        let mut target = *targets.next()?;
+        for record in records {
+            if record.sequence < target {
+                continue;
+            }
+            if record.sequence != target || !record.complete {
+                return None;
+            }
+            resolved.push(record);
+            let Some(next) = targets.next() else {
+                return Some(resolved);
+            };
+            target = *next;
+        }
+        None
+    }
+
+    fn fold_summary(
+        &self,
+        terminal: &TerminalState,
+        policy: &crate::terminal::ProjectionPolicy,
+    ) -> ReviewFoldSummary {
+        let source = (policy.revision(), terminal.finished_output_revision());
+        if source.1 != 0 {
+            if let Some((policy_revision, output_revision, summary)) = *self.fold_cache.borrow() {
+                if (policy_revision, output_revision) == source {
+                    return summary;
+                }
+            }
+        }
+        let ranges = terminal.finished_output_ranges(&self.sequences);
+        let mut summary = ReviewFoldSummary::default();
+        for sequence in &self.sequences {
+            if policy.is_collapsed(*sequence) {
+                summary.collapsed += 1;
+            } else if ranges.contains_key(sequence) {
+                summary.collapsible += 1;
+            } else {
+                summary.unavailable += 1;
+            }
+        }
+        *self.fold_cache.borrow_mut() = (source.1 != 0).then_some((source.0, source.1, summary));
+        summary
+    }
+}
+
+/// At most the active record's bounded text is duplicated. Exact source
+/// equality invalidates the display cache even when byte length is unchanged.
+#[derive(Clone, Debug, Default)]
+struct ReviewTextCache {
+    sequence: Option<u64>,
+    command: Option<String>,
+    cwd: Option<String>,
+    output: Option<crate::terminal::ExtractedText>,
+    shown_command: Arc<str>,
+    shown_cwd: Arc<str>,
+    shown_output: Arc<str>,
+}
+
+impl ReviewTextCache {
+    fn update(&mut self, record: &CommandRecord) {
+        let changed_record = self.sequence != Some(record.sequence);
+        if changed_record || self.command != record.command {
+            self.shown_command = display_text(
+                record
+                    .command
+                    .as_deref()
+                    .unwrap_or("No command text retained"),
+            )
+            .into();
+            self.command.clone_from(&record.command);
+        }
+        if changed_record || self.cwd != record.cwd {
+            self.shown_cwd = display_text(
+                record
+                    .cwd
+                    .as_deref()
+                    .unwrap_or("Working directory not reported"),
+            )
+            .into();
+            self.cwd.clone_from(&record.cwd);
+        }
+        if changed_record || self.output != record.captured_output {
+            self.shown_output = record
+                .captured_output
+                .as_ref()
+                .map(|output| display_text(&output.text))
+                .unwrap_or_default()
+                .into();
+            self.output.clone_from(&record.captured_output);
+        }
+        self.sequence = Some(record.sequence);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReviewFoldSummary {
+    collapsed: usize,
+    collapsible: usize,
+    unavailable: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReviewFoldResult {
+    pub changed: usize,
+    pub unavailable: usize,
+}
+
+/// Resolve every captured identity before any policy mutation. Folding remains
+/// available for review-only sessions and inexact commands: it never writes to
+/// the PTY or removes raw output. Full-screen apps retain their own geometry.
+pub(super) fn set_reviewed_output_collapsed(
+    review: &BlockReview,
+    terminal: &mut TerminalState,
+    policy: &mut crate::terminal::ProjectionPolicy,
+    collapsed: bool,
+) -> Result<ReviewFoldResult, &'static str> {
+    if terminal.is_alt_buffer_active() {
+        return Err("Block output controls resume after the full-screen app closes.");
+    }
+    let records = review.resolve(terminal).ok_or("A selected block is no longer retained. Select the available blocks again; no output changed.")?;
+    let ranges = collapsed.then(|| terminal.finished_output_ranges(&review.sequences));
+    let targets = records
+        .iter()
+        .filter(|record| {
+            !collapsed
+                || policy.is_collapsed(record.sequence)
+                || ranges
+                    .as_ref()
+                    .is_some_and(|ranges| ranges.contains_key(&record.sequence))
+        })
+        .map(|record| record.sequence)
+        .collect::<Vec<_>>();
+    let unavailable = review.sequences.len() - targets.len();
+    let changed = policy.set_collapsed_batch(&targets, collapsed);
+    if changed != 0 {
+        terminal.clear_text_selection();
+    }
+    Ok(ReviewFoldResult {
+        changed,
+        unavailable,
+    })
 }
 
 /// Preserve meaningful line breaks but expose terminal controls and bidi text.
@@ -231,19 +406,26 @@ impl ReadingHistory {
 struct ReviewView {
     rows: Vec<String>,
     summary: String,
-    command: String,
-    cwd: String,
+    command: Arc<str>,
+    cwd: Arc<str>,
     status: String,
     provenance: String,
-    output: String,
+    output: Arc<str>,
     notice: String,
     ready: bool,
     insertion_issue: Option<String>,
     copy_issue: Option<String>,
     unavailable: bool,
+    fold: ReviewFoldSummary,
+    alternate_screen: bool,
 }
 
-fn review_view(review: &BlockReview, terminal: &TerminalState, writable: bool) -> ReviewView {
+fn review_view(
+    review: &BlockReview,
+    terminal: &TerminalState,
+    writable: bool,
+    policy: &crate::terminal::ProjectionPolicy,
+) -> ReviewView {
     let Some(records) = review.resolve(terminal) else {
         return ReviewView {
             unavailable: true,
@@ -251,6 +433,8 @@ fn review_view(review: &BlockReview, terminal: &TerminalState, writable: bool) -
         };
     };
     let record = records[review.active.min(records.len() - 1)];
+    let mut text_cache = review.text_cache.borrow_mut();
+    text_cache.update(record);
     let output = record.captured_output.as_ref();
     let notice = match output {
         None => {
@@ -270,7 +454,7 @@ fn review_view(review: &BlockReview, terminal: &TerminalState, writable: bool) -
     } else {
         "Screen-derived or unavailable command; insertion requires exact shell metadata."
     };
-    let copy_issue = review.copy_commands(terminal).err().map(str::to_owned);
+    let copy_issue = review.command_copy_size(&records).err().map(str::to_owned);
     let insertion_issue = super::commands::review_replay_error(&records).or_else(|| {
         copy_issue
             .as_ref()
@@ -314,18 +498,8 @@ fn review_view(review: &BlockReview, terminal: &TerminalState, writable: bool) -
                 )
             })
             .collect(),
-        command: display_text(
-            record
-                .command
-                .as_deref()
-                .unwrap_or("No command text retained"),
-        ),
-        cwd: display_text(
-            record
-                .cwd
-                .as_deref()
-                .unwrap_or("Working directory not reported"),
-        ),
+        command: Arc::clone(&text_cache.shown_command),
+        cwd: Arc::clone(&text_cache.shown_cwd),
         status: super::rendering::block_workspace_status(record, false).0,
         provenance: format!(
             "{}\n{}\nStable block #{}",
@@ -336,9 +510,7 @@ fn review_view(review: &BlockReview, terminal: &TerminalState, writable: bool) -
             ),
             record.sequence
         ),
-        output: output
-            .map(|output| display_text(&output.text))
-            .unwrap_or_default(),
+        output: Arc::clone(&text_cache.shown_output),
         notice,
         ready: writable
             && !terminal.is_alt_buffer_active()
@@ -349,6 +521,8 @@ fn review_view(review: &BlockReview, terminal: &TerminalState, writable: bool) -
         insertion_issue,
         copy_issue,
         unavailable: false,
+        fold: review.fold_summary(terminal, policy),
+        alternate_screen: terminal.is_alt_buffer_active(),
     }
 }
 
@@ -357,6 +531,32 @@ enum ReviewAction {
     Close,
     Copy,
     Insert,
+    Collapse,
+    Expand,
+}
+
+fn draw_review_order(ui: &mut egui::Ui, review: &mut BlockReview, rows: &[String], armed: bool) {
+    egui::ScrollArea::vertical()
+        .id_salt("review-order")
+        .max_height(120.0)
+        .show_rows(ui, 24.0, rows.len(), |ui, range| {
+            for index in range {
+                if ui
+                    .add_enabled_ui(armed, |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), 24.0],
+                            egui::Button::new(&rows[index])
+                                .selected(index == review.active)
+                                .truncate(),
+                        )
+                    })
+                    .inner
+                    .clicked()
+                {
+                    review.active = index;
+                }
+            }
+        });
 }
 
 fn draw_review(
@@ -380,16 +580,14 @@ fn draw_review(
         if view.unavailable {
             ui.colored_label(ui.visuals().warn_fg_color, "A reviewed block is no longer retained. Close and select the available blocks again.");
         } else {
-            egui::ScrollArea::vertical().id_salt("review-body").max_height((size.y - if size.x < 480.0 { 340.0 } else { 280.0 }).max(60.0)).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("review-body").max_height((size.y - if size.x < 480.0 { 400.0 } else { 350.0 }).max(60.0)).show(ui, |ui| {
                 if view.rows.len() > 1 {
-                    ui.strong("Selection order");
-                    egui::ScrollArea::vertical().id_salt("review-order").max_height(120.0).show_rows(ui, 24.0, view.rows.len(), |ui, range| {
-                        for index in range {
-                            if ui.add_enabled_ui(armed, |ui| ui.add_sized([ui.available_width(), 24.0], egui::Button::new(&view.rows[index]).selected(index == review.active).truncate())).inner.clicked() {
-                                review.active = index;
-                            }
-                        }
-                    });
+                    if size.x < 480.0 {
+                        ui.collapsing("Selection order", |ui| draw_review_order(ui, review, &view.rows, armed));
+                    } else {
+                        ui.strong("Selection order");
+                        draw_review_order(ui, review, &view.rows, armed);
+                    }
                     ui.separator();
                 }
                 ui.horizontal_wrapped(|ui| {
@@ -398,15 +596,15 @@ fn draw_review(
                     ui.strong(format!("{} / {}", displayed_index + 1, view.rows.len()));
                 });
                 ui.label(&view.status);
-                ui.add(egui::Label::new(egui::RichText::new(&view.command).monospace()).selectable(true).wrap());
-                ui.add(egui::Label::new(egui::RichText::new(&view.cwd).weak()).selectable(true).wrap());
+                ui.add(egui::Label::new(egui::RichText::new(view.command.as_ref()).monospace()).selectable(true).wrap());
+                ui.add(egui::Label::new(egui::RichText::new(view.cwd.as_ref()).weak()).selectable(true).wrap());
                 ui.collapsing("Command provenance", |ui| { ui.label(&view.provenance); });
                 ui.separator();
                 ui.strong("Captured output");
                 ui.weak(&view.notice);
                 ui.small("Display capped at 256 KiB; control and bidi characters are shown escaped.");
                 if !view.output.is_empty() {
-                    ui.add(egui::Label::new(egui::RichText::new(&view.output).monospace()).selectable(true).wrap());
+                    ui.add(egui::Label::new(egui::RichText::new(view.output.as_ref()).monospace()).selectable(true).wrap());
                 }
             });
         }
@@ -419,6 +617,25 @@ fn draw_review(
             if ui.add_enabled(armed && view.copy_issue.is_none() && !view.unavailable, egui::Button::new("Copy commands")).on_disabled_hover_text(view.copy_issue.as_deref().unwrap_or("Reviewed blocks are unavailable")).clicked() && !enter_pressed { action = Some(ReviewAction::Copy); }
             if ui.add_enabled(armed && view.ready && !view.unavailable, egui::Button::new("Insert at prompt")).clicked() && !enter_pressed { action = Some(ReviewAction::Insert); }
         });
+        if !view.unavailable {
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(armed && !view.alternate_screen && view.fold.collapsible > 0, egui::Button::new("Collapse selected output")).on_hover_text("Collapse retained output for this exact selection. Captured output and commands remain available.").clicked() && !enter_pressed {
+                    action = Some(ReviewAction::Collapse);
+                }
+                if ui.add_enabled(armed && !view.alternate_screen && view.fold.collapsed > 0, egui::Button::new("Expand selected output")).clicked() && !enter_pressed {
+                    action = Some(ReviewAction::Expand);
+                }
+            });
+            if view.alternate_screen {
+                ui.weak("Output controls resume after the full-screen app closes.");
+            } else {
+                let mut status = format!("{} collapsed · {} can collapse", view.fold.collapsed, view.fold.collapsible);
+                if view.fold.unavailable > 0 {
+                    status.push_str(&format!(" · {} without exact retained output", view.fold.unavailable));
+                }
+                ui.weak(status);
+            }
+        }
         ui.weak("Insertion uses the current shell folder; it does not change directory.");
         ui.weak("Insertion fills the prompt only. Review it there before pressing Enter. Esc closes review.");
     });
@@ -454,6 +671,98 @@ fn copy_review_commands(
 }
 
 impl TerminalApp {
+    fn capture_selected_output_review(&self) -> Option<BlockReview> {
+        if !self.config.command_cards_enabled() {
+            return None;
+        }
+        let session = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())?;
+        let selection = self.block_selection.as_ref().filter(|selection| {
+            selection.session_id == session.metadata.session_id
+                && selection.selected_ids.contains(&selection.active_id)
+        })?;
+        let terminal = session.terminal.lock();
+        if terminal.is_alt_buffer_active() {
+            return None;
+        }
+        BlockReview::capture(
+            selection.session_id.clone(),
+            &selection.selected_ids,
+            &terminal,
+        )
+    }
+
+    pub(super) fn selected_output_action_available(&self, collapsed: bool) -> bool {
+        let Some(review) = self.capture_selected_output_review() else {
+            return false;
+        };
+        let session = &self.session_manager.sessions()[self.session_manager.active_index()];
+        let summary = review.fold_summary(&session.terminal.lock(), &session.projection_policy);
+        if collapsed {
+            summary.collapsible > 0
+        } else {
+            summary.collapsed > 0
+        }
+    }
+
+    pub(crate) fn block_set_selected_output_collapsed(&mut self, collapsed: bool) {
+        let Some(review) = self.capture_selected_output_review() else {
+            self.set_status(
+                "Select retained completed blocks in this pane before changing output.",
+            );
+            return;
+        };
+        let message = self.apply_reviewed_output_state(&review, collapsed);
+        self.set_status(message);
+    }
+
+    fn apply_reviewed_output_state(&mut self, review: &BlockReview, collapsed: bool) -> String {
+        if !self.config.command_cards_enabled() {
+            return "Block output controls require Block Mode.".to_owned();
+        }
+        let active = self.session_manager.active_index();
+        let Some(session) = self
+            .session_manager
+            .sessions_mut()
+            .get_mut(active)
+            .filter(|session| session.metadata.session_id == review.session_id)
+        else {
+            return "The selected pane is no longer active; no output changed.".to_owned();
+        };
+        let result = set_reviewed_output_collapsed(
+            review,
+            &mut session.terminal.lock(),
+            &mut session.projection_policy,
+            collapsed,
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => return error.to_owned(),
+        };
+        if result.changed > 0 {
+            self.smooth_scroll_velocity = 0.0;
+            self.smooth_scroll_pixel_offset = 0.0;
+            if self.search_state.is_open {
+                self.reveal_current_search_match();
+            }
+        }
+        format!(
+            "{} {} selected block outputs{}",
+            if collapsed { "Collapsed" } else { "Expanded" },
+            result.changed,
+            if result.unavailable == 0 {
+                String::new()
+            } else {
+                format!(
+                    " · {} without exact retained output skipped",
+                    result.unavailable
+                )
+            }
+        )
+    }
+
     pub(super) fn remember_block_review_invoker(&mut self, ctx: &egui::Context) {
         if !self.block_chrome_owns_keyboard(ctx) {
             return;
@@ -508,8 +817,10 @@ impl TerminalApp {
             session.purpose != crate::session::SessionPurpose::RetainedCommand
                 && session.pending_input.is_empty()
                 && !self.direct_input_is_blocked_for_session(&review.session_id),
+            &session.projection_policy,
         );
-        match draw_review(ctx, &mut review, &view) {
+        let draw_action = draw_review(ctx, &mut review, &view);
+        match draw_action {
             Some(ReviewAction::Close) => {
                 egui::Popup::close_all(ctx);
                 if view.unavailable || !restore_review_invoker(ctx, review.invoker) {
@@ -564,6 +875,12 @@ impl TerminalApp {
                 }
                 self.block_review = Some(review);
             }
+            Some(ReviewAction::Collapse | ReviewAction::Expand) => {
+                let collapsed = matches!(draw_action, Some(ReviewAction::Collapse));
+                review.error = Some(self.apply_reviewed_output_state(&review, collapsed));
+                self.block_review = Some(review);
+                ctx.request_repaint();
+            }
             None => self.block_review = Some(review),
         }
     }
@@ -598,7 +915,12 @@ mod tests {
     fn review_resolves_stable_terminal_order_without_changing_viewport() {
         let (mut terminal, review) = fixture();
         terminal.scroll_offset = 4;
-        let view = review_view(&review, &terminal, true);
+        let view = review_view(
+            &review,
+            &terminal,
+            true,
+            &crate::terminal::ProjectionPolicy::new(),
+        );
         assert!(view.rows[0].contains("cargo check"));
         assert!(view.rows[1].contains("cargo test"));
         assert!(view.provenance.contains("Exact shell-reported"));
@@ -608,26 +930,296 @@ mod tests {
     }
 
     #[test]
+    fn batch_output_actions_preserve_raw_output_and_only_change_selected_blocks() {
+        let (mut terminal, review) = fixture();
+        finish(&mut terminal, "unselected", "pwd", 0);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;jsh_id=live\x07\x1b]133;C;jsh_id=live;cmdline_url=sleep\x07running\r\n");
+        let unselected = terminal.command_record("unselected").unwrap().sequence;
+        let live = terminal.command_record("live").unwrap().sequence;
+        let raw_version = terminal.get_grid_version();
+        let snapshots = terminal
+            .command_records()
+            .iter()
+            .map(|record| {
+                (
+                    record.sequence,
+                    record.command.clone(),
+                    record.captured_output.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        let revision = policy.revision();
+        let result =
+            set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, true).unwrap();
+        assert_eq!(
+            result,
+            ReviewFoldResult {
+                changed: 2,
+                unavailable: 0
+            }
+        );
+        assert_eq!(
+            policy.revision(),
+            revision + 1,
+            "one projection transaction for the batch"
+        );
+        assert!(review
+            .sequences
+            .iter()
+            .all(|sequence| policy.is_collapsed(*sequence)));
+        assert!(!policy.is_collapsed(unselected));
+        assert!(!policy.is_collapsed(live));
+        let mut state = crate::terminal::ProjectionViewState::new();
+        let folded = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut state,
+        );
+        assert_eq!(folded.effective_collapsed().len(), 2);
+        assert_eq!(review.fold_summary(&terminal, &policy).collapsed, 2);
+        assert_eq!(
+            set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, true)
+                .unwrap()
+                .changed,
+            0
+        );
+        assert_eq!(policy.revision(), revision + 1);
+        assert_eq!(
+            set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, false)
+                .unwrap()
+                .changed,
+            2
+        );
+        let expanded = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut state,
+        );
+        assert!(expanded.effective_collapsed().is_empty());
+        assert_eq!(terminal.get_grid_version(), raw_version);
+        assert_eq!(
+            terminal
+                .command_records()
+                .iter()
+                .map(|record| (
+                    record.sequence,
+                    record.command.clone(),
+                    record.captured_output.clone()
+                ))
+                .collect::<Vec<_>>(),
+            snapshots
+        );
+        assert_eq!(
+            review.copy_commands(&terminal).unwrap(),
+            "cargo check\ncargo test"
+        );
+        assert!(!terminal.command_record("live").unwrap().complete);
+    }
+
+    #[test]
+    fn batch_output_revalidates_the_whole_identity_set_before_mutating() {
+        let (mut terminal, mut review) = fixture();
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        policy.collapse(review.sequences[0]);
+        let revision = policy.revision();
+        review.sequences.push(u64::MAX);
+        assert!(set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, false).is_err());
+        assert_eq!(policy.revision(), revision);
+        assert!(policy.is_collapsed(review.sequences[0]));
+        review.sequences.pop();
+        terminal.clear_completed_blocks();
+        finish(&mut terminal, "first", "replacement", 0);
+        finish(&mut terminal, "second", "replacement", 0);
+        assert!(set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, true).is_err());
+        assert_eq!(policy.revision(), revision);
+        assert!(terminal
+            .command_records()
+            .iter()
+            .all(|record| !policy.is_collapsed(record.sequence)));
+    }
+
+    #[test]
+    fn batch_output_skips_unavailable_ranges_and_pauses_for_alternate_screen() {
+        let (mut terminal, _) = fixture();
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;jsh_id=empty\x07true\r\n\x1b]133;C;jsh_id=empty;cmdline_url=true\x07\x1b]133;D;0;jsh_id=empty\x07");
+        let review = BlockReview::capture(
+            "pane".into(),
+            &["first".into(), "second".into(), "empty".into()],
+            &terminal,
+        )
+        .unwrap();
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        assert_eq!(
+            review.fold_summary(&terminal, &policy),
+            ReviewFoldSummary {
+                collapsed: 0,
+                collapsible: 2,
+                unavailable: 1
+            }
+        );
+        assert_eq!(
+            set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, true).unwrap(),
+            ReviewFoldResult {
+                changed: 2,
+                unavailable: 1
+            }
+        );
+        let revision = policy.revision();
+        terminal.process_input(b"\x1b[?1049h");
+        assert!(set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, false).is_err());
+        assert_eq!(policy.revision(), revision);
+        terminal.process_input(b"\x1b[?1049l");
+        assert_eq!(
+            set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, false)
+                .unwrap()
+                .changed,
+            2
+        );
+    }
+
+    #[test]
+    fn sparse_and_large_review_selections_use_one_ordered_scan() {
+        let mut terminal = TerminalState::new(80, 12);
+        for index in 0..160 {
+            finish(&mut terminal, &format!("block-{index}"), "pwd", 0);
+        }
+        let selected = (0..160)
+            .filter(|index| index % 2 == 0)
+            .map(|index| format!("block-{index}"))
+            .collect::<Vec<_>>();
+        let review = BlockReview::capture("pane".into(), &selected, &terminal).unwrap();
+        assert!(
+            review.commands.is_none(),
+            "large review keeps its existing copy budget"
+        );
+        let visits = std::cell::Cell::new(0);
+        let resolved = review
+            .resolve_from_records(
+                terminal
+                    .command_records()
+                    .iter()
+                    .inspect(|_| visits.set(visits.get() + 1)),
+            )
+            .unwrap();
+        assert_eq!(resolved.len(), 80);
+        assert!(visits.get() <= terminal.command_records().len());
+        assert_eq!(
+            resolved.iter().map(|record| &record.id).collect::<Vec<_>>(),
+            selected.iter().collect::<Vec<_>>()
+        );
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        let result =
+            set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, true).unwrap();
+        assert!(
+            result.changed > MAX_REVIEW_COMMANDS,
+            "folding does not inherit the command-copy limit"
+        );
+        assert!(terminal
+            .command_records()
+            .iter()
+            .filter(|record| !selected.contains(&record.id))
+            .all(|record| !policy.is_collapsed(record.sequence)));
+        assert!(BlockReview::capture(
+            "pane".into(),
+            &[selected[0].clone(), selected[0].clone()],
+            &terminal
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn review_text_cache_reuses_unchanged_output_and_refreshes_equal_length_changes() {
+        let (terminal, review) = fixture();
+        let policy = crate::terminal::ProjectionPolicy::new();
+        let first = review_view(&review, &terminal, false, &policy);
+        let second = review_view(&review, &terminal, false, &policy);
+        assert!(Arc::ptr_eq(&first.output, &second.output));
+        assert!(Arc::ptr_eq(&first.command, &second.command));
+        let mut record = terminal.command_record("first").unwrap().clone();
+        let mut cache = review.text_cache.borrow_mut();
+        let old_len = record.captured_output.as_ref().unwrap().text.len();
+        record
+            .captured_output
+            .as_mut()
+            .unwrap()
+            .text
+            .replace_range(..5, "Other");
+        assert_eq!(record.captured_output.as_ref().unwrap().text.len(), old_len);
+        cache.update(&record);
+        assert!(!Arc::ptr_eq(&first.output, &cache.shown_output));
+        assert!(cache.shown_output.starts_with("Other"));
+        record.captured_output = None;
+        cache.update(&record);
+        assert!(
+            cache.shown_output.is_empty(),
+            "eviction cannot display stale captured bytes"
+        );
+    }
+
+    #[test]
     fn review_rejects_evicted_identity_even_when_shell_id_is_reused() {
         let (mut terminal, review) = fixture();
         terminal.clear_completed_blocks();
         finish(&mut terminal, "first", "different", 0);
         assert!(review.resolve(&terminal).is_none());
-        assert!(review_view(&review, &terminal, true).unavailable);
+        assert!(
+            review_view(
+                &review,
+                &terminal,
+                true,
+                &crate::terminal::ProjectionPolicy::new()
+            )
+            .unavailable
+        );
     }
 
     #[test]
     fn review_is_read_only_for_dirty_busy_alt_or_retained_prompt() {
         let (mut terminal, review) = fixture();
-        assert!(!review_view(&review, &terminal, false).ready);
+        assert!(
+            !review_view(
+                &review,
+                &terminal,
+                false,
+                &crate::terminal::ProjectionPolicy::new()
+            )
+            .ready
+        );
         terminal.note_user_input(b"x");
-        assert!(!review_view(&review, &terminal, true).ready);
+        assert!(
+            !review_view(
+                &review,
+                &terminal,
+                true,
+                &crate::terminal::ProjectionPolicy::new()
+            )
+            .ready
+        );
         let (mut terminal, review) = fixture();
         terminal.process_input(b"\x1b]133;C;jsh_id=prompt;cmdline_url=sleep\x07");
-        assert!(!review_view(&review, &terminal, true).ready);
+        assert!(
+            !review_view(
+                &review,
+                &terminal,
+                true,
+                &crate::terminal::ProjectionPolicy::new()
+            )
+            .ready
+        );
         let (mut terminal, review) = fixture();
         terminal.process_input(b"\x1b[?1049h");
-        assert!(!review_view(&review, &terminal, true).ready);
+        assert!(
+            !review_view(
+                &review,
+                &terminal,
+                true,
+                &crate::terminal::ProjectionPolicy::new()
+            )
+            .ready
+        );
     }
 
     #[test]
@@ -819,7 +1411,12 @@ mod tests {
         let review = BlockReview::capture("pane".into(), &ids, &terminal).unwrap();
         assert!(review.resolve(&terminal).is_some());
         assert!(review.copy_commands(&terminal).is_err());
-        let view = review_view(&review, &terminal, true);
+        let view = review_view(
+            &review,
+            &terminal,
+            true,
+            &crate::terminal::ProjectionPolicy::new(),
+        );
         assert!(!view.unavailable);
         assert!(!view.ready);
         assert!(view.copy_issue.unwrap().contains("64 blocks"));
@@ -963,7 +1560,12 @@ mod tests {
             } else {
                 terminal.note_user_input(b"draft");
             }
-            let view = review_view(&review, &terminal, false);
+            let view = review_view(
+                &review,
+                &terminal,
+                false,
+                &crate::terminal::ProjectionPolicy::new(),
+            );
             assert!(!view.ready);
             assert!(view.copy_issue.is_none());
             let mut output = None;
@@ -996,11 +1598,88 @@ mod tests {
     }
 
     #[test]
+    fn review_batch_buttons_dispatch_real_accessible_actions_without_enter_or_prompt_writes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let (mut terminal, mut review) = fixture();
+        terminal.note_user_input(b"keep my draft");
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        let view = review_view(&review, &terminal, false, &policy);
+        let mut output = None;
+        for _ in 0..2 {
+            output = Some(test_frame(&ctx, raw_input(vec![]), |_ui| {
+                assert!(draw_review(&ctx, &mut review, &view).is_none());
+            }));
+        }
+        let collapse = button_node(output.as_ref().unwrap(), "Collapse selected output");
+        let _ = test_frame(
+            &ctx,
+            raw_input(vec![action_event(collapse, egui::accesskit::Action::Focus)]),
+            |_ui| {
+                assert!(draw_review(&ctx, &mut review, &view).is_none());
+            },
+        );
+        let _ = test_frame(
+            &ctx,
+            raw_input(vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            |_ui| {
+                assert!(draw_review(&ctx, &mut review, &view).is_none());
+            },
+        );
+        let _ = test_frame(
+            &ctx,
+            raw_input(vec![action_event(collapse, egui::accesskit::Action::Click)]),
+            |_ui| {
+                assert!(draw_review(&ctx, &mut review, &view) == Some(ReviewAction::Collapse));
+                assert_eq!(
+                    set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, true)
+                        .unwrap()
+                        .changed,
+                    2
+                );
+            },
+        );
+        let view = review_view(&review, &terminal, false, &policy);
+        assert_eq!(view.fold.collapsed, 2);
+        assert_eq!(view.fold.collapsible, 0);
+        let output = test_frame(&ctx, raw_input(vec![]), |_ui| {
+            assert!(draw_review(&ctx, &mut review, &view).is_none());
+        });
+        let expand = button_node(&output, "Expand selected output");
+        let _ = test_frame(
+            &ctx,
+            raw_input(vec![action_event(expand, egui::accesskit::Action::Click)]),
+            |_ui| {
+                assert!(draw_review(&ctx, &mut review, &view) == Some(ReviewAction::Expand));
+                assert_eq!(
+                    set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, false)
+                        .unwrap()
+                        .changed,
+                    2
+                );
+            },
+        );
+        assert!(!terminal.prompt_input_is_empty());
+        assert!(!policy.collapsed_zone_ids().any(|_| true));
+    }
+
+    #[test]
     fn review_enter_never_inserts_even_with_insert_button_focused() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let (terminal, mut review) = fixture();
-        let view = review_view(&review, &terminal, true);
+        let view = review_view(
+            &review,
+            &terminal,
+            true,
+            &crate::terminal::ProjectionPolicy::new(),
+        );
         let mut output = None;
         for _ in 0..2 {
             output = Some(test_frame(&ctx, raw_input(vec![]), |_ui| {
@@ -1051,6 +1730,7 @@ mod tests {
             ("review-unsafe", 360, 640, false),
             ("review-unicode", 360, 640, false),
             ("review-copied", 360, 640, false),
+            ("review-collapsed", 360, 640, false),
         ] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
@@ -1084,7 +1764,11 @@ mod tests {
                 review =
                     BlockReview::capture("pane".into(), &["display".into()], &terminal).unwrap();
             }
-            let view = review_view(&review, &terminal, true);
+            let mut policy = crate::terminal::ProjectionPolicy::new();
+            if name == "review-collapsed" {
+                set_reviewed_output_collapsed(&review, &mut terminal, &mut policy, true).unwrap();
+            }
+            let view = review_view(&review, &terminal, true, &policy);
             let mut capture = super::super::visual_test_support::OffscreenCapture::default();
             for pass in 0..3 {
                 let mut result = None;
@@ -1131,7 +1815,13 @@ mod tests {
                     {
                         if matches!(
                             node.label(),
-                            Some("Copy commands" | "Insert at prompt" | "Close review")
+                            Some(
+                                "Copy commands"
+                                    | "Insert at prompt"
+                                    | "Close review"
+                                    | "Collapse selected output"
+                                    | "Expand selected output"
+                            )
                         ) {
                             let bounds = node.bounds().expect("footer action bounds");
                             assert!(

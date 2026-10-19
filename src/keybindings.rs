@@ -86,6 +86,9 @@ pub enum Command {
     BlockToggleBookmark,
     /// Toggle output collapse on the explicitly selected active-pane block.
     BlockToggleCollapse,
+    /// Deterministic bulk output actions for the explicit active-pane selection.
+    BlockCollapseSelected,
+    BlockExpandSelected,
     BlockJumpPrevBookmark,
     BlockJumpNextBookmark,
     /// 清除当前 pane 中所有已完成块（frost 的 `block:clear`；可撤销）。
@@ -205,6 +208,8 @@ impl std::fmt::Display for Command {
             Command::BlockSearchToggle => write!(f, "block:search"),
             Command::BlockToggleBookmark => write!(f, "block:toggle_bookmark"),
             Command::BlockToggleCollapse => write!(f, "block:toggle_collapse"),
+            Command::BlockCollapseSelected => write!(f, "block:collapse_selected"),
+            Command::BlockExpandSelected => write!(f, "block:expand_selected"),
             Command::BlockJumpPrevBookmark => write!(f, "block:jump_prev_bookmark"),
             Command::BlockJumpNextBookmark => write!(f, "block:jump_next_bookmark"),
             Command::BlockClear => write!(f, "block:clear"),
@@ -295,6 +300,8 @@ impl std::str::FromStr for Command {
             "block:search" => Ok(Command::BlockSearchToggle),
             "block:toggle_bookmark" => Ok(Command::BlockToggleBookmark),
             "block:toggle_collapse" => Ok(Command::BlockToggleCollapse),
+            "block:collapse_selected" => Ok(Command::BlockCollapseSelected),
+            "block:expand_selected" => Ok(Command::BlockExpandSelected),
             "block:jump_prev_bookmark" => Ok(Command::BlockJumpPrevBookmark),
             "block:jump_next_bookmark" => Ok(Command::BlockJumpNextBookmark),
             "block:clear" => Ok(Command::BlockClear),
@@ -1003,6 +1010,32 @@ mod tests {
             .bindings
             .insert("alt+c".into(), command.to_string());
         assert_eq!(configured.get_command("alt+c"), Some(command));
+    }
+
+    #[test]
+    fn selected_batch_output_actions_are_bindable_without_default_key_conflicts() {
+        let defaults = KeyBindings::default_bindings();
+        for (name, command, key) in [
+            (
+                "block:collapse_selected",
+                Command::BlockCollapseSelected,
+                "alt+shift+c",
+            ),
+            (
+                "block:expand_selected",
+                Command::BlockExpandSelected,
+                "alt+shift+e",
+            ),
+        ] {
+            assert_eq!(name.parse::<Command>().unwrap(), command);
+            assert_eq!(command.to_string(), name);
+            assert!(!defaults.bindings.values().any(|value| value == name));
+            let mut configured = KeyBindings::new();
+            configured
+                .bindings
+                .insert(KeyBindings::normalize_binding(key).unwrap(), name.into());
+            assert_eq!(configured.get_command(key), Some(command));
+        }
     }
 
     #[test]

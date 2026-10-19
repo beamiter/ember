@@ -898,6 +898,8 @@ fn contextual_block_shortcut_may_dispatch(
         keybindings::Command::BlockReinputSelectedCommands
             | keybindings::Command::BlockToggleBookmark
             | keybindings::Command::BlockToggleCollapse
+            | keybindings::Command::BlockCollapseSelected
+            | keybindings::Command::BlockExpandSelected
     ) || has_target;
     if !available && !terminal_input_blocked && !crate::ui::is_modifier_only_key(key) {
         *terminal_input_seen = true;
@@ -1516,6 +1518,12 @@ impl TerminalApp {
             keybindings::Command::BlockSearchToggle => self.block_search_toggle(),
             keybindings::Command::BlockToggleBookmark => self.block_toggle_bookmark(),
             keybindings::Command::BlockToggleCollapse => self.block_toggle_collapse(),
+            keybindings::Command::BlockCollapseSelected => {
+                self.block_set_selected_output_collapsed(true)
+            }
+            keybindings::Command::BlockExpandSelected => {
+                self.block_set_selected_output_collapsed(false)
+            }
             keybindings::Command::BlockJumpPrevBookmark => {
                 self.block_jump_bookmark(crate::block_mode::SelectStep::Older)
             }
@@ -2608,11 +2616,17 @@ impl TerminalApp {
                     // older bytes when input blocking is recomputed below.
                     return OrderedPressOutcome::Ignored;
                 }
-                let has_contextual_target = if command == keybindings::Command::BlockToggleCollapse
-                {
-                    self.block_collapse_request().is_some()
-                } else {
-                    self.live_block_target().is_some()
+                let has_contextual_target = match command {
+                    keybindings::Command::BlockToggleCollapse => {
+                        self.block_collapse_request().is_some()
+                    }
+                    keybindings::Command::BlockCollapseSelected => {
+                        self.selected_output_action_available(true)
+                    }
+                    keybindings::Command::BlockExpandSelected => {
+                        self.selected_output_action_available(false)
+                    }
+                    _ => self.live_block_target().is_some(),
                 };
                 if !contextual_block_shortcut_may_dispatch(
                     &command,
@@ -3622,6 +3636,8 @@ mod tests {
         for (key, command) in [
             ("alt+c", "block:toggle_collapse"),
             ("f6", "block:toggle_collapse"),
+            ("f7", "block:collapse_selected"),
+            ("f8", "block:expand_selected"),
             ("alt+b", "block:toggle_bookmark"),
             ("alt+i", "block:reinput_selected_commands"),
             ("ctrl+shift+p", "command_palette:toggle"),
@@ -3719,6 +3735,31 @@ mod tests {
             assert!(route.queued_ime.is_empty());
             assert!(route.terminal_input_seen);
             assert!(!route.selection_postdates_input);
+        }
+    }
+
+    #[test]
+    fn bulk_output_shortcuts_keep_unavailable_keys_and_later_ime_in_terminal_order() {
+        for (key, command) in [
+            (egui::Key::F7, keybindings::Command::BlockCollapseSelected),
+            (egui::Key::F8, keybindings::Command::BlockExpandSelected),
+        ] {
+            let events = vec![
+                key_press(key, egui::Modifiers::NONE),
+                egui::Event::Ime(egui::ImeEvent::Commit("编译".into())),
+                collapse_test_palette_chord(),
+            ];
+            let unavailable = contextual_shortcut_test_route(&events, false, false);
+            assert!(unavailable.dispatched.is_empty());
+            assert!(unavailable.queued_ime.is_empty());
+            assert!(unavailable.terminal_input_seen);
+            let available = contextual_shortcut_test_route(&events, true, false);
+            assert_eq!(
+                available.dispatched,
+                vec![command, keybindings::Command::CommandPaletteToggle]
+            );
+            assert_eq!(available.queued_ime, vec!["编译"]);
+            assert!(!available.terminal_input_seen);
         }
     }
 

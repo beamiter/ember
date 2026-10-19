@@ -3761,6 +3761,31 @@ impl super::TerminalState {
             .iter()
             .any(|record| record.sequence == zone_id && record.complete)
             .then_some(())?;
+        self.retained_finished_output_range(zone_id)
+    }
+
+    /// Resolve selected output ownership with one completed-record scan. A
+    /// large selection must not scan the entire timeline once per block.
+    /// Missing or replaced row identities remain unavailable individually.
+    pub fn finished_output_ranges(
+        &self,
+        zone_ids: &[u64],
+    ) -> std::collections::HashMap<u64, FinishedOutputRange> {
+        let wanted = zone_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        self.command_records
+            .iter()
+            .filter(|record| record.complete && wanted.contains(&record.sequence))
+            .filter_map(|record| {
+                self.retained_finished_output_range(record.sequence)
+                    .map(|range| (record.sequence, range))
+            })
+            .collect()
+    }
+
+    fn retained_finished_output_range(&self, zone_id: u64) -> Option<FinishedOutputRange> {
         let provenance = self.finished_output_provenance.get(&zone_id)?;
         if provenance.range.zone_id != zone_id || provenance.rows.is_empty() {
             return None;

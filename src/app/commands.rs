@@ -5746,12 +5746,19 @@ fn selected_commands_in_terminal_order<'a>(
     if selected_ids.is_empty() {
         return Err(SelectedReplayError::NoSelection);
     }
+    let selected = selected_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    if selected.len() != selected_ids.len() {
+        return Err(SelectedReplayError::MissingRecord);
+    }
 
     let mut text = String::new();
     let mut command_count = 0usize;
     let mut seen_records = 0usize;
     for record in records {
-        if !selected_ids.iter().any(|selected| selected == record.id) {
+        if !selected.contains(record.id) {
             continue;
         }
         seen_records += 1;
