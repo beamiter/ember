@@ -98,6 +98,11 @@ pub enum Command {
     /// 把整个会话的已完成块导出为私有 Markdown/JSON 文件（frost 的会话导出）。
     BlockExportSessionMarkdown,
     BlockExportSessionJson,
+    /// Compare two explicitly selected completed command outputs in Review.
+    BlockCompareSelected,
+    /// Export only the explicit reviewed selection, in terminal order.
+    BlockExportSelectedMarkdown,
+    BlockExportSelectedJson,
 
     FontIncrease,
     FontDecrease,
@@ -218,6 +223,9 @@ impl std::fmt::Display for Command {
                 write!(f, "block:export_session_markdown")
             }
             Command::BlockExportSessionJson => write!(f, "block:export_session_json"),
+            Command::BlockCompareSelected => write!(f, "block:compare_selected"),
+            Command::BlockExportSelectedMarkdown => write!(f, "block:export_selected_markdown"),
+            Command::BlockExportSelectedJson => write!(f, "block:export_selected_json"),
             Command::FontIncrease => write!(f, "font:increase"),
             Command::FontDecrease => write!(f, "font:decrease"),
             Command::FontReset => write!(f, "font:reset"),
@@ -308,6 +316,9 @@ impl std::str::FromStr for Command {
             "block:undo_clear" => Ok(Command::BlockUndoClear),
             "block:export_session_markdown" => Ok(Command::BlockExportSessionMarkdown),
             "block:export_session_json" => Ok(Command::BlockExportSessionJson),
+            "block:compare_selected" => Ok(Command::BlockCompareSelected),
+            "block:export_selected_markdown" => Ok(Command::BlockExportSelectedMarkdown),
+            "block:export_selected_json" => Ok(Command::BlockExportSelectedJson),
             "font:increase" => Ok(Command::FontIncrease),
             "font:decrease" => Ok(Command::FontDecrease),
             "font:reset" => Ok(Command::FontReset),
@@ -1025,6 +1036,21 @@ mod tests {
                 "block:expand_selected",
                 Command::BlockExpandSelected,
                 "alt+shift+e",
+            ),
+            (
+                "block:compare_selected",
+                Command::BlockCompareSelected,
+                "alt+shift+d",
+            ),
+            (
+                "block:export_selected_markdown",
+                Command::BlockExportSelectedMarkdown,
+                "alt+shift+m",
+            ),
+            (
+                "block:export_selected_json",
+                Command::BlockExportSelectedJson,
+                "alt+shift+j",
             ),
         ] {
             assert_eq!(name.parse::<Command>().unwrap(), command);

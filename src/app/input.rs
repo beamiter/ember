@@ -900,6 +900,9 @@ fn contextual_block_shortcut_may_dispatch(
             | keybindings::Command::BlockToggleCollapse
             | keybindings::Command::BlockCollapseSelected
             | keybindings::Command::BlockExpandSelected
+            | keybindings::Command::BlockCompareSelected
+            | keybindings::Command::BlockExportSelectedMarkdown
+            | keybindings::Command::BlockExportSelectedJson
     ) || has_target;
     if !available && !terminal_input_blocked && !crate::ui::is_modifier_only_key(key) {
         *terminal_input_seen = true;
@@ -1537,6 +1540,13 @@ impl TerminalApp {
             }
             keybindings::Command::BlockExportSessionJson => {
                 self.block_export_session(crate::block_export::SessionExportFormat::Json)
+            }
+            keybindings::Command::BlockCompareSelected => self.block_compare_selected(),
+            keybindings::Command::BlockExportSelectedMarkdown => {
+                self.block_export_selected(crate::block_export::SessionExportFormat::Markdown)
+            }
+            keybindings::Command::BlockExportSelectedJson => {
+                self.block_export_selected(crate::block_export::SessionExportFormat::Json)
             }
             keybindings::Command::FontIncrease => {
                 self.set_font_size_from_command(ctx, self.config.font_size + 1.0, "Font increased")

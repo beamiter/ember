@@ -19,6 +19,8 @@ pub(crate) struct BlockReview {
     armed: bool,
     invoker: Option<egui::Id>,
     error: Option<String>,
+    comparison: Option<ReviewComparison>,
+    show_comparison: bool,
     text_cache: RefCell<ReviewTextCache>,
     fold_cache: RefCell<Option<(u64, u64, ReviewFoldSummary)>>,
 }
@@ -65,6 +67,8 @@ impl BlockReview {
             armed: false,
             invoker: None,
             error: None,
+            comparison: None,
+            show_comparison: false,
             text_cache: RefCell::default(),
             fold_cache: RefCell::default(),
         })
@@ -167,6 +171,16 @@ impl BlockReview {
         self.resolve_from_records(terminal.command_records().iter())
     }
 
+    fn compare_output(&mut self, terminal: &TerminalState) -> Result<(), &'static str> {
+        let records = self.resolve(terminal).ok_or(
+            "A reviewed block is no longer retained. Close and review the available blocks again.",
+        )?;
+        let comparison = ReviewComparison::capture(&records)?;
+        self.comparison = Some(comparison);
+        self.show_comparison = true;
+        Ok(())
+    }
+
     /// Both lists use terminal-owned monotonic sequences. Merge once instead
     /// of looking up every selected block from the beginning of the history.
     fn resolve_from_records<'a>(
@@ -221,6 +235,183 @@ impl BlockReview {
         }
         *self.fold_cache.borrow_mut() = (source.1 != 0).then_some((source.0, source.1, summary));
         summary
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReviewComparisonSource {
+    sequence: u64,
+    command: Option<String>,
+    command_exact: bool,
+    command_truncated: bool,
+    cwd: Option<String>,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    state: crate::terminal::CommandState,
+    finished_at: Option<std::time::SystemTime>,
+    start_mark_seen: bool,
+    completion_provenance: crate::block_mode::CompletionProvenance,
+    output: crate::terminal::ExtractedText,
+}
+
+impl ReviewComparisonSource {
+    fn capture(record: &CommandRecord) -> Result<Self, &'static str> {
+        let output = record.captured_output.as_ref().ok_or(
+            "Captured output is unavailable for one of these blocks. Missing output cannot be compared as empty output.",
+        )?;
+        if output.text.len() > crate::terminal::MAX_COMPLETED_COMMAND_OUTPUT_BYTES {
+            return Err("Captured output exceeds the comparison limit.");
+        }
+        Ok(Self {
+            sequence: record.sequence,
+            command: record.command.clone(),
+            command_exact: record.command_exact,
+            command_truncated: record.command_truncated,
+            cwd: record.cwd.clone(),
+            exit_code: record.exit_code,
+            duration_ms: record.duration_ms,
+            state: record.state,
+            finished_at: record.finished_at,
+            start_mark_seen: record.start_mark_seen,
+            completion_provenance: record.completion_provenance,
+            output: output.clone(),
+        })
+    }
+
+    fn matches(&self, record: &CommandRecord) -> bool {
+        record.complete
+            && self.sequence == record.sequence
+            && self.command == record.command
+            && self.command_exact == record.command_exact
+            && self.command_truncated == record.command_truncated
+            && self.cwd == record.cwd
+            && self.exit_code == record.exit_code
+            && self.duration_ms == record.duration_ms
+            && self.state == record.state
+            && self.finished_at == record.finished_at
+            && self.start_mark_seen == record.start_mark_seen
+            && self.completion_provenance == record.completion_provenance
+            && record.captured_output.as_ref() == Some(&self.output)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReviewComparisonDisplay {
+    before: Arc<str>,
+    after: Arc<str>,
+    summary: Arc<str>,
+    text: Arc<str>,
+    lines: Arc<Vec<std::ops::Range<usize>>>,
+    complete: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewComparison {
+    sources: [ReviewComparisonSource; 2],
+    display: ReviewComparisonDisplay,
+}
+
+fn comparison_issue(records: &[&CommandRecord]) -> Option<&'static str> {
+    if records.len() != 2 {
+        Some("Select exactly two completed command blocks to compare their captured output.")
+    } else if !records.iter().all(|record| record.complete)
+        || records[0].sequence >= records[1].sequence
+    {
+        Some("The comparison needs two distinct completed blocks in terminal order.")
+    } else if records.iter().any(|record| {
+        !record.command_truncated
+            && record
+                .command
+                .as_deref()
+                .is_none_or(|command| command.trim().is_empty())
+    }) {
+        Some("Output comparison needs two command blocks; background-only blocks have no command to compare.")
+    } else if records
+        .iter()
+        .any(|record| record.captured_output.is_none())
+    {
+        Some("Captured output is unavailable for one of these blocks. Missing output cannot be compared as empty output.")
+    } else {
+        None
+    }
+}
+
+fn comparison_heading(label: &str, record: &CommandRecord) -> Arc<str> {
+    format!(
+        "{label} · block #{} · {}\n{}\n{}",
+        record.sequence,
+        super::rendering::block_workspace_status(record, false).0,
+        display_text_bounded(
+            record
+                .command
+                .as_deref()
+                .unwrap_or("Command text unavailable"),
+            1024
+        ),
+        display_text_bounded(
+            record
+                .cwd
+                .as_deref()
+                .unwrap_or("Working directory not reported"),
+            1024
+        ),
+    )
+    .into()
+}
+
+impl ReviewComparison {
+    fn capture(records: &[&CommandRecord]) -> Result<Self, &'static str> {
+        if let Some(issue) = comparison_issue(records) {
+            return Err(issue);
+        }
+        let sources = [
+            ReviewComparisonSource::capture(records[0])?,
+            ReviewComparisonSource::capture(records[1])?,
+        ];
+        let result = jterm_core::output_compare::compare(
+            jterm_core::output_compare::OutputSnapshot {
+                text: &sources[0].output.text,
+                truncated: sources[0].output.truncated
+                    || sources[0].output.total_bytes > sources[0].output.text.len(),
+            },
+            jterm_core::output_compare::OutputSnapshot {
+                text: &sources[1].output.text,
+                truncated: sources[1].output.truncated
+                    || sources[1].output.total_bytes > sources[1].output.text.len(),
+            },
+        );
+        let complete = result.is_complete();
+        let summary = result.summary().into();
+        let text: Arc<str> = result.text.into();
+        let mut start = 0;
+        let lines = text
+            .split_inclusive('\n')
+            .map(|line| {
+                let range = start..start + line.trim_end_matches('\n').len();
+                start += line.len();
+                range
+            })
+            .collect();
+        Ok(Self {
+            sources,
+            display: ReviewComparisonDisplay {
+                before: comparison_heading("Before", records[0]),
+                after: comparison_heading("After", records[1]),
+                summary,
+                text,
+                lines: Arc::new(lines),
+                complete,
+            },
+        })
+    }
+
+    fn matches(&self, records: &[&CommandRecord]) -> bool {
+        records.len() == 2
+            && self
+                .sources
+                .iter()
+                .zip(records)
+                .all(|(source, record)| source.matches(record))
     }
 }
 
@@ -418,6 +609,10 @@ struct ReviewView {
     unavailable: bool,
     fold: ReviewFoldSummary,
     alternate_screen: bool,
+    comparison: Option<ReviewComparisonDisplay>,
+    comparison_issue: Option<String>,
+    comparison_stale: bool,
+    export_busy: bool,
 }
 
 fn review_view(
@@ -460,6 +655,10 @@ fn review_view(
             .as_ref()
             .map(|issue| issue.replace("nothing copied", "nothing inserted"))
     });
+    let comparison = review
+        .comparison
+        .as_ref()
+        .filter(|comparison| comparison.matches(&records));
     ReviewView {
         summary: format!(
             "{} commands · {} failures · {} background blocks",
@@ -523,6 +722,10 @@ fn review_view(
         unavailable: false,
         fold: review.fold_summary(terminal, policy),
         alternate_screen: terminal.is_alt_buffer_active(),
+        comparison: comparison.map(|comparison| comparison.display.clone()),
+        comparison_issue: comparison_issue(&records).map(str::to_owned),
+        comparison_stale: review.comparison.is_some() && comparison.is_none(),
+        export_busy: false,
     }
 }
 
@@ -533,6 +736,51 @@ enum ReviewAction {
     Insert,
     Collapse,
     Expand,
+    Compare,
+    CopyComparison,
+    ExportMarkdown,
+    ExportJson,
+}
+
+fn draw_review_comparison(ui: &mut egui::Ui, comparison: &ReviewComparisonDisplay) {
+    ui.separator();
+    ui.heading("Output comparison");
+    ui.add(
+        egui::Label::new(comparison.before.as_ref())
+            .selectable(true)
+            .wrap(),
+    );
+    ui.add(
+        egui::Label::new(comparison.after.as_ref())
+            .selectable(true)
+            .wrap(),
+    );
+    if comparison.complete {
+        ui.strong(comparison.summary.as_ref());
+    } else {
+        ui.colored_label(ui.visuals().warn_fg_color, comparison.summary.as_ref());
+    }
+    ui.weak("− removed from the earlier run · + added in the later run");
+    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+    egui::ScrollArea::both()
+        .id_salt("review-comparison-output")
+        .max_height(300.0)
+        .show_rows(ui, row_height, comparison.lines.len(), |ui, range| {
+            for index in range {
+                let line = &comparison.text[comparison.lines[index].clone()];
+                let color = match (line.as_bytes().first(), ui.visuals().dark_mode) {
+                    (Some(b'+'), true) => egui::Color32::from_rgb(100, 205, 130),
+                    (Some(b'+'), false) => egui::Color32::from_rgb(25, 115, 65),
+                    (Some(b'-'), true) => egui::Color32::from_rgb(235, 130, 130),
+                    (Some(b'-'), false) => egui::Color32::from_rgb(170, 35, 35),
+                    _ => ui.visuals().text_color(),
+                };
+                ui.add(
+                    egui::Label::new(egui::RichText::new(line).monospace().color(color))
+                        .selectable(true),
+                );
+            }
+        });
 }
 
 fn draw_review_order(ui: &mut egui::Ui, review: &mut BlockReview, rows: &[String], armed: bool) {
@@ -580,31 +828,44 @@ fn draw_review(
         if view.unavailable {
             ui.colored_label(ui.visuals().warn_fg_color, "A reviewed block is no longer retained. Close and select the available blocks again.");
         } else {
-            egui::ScrollArea::vertical().id_salt("review-body").max_height((size.y - if size.x < 480.0 { 400.0 } else { 350.0 }).max(60.0)).show(ui, |ui| {
-                if view.rows.len() > 1 {
-                    if size.x < 480.0 {
-                        ui.collapsing("Selection order", |ui| draw_review_order(ui, review, &view.rows, armed));
-                    } else {
-                        ui.strong("Selection order");
-                        draw_review_order(ui, review, &view.rows, armed);
-                    }
-                    ui.separator();
+            egui::ScrollArea::vertical().id_salt(("review-body", review.show_comparison)).max_height((size.y - if size.x < 480.0 { 350.0 } else { 320.0 }).max(60.0)).show(ui, |ui| {
+                if view.comparison.is_some() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(&mut review.show_comparison, false, "Block output");
+                        ui.selectable_value(&mut review.show_comparison, true, "Comparison");
+                    });
                 }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(armed && displayed_index > 0, egui::Button::new("Previous block")).clicked() { review.active = displayed_index - 1; }
-                    if ui.add_enabled(armed && displayed_index + 1 < view.rows.len(), egui::Button::new("Next block")).clicked() { review.active = displayed_index + 1; }
-                    ui.strong(format!("{} / {}", displayed_index + 1, view.rows.len()));
-                });
-                ui.label(&view.status);
-                ui.add(egui::Label::new(egui::RichText::new(view.command.as_ref()).monospace()).selectable(true).wrap());
-                ui.add(egui::Label::new(egui::RichText::new(view.cwd.as_ref()).weak()).selectable(true).wrap());
-                ui.collapsing("Command provenance", |ui| { ui.label(&view.provenance); });
-                ui.separator();
-                ui.strong("Captured output");
-                ui.weak(&view.notice);
-                ui.small("Display capped at 256 KiB; control and bidi characters are shown escaped.");
-                if !view.output.is_empty() {
-                    ui.add(egui::Label::new(egui::RichText::new(view.output.as_ref()).monospace()).selectable(true).wrap());
+                if let Some(comparison) = view.comparison.as_ref().filter(|_| review.show_comparison) {
+                    draw_review_comparison(ui, comparison);
+                } else {
+                    if view.rows.len() > 1 {
+                        if size.x < 480.0 {
+                            ui.collapsing("Selection order", |ui| draw_review_order(ui, review, &view.rows, armed));
+                        } else {
+                            ui.strong("Selection order");
+                            draw_review_order(ui, review, &view.rows, armed);
+                        }
+                        ui.separator();
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(armed && displayed_index > 0, egui::Button::new("Previous block")).clicked() { review.active = displayed_index - 1; }
+                        if ui.add_enabled(armed && displayed_index + 1 < view.rows.len(), egui::Button::new("Next block")).clicked() { review.active = displayed_index + 1; }
+                        ui.strong(format!("{} / {}", displayed_index + 1, view.rows.len()));
+                    });
+                    ui.label(&view.status);
+                    ui.add(egui::Label::new(egui::RichText::new(view.command.as_ref()).monospace()).selectable(true).wrap());
+                    ui.add(egui::Label::new(egui::RichText::new(view.cwd.as_ref()).weak()).selectable(true).wrap());
+                    ui.collapsing("Command provenance", |ui| { ui.label(&view.provenance); });
+                    ui.separator();
+                    if view.comparison_stale {
+                        ui.colored_label(ui.visuals().warn_fg_color, "The compared snapshots changed or were evicted. Compare the retained output again.");
+                    }
+                    ui.strong("Captured output");
+                    ui.weak(&view.notice);
+                    ui.small("Display capped at 256 KiB; control and bidi characters are shown escaped.");
+                    if !view.output.is_empty() {
+                        ui.add(egui::Label::new(egui::RichText::new(view.output.as_ref()).monospace()).selectable(true).wrap());
+                    }
                 }
             });
         }
@@ -618,6 +879,23 @@ fn draw_review(
             if ui.add_enabled(armed && view.ready && !view.unavailable, egui::Button::new("Insert at prompt")).clicked() && !enter_pressed { action = Some(ReviewAction::Insert); }
         });
         if !view.unavailable {
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(armed && view.comparison_issue.is_none(), egui::Button::new("Compare output")).on_disabled_hover_text(view.comparison_issue.as_deref().unwrap_or("Select two completed command blocks")).clicked() && !enter_pressed {
+                    action = Some(ReviewAction::Compare);
+                }
+                if ui.add_enabled(armed && view.comparison.is_some(), egui::Button::new("Copy comparison")).clicked() && !enter_pressed {
+                    action = Some(ReviewAction::CopyComparison);
+                }
+                if ui.add_enabled(armed && !view.export_busy, egui::Button::new("Export selected Markdown")).clicked() && !enter_pressed {
+                    action = Some(ReviewAction::ExportMarkdown);
+                }
+                if ui.add_enabled(armed && !view.export_busy, egui::Button::new("Export selected JSON")).clicked() && !enter_pressed {
+                    action = Some(ReviewAction::ExportJson);
+                }
+            });
+            if view.export_busy {
+                ui.weak("An export is in progress. Its completion and path appear in the status bar.");
+            }
             ui.horizontal_wrapped(|ui| {
                 if ui.add_enabled(armed && !view.alternate_screen && view.fold.collapsible > 0, egui::Button::new("Collapse selected output")).on_hover_text("Collapse retained output for this exact selection. Captured output and commands remain available.").clicked() && !enter_pressed {
                     action = Some(ReviewAction::Collapse);
@@ -636,8 +914,7 @@ fn draw_review(
                 ui.weak(status);
             }
         }
-        ui.weak("Insertion uses the current shell folder; it does not change directory.");
-        ui.weak("Insertion fills the prompt only. Review it there before pressing Enter. Esc closes review.");
+        ui.weak("Insertion fills the current shell prompt without changing folder. Review it there before Enter. Esc closes review.");
     });
     if armed && response.should_close() {
         action = Some(ReviewAction::Close);
@@ -670,7 +947,87 @@ fn copy_review_commands(
     Ok(())
 }
 
+fn copy_review_comparison(
+    ctx: &egui::Context,
+    review: &BlockReview,
+    terminal: &TerminalState,
+) -> Result<(), &'static str> {
+    let records = review
+        .resolve(terminal)
+        .ok_or("A compared block is no longer retained. Compare again before copying.")?;
+    let comparison = review
+        .comparison
+        .as_ref()
+        .filter(|comparison| comparison.matches(&records))
+        .ok_or(
+            "The compared snapshots changed. Compare the retained output again before copying.",
+        )?;
+    let display = &comparison.display;
+    ctx.copy_text(format!(
+        "{}\n\n{}\n\n{}\n\n{}",
+        display.before, display.after, display.summary, display.text,
+    ));
+    Ok(())
+}
+
 impl TerminalApp {
+    pub(crate) fn block_compare_selected(&mut self) {
+        let Some(mut review) = self.capture_selected_output_review() else {
+            self.set_status("Select two completed command blocks in this pane to compare output.");
+            return;
+        };
+        let session = &self.session_manager.sessions()[self.session_manager.active_index()];
+        if let Err(error) = review.compare_output(&session.terminal.lock()) {
+            review.error = Some(error.to_owned());
+        }
+        self.block_review = Some(review);
+        self.claim_enter_for_prompt_recall();
+    }
+
+    pub(crate) fn block_export_selected(
+        &mut self,
+        format: crate::block_export::SessionExportFormat,
+    ) {
+        let Some(review) = self.capture_selected_output_review() else {
+            self.set_status("Select retained completed blocks in this pane before exporting.");
+            return;
+        };
+        match self.start_review_export(&review, format) {
+            Ok(()) => self.set_status(format!("Exporting {} selected blocks…", format.label())),
+            Err(error) => self.set_status(error),
+        }
+    }
+
+    fn start_review_export(
+        &mut self,
+        review: &BlockReview,
+        format: crate::block_export::SessionExportFormat,
+    ) -> Result<(), String> {
+        if self.pending_session_export.is_some() {
+            return Err("An export is already in progress.".to_owned());
+        }
+        let session = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .filter(|session| {
+                session.metadata.session_id == review.session_id
+                    && self.config.command_cards_enabled()
+            })
+            .ok_or("The reviewed pane is no longer active; nothing exported.")?;
+        let snapshot = crate::block_export::snapshot_selected(
+            &session.terminal.lock(),
+            &review.session_id,
+            &review.sequences,
+        )
+        .map_err(|error| error.to_string())?;
+        self.pending_session_export = Some(
+            crate::block_export::start_session_export(snapshot, format)
+                .map_err(|error| format!("Could not start export: {error}"))?,
+        );
+        Ok(())
+    }
+
     fn capture_selected_output_review(&self) -> Option<BlockReview> {
         if !self.config.command_cards_enabled() {
             return None;
@@ -811,7 +1168,7 @@ impl TerminalApp {
         if !review.armed && review.invoker.is_none() && self.block_chrome_owns_keyboard(ctx) {
             review.invoker = ctx.memory(|memory| memory.focused());
         }
-        let view = review_view(
+        let mut view = review_view(
             &review,
             &session.terminal.lock(),
             session.purpose != crate::session::SessionPurpose::RetainedCommand
@@ -819,6 +1176,7 @@ impl TerminalApp {
                 && !self.direct_input_is_blocked_for_session(&review.session_id),
             &session.projection_policy,
         );
+        view.export_busy = self.pending_session_export.is_some();
         let draw_action = draw_review(ctx, &mut review, &view);
         match draw_action {
             Some(ReviewAction::Close) => {
@@ -837,6 +1195,36 @@ impl TerminalApp {
                     Err(error) => review.error = Some(error.into()),
                 }
                 self.block_review = Some(review);
+            }
+            Some(ReviewAction::Compare) => {
+                review.error = review
+                    .compare_output(&session.terminal.lock())
+                    .err()
+                    .map(str::to_owned);
+                self.block_review = Some(review);
+                ctx.request_repaint();
+            }
+            Some(ReviewAction::CopyComparison) => {
+                review.error = Some(
+                    match copy_review_comparison(ctx, &review, &session.terminal.lock()) {
+                        Ok(()) => "Comparison copied.".to_owned(),
+                        Err(error) => error.to_owned(),
+                    },
+                );
+                self.block_review = Some(review);
+            }
+            Some(ReviewAction::ExportMarkdown | ReviewAction::ExportJson) => {
+                let format = if matches!(draw_action, Some(ReviewAction::ExportMarkdown)) {
+                    crate::block_export::SessionExportFormat::Markdown
+                } else {
+                    crate::block_export::SessionExportFormat::Json
+                };
+                review.error = Some(match self.start_review_export(&review, format) {
+                    Ok(()) => format!("Exporting {} selected blocks. The saved path will appear in the status bar.", format.label()),
+                    Err(error) => error,
+                });
+                self.block_review = Some(review);
+                ctx.request_repaint();
             }
             Some(ReviewAction::Insert) => {
                 // Resolve every sequence again at action time. Never use a stale
@@ -909,6 +1297,151 @@ mod tests {
             BlockReview::capture("pane".into(), &["second".into(), "first".into()], &terminal)
                 .unwrap();
         (terminal, review)
+    }
+
+    #[test]
+    fn review_comparison_uses_terminal_order_and_rejects_changed_capture() {
+        let (terminal, mut review) = fixture();
+        review.compare_output(&terminal).unwrap();
+        let compared = review.comparison.as_ref().unwrap();
+        assert!(review.show_comparison);
+        assert!(compared.display.before.contains("cargo check"));
+        assert!(compared.display.after.contains("cargo test"));
+        assert!(compared
+            .display
+            .text
+            .contains("Build finished successfully"));
+        let mut records = terminal
+            .command_records()
+            .iter()
+            .filter(|record| record.complete)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(compared.matches(&records.iter().collect::<Vec<_>>()));
+        let original = records[0].captured_output.clone();
+        // Equal-length replacement is still a different captured result.
+        records[0]
+            .captured_output
+            .as_mut()
+            .unwrap()
+            .text
+            .replace_range(..5, "Other");
+        assert!(!compared.matches(&records.iter().collect::<Vec<_>>()));
+        records[0].captured_output = original;
+        records[0].cwd = Some("/tmp/another-project".to_owned());
+        assert!(!compared.matches(&records.iter().collect::<Vec<_>>()));
+        records[1].captured_output = None;
+        assert!(ReviewComparison::capture(&records.iter().collect::<Vec<_>>()).is_err());
+        assert!(ReviewComparison::capture(&[&records[0]]).is_err());
+    }
+
+    #[test]
+    fn review_comparison_retains_partial_evidence_and_empty_output_is_available() {
+        let (terminal, review) = fixture();
+        let mut records = review
+            .resolve(&terminal)
+            .unwrap()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        records[0].captured_output = Some(crate::terminal::ExtractedText::default());
+        records[1].captured_output = Some(crate::terminal::ExtractedText {
+            text: "tail\n".to_owned(),
+            truncated: true,
+            total_bytes: 9000,
+        });
+        let compared = ReviewComparison::capture(&records.iter().collect::<Vec<_>>()).unwrap();
+        assert!(!compared.display.complete);
+        assert!(compared.display.text.contains("tail"));
+        records[1].captured_output.as_mut().unwrap().truncated = false;
+        let compared = ReviewComparison::capture(&records.iter().collect::<Vec<_>>()).unwrap();
+        assert!(
+            !compared.display.complete,
+            "retention byte evidence also discloses omission"
+        );
+        records[1].sequence = records[0].sequence;
+        assert!(ReviewComparison::capture(&records.iter().collect::<Vec<_>>()).is_err());
+    }
+
+    #[test]
+    fn copied_comparison_is_read_only_and_revalidates_retained_blocks() {
+        let ctx = egui::Context::default();
+        let (mut terminal, mut review) = fixture();
+        terminal.scroll_offset = 4;
+        terminal.note_user_input(b"keep draft");
+        review.compare_output(&terminal).unwrap();
+        let copied = test_frame(&ctx, raw_input(vec![]), |_ui| {
+            copy_review_comparison(&ctx, &review, &terminal).unwrap();
+        });
+        assert!(copied.platform_output.commands.iter().any(|command|
+            matches!(command, egui::OutputCommand::CopyText(text)
+                if text.contains("Before") && text.contains("After") && text.contains("cargo check"))));
+        assert_eq!(terminal.scroll_offset, 4);
+        assert!(!terminal.prompt_input_is_empty());
+        terminal.clear_completed_blocks();
+        let rejected = test_frame(&ctx, raw_input(vec![]), |_ui| {
+            assert!(copy_review_comparison(&ctx, &review, &terminal).is_err());
+        });
+        assert!(!rejected
+            .platform_output
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::OutputCommand::CopyText(_))));
+    }
+
+    #[test]
+    fn review_compare_and_export_buttons_require_explicit_actions() {
+        for (label, expected) in [
+            ("Compare output", ReviewAction::Compare),
+            ("Export selected Markdown", ReviewAction::ExportMarkdown),
+            ("Export selected JSON", ReviewAction::ExportJson),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let (mut terminal, mut review) = fixture();
+            terminal.note_user_input(b"keep draft");
+            let view = review_view(
+                &review,
+                &terminal,
+                false,
+                &crate::terminal::ProjectionPolicy::new(),
+            );
+            let mut output = None;
+            for _ in 0..2 {
+                output = Some(test_frame(&ctx, raw_input(vec![]), |_ui| {
+                    assert!(draw_review(&ctx, &mut review, &view).is_none());
+                }));
+            }
+            let button = button_node(output.as_ref().unwrap(), label);
+            let _ = test_frame(
+                &ctx,
+                raw_input(vec![action_event(button, egui::accesskit::Action::Focus)]),
+                |_ui| {
+                    assert!(draw_review(&ctx, &mut review, &view).is_none());
+                },
+            );
+            let _ = test_frame(
+                &ctx,
+                raw_input(vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]),
+                |_ui| {
+                    assert!(draw_review(&ctx, &mut review, &view).is_none());
+                },
+            );
+            let _ = test_frame(
+                &ctx,
+                raw_input(vec![action_event(button, egui::accesskit::Action::Click)]),
+                |_ui| {
+                    assert!(draw_review(&ctx, &mut review, &view) == Some(expected));
+                },
+            );
+            assert!(!terminal.prompt_input_is_empty());
+        }
     }
 
     #[test]
@@ -1731,6 +2264,7 @@ mod tests {
             ("review-unicode", 360, 640, false),
             ("review-copied", 360, 640, false),
             ("review-collapsed", 360, 640, false),
+            ("review-comparison", 360, 640, false),
         ] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
@@ -1753,6 +2287,9 @@ mod tests {
             }
             if name == "review-copied" {
                 review.error = Some("Commands copied. Nothing inserted or run.".into());
+            }
+            if name == "review-comparison" {
+                review.compare_output(&terminal).unwrap();
             }
             if matches!(name, "review-unsafe" | "review-unicode") {
                 let command = if name == "review-unsafe" {
@@ -1821,6 +2358,10 @@ mod tests {
                                     | "Close review"
                                     | "Collapse selected output"
                                     | "Expand selected output"
+                                    | "Compare output"
+                                    | "Copy comparison"
+                                    | "Export selected Markdown"
+                                    | "Export selected JSON"
                             )
                         ) {
                             let bounds = node.bounds().expect("footer action bounds");
@@ -1832,6 +2373,29 @@ mod tests {
                                 "{name}: footer {bounds:?} outside {width}x{height}"
                             );
                         }
+                    }
+                    if name == "review-comparison" {
+                        let nodes = &output
+                            .platform_output
+                            .accesskit_update
+                            .as_ref()
+                            .unwrap()
+                            .nodes;
+                        let footer = nodes
+                            .iter()
+                            .find(|(_, node)| node.label() == Some("Close review"))
+                            .and_then(|(_, node)| node.bounds())
+                            .expect("visible comparison footer");
+                        let removed = nodes
+                            .iter()
+                            .find(|(_, node)| {
+                                node.label() == Some("-Build finished successfully")
+                                    || node.value() == Some("-Build finished successfully")
+                            })
+                            .and_then(|(_, node)| node.bounds())
+                            .expect("first changed line is rendered");
+                        assert!(removed.y0 >= 0.0 && removed.y1 <= footer.y0,
+                            "comparison changes must be visible on opening, above the footer: {removed:?}, {footer:?}");
                     }
                 }
                 if pass == 2 {

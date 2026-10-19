@@ -468,6 +468,18 @@ changing the terminal viewport height. Narrow panes move secondary actions into 
   one clipboard write; incomplete, truncated, inexact, unsafe or evicted commands reject
   the whole batch. Copy and review insertion are bounded to 64 blocks / 256 KiB including
   command separators. Larger selections remain inspectable; select a smaller range to copy
+- **Compare output** compares exactly two selected completed command blocks, with the
+  earlier run as **Before** and the later run as **After**. Review shows both commands,
+  working directories and outcomes alongside added/removed lines. **Block output** and
+  **Comparison** switch between the retained output and the comparison without losing the
+  selection; **Copy comparison** copies the labelled report. Missing snapshots cannot be
+  mistaken for empty output, and a changed or evicted snapshot invalidates the old report
+- **Export selected Markdown / JSON** writes only the selected blocks in terminal order.
+  The document records its selection scope, command provenance, status, duration, cwd and
+  missing/truncated output; unselected history is excluded. Files are saved privately as
+  `selection-<timestamp>.md` / `.json` in Ember's data directory under `exports/`, with
+  collision-safe publication. The status bar shows the saved path. Export uses the same
+  captured snapshots as Review, without reconstructing missing output from current rows
 - **Fill prompt** and card-menu insertion open this review before **Insert at prompt**;
   **Enter** keeps the existing direct, guarded selection-insertion shortcut outside review.
   Inside review Enter never inserts; use the explicit button. Insertion uses the current
@@ -513,6 +525,16 @@ validate command size without assembling discarded clipboard payloads, while the
 command/output display reuses its escaped text until the exact retained source changes.
 Output-fold availability follows the terminal's ownership revision, so an unchanged
 review does not rescan every selected output range on every frame.
+
+Comparisons are computed only on request, cache the exact source snapshots, and render
+visible diff rows. The shared comparison engine bounds each input to 256 KiB / 4096 lines,
+alignment to 1,048,576 cells and the report to 512 KiB; partial captures and coarse or
+clipped comparisons are labelled. Selection export retains the existing 16 MiB source
+and 64 MiB serialized-document limits and runs file I/O outside the UI thread. Compare
+and export also appear in **Actions** and the command palette, and can be assigned to
+`block:compare_selected`, `block:export_selected_markdown` and
+`block:export_selected_json`. They do not submit commands or change the current shell
+folder, and introduce no default shortcut conflicts.
 
 Completed records use `jterm_core::block_contract` only after Ember has merged
 OSC 133 metadata with its bounded screen reconstruction. Card badges,

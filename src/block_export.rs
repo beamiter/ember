@@ -7,7 +7,7 @@
 
 use crate::block_mode;
 use crate::persistence_file;
-use crate::terminal::{TerminalState, MAX_COMPLETED_COMMAND_OUTPUT_BYTES};
+use crate::terminal::{CommandRecord, TerminalState, MAX_COMPLETED_COMMAND_OUTPUT_BYTES};
 use serde::Serialize;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -43,6 +43,22 @@ impl SessionExportFormat {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionExportScope {
+    Session,
+    Selection,
+}
+
+impl SessionExportScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Selection => "selected",
+        }
+    }
+}
+
 /// Stable, renderer-independent representation of one exported ember block.
 /// Mirrors frost's export shape, plus `command_exact` so a screen-reconstructed
 /// command can never read like shell-supplied metadata.
@@ -57,8 +73,9 @@ pub struct SessionExportBlock {
     pub command_exact: bool,
     pub output: String,
     pub output_truncated: bool,
-    /// Both the retained output snapshot and its original buffer rows are
-    /// gone. Kept distinct from a command that genuinely printed nothing.
+    /// No output was available under this export's retention policy. A
+    /// selection export never reconstructs missing snapshots from live rows.
+    /// Kept distinct from a command that genuinely printed nothing.
     pub output_unavailable: bool,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
@@ -107,6 +124,7 @@ pub struct SessionExportSnapshot {
     pub pane_session_id: String,
     pub captured_at_ms: u64,
     pub captured_tz_offset_secs: i32,
+    pub scope: SessionExportScope,
     pub blocks: Vec<SessionExportBlock>,
 }
 
@@ -130,6 +148,7 @@ struct JsonSessionExport<'a> {
     captured_at_ms: u64,
     captured_tz_offset_secs: i32,
     block_order: &'static str,
+    scope: SessionExportScope,
     retention: SessionExportRetention,
     blocks: &'a [SessionExportBlock],
 }
@@ -225,9 +244,9 @@ impl SessionExportBlock {
             self.completion_provenance,
         );
         if self.output_unavailable {
-            // An evicted capture is not evidence that the command printed
+            // An unavailable capture is not evidence that the command printed
             // nothing. Keep that distinction in Markdown as well as JSON.
-            markdown.push_str("\n- Note: output unavailable (snapshot and buffer rows evicted)\n");
+            markdown.push_str("\n- Note: output unavailable; no output was reconstructed\n");
         }
         markdown
     }
@@ -312,6 +331,125 @@ pub fn snapshot_session(
         pane_session_id: pane_session_id.to_string(),
         captured_at_ms: now_ms,
         captured_tz_offset_secs: block_mode::local_utc_offset_secs(now_ms / 1000),
+        scope: SessionExportScope::Session,
+        blocks,
+    })
+}
+
+/// Snapshot only the exact reviewed terminal-owned sequences. Resolve the
+/// entire oldest-first identity set before cloning any output; one retired,
+/// replaced or still-running record rejects the operation. Unlike a whole
+/// session export, this deliberately uses the same captured snapshots shown
+/// in Review and never silently substitutes current scrollback rows.
+pub fn snapshot_selected(
+    terminal: &TerminalState,
+    pane_session_id: &str,
+    sequences: &[u64],
+) -> io::Result<SessionExportSnapshot> {
+    snapshot_selected_records(
+        terminal.command_records().iter(),
+        pane_session_id,
+        sequences,
+    )
+}
+
+fn snapshot_selected_records<'a>(
+    records: impl Iterator<Item = &'a CommandRecord>,
+    pane_session_id: &str,
+    sequences: &[u64],
+) -> io::Result<SessionExportSnapshot> {
+    let unavailable = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Selected blocks changed or are no longer retained. Review the selection again; nothing exported.",
+        )
+    };
+    if sequences.is_empty()
+        || sequences.len() > crate::terminal::MAX_COMMAND_MARKS
+        || sequences.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(unavailable());
+    }
+    let mut selected = Vec::with_capacity(sequences.len());
+    let mut targets = sequences.iter().copied();
+    let mut target = targets.next().ok_or_else(unavailable)?;
+    for record in records {
+        if record.sequence < target {
+            continue;
+        }
+        if record.sequence != target || !record.complete {
+            return Err(unavailable());
+        }
+        selected.push(record);
+        let Some(next) = targets.next() else {
+            break;
+        };
+        target = next;
+    }
+    if selected.len() != sequences.len() {
+        return Err(unavailable());
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut source_bytes = 0usize;
+    let mut blocks = Vec::with_capacity(selected.len());
+    for record in selected {
+        let captured = record.captured_output.as_ref();
+        let output = captured.map_or("", |text| text.text.as_str());
+        if output.len() > MAX_COMPLETED_COMMAND_OUTPUT_BYTES {
+            return Err(too_large());
+        }
+        let record_bytes = output
+            .len()
+            .saturating_add(record.command.as_ref().map_or(0, String::len))
+            .saturating_add(record.cwd.as_ref().map_or(0, String::len))
+            .saturating_add(128);
+        source_bytes = source_bytes
+            .checked_add(record_bytes)
+            .ok_or_else(too_large)?;
+        if source_bytes > MAX_SESSION_EXPORT_SOURCE_BYTES {
+            return Err(too_large());
+        }
+        let finished_secs = record
+            .finished_at
+            .and_then(block_mode::epoch_secs)
+            .unwrap_or(now_ms / 1000);
+        blocks.push(SessionExportBlock {
+            id: record.id.clone(),
+            sequence: record.sequence,
+            command: record.command.clone(),
+            command_exact: record.command_exact,
+            output: output.to_owned(),
+            output_truncated: captured
+                .is_some_and(|text| text.truncated || text.total_bytes > text.text.len()),
+            output_unavailable: captured.is_none(),
+            exit_code: record.exit_code,
+            duration_ms: record.duration_ms,
+            finished_at_ms: record
+                .finished_at
+                .and_then(block_mode::epoch_secs)
+                .map(|secs| secs.saturating_mul(1_000)),
+            tz_offset_secs: block_mode::local_utc_offset_secs(finished_secs),
+            cwd: record.cwd.clone(),
+            command_truncated: record.command_truncated,
+            start_mark_seen: record.start_mark_seen,
+            completion_provenance: record.completion_provenance,
+            lifecycle_health: block_mode::assess_lifecycle(
+                record.start_mark_seen,
+                record.completion_provenance,
+            ),
+            completion_observed: record.completion_provenance
+                == block_mode::CompletionProvenance::ShellReported,
+        });
+    }
+    Ok(SessionExportSnapshot {
+        pane_session_id: pane_session_id.to_owned(),
+        captured_at_ms: now_ms,
+        captured_tz_offset_secs: block_mode::local_utc_offset_secs(now_ms / 1000),
+        scope: SessionExportScope::Selection,
         blocks,
     })
 }
@@ -364,6 +502,7 @@ fn serialize_session(
                 captured_at_ms: snapshot.captured_at_ms,
                 captured_tz_offset_secs: snapshot.captured_tz_offset_secs,
                 block_order: "oldest_first",
+                scope: snapshot.scope,
                 retention: snapshot.retention(),
                 blocks: &snapshot.blocks,
             };
@@ -372,7 +511,14 @@ fn serialize_session(
             writer.write_all(b"\n")?;
         }
         SessionExportFormat::Markdown => {
-            writeln!(writer, "# Terminal Session Export\n")?;
+            writeln!(
+                writer,
+                "# Terminal {} Export\n",
+                match snapshot.scope {
+                    SessionExportScope::Session => "Session",
+                    SessionExportScope::Selection => "Selection",
+                }
+            )?;
             writeln!(writer, "Pane session: {}", snapshot.pane_session_id)?;
             writeln!(
                 writer,
@@ -382,7 +528,22 @@ fn serialize_session(
                     snapshot.captured_tz_offset_secs
                 )
             )?;
-            writeln!(writer, "Total retained blocks: {}\n", snapshot.blocks.len())?;
+            match snapshot.scope {
+                SessionExportScope::Session => {
+                    writeln!(writer, "Total retained blocks: {}\n", snapshot.blocks.len())?;
+                }
+                SessionExportScope::Selection => {
+                    writeln!(
+                        writer,
+                        "Selected blocks: {} (terminal order)\n",
+                        snapshot.blocks.len()
+                    )?;
+                    writeln!(
+                        writer,
+                        "Only the selected captured snapshots are included.\n"
+                    )?;
+                }
+            }
             writeln!(writer, "---\n")?;
             for (index, block) in snapshot.blocks.iter().enumerate() {
                 writeln!(writer, "## Block #{}\n", index + 1)?;
@@ -394,11 +555,20 @@ fn serialize_session(
     Ok(writer.finish())
 }
 
-fn export_file_name(stamp: &str, extension: &str, attempt: u32) -> String {
+fn export_file_name(
+    stamp: &str,
+    extension: &str,
+    attempt: u32,
+    scope: SessionExportScope,
+) -> String {
+    let prefix = match scope {
+        SessionExportScope::Session => "session",
+        SessionExportScope::Selection => "selection",
+    };
     if attempt == 0 {
-        format!("session-{stamp}.{extension}")
+        format!("{prefix}-{stamp}.{extension}")
     } else {
-        format!("session-{stamp}-{attempt}.{extension}")
+        format!("{prefix}-{stamp}-{attempt}.{extension}")
     }
 }
 
@@ -407,10 +577,11 @@ fn write_session_export(
     stamp: &str,
     format: SessionExportFormat,
     contents: &[u8],
+    scope: SessionExportScope,
 ) -> io::Result<PathBuf> {
     persistence_file::ensure_private_directory(directory)?;
     for attempt in 0..100u32 {
-        let path = directory.join(export_file_name(stamp, format.extension(), attempt));
+        let path = directory.join(export_file_name(stamp, format.extension(), attempt, scope));
         match persistence_file::write_new_private_file(
             &path,
             contents,
@@ -447,7 +618,13 @@ pub fn export_session_to_file(
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no user data directory"))?
         .join("ember")
         .join("exports");
-    write_session_export(&directory, &export_stamp(), format, &contents)
+    write_session_export(
+        &directory,
+        &export_stamp(),
+        format,
+        &contents,
+        snapshot.scope,
+    )
 }
 
 /// In-flight export worker polled by the app each frame. The owned snapshot
@@ -455,6 +632,7 @@ pub fn export_session_to_file(
 /// through an export.
 pub struct PendingSessionExport {
     pub format: SessionExportFormat,
+    pub scope: SessionExportScope,
     receiver: std::sync::mpsc::Receiver<io::Result<PathBuf>>,
 }
 
@@ -472,12 +650,17 @@ pub fn start_session_export(
     format: SessionExportFormat,
 ) -> io::Result<PendingSessionExport> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let scope = snapshot.scope;
     std::thread::Builder::new()
         .name("ember-session-export".to_string())
         .spawn(move || {
             let _ = sender.send(export_session_to_file(&snapshot, format));
         })?;
-    Ok(PendingSessionExport { format, receiver })
+    Ok(PendingSessionExport {
+        format,
+        scope,
+        receiver,
+    })
 }
 
 #[cfg(test)]
@@ -535,8 +718,113 @@ mod tests {
             pane_session_id: "pane-42".to_string(),
             captured_at_ms: 0,
             captured_tz_offset_secs: 0,
+            scope: SessionExportScope::Session,
             blocks,
         }
+    }
+
+    fn selection_fixture() -> Vec<CommandRecord> {
+        let mut terminal = TerminalState::new(80, 12);
+        for (id, command, output) in [
+            ("first", "cargo%20check", "first result"),
+            ("private", "printf%20unrelated", "unrelated output"),
+            ("last", "cargo%20test", "last result"),
+        ] {
+            terminal.process_input(format!(
+                "\x1b]133;A\x07$ \x1b]133;B;jsh_id={id}\x07run\r\n\x1b]133;C;jsh_id={id};cmdline_url={command}\x07{output}\r\n\x1b]133;D;0;jsh_id={id}\x07\r\n"
+            ).as_bytes());
+        }
+        terminal
+            .command_records()
+            .iter()
+            .filter(|record| record.complete)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn selected_export_preserves_sparse_identity_order_and_omits_other_blocks() {
+        let records = selection_fixture();
+        assert_eq!(records.len(), 3);
+        let ids = [records[0].sequence, records[2].sequence];
+        let selected = snapshot_selected_records(records.iter(), "pane", &ids).unwrap();
+        assert_eq!(selected.scope, SessionExportScope::Selection);
+        assert_eq!(
+            selected
+                .blocks
+                .iter()
+                .map(|block| block.sequence)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(selected.blocks[0].output, "first result\n");
+        let json: serde_json::Value = serde_json::from_slice(
+            &serialize_session(&selected, SessionExportFormat::Json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["scope"], "selection");
+        assert_eq!(json["blocks"].as_array().unwrap().len(), 2);
+        let markdown =
+            String::from_utf8(serialize_session(&selected, SessionExportFormat::Markdown).unwrap())
+                .unwrap();
+        assert!(markdown.starts_with("# Terminal Selection Export\n"));
+        assert!(markdown.contains("Selected blocks: 2 (terminal order)"));
+        assert!(markdown.find("first result").unwrap() < markdown.find("last result").unwrap());
+        assert!(!markdown.contains("unrelated"));
+    }
+
+    #[test]
+    fn selected_export_rejects_stale_duplicate_reordered_and_running_identities() {
+        let mut records = selection_fixture();
+        let first = records[0].sequence;
+        let last = records[2].sequence;
+        for ids in [
+            vec![],
+            vec![first, first],
+            vec![last, first],
+            vec![first, last + 1],
+        ] {
+            assert!(snapshot_selected_records(records.iter(), "pane", &ids).is_err());
+        }
+        records[2].complete = false;
+        assert!(snapshot_selected_records(records.iter(), "pane", &[first, last]).is_err());
+        records[2].complete = true;
+        // Reusing a shell-controlled id cannot authorize a replacement sequence.
+        records[2].sequence += 1;
+        assert!(snapshot_selected_records(records.iter(), "pane", &[first, last]).is_err());
+    }
+
+    #[test]
+    fn selected_export_discloses_missing_and_partial_snapshots_without_reconstruction() {
+        let mut records = selection_fixture();
+        let ids = [records[0].sequence, records[2].sequence];
+        records[0].captured_output = None;
+        records[2].captured_output = Some(crate::terminal::ExtractedText {
+            text: "bounded tail\n".to_owned(),
+            truncated: true,
+            total_bytes: 1_000_000,
+        });
+        let selected = snapshot_selected_records(records.iter(), "pane", &ids).unwrap();
+        assert!(selected.blocks[0].output_unavailable);
+        assert!(selected.blocks[0].output.is_empty());
+        assert!(selected.blocks[1].output_truncated);
+        let json: serde_json::Value = serde_json::from_slice(
+            &serialize_session(&selected, SessionExportFormat::Json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["retention"]["output_unavailable"], 1);
+        assert_eq!(json["retention"]["output_truncated"], 1);
+        records[0].captured_output = Some(crate::terminal::ExtractedText {
+            text: "x".repeat(MAX_COMPLETED_COMMAND_OUTPUT_BYTES + 1),
+            truncated: false,
+            total_bytes: MAX_COMPLETED_COMMAND_OUTPUT_BYTES + 1,
+        });
+        assert_eq!(
+            snapshot_selected_records(records.iter(), "pane", &ids)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::FileTooLarge,
+        );
     }
 
     #[test]
@@ -731,7 +1019,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                markdown.contains("- Note: output unavailable (snapshot and buffer rows evicted)"),
+                markdown.contains("- Note: output unavailable; no output was reconstructed"),
                 "{markdown}"
             );
             let mut empty = unavailable.clone();
@@ -751,6 +1039,7 @@ mod tests {
             "20260807-101112",
             SessionExportFormat::Markdown,
             b"first",
+            SessionExportScope::Session,
         )
         .unwrap();
         let second = write_session_export(
@@ -758,6 +1047,7 @@ mod tests {
             "20260807-101112",
             SessionExportFormat::Markdown,
             b"second",
+            SessionExportScope::Session,
         )
         .unwrap();
 
@@ -799,6 +1089,7 @@ mod tests {
                         "20260807-101112",
                         SessionExportFormat::Json,
                         contents,
+                        SessionExportScope::Session,
                     )
                     .unwrap()
                 })
@@ -820,12 +1111,16 @@ mod tests {
     #[test]
     fn export_file_names_are_family_shaped() {
         assert_eq!(
-            export_file_name("20260807-101112", "json", 0),
+            export_file_name("20260807-101112", "json", 0, SessionExportScope::Session),
             "session-20260807-101112.json"
         );
         assert_eq!(
-            export_file_name("20260807-101112", "json", 3),
+            export_file_name("20260807-101112", "json", 3, SessionExportScope::Session),
             "session-20260807-101112-3.json"
+        );
+        assert_eq!(
+            export_file_name("20260807-101112", "md", 0, SessionExportScope::Selection),
+            "selection-20260807-101112.md"
         );
     }
 
@@ -840,9 +1135,14 @@ mod tests {
         let first_name = dir.0.join("session-20260807-101112.json");
         symlink(&victim, &first_name).unwrap();
 
-        let exported =
-            write_session_export(&dir.0, "20260807-101112", SessionExportFormat::Json, b"new")
-                .unwrap();
+        let exported = write_session_export(
+            &dir.0,
+            "20260807-101112",
+            SessionExportFormat::Json,
+            b"new",
+            SessionExportScope::Session,
+        )
+        .unwrap();
 
         assert_eq!(
             exported.file_name().unwrap(),
@@ -871,6 +1171,7 @@ mod tests {
             "20260807-101112",
             SessionExportFormat::Markdown,
             b"private",
+            SessionExportScope::Session,
         )
         .is_err());
         assert_eq!(fs::read_dir(&victim).unwrap().count(), 0);

@@ -1004,6 +1004,37 @@ fn block_workspace_selection_menu(
             BlockWorkspaceAction::Target(choice),
         );
     }
+    for (label, command, enabled, tooltip) in [
+        (
+            "Compare selected outputs",
+            crate::keybindings::Command::BlockCompareSelected,
+            valid && snapshot.selected_count == 2,
+            "Compare two completed command snapshots in terminal order",
+        ),
+        (
+            "Export selected as Markdown",
+            crate::keybindings::Command::BlockExportSelectedMarkdown,
+            valid,
+            "Export only this selection with captured output and provenance",
+        ),
+        (
+            "Export selected as JSON",
+            crate::keybindings::Command::BlockExportSelectedJson,
+            valid,
+            "Export only this selection in a structured document",
+        ),
+    ] {
+        block_workspace_menu_item(
+            ui,
+            focus,
+            keybindings,
+            action,
+            label,
+            enabled,
+            tooltip,
+            BlockWorkspaceAction::Command(command),
+        );
+    }
     ui.separator();
     block_workspace_menu_item(ui, focus, keybindings, action, review_commands_menu_label(snapshot.selected_count), valid && !snapshot.read_only,
         "Review selected commands before inserting. Opening review does not fill the prompt or run anything; insertion requires a separate explicit action.",

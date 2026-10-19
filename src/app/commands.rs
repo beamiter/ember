@@ -3400,10 +3400,10 @@ impl TerminalApp {
     /// `poll_task_creation`. Completion only touches the status line; the
     /// worker already published the file.
     pub(crate) fn poll_session_export(&mut self, ctx: &egui::Context) {
-        let Some((format, result)) = self
+        let Some((format, scope, result)) = self
             .pending_session_export
             .as_ref()
-            .map(|pending| (pending.format, pending.try_recv()))
+            .map(|pending| (pending.format, pending.scope, pending.try_recv()))
         else {
             return;
         };
@@ -3422,8 +3422,9 @@ impl TerminalApp {
                 self.pending_session_export = None;
                 self.set_status_for(
                     format!(
-                        "Exported {} session blocks to {}",
+                        "Exported {} {} blocks to {}",
                         format.label(),
+                        scope.label(),
                         path.display()
                     ),
                     Duration::from_secs(8),

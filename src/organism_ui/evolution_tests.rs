@@ -366,7 +366,7 @@ fn native_transition_uses_its_own_submitted_pose_and_stable_envelope() {
     let arc = host.native_bridge.active.unwrap();
     assert_eq!(arc.transition, VisualTransition::InspectErrorToGuardFailure);
     assert_eq!(host.bridge.last_settled, Some(Behavior::Sleep));
-    let now = arc.started + Duration::from_millis(u64::from(arc.transition.frame_count()) * 100);
+    let now = arc.started + Duration::from_millis(arc.transition.frame_count() * 100);
     host.born = Instant::now() - now;
     body_frame(&mut host, &ctx, &config, "active", safe_region());
     assert!(host.native_bridge.active.is_none());
