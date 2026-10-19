@@ -55,6 +55,7 @@ mod terminal;
 mod terminal_ime;
 mod theme;
 mod ui;
+mod vim9_ide;
 mod watch_adapter;
 mod windows_compat;
 mod workflow_picker;
@@ -2454,6 +2455,12 @@ impl TerminalApp {
         repaint_ctx: egui::Context,
         wgpu_render_state: Option<egui_wgpu::RenderState>,
     ) -> std::result::Result<Self, String> {
+        let startup_editor = vim9_ide::startup_target()
+            .map(jterm_core::vim9::Vim9Session::start)
+            .transpose()
+            .map_err(|e| format!("Vim9 IDE could not start: {e}"))?;
+        let startup_root = startup_editor.as_ref().map(|s| s.root().to_path_buf());
+        let startup_argv = startup_editor.as_ref().map(|s| s.launch_argv());
         let (cols, rows) = clamp_terminal_dimensions(cfg.cols, cfg.rows);
         crate::debug_log!(
             "[INIT] terminal dimensions cfg=({}, {}) clamped=({}, {})",
@@ -2469,11 +2476,12 @@ impl TerminalApp {
 
         let mut session_restore_notice = None;
         let mut session_recovery = None;
-        let mut session_persistence_blocked = false;
+        let mut session_persistence_blocked = startup_editor.is_some();
 
         // 仅在首个实例且配置允许时恢复会话。损坏文件先移到旁路备份；
         // 若备份失败则禁止本进程保存，绝不让新建的单会话覆盖原始证据。
-        let saved_snapshot = if cfg.restore_session && is_first_instance {
+        let saved_snapshot = if cfg.restore_session && is_first_instance && startup_editor.is_none()
+        {
             match cfg.resolved_session_history_path() {
                 Ok(path) => {
                     let (loaded, recovery) = session_recovery::SessionRecovery::load(&path);
@@ -2522,9 +2530,14 @@ impl TerminalApp {
         };
 
         // 创建首个会话，使用保存的 cwd 和 session_id（如果有）
-        let first_cwd = saved_snapshot
+        let first_cwd = startup_root
             .as_ref()
-            .and_then(|s| s.sessions.first()?.cwd.as_deref().map(String::from));
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| {
+                saved_snapshot
+                    .as_ref()
+                    .and_then(|s| s.sessions.first()?.cwd.as_deref().map(String::from))
+            });
         let first_session_id = saved_snapshot
             .as_ref()
             .and_then(|s| s.sessions.first()?.session_id.as_deref().map(String::from))
@@ -2546,7 +2559,7 @@ impl TerminalApp {
             first_cwd.as_deref(),
             Some(&first_session_id),
             configured_shell.as_deref(),
-            None,
+            startup_argv.as_deref(),
             repaint_ctx.clone(),
         ) {
             Ok(session) => {
@@ -2554,6 +2567,9 @@ impl TerminalApp {
                 session
             }
             Err(e) => {
+                if startup_editor.is_some() {
+                    return Err(format!("Vim9 editor process could not start: {e}"));
+                }
                 eprintln!(
                     "✗ Failed to start shell with saved cwd, falling back: {}",
                     e
@@ -2578,12 +2594,18 @@ impl TerminalApp {
             }
         };
 
-        let session = Session::with_default_name_and_session_id(
+        let mut session = Session::with_default_name_and_session_id(
             0,
             Arc::new(ParkingMutex::new(terminal)),
             shell,
-            first_session_id,
+            first_session_id.clone(),
         );
+        let mut vim9_editors = std::collections::HashMap::new();
+        if let Some(editor) = startup_editor {
+            session.purpose = crate::session::SessionPurpose::EphemeralCommand;
+            session.metadata.name = "Vim9 IDE".to_string();
+            vim9_editors.insert(first_session_id, vim9_ide::Workbench::new(editor));
+        }
         let mut session_manager = SessionManager::new(session, repaint_ctx, configured_shell);
 
         // 恢复额外的会话（包括 restorable commands 回放）
@@ -2676,6 +2698,9 @@ impl TerminalApp {
 
         Ok(TerminalApp {
             session_manager,
+            vim9_editors,
+            vim9_window_close_pending: false,
+            vim9_pending_tab_closes: Vec::new(),
             renderer,
             clipboard,
             clipboard_request_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2713,6 +2738,13 @@ impl TerminalApp {
                 // 三个视图在两种 tab 栏布局下都可用：Top 模式下侧边栏的
                 // Sessions 列表与顶部 tab 栏并存(与 frost 一致)。
                 sb.view = sidebar::effective_view(cfg.sidebar_view, cfg.experimental_task_sidebar);
+                if let Some(root) = startup_root {
+                    sb.visible = true;
+                    sb.view = sidebar::SidebarView::Files;
+                    if let Some(error) = sb.set_current_dir(root) {
+                        eprintln!("[Vim9] file tree: {error}");
+                    }
+                }
                 sb
             },
             sidebar_name_dialog: None,
@@ -4363,13 +4395,17 @@ impl TerminalApp {
             }
         }
         if let Some(path) = open_file_path.take() {
-            match crate::link::open_local_path(&path) {
-                Ok(()) => self
-                    .set_status_for(format!("Opened {}", path.display()), Duration::from_secs(3)),
-                Err(error) => self.set_status_for(
-                    format!("Could not open {}: {error}", path.display()),
-                    Duration::from_secs(5),
-                ),
+            if !self.vim9_open_file(&path) {
+                match crate::link::open_local_path(&path) {
+                    Ok(()) => self.set_status_for(
+                        format!("Opened {}", path.display()),
+                        Duration::from_secs(3),
+                    ),
+                    Err(error) => self.set_status_for(
+                        format!("Could not open {}: {error}", path.display()),
+                        Duration::from_secs(5),
+                    ),
+                }
             }
         }
         if follow_toggled {
@@ -5506,6 +5542,7 @@ impl TerminalApp {
         // 窗口底边，侧边栏落在顶栏与它之间。
         self.render_bottom_bar(root_ui);
         self.render_organism(root_ui);
+        self.render_vim9_workbench(root_ui);
 
         // 侧边栏：在顶栏之后声明，占据顶栏下方区域的左侧。
         self.render_sidebar(root_ui);
@@ -5643,6 +5680,7 @@ impl eframe::App for TerminalApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.guard_vim9_window_close(ctx);
         self.observe_organism_visibility(ctx);
     }
 
@@ -5658,6 +5696,7 @@ impl eframe::App for TerminalApp {
         // observation must still yield to an explicit Files intent that ran
         // earlier in the same frame.
         let frame_start_files_user_intent = self.sidebar.files_user_intent_generation();
+        self.flush_vim9_tab_closes(ctx);
 
         // 检查是否收到退出信号（SIGINT/SIGTERM）
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
@@ -5889,6 +5928,7 @@ impl eframe::App for TerminalApp {
             .map(|exited| (exited.session_id, exited.exit_code))
             .collect();
         for (session_id, exit_code) in exited_sessions {
+            self.vim9_editors.remove(&session_id);
             let terminal_role = self.task_manager.terminal_role_for_session(&session_id);
             let task_terminal = self.handle_task_terminal_exit(&session_id, exit_code);
             let Some(session_idx) = self.session_manager.index_of(&session_id) else {
@@ -6574,6 +6614,7 @@ impl eframe::App for TerminalApp {
                         }
                     }
                     Ok(ShellEvent::Exit(code)) => {
+                        self.vim9_editors.remove(&session.metadata.session_id);
                         crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
                         shell_exit_observed = true;
                         shell_exit_code = Some(code);

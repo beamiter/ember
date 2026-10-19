@@ -141,6 +141,9 @@ pub struct TerminalMouseCapture {
 /// Main application state
 pub struct TerminalApp {
     pub session_manager: SessionManager,
+    pub(crate) vim9_editors: std::collections::HashMap<String, crate::vim9_ide::Workbench>,
+    pub(crate) vim9_window_close_pending: bool,
+    pub(crate) vim9_pending_tab_closes: Vec<Vec<String>>,
     pub renderer: TerminalRenderer,
     pub clipboard: Option<ClipboardManager>,
     /// Serializes OSC 5522 clipboard reads. Clipboard owners are external

@@ -694,6 +694,12 @@ impl CommandPalette {
                 "Show or hide renderer diagnostics",
                 crate::keybindings::Command::DebugToggle,
             ),
+            CommandInfo::new(
+                "Vim9 IDE: Open Project",
+                CommandCategory::Session,
+                "Open a real Vim9 editor with native buffers, code actions, project search and build diagnostics",
+                crate::keybindings::Command::Vim9Open,
+            ),
         ];
 
         for index in 0..8 {

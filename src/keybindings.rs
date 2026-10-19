@@ -22,6 +22,7 @@ fn write_binding_warning(writer: &mut impl std::io::Write, warning: &str) {
 /// 所有可用的命令
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Command {
+    Vim9Open,
     // === 会话管理 ===
     SessionNew,
     SessionClose,
@@ -171,6 +172,7 @@ pub enum Command {
 impl std::fmt::Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Command::Vim9Open => write!(f, "ide:open"),
             Command::SessionNew => write!(f, "session:new"),
             Command::SessionClose => write!(f, "session:close"),
             Command::SessionNext => write!(f, "session:next"),
@@ -269,6 +271,7 @@ impl std::str::FromStr for Command {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "ide:open" => Ok(Command::Vim9Open),
             "session:new" => Ok(Command::SessionNew),
             "session:close" => Ok(Command::SessionClose),
             "session:next" => Ok(Command::SessionNext),

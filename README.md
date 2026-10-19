@@ -8,6 +8,16 @@ The project is under active development. It is useful as a daily terminal for
 testing, but compatibility with every TUI and escape sequence is not yet
 claimed.
 
+## Native Vim9 IDE
+
+Run `ember --ide /path/to/project` (or `ember --ide file.rs`) to open a real
+Vim9 editor in the GPU terminal grid with an egui workbench: file navigation,
+buffers, saving, project search, asynchronous builds, output and clickable
+diagnostics. The **Vim9** title-bar button and **Vim9 IDE: Open Project**
+command-palette action open a new editor tab in an existing terminal workspace.
+Your Vim configuration, mappings, registers and undo remain Vim's.
+See [the Vim9 IDE guide](docs/vim9-ide.md).
+
 ## Highlights
 
 - WGPU terminal grid rendering with a CPU/Glow fallback

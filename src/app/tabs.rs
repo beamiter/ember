@@ -501,6 +501,22 @@ impl TerminalApp {
     /// 窗格的意义——不会有孤儿 PTY 以隐藏会话的形式留在后台。
     /// 返回 false 表示这是最后一个 tab(调用方应转为关闭窗口)。
     pub fn close_tab_synced(&mut self, tab_idx: usize) -> bool {
+        let vim9_targets = self.tabs.sessions_in(tab_idx);
+        if self.request_vim9_close(&vim9_targets) {
+            let members: Vec<_> = vim9_targets
+                .iter()
+                .filter_map(|&index| {
+                    self.session_manager
+                        .sessions()
+                        .get(index)
+                        .map(|s| s.metadata.session_id.clone())
+                })
+                .collect();
+            if !self.vim9_pending_tab_closes.contains(&members) {
+                self.vim9_pending_tab_closes.push(members);
+            }
+            return true;
+        }
         if tab_idx >= self.tabs.len() || self.tabs.len() <= 1 {
             return false;
         }
@@ -558,6 +574,9 @@ impl TerminalApp {
     /// 只处理单个会话。若它是所属 tab 的最后一个窗格,请改用
     /// [`Self::close_tab_synced`],否则那个 tab 会留下指向已删除会话的窗格。
     pub fn close_session_synced(&mut self, index: usize) -> bool {
+        if self.request_vim9_close(&[index]) {
+            return false;
+        }
         if index >= self.session_manager.len() || self.session_manager.len() <= 1 {
             return false;
         }
@@ -1392,6 +1411,15 @@ impl TerminalApp {
         )
         .on_hover_text("Move tab bar to the top");
 
+        let vim9_launch_clicked = crate::vim9_ide::launch_button(
+            ui,
+            egui::Rect::from_min_size(
+                egui::pos2(tab_rect.left() + 65.0, tab_rect.top() + 5.0),
+                egui::vec2(52.0, tab_height - 10.0),
+            ),
+            font_size,
+        );
+
         // 关闭窗口按钮（最右侧，与顶部 tab 模式保持一致）
         let close_win_size = 25.0;
         let close_win_rect = egui::Rect::from_min_size(
@@ -1449,6 +1477,9 @@ impl TerminalApp {
             egui::vec2(ui.available_width(), tab_height),
             egui::Sense::hover(),
         );
+        if vim9_launch_clicked && !workspace_drag_in_flight {
+            self.open_vim9_ide(None);
+        }
     }
 
     pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
@@ -1492,10 +1523,9 @@ impl TerminalApp {
         let active_min_width: f32 = min_tab_width * 2.0; // 当前 session 最小宽度，更突出
         let tab_spacing: f32 = 1.0;
         let base_left_margin: f32 = 5.0;
-        // 顶栏左侧始终预留两个控件位：☰ 侧边栏开关 + ⬓ 标签栏位置切换。
-        // 标签从这两个控件之后开始排布，避免遮挡。
+        // 顶栏左侧预留侧边栏、标签栏位置和 Vim9 启动控件，避免遮挡标签。
         let ctrl_btn_w: f32 = font_size + 16.0;
-        let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0 + 4.0;
+        let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0 + 60.0;
         let reserved_right: f32 = 80.0; // "+"按钮 + 关闭窗口按钮 + margin
         let tab_clip_rect = egui::Rect::from_min_max(
             egui::pos2(tab_rect.left() + left_margin, tab_rect.top()),
@@ -1706,6 +1736,17 @@ impl TerminalApp {
         let mut begin_rename_idx: Option<Vec<String>> = None;
         let mut renaming_rect: Option<(std::sync::Arc<()>, egui::Rect)> = None;
 
+        let vim9_launch_clicked = crate::vim9_ide::launch_button(
+            ui,
+            egui::Rect::from_min_size(
+                egui::pos2(
+                    tab_rect.left() + base_left_margin + ctrl_btn_w * 2.0,
+                    tab_rect.top() + 5.0,
+                ),
+                egui::vec2(52.0, tab_height - 10.0),
+            ),
+            font_size,
+        );
         // === 顶栏左侧控件：☰ 侧边栏开关 + ⬓ 标签栏位置切换（始终显示）===
         {
             // ☰ 侧边栏开关
@@ -2466,6 +2507,9 @@ impl TerminalApp {
             }
         }
 
+        if vim9_launch_clicked && !any_tab_drag_in_flight && !pane_drag_in_flight {
+            self.open_vim9_ide(None);
+        }
         false
     }
 }

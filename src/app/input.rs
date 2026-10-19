@@ -1226,6 +1226,14 @@ impl TerminalApp {
 
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
         self.block_review.is_some()
+            || (egui::Popup::is_any_open(ctx)
+                && self
+                    .session_manager
+                    .sessions()
+                    .get(self.session_manager.active_index())
+                    .is_some_and(|session| {
+                        self.vim9_editors.contains_key(&session.metadata.session_id)
+                    }))
             || should_block_terminal_input(
                 self.search_state.is_open,
                 self.config_panel.is_open,
@@ -1419,6 +1427,7 @@ impl TerminalApp {
         command: keybindings::Command,
     ) -> bool {
         match command {
+            keybindings::Command::Vim9Open => self.open_vim9_ide(None),
             keybindings::Command::SessionNew => {
                 self.new_tab();
             }
