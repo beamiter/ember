@@ -721,6 +721,40 @@ const MIN_ADAPTIVE_SAMPLE_BYTES: usize = 4 * 1024;
 const BLOCK_WORKSPACE_HEIGHT: f32 = 36.0;
 const BLOCK_WORKSPACE_ROW_HEIGHT: f32 = 24.0;
 
+/// Only known immersive executables, not arbitrary running shell commands,
+/// can hide the navigator when alternate-screen detection is unavailable.
+fn immersive_block_command(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let name = first.trim_matches(|ch| ch == '\'' || ch == '"').rsplit('/').next().unwrap_or("");
+    let name = if matches!(name, "npx" | "bunx") {
+        words.next().unwrap_or("")
+    } else if name == "pnpm" && matches!(words.next(), Some("dlx" | "exec")) {
+        words.next().unwrap_or("")
+    } else {
+        name
+    };
+    let name = name.trim_matches(|ch| ch == '\'' || ch == '"').rsplit('/').next().unwrap_or("");
+    matches!(name,
+        "vi" | "vim" | "nvim" | "view" | "vimdiff" | "emacs" | "nano"
+        | "hx" | "helix" | "kak" | "less" | "most" | "more"
+        | "top" | "htop" | "btop" | "yazi" | "ranger" | "nnn"
+        | "tmux" | "screen" | "lazygit" | "lazydocker" | "k9s"
+        | "codex" | "@openai/codex" | "claude" | "@anthropic-ai/claude-code"
+        | "gemini" | "opencode" | "aider")
+}
+
+fn block_workspace_should_show(
+    block_mode: bool,
+    user_hidden: bool,
+    alternate_screen: bool,
+    native_vim9_editor: bool,
+    running_command: Option<&str>,
+) -> bool {
+    block_mode && !user_hidden && !alternate_screen && !native_vim9_editor
+        && !running_command.is_some_and(immersive_block_command)
+}
+
 fn block_workspace_height(ui: &egui::Ui) -> f32 {
     // One compact row, with enough room for the actual font at larger zoom.
     // Selection and window width never add a second row or resize the PTY.
@@ -2252,8 +2286,13 @@ impl TerminalApp {
         };
         let terminal = session.terminal.lock();
         let workspace_height = block_workspace_height(ui);
-        if !self.config.command_cards_enabled()
-            || !block_workspace_has_room(
+        if !block_workspace_should_show(
+            self.config.command_cards_enabled(),
+            self.block_bar_user_hidden,
+            terminal.is_alt_buffer_active(),
+            self.renderer.native_vim9_frame.is_some(),
+            terminal.running_command(),
+        ) || !block_workspace_has_room(
                 ui.available_size(),
                 self.renderer.line_height,
                 workspace_height,
@@ -6561,6 +6600,28 @@ mod tests {
             20.0,
             height
         ));
+    }
+
+    #[test]
+    fn block_workspace_auto_hides_only_for_immersive_sessions() {
+        use super::{block_workspace_should_show as visible, immersive_block_command as tui};
+        for executable in ["vim", "nvim", "codex", "claude", "gemini", "opencode", "htop", "tmux"] {
+            assert!(tui(executable));
+            assert!(!visible(true, false, false, false, Some(executable)));
+        }
+        assert!(tui("/usr/bin/vim README.md"));
+        assert!(tui("npx @openai/codex"));
+        assert!(tui("pnpm dlx codex"));
+        assert!(!tui("echo codex"));
+        assert!(!tui("cargo test"));
+        assert!(visible(true, false, false, false, Some("cargo test")));
+        assert!(visible(true, false, false, false, None));
+        assert!(!visible(true, false, true, false, None));
+        assert!(!visible(true, false, false, true, None));
+        assert!(!visible(true, true, false, false, None));
+        assert!(!visible(false, false, false, false, None));
+        // A finished TUI restores full shell controls unless hidden by the user.
+        assert!(visible(true, false, false, false, None));
     }
 
     #[test]

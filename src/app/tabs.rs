@@ -1302,6 +1302,48 @@ impl TerminalApp {
     /// 渲染会话标签栏。返回 true 表示请求关闭窗口，render_ui 应据此提前返回。
     /// Sidebar tab 模式下的精简顶部栏：仅含侧边栏 toggle(☰)，用于预留顶部空间，
     /// 避免用浮动按钮直接覆盖终端内容造成 UI 干扰。
+    /// Always-available, zero-extra-height Blocks toggle in either tab-bar mode.
+    /// Clicking never changes terminal input or adds a row to the editor area.
+    fn render_blocks_nav_toggle(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        font_size: f32,
+        accent: egui::Color32,
+        inactive: egui::Color32,
+    ) {
+        if !self.config.command_cards_enabled() {
+            return;
+        }
+        let help = if self.block_bar_user_hidden {
+            "Show Blocks navigator at the shell (interactive apps stay full-screen)"
+        } else {
+            "Hide Blocks navigator (auto-hidden inside interactive apps)"
+        };
+        let response = ui.interact(
+            rect,
+            egui::Id::new("blocks-nav-toolbar-toggle"),
+            egui::Sense::click(),
+        ).on_hover_text(help);
+        ui.painter().rect_filled(
+            rect,
+            5.0,
+            accent.gamma_multiply(if response.hovered() { 0.22 } else { 0.08 }),
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "▤",
+            egui::FontId::proportional(font_size.min(18.0)),
+            if self.block_bar_user_hidden { inactive } else { accent },
+        );
+        if response.clicked() {
+            self.block_bar_user_hidden = !self.block_bar_user_hidden;
+            self.return_focus_to_terminal(ui.ctx());
+            ui.ctx().request_repaint();
+        }
+    }
+
     pub fn render_sidebar_mode_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let font_size = self.config.effective_ui_font_size();
         let tab_height = crate::theme::workspace_control_height(font_size) + 10.0;
@@ -1473,6 +1515,18 @@ impl TerminalApp {
         )
         .on_hover_text("Close window");
 
+        if !workspace_drag_in_flight {
+            self.render_blocks_nav_toggle(
+                ui,
+                egui::Rect::from_min_size(
+                    egui::pos2(tab_rect.left() + 123.0, tab_rect.top() + 5.0),
+                    egui::vec2(26.0, tab_height - 10.0),
+                ),
+                font_size,
+                tb_accent,
+                tb_inactive_text,
+            );
+        }
         ui.allocate_exact_size(
             egui::vec2(ui.available_width(), tab_height),
             egui::Sense::hover(),
@@ -1525,7 +1579,7 @@ impl TerminalApp {
         let base_left_margin: f32 = 5.0;
         // 顶栏左侧预留侧边栏、标签栏位置和 Vim9 启动控件，避免遮挡标签。
         let ctrl_btn_w: f32 = font_size + 16.0;
-        let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0 + 60.0;
+        let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0 + 90.0;
         let reserved_right: f32 = 80.0; // "+"按钮 + 关闭窗口按钮 + margin
         let tab_clip_rect = egui::Rect::from_min_max(
             egui::pos2(tab_rect.left() + left_margin, tab_rect.top()),
@@ -1747,6 +1801,21 @@ impl TerminalApp {
             ),
             font_size,
         );
+        if !any_tab_drag_in_flight && !pane_drag_in_flight {
+            self.render_blocks_nav_toggle(
+                ui,
+                egui::Rect::from_min_size(
+                    egui::pos2(
+                        tab_rect.left() + base_left_margin + ctrl_btn_w * 2.0 + 58.0,
+                        tab_rect.top() + 5.0,
+                    ),
+                    egui::vec2(26.0, tab_height - 10.0),
+                ),
+                font_size,
+                tb_accent,
+                tb_inactive_text,
+            );
+        }
         // === 顶栏左侧控件：☰ 侧边栏开关 + ⬓ 标签栏位置切换（始终显示）===
         {
             // ☰ 侧边栏开关

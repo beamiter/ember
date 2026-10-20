@@ -248,6 +248,8 @@ pub struct TerminalApp {
     pub(crate) block_review: Option<super::block_review::BlockReview>,
     pub(crate) reading_history: super::block_review::ReadingHistory,
     pub block_selection: Option<crate::block_mode::BlockSelection>,
+    /// Manual user preference. Immersive programs still auto-hide until they exit.
+    pub(crate) block_bar_user_hidden: bool,
 
     /// `block:search` 跨块搜索选择器（palette 式浮层）。打开期间拥有键盘
     /// 输入,终端事件被拦截,因此不会顺带清掉 block_selection。

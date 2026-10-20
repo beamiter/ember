@@ -2771,6 +2771,7 @@ impl TerminalApp {
             block_review: None,
             reading_history: Default::default(),
             block_selection: None,
+            block_bar_user_hidden: false,
             block_search: Default::default(),
             block_bookmarks: Default::default(),
             pending_session_export: None,
