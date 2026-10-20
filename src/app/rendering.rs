@@ -744,6 +744,36 @@ fn immersive_block_command(command: &str) -> bool {
         .rsplit('/')
         .next()
         .unwrap_or("");
+    // Keep the shell navigator visible for noninteractive subcommands and
+    // help/version queries, even when their executable is a known TUI.
+    if words
+        .clone()
+        .any(|arg| matches!(arg, "-h" | "--help" | "--version"))
+    {
+        return false;
+    }
+    const AGENTS: &[&str] = &[
+        "codex",
+        "@openai/codex",
+        "claude",
+        "@anthropic-ai/claude-code",
+        "gemini",
+        "opencode",
+        "aider",
+    ];
+    const NON_INTERACTIVE: &[&str] = &[
+        "exec",
+        "e",
+        "completion",
+        "login",
+        "logout",
+        "--print",
+        "-p",
+        "--prompt",
+    ];
+    if AGENTS.contains(&name) && words.any(|arg| NON_INTERACTIVE.contains(&arg)) {
+        return false;
+    }
     const APPS: &[&str] = &[
         "vi",
         "vim",
@@ -2325,12 +2355,25 @@ impl TerminalApp {
         };
         let terminal = session.terminal.lock();
         let workspace_height = block_workspace_height(ui);
+        let running_command = terminal.running_command();
+        // Alternate-screen covers most editors. Without OSC 133, the actual
+        // foreground process identifies no-alt-screen agent CLIs as well.
+        // Avoid /proc reads when a trusted prompt is idle or metadata suffices.
+        let foreground_process = if running_command.is_none()
+            && !terminal.is_alt_buffer_active()
+            && !terminal.shell_is_prompt_ready()
+            && self.config.command_cards_enabled()
+        {
+            crate::session_manager::get_foreground_command(session.get_shell_pid())
+        } else {
+            None
+        };
         if !block_workspace_should_show(
             self.config.command_cards_enabled(),
             self.block_bar_user_hidden,
             terminal.is_alt_buffer_active(),
             self.renderer.native_vim9_frame.is_some(),
-            terminal.running_command(),
+            running_command.or(foreground_process.as_deref()),
         ) || !block_workspace_has_room(
             ui.available_size(),
             self.renderer.line_height,
@@ -6654,6 +6697,13 @@ mod tests {
         assert!(tui("pnpm dlx codex"));
         assert!(!tui("echo codex"));
         assert!(!tui("cargo test"));
+        assert!(!tui("codex exec --json"));
+        assert!(!tui("npx @openai/codex exec"));
+        assert!(!tui("claude -p hello"));
+        assert!(!tui("gemini --prompt hello"));
+        assert!(!tui("vim --version"));
+        assert!(tui("codex --no-alt-screen"));
+        assert!(tui("npx @openai/codex --no-alt-screen"));
         assert!(visible(true, false, false, false, Some("cargo test")));
         assert!(visible(true, false, false, false, None));
         assert!(!visible(true, false, true, false, None));
