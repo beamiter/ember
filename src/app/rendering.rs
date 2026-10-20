@@ -726,22 +726,32 @@ const BLOCK_WORKSPACE_ROW_HEIGHT: f32 = 24.0;
 fn immersive_block_command(command: &str) -> bool {
     let mut words = command.split_whitespace();
     let first = words.next().unwrap_or("");
-    let name = first.trim_matches(|ch| ch == '\'' || ch == '"').rsplit('/').next().unwrap_or("");
-    let name = if matches!(name, "npx" | "bunx") {
-        words.next().unwrap_or("")
-    } else if name == "pnpm" && matches!(words.next(), Some("dlx" | "exec")) {
-        words.next().unwrap_or("")
-    } else {
-        name
+    let name = first
+        .trim_matches(|ch| ch == '\'' || ch == '"')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let name = match name {
+        "npx" | "bunx" => words.next().unwrap_or(""),
+        "pnpm" => match words.next() {
+            Some("dlx" | "exec") => words.next().unwrap_or(""),
+            _ => name,
+        },
+        _ => name,
     };
-    let name = name.trim_matches(|ch| ch == '\'' || ch == '"').rsplit('/').next().unwrap_or("");
-    matches!(name,
-        "vi" | "vim" | "nvim" | "view" | "vimdiff" | "emacs" | "nano"
-        | "hx" | "helix" | "kak" | "less" | "most" | "more"
-        | "top" | "htop" | "btop" | "yazi" | "ranger" | "nnn"
-        | "tmux" | "screen" | "lazygit" | "lazydocker" | "k9s"
-        | "codex" | "@openai/codex" | "claude" | "@anthropic-ai/claude-code"
-        | "gemini" | "opencode" | "aider")
+    let name = name
+        .trim_matches(|ch| ch == '\'' || ch == '"')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    const APPS: &[&str] = &[
+        "vi", "vim", "nvim", "view", "vimdiff", "emacs", "nano", "hx", "helix",
+        "kak", "less", "most", "more", "top", "htop", "btop", "yazi", "ranger",
+        "nnn", "tmux", "screen", "lazygit", "lazydocker", "k9s", "codex",
+        "@openai/codex", "claude", "@anthropic-ai/claude-code", "gemini",
+        "opencode", "aider",
+    ];
+    APPS.contains(&name)
 }
 
 fn block_workspace_should_show(
@@ -751,7 +761,10 @@ fn block_workspace_should_show(
     native_vim9_editor: bool,
     running_command: Option<&str>,
 ) -> bool {
-    block_mode && !user_hidden && !alternate_screen && !native_vim9_editor
+    block_mode
+        && !user_hidden
+        && !alternate_screen
+        && !native_vim9_editor
         && !running_command.is_some_and(immersive_block_command)
 }
 
@@ -2293,11 +2306,10 @@ impl TerminalApp {
             self.renderer.native_vim9_frame.is_some(),
             terminal.running_command(),
         ) || !block_workspace_has_room(
-                ui.available_size(),
-                self.renderer.line_height,
-                workspace_height,
-            )
-        {
+            ui.available_size(),
+            self.renderer.line_height,
+            workspace_height,
+        ) {
             drop(terminal);
             if block_workspace_has_focus(ctx) {
                 self.return_focus_to_terminal(ctx);
@@ -6605,7 +6617,9 @@ mod tests {
     #[test]
     fn block_workspace_auto_hides_only_for_immersive_sessions() {
         use super::{block_workspace_should_show as visible, immersive_block_command as tui};
-        for executable in ["vim", "nvim", "codex", "claude", "gemini", "opencode", "htop", "tmux"] {
+        for executable in [
+            "vim", "nvim", "codex", "claude", "gemini", "opencode", "htop", "tmux",
+        ] {
             assert!(tui(executable));
             assert!(!visible(true, false, false, false, Some(executable)));
         }

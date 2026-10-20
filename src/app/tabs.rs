@@ -1320,11 +1320,13 @@ impl TerminalApp {
         } else {
             "Hide Blocks navigator (auto-hidden inside interactive apps)"
         };
-        let response = ui.interact(
-            rect,
-            egui::Id::new("blocks-nav-toolbar-toggle"),
-            egui::Sense::click(),
-        ).on_hover_text(help);
+        let response = ui
+            .interact(
+                rect,
+                egui::Id::new("blocks-nav-toolbar-toggle"),
+                egui::Sense::click(),
+            )
+            .on_hover_text(help);
         ui.painter().rect_filled(
             rect,
             5.0,
@@ -1335,7 +1337,11 @@ impl TerminalApp {
             egui::Align2::CENTER_CENTER,
             "▤",
             egui::FontId::proportional(font_size.min(18.0)),
-            if self.block_bar_user_hidden { inactive } else { accent },
+            if self.block_bar_user_hidden {
+                inactive
+            } else {
+                accent
+            },
         );
         if response.clicked() {
             self.block_bar_user_hidden = !self.block_bar_user_hidden;
