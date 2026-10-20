@@ -18,6 +18,12 @@ command-palette action open a new editor tab in an existing terminal workspace.
 Your Vim configuration, mappings, registers and undo remain Vim's.
 See [the Vim9 IDE guide](docs/vim9-ide.md).
 
+The native workbench includes fuzzy **Quick Open** (`Ctrl+Shift+P`),
+**Go to line** (`Ctrl+Shift+G`), protected buffer close, Vim window splits,
+keyboard save/search/build actions, and an explicit **Save + Build** command.
+Project indexing runs in the background, while modal input stays isolated
+from the real Vim editing process.
+
 ## Highlights
 
 - WGPU terminal grid rendering with a CPU/Glow fallback

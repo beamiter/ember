@@ -1,5 +1,52 @@
 # Engineering handoff
 
+## 2026-10-20 — native Vim9 keyboard workbench
+
+- Added native Quick Open and Go to line dialogs around the real Vim process.
+  Quick Open uses the shared asynchronous, ignore-aware project index; matches
+  are ranked only when the query or indexed file `Arc` changes. Keyboard
+  selection, scanning/error/limit feedback, refresh, and filenames containing
+  spaces are supported. Go to line accepts positive `line` or `line:column`.
+- Routed the shared editor shortcuts through Ember's existing ordered input
+  dispatcher only when the active Vim grid owns input. Ordinary Vim control
+  chords and shell-tab bindings retain their existing behavior. Native forms
+  and dialogs own keyboard/IME input, including confirmation/cancellation
+  batches and held Enter; same-frame text edits are applied before choosing
+  a Quick Open result. Editor commands are also available in the palette and
+  as named custom bindings.
+- Added protected buffer close, previous/next buffer navigation, native Vim
+  vertical/horizontal split actions, and stable session/buffer widget IDs.
+  Current-buffer close resolves its target inside Vim when the command runs;
+  each buffer-strip close retains its explicit buffer ID.
+  Build and search shortcuts focus their forms. The separate Save + Build
+  action requests write-all followed by a build only after successful writes.
+  The ordinary Build action retains its explicit execution behavior.
+- Status now includes line count, file type, encoding, Vim window count,
+  cancelled builds, omitted output lines, and the shared core's bounded wait
+  for Vim to finish input before saving. Build output retains the newest
+  lines through the shared core rather than freezing after a large job.
+- Focused validation passed: 9 new Vim9 UI routing/command tests, 57 existing
+  application input tests, and 17 command-palette tests (in both library and
+  binary targets). Repository Rustfmt, Python smoke-script syntax, diff check,
+  and workspace/all-targets/all-features Clippy with warnings denied passed.
+  The local compiler needed command-line-only single-codegen-unit overrides
+  for several large crates after producing empty object files; repository
+  build profiles remain unchanged.
+- The complete `scripts/native-vim9-smoke.py` passed in a real Ember/Vim window
+  on Xvfb with software GLES: immediate Escape then Ctrl+S, Quick Open with a
+  space-containing path, Go to line, native modal/form cancellation, split,
+  modified-buffer protection, Save all, explicit Save + Build, and explicit
+  build-form submission. A batched Escape + Enter neither executes the build
+  nor moves the Vim cursor; reopening and submitting executes exactly once.
+  Clean exit and the saved shell layout also passed. No extra Escape-settling
+  delay was added to bypass the shared Vim busy-state regression. This does
+  not certify physical GPUs, Wayland, or a platform IME.
+- Final integration pins both dependency entries, Cargo.lock, and the
+  cargo-deny Git allow-list to published `jterm_core`
+  `3b6b0590799bca0a64441f1f5fe17e2cf0234cbd`. No unrelated lock entries changed.
+  `cargo check --locked --tests` passed against the real remote Git dependency,
+  without a local path override.
+
 ## 2026-10-19 — selected-output workspace upgrade
 
 - Added `block:collapse_selected` / `block:expand_selected`, without default

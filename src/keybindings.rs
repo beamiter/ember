@@ -23,6 +23,17 @@ fn write_binding_warning(writer: &mut impl std::io::Write, warning: &str) {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Command {
     Vim9Open,
+    Vim9QuickOpen,
+    Vim9Goto,
+    Vim9Save,
+    Vim9SaveAll,
+    Vim9Search,
+    Vim9Build,
+    Vim9PreviousBuffer,
+    Vim9NextBuffer,
+    Vim9CloseBuffer,
+    Vim9NextProblem,
+    Vim9PreviousProblem,
     // === 会话管理 ===
     SessionNew,
     SessionClose,
@@ -173,6 +184,17 @@ impl std::fmt::Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Command::Vim9Open => write!(f, "ide:open"),
+            Command::Vim9QuickOpen => write!(f, "ide:quick_open"),
+            Command::Vim9Goto => write!(f, "ide:goto"),
+            Command::Vim9Save => write!(f, "ide:save"),
+            Command::Vim9SaveAll => write!(f, "ide:save_all"),
+            Command::Vim9Search => write!(f, "ide:search"),
+            Command::Vim9Build => write!(f, "ide:build"),
+            Command::Vim9PreviousBuffer => write!(f, "ide:previous_buffer"),
+            Command::Vim9NextBuffer => write!(f, "ide:next_buffer"),
+            Command::Vim9CloseBuffer => write!(f, "ide:close_buffer"),
+            Command::Vim9NextProblem => write!(f, "ide:next_problem"),
+            Command::Vim9PreviousProblem => write!(f, "ide:previous_problem"),
             Command::SessionNew => write!(f, "session:new"),
             Command::SessionClose => write!(f, "session:close"),
             Command::SessionNext => write!(f, "session:next"),
@@ -272,6 +294,17 @@ impl std::str::FromStr for Command {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "ide:open" => Ok(Command::Vim9Open),
+            "ide:quick_open" => Ok(Command::Vim9QuickOpen),
+            "ide:goto" => Ok(Command::Vim9Goto),
+            "ide:save" => Ok(Command::Vim9Save),
+            "ide:save_all" => Ok(Command::Vim9SaveAll),
+            "ide:search" => Ok(Command::Vim9Search),
+            "ide:build" => Ok(Command::Vim9Build),
+            "ide:previous_buffer" => Ok(Command::Vim9PreviousBuffer),
+            "ide:next_buffer" => Ok(Command::Vim9NextBuffer),
+            "ide:close_buffer" => Ok(Command::Vim9CloseBuffer),
+            "ide:next_problem" => Ok(Command::Vim9NextProblem),
+            "ide:previous_problem" => Ok(Command::Vim9PreviousProblem),
             "session:new" => Ok(Command::SessionNew),
             "session:close" => Ok(Command::SessionClose),
             "session:next" => Ok(Command::SessionNext),

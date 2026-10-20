@@ -1199,7 +1199,7 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn claim_enter_for_prompt_recall(&mut self) {
+    pub(crate) fn claim_enter_for_prompt_recall(&mut self) {
         self.native_enter_ownership.claim_pressed();
         claim_prompt_fill_enter(
             self.prompt_fill_enter_down,
@@ -1208,9 +1208,10 @@ impl TerminalApp {
     }
 
     pub(crate) fn block_chrome_owns_keyboard(&self, ctx: &egui::Context) -> bool {
-        self.config.command_cards_enabled()
-            && (super::rendering::block_workspace_has_focus(ctx)
-                || crate::ui::block_action_has_focus(ctx))
+        self.vim9_chrome_owns_keyboard(ctx)
+            || self.config.command_cards_enabled()
+                && (super::rendering::block_workspace_has_focus(ctx)
+                    || crate::ui::block_action_has_focus(ctx))
     }
 
     pub(crate) fn return_focus_to_terminal(&mut self, ctx: &egui::Context) {
@@ -1226,6 +1227,7 @@ impl TerminalApp {
 
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
         self.block_review.is_some()
+            || self.vim9_dialog_is_open()
             || (egui::Popup::is_any_open(ctx)
                 && self
                     .session_manager
@@ -1428,6 +1430,17 @@ impl TerminalApp {
     ) -> bool {
         match command {
             keybindings::Command::Vim9Open => self.open_vim9_ide(None),
+            command @ (keybindings::Command::Vim9QuickOpen
+            | keybindings::Command::Vim9Goto
+            | keybindings::Command::Vim9Save
+            | keybindings::Command::Vim9SaveAll
+            | keybindings::Command::Vim9Search
+            | keybindings::Command::Vim9Build
+            | keybindings::Command::Vim9PreviousBuffer
+            | keybindings::Command::Vim9NextBuffer
+            | keybindings::Command::Vim9CloseBuffer
+            | keybindings::Command::Vim9NextProblem
+            | keybindings::Command::Vim9PreviousProblem) => self.dispatch_vim9_command(command),
             keybindings::Command::SessionNew => {
                 self.new_tab();
             }
@@ -2613,7 +2626,14 @@ impl TerminalApp {
                 terminal_input_seen = true;
                 selection_postdates_terminal_input = false;
             }
-            if let Some(command) = press.command.clone() {
+            // Editor shortcuts are contextual: shell sessions keep every
+            // existing terminal binding, and a native text field keeps its
+            // own editing keys. Use the same ordered router as other commands
+            // so a modal cannot overtake earlier text/IME in this OS batch.
+            let ide_command = (!ui_input_blocked && self.active_vim9_editor().is_some())
+                .then(|| crate::vim9_ide::shortcut_command(press.key, press.modifiers))
+                .flatten();
+            if let Some(command) = ide_command.or_else(|| press.command.clone()) {
                 if command == keybindings::Command::EditPaste {
                     log::debug!(target: "ember::clipboard_route",
                         "paste_dispatch ui_blocked={} older_terminal_input={}",
@@ -2634,6 +2654,11 @@ impl TerminalApp {
                     // this prevents a newly opened modal from suppressing the
                     // older bytes when input blocking is recomputed below.
                     return OrderedPressOutcome::Ignored;
+                }
+                if crate::vim9_ide::is_editor_command(&command)
+                    && matches!(press.event, egui::Event::Key { repeat: true, .. })
+                {
+                    return OrderedPressOutcome::Consumed;
                 }
                 let has_contextual_target = match command {
                     keybindings::Command::BlockToggleCollapse => {

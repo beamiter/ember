@@ -702,6 +702,71 @@ impl CommandPalette {
             ),
         ];
 
+        for (label, description, command) in [
+            (
+                "Quick Open",
+                "Find a file in the active Vim project",
+                crate::keybindings::Command::Vim9QuickOpen,
+            ),
+            (
+                "Go to Line",
+                "Jump to a line or line:column in the active Vim buffer",
+                crate::keybindings::Command::Vim9Goto,
+            ),
+            (
+                "Save",
+                "Write the current Vim buffer",
+                crate::keybindings::Command::Vim9Save,
+            ),
+            (
+                "Save All",
+                "Write all modified Vim buffers",
+                crate::keybindings::Command::Vim9SaveAll,
+            ),
+            (
+                "Project Search",
+                "Focus the active editor's project search field",
+                crate::keybindings::Command::Vim9Search,
+            ),
+            (
+                "Build Command",
+                "Focus the build command field without running a command",
+                crate::keybindings::Command::Vim9Build,
+            ),
+            (
+                "Previous Buffer",
+                "Select the previous listed Vim buffer",
+                crate::keybindings::Command::Vim9PreviousBuffer,
+            ),
+            (
+                "Next Buffer",
+                "Select the next listed Vim buffer",
+                crate::keybindings::Command::Vim9NextBuffer,
+            ),
+            (
+                "Close Buffer",
+                "Close the current Vim buffer with modified-buffer protection",
+                crate::keybindings::Command::Vim9CloseBuffer,
+            ),
+            (
+                "Next Problem",
+                "Go to the next quickfix entry",
+                crate::keybindings::Command::Vim9NextProblem,
+            ),
+            (
+                "Previous Problem",
+                "Go to the previous quickfix entry",
+                crate::keybindings::Command::Vim9PreviousProblem,
+            ),
+        ] {
+            commands.push(CommandInfo::new(
+                &format!("Vim9 IDE: {label}"),
+                CommandCategory::Session,
+                description,
+                command,
+            ));
+        }
+
         for index in 0..8 {
             commands.push(CommandInfo::new(
                 &format!("Go to Session {}", index + 1),

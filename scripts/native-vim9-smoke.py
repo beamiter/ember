@@ -109,6 +109,30 @@ class Input:
         for char in value:
             self.key(ord(char))
 
+    def chord(self, symbol, *, ctrl=False, shift=False):
+        modifiers = ([0xFFE3] if ctrl else []) + ([0xFFE1] if shift else [])
+        codes = [self.x.XKeysymToKeycode(self.d, key) for key in modifiers]
+        keycode = self.x.XKeysymToKeycode(self.d, symbol)
+        assert keycode and all(codes)
+        for code in codes:
+            self.t.XTestFakeKeyEvent(self.d, code, True, 0)
+        self.t.XTestFakeKeyEvent(self.d, keycode, True, 0)
+        self.t.XTestFakeKeyEvent(self.d, keycode, False, 0)
+        for code in reversed(codes):
+            self.t.XTestFakeKeyEvent(self.d, code, False, 0)
+        self.x.XSync(self.d, False)
+        time.sleep(0.25)
+
+    def key_batch(self, *symbols):
+        """Queue plain keys together to exercise a form-cancellation batch."""
+        for symbol in symbols:
+            code = self.x.XKeysymToKeycode(self.d, symbol)
+            assert code and self.x.XkbKeycodeToKeysym(self.d, code, 0, 0) == symbol
+            self.t.XTestFakeKeyEvent(self.d, code, True, 0)
+            self.t.XTestFakeKeyEvent(self.d, code, False, 0)
+        self.x.XSync(self.d, False)
+        time.sleep(0.25)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -127,6 +151,12 @@ def main():
     (project / "Cargo.toml").write_text('[package]\nname = "native-smoke"\nversion = "0.1.0"\n')
     source = project / "main.rs"
     source.write_text("original-native-text\n")
+    nested = project / "src" / "target file.rs"
+    nested.parent.mkdir()
+    nested.write_text("first\nsecond\nthird\n")
+    (project / ".git").mkdir()
+    (project / ".gitignore").write_text("ignored.rs\n")
+    (project / "ignored.rs").write_text("ignored\n")
     runtime = out / "runtime"
     runtime.mkdir(mode=0o700)
     env = os.environ.copy()
@@ -153,11 +183,31 @@ def main():
         (out / (label + ".tsv")).write_text(text)
         return [row for row in csv.DictReader(io.StringIO(text), delimiter="\t") if row["text"].strip()]
 
-    def click_word(label, word, rightmost=False):
+    def click_word(label, word, rightmost=False, occurrence=0):
         rows = [row for row in words(label) if row["text"] == word]
         assert rows, (word, label)
-        row = sorted(rows, key=lambda r: int(r["left"]), reverse=rightmost)[0]
+        row = sorted(rows, key=lambda r: int(r["left"]), reverse=rightmost)[occurrence]
         xinput.click(int(row["left"]) + int(row["width"]) / 2, int(row["top"]) + int(row["height"]) / 2)
+
+    def click_phrase(label, phrase):
+        lines = {}
+        for row in words(label):
+            lines.setdefault((row["block_num"], row["par_num"], row["line_num"]), []).append(row)
+        target = phrase.split()
+        candidates = []
+        for line in lines.values():
+            line.sort(key=lambda row: int(row["left"]))
+            for index in range(len(line) - len(target) + 1):
+                rows = line[index:index + len(target)]
+                if [row["text"] for row in rows] == target:
+                    candidates.append(rows)
+        assert len(candidates) == 1, (label, phrase, len(candidates))
+        rows = candidates[0]
+        left = min(int(row["left"]) for row in rows)
+        right = max(int(row["left"]) + int(row["width"]) for row in rows)
+        top = min(int(row["top"]) for row in rows)
+        bottom = max(int(row["top"]) + int(row["height"]) for row in rows)
+        xinput.click((left + right) / 2, (top + bottom) / 2)
 
     try:
         read_fd, write_fd = os.pipe()
@@ -185,11 +235,108 @@ def main():
         click_word("before-save", "Save")
         wait_for(lambda: source.read_text() == "native original-native-text\n", "Native Save writes real Vim buffer")
         result["edit_and_native_save"] = True
-        click_word("before-build", "Build", rightmost=True)
+        # Rightmost is Save + Build; the next is the ordinary Build button.
+        # The input's placeholder also contains the word Build.
+        click_word("before-build", "Build", rightmost=True, occurrence=1)
         time.sleep(1)
         output = " ".join(row["text"] for row in words("build-output"))
         assert "native-build-output" in output, output
         result["native_build_output"] = True
+
+        # Native file navigation is entirely keyboard-driven. Exact disk
+        # contents independently prove that picker query/Enter never reached
+        # the old Vim buffer and that a filename containing spaces survived.
+        xinput.chord(ord("p"), ctrl=True, shift=True)
+        time.sleep(0.5)
+        xinput.text("target file")
+        time.sleep(0.25)
+        picker = " ".join(row["text"] for row in words("quick-open"))
+        assert "Quick Open" in picker and "target" in picker, picker
+        xinput.key(0xFF0D)
+        time.sleep(0.4)
+        xinput.text("gg0iquick-open:")
+        xinput.key(0xFF1B)
+        xinput.chord(ord("s"), ctrl=True)
+        wait_for(lambda: nested.read_text() == "quick-open:first\nsecond\nthird\n", "Quick Open and Ctrl+S")
+        assert source.read_text() == "native original-native-text\n"
+        result["quick_open_keyboard_and_space_path"] = True
+
+        xinput.chord(ord("g"), ctrl=True, shift=True)
+        xinput.text("3:1")
+        xinput.key(0xFF0D)
+        time.sleep(0.3)
+        xinput.text("iline-three:")
+        xinput.key(0xFF1B)
+        xinput.chord(ord("s"), ctrl=True)
+        wait_for(lambda: nested.read_text() == "quick-open:first\nsecond\nline-three:third\n", "Go to line:column")
+        result["goto_keyboard"] = True
+
+        # Escape closes a native modal without inserting a query in Vim.
+        xinput.chord(ord("p"), ctrl=True, shift=True)
+        xinput.text("never-type-this-in-vim")
+        xinput.key(0xFF1B)
+        time.sleep(0.3)
+        xinput.chord(ord("s"), ctrl=True)
+        time.sleep(0.3)
+        assert nested.read_text() == "quick-open:first\nsecond\nline-three:third\n"
+        result["picker_escape_keeps_buffer_unchanged"] = True
+
+        xinput.chord(ord("f"), ctrl=True, shift=True)
+        xinput.text("search-query-is-ui-only")
+        xinput.key(0xFF1B)
+        time.sleep(0.25)
+        xinput.chord(ord("s"), ctrl=True)
+        time.sleep(0.25)
+        assert nested.read_text() == "quick-open:first\nsecond\nline-three:third\n"
+        result["search_form_escape_keeps_buffer_unchanged"] = True
+
+        click_word("before-window-menu", "Windows")
+        click_phrase("window-menu", "Vertical split")
+        time.sleep(0.35)
+        split_status = " ".join(row["text"] for row in words("vertical-split"))
+        assert "2 Vim window" in split_status, split_status
+        xinput.text(":close")
+        xinput.key(0xFF0D)
+        time.sleep(0.3)
+        result["native_vim_window_split"] = True
+
+        xinput.text("gg0idirty:")
+        xinput.key(0xFF1B)
+        xinput.chord(ord("w"), ctrl=True, shift=True)
+        time.sleep(0.4)
+        assert app.poll() is None
+        assert nested.read_text() == "quick-open:first\nsecond\nline-three:third\n"
+        xinput.chord(ord("s"), ctrl=True, shift=True)
+        wait_for(lambda: nested.read_text() == "dirty:quick-open:first\nsecond\nline-three:third\n", "Dirty buffer close refused; Save All keeps editor active")
+        result["modified_buffer_close_and_save_all"] = True
+
+        xinput.text("gg0isaved-build:")
+        xinput.key(0xFF1B)
+        click_phrase("before-save-build", "Save + Build")
+        wait_for(lambda: nested.read_text().startswith("saved-build:dirty:"), "Save + Build writes modified buffers")
+        result["explicit_save_and_build"] = True
+
+        # The build shortcut focuses a form; only Enter executes the command.
+        xinput.chord(ord("b"), ctrl=True, shift=True)
+        build_count = project / "keyboard-build-count.txt"
+        xinput.text("printf keyboard-build-output; printf x >> keyboard-build-count.txt")
+        assert not build_count.exists(), "Focusing/editing the build form ran it"
+        time.sleep(0.2)
+        xinput.key_batch(0xFF1B, 0xFF0D)
+        time.sleep(0.3)
+        assert not build_count.exists(), "Escape followed by Enter submitted the cancelled build form"
+        cancelled = " ".join(row["text"] for row in words("build-form-cancelled"))
+        assert "Ln 1/3" in cancelled, "Cancelling form keys moved the Vim cursor: " + cancelled
+        result["build_form_cancel_owns_enter_batch"] = True
+        xinput.chord(ord("b"), ctrl=True, shift=True)
+        xinput.key(0xFF0D)
+        wait_for(lambda: build_count.exists() and build_count.read_text() == "x", "Build form Enter runs once")
+        result["build_form_keyboard_and_explicit_execution"] = True
+
+        # Close the saved buffer and return to the original file, then exercise
+        # the pre-existing whole-editor close protection with the new chrome.
+        xinput.chord(ord("w"), ctrl=True, shift=True)
+        time.sleep(0.5)
         xinput.click(900, 400)
         xinput.text("gg0ix")
         xinput.key(0xFF1B)

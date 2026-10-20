@@ -5561,6 +5561,7 @@ impl TerminalApp {
             font_zoom::FontGroup::Main,
         );
         self.render_floating_panels(ctx);
+        self.render_vim9_dialog(ctx);
         self.handle_font_zoom(ctx);
     }
 
@@ -6003,10 +6004,16 @@ impl eframe::App for TerminalApp {
             && !block_search_owned_input
             && !history_picker_owned_input
             && self.handle_workflow_picker_input();
+        let vim9_dialog_owned_input = !palette_owned_input
+            && !block_search_owned_input
+            && !history_picker_owned_input
+            && !workflow_picker_owned_input
+            && self.handle_vim9_dialog_input(ctx);
         let overlay_owned_input = palette_owned_input
             || block_search_owned_input
             || history_picker_owned_input
-            || workflow_picker_owned_input;
+            || workflow_picker_owned_input
+            || vim9_dialog_owned_input;
 
         let (keybinding_requested_close, selection_postdates_terminal_input, accepted_ime_input) =
             self.handle_keybindings(
