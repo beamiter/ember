@@ -3,7 +3,10 @@
 
 use crate::app::state::TerminalApp;
 use eframe::egui;
-use jterm_core::vim9::{Vim9Command, Vim9ProjectFile, Vim9ProjectIndex, Vim9Session, Vim9Snapshot};
+use jterm_core::vim9::{
+    Vim9Command, Vim9ProjectFile, Vim9ProjectIndex, Vim9SearchCase, Vim9SearchOptions, Vim9Session,
+    Vim9Snapshot,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -155,6 +158,26 @@ fn parse_location(input: &str) -> Result<(u64, Option<u64>), &'static str> {
     Ok((line, column))
 }
 
+fn search_options_summary(options: &Vim9SearchOptions) -> String {
+    let mut summary = format!(
+        "{} · {}",
+        if options.regex { "Regex" } else { "Literal" },
+        match options.case {
+            Vim9SearchCase::Smart => "smart case",
+            Vim9SearchCase::Sensitive => "match case",
+            Vim9SearchCase::Ignore => "ignore case",
+        }
+    );
+    if options.whole_word {
+        summary.push_str(" · whole word");
+    }
+    if !options.glob.is_empty() {
+        summary.push_str(" · glob: ");
+        summary.push_str(&crate::review_text::visible_bounded(&options.glob, 256));
+    }
+    summary
+}
+
 fn focused_chrome_widget(ctx: &egui::Context, rects: &[egui::Rect]) -> Option<egui::Id> {
     let id = ctx.memory(|memory| memory.focused())?;
     let response = ctx.read_response(id)?;
@@ -207,6 +230,18 @@ pub(crate) fn shortcut_command(
     modifiers: egui::Modifiers,
 ) -> Option<crate::keybindings::Command> {
     use crate::keybindings::Command;
+    if modifiers.alt
+        && !modifiers.ctrl
+        && !modifiers.command
+        && !modifiers.mac_cmd
+        && !modifiers.shift
+    {
+        return match key {
+            egui::Key::ArrowLeft => Some(Command::Vim9NavigateBack),
+            egui::Key::ArrowRight => Some(Command::Vim9NavigateForward),
+            _ => None,
+        };
+    }
     if modifiers.alt || modifiers.mac_cmd {
         return None;
     }
@@ -233,9 +268,12 @@ pub(crate) fn is_editor_command(command: &crate::keybindings::Command) -> bool {
         command,
         Command::Vim9QuickOpen
             | Command::Vim9Goto
+            | Command::Vim9NavigateBack
+            | Command::Vim9NavigateForward
             | Command::Vim9Save
             | Command::Vim9SaveAll
             | Command::Vim9Search
+            | Command::Vim9CancelSearch
             | Command::Vim9Build
             | Command::Vim9PreviousBuffer
             | Command::Vim9NextBuffer
@@ -251,6 +289,7 @@ pub(crate) struct Workbench {
     refreshed_at: Instant,
     file_input: String,
     search_input: String,
+    search_options: Vim9SearchOptions,
     build_input: String,
     rename_input: String,
     problems_open: bool,
@@ -260,6 +299,7 @@ pub(crate) struct Workbench {
     focus_input: Option<ToolInput>,
     chrome_rects: Vec<egui::Rect>,
     chrome_focus: Option<egui::Id>,
+    chrome_popup_open: bool,
     return_focus: bool,
 }
 
@@ -272,6 +312,7 @@ impl Workbench {
             refreshed_at: Instant::now(),
             file_input: String::new(),
             search_input: String::new(),
+            search_options: Vim9SearchOptions::default(),
             build_input: String::new(),
             rename_input: String::new(),
             problems_open: false,
@@ -281,6 +322,7 @@ impl Workbench {
             focus_input: None,
             chrome_rects: Vec::new(),
             chrome_focus: None,
+            chrome_popup_open: false,
             return_focus: false,
         }
     }
@@ -321,6 +363,18 @@ impl Workbench {
                 "Connecting to Vim…".to_string()
             });
             ui.add_enabled_ui(snapshot.connected, |ui| {
+                if ui.add_enabled(snapshot.navigation.can_go_back, egui::Button::new("Back"))
+                    .on_hover_text("Previous Vim jump location · Alt+Left")
+                    .on_disabled_hover_text("No earlier location in this Vim window's jump list")
+                    .clicked() {
+                    self.send(Vim9Command::NavigateBack);
+                }
+                if ui.add_enabled(snapshot.navigation.can_go_forward, egui::Button::new("Forward"))
+                    .on_hover_text("Next Vim jump location · Alt+Right")
+                    .on_disabled_hover_text("No later location in this Vim window's jump list")
+                    .clicked() {
+                    self.send(Vim9Command::NavigateForward);
+                }
                 if ui.button("Quick Open").on_hover_text("Find project files · Ctrl+Shift+P").clicked() {
                     self.open_dialog(DialogKind::QuickOpen);
                 }
@@ -411,31 +465,6 @@ impl Workbench {
                             column: None,
                         });
                     }
-                    let search = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_input)
-                            .hint_text("Project search")
-                            .desired_width(180.0)
-                            .char_limit(4096),
-                    );
-                    if self.focus_input == Some(ToolInput::Search) {
-                        search.request_focus();
-                        self.focus_input = None;
-                    }
-                    let enter = form_submitted(&search);
-                    if (ui
-                        .add_enabled(
-                            snapshot.connected && !self.search_input.is_empty(),
-                            egui::Button::new("Find"),
-                        )
-                        .clicked()
-                        || enter)
-                        && !self.search_input.is_empty()
-                    {
-                        self.send(Vim9Command::Search {
-                            query: self.search_input.clone(),
-                        });
-                        self.problems_open = true;
-                    }
                     let build = ui.add(
                         egui::TextEdit::singleline(&mut self.build_input)
                             .hint_text("Build command · blank uses Vim makeprg")
@@ -478,6 +507,7 @@ impl Workbench {
                     }
                 });
             });
+        self.search_tools(ui, &snapshot);
         egui::ScrollArea::horizontal()
             .id_salt("vim9_buffers")
             .show(ui, |ui| {
@@ -551,6 +581,8 @@ impl Workbench {
                     "Searching: {} · {} matches",
                     snapshot.search.query, snapshot.search.count
                 ));
+            } else if snapshot.search.cancelled {
+                ui.small("Search cancelled");
             } else if !snapshot.search.query.is_empty() {
                 if (0..=1).contains(&snapshot.search.exit_code) {
                     ui.small(format!("Search: {} matches", snapshot.search.count));
@@ -579,6 +611,90 @@ impl Workbench {
         }
     }
 
+    fn search_tools(&mut self, ui: &mut egui::Ui, snapshot: &Vim9Snapshot) {
+        ui.horizontal_wrapped(|ui| {
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.search_input)
+                    .id_salt("vim9_project_search")
+                    .hint_text("Project search · Ctrl+Shift+F")
+                    .desired_width(250.0_f32.min((ui.available_width() - 12.0).max(80.0)))
+                    .char_limit(4096),
+            );
+            if self.focus_input == Some(ToolInput::Search) {
+                search.request_focus();
+                self.focus_input = None;
+            }
+            let enter = form_submitted(&search);
+            let options_label = if self.search_options == Vim9SearchOptions::default() {
+                "Search options"
+            } else {
+                "Search options •"
+            };
+            egui::containers::menu::MenuButton::new(options_label)
+                .config(
+                    egui::containers::menu::MenuConfig::new()
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                )
+                .ui(ui, |ui| {
+                    ui.set_max_width((ui.ctx().viewport_rect().width() - 32.0).clamp(220.0, 380.0));
+                    ui.strong("Options for the next search");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.radio_value(
+                            &mut self.search_options.case,
+                            Vim9SearchCase::Smart,
+                            "Smart case",
+                        );
+                        ui.radio_value(
+                            &mut self.search_options.case,
+                            Vim9SearchCase::Sensitive,
+                            "Match case",
+                        );
+                        ui.radio_value(
+                            &mut self.search_options.case,
+                            Vim9SearchCase::Ignore,
+                            "Ignore case",
+                        );
+                    });
+                    ui.weak("An uppercase query makes smart case sensitive.");
+                    ui.checkbox(&mut self.search_options.regex, "Regular expression");
+                    ui.checkbox(&mut self.search_options.whole_word, "Whole word");
+                    ui.label("File glob");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.search_options.glob)
+                            .hint_text("For example **/*.rs or !vendor/**")
+                            .desired_width(ui.available_width().min(270.0))
+                            .char_limit(4096),
+                    );
+                    ui.weak("One pattern; spaces and commas belong to the filename.");
+                    if ui.button("Reset options").clicked() {
+                        self.search_options = Vim9SearchOptions::default();
+                    }
+                })
+                .0
+                .on_hover_text(search_options_summary(&self.search_options));
+            if (ui
+                .add_enabled(
+                    snapshot.connected && !self.search_input.is_empty(),
+                    egui::Button::new("Find"),
+                )
+                .on_hover_text("Run a project search with the selected options")
+                .clicked()
+                || enter)
+                && snapshot.connected
+                && !self.search_input.is_empty()
+            {
+                self.send(Vim9Command::SearchWithOptions {
+                    query: self.search_input.clone(),
+                    options: self.search_options.clone(),
+                });
+                self.problems_open = true;
+            }
+            if snapshot.search.running && ui.button("Stop search").clicked() {
+                self.send(Vim9Command::CancelSearch);
+            }
+        });
+    }
+
     fn problems(&mut self, ui: &mut egui::Ui) {
         let snapshot = Arc::clone(&self.snapshot);
         ui.horizontal(|ui| {
@@ -590,11 +706,26 @@ impl Workbench {
                 self.problems_open = false;
             }
         });
-        egui::ScrollArea::vertical().id_salt("vim9_problems").show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("vim9_problems").auto_shrink([false, false]).show(ui, |ui| {
+            if !snapshot.quickfix.title.is_empty() || snapshot.quickfix.count > 0 {
+                let source = match snapshot.quickfix.source.as_str() {
+                    "search" => "Project search",
+                    "build" => "Build",
+                    _ => "Vim quickfix",
+                };
+                ui.label(format!("Quickfix · {source} · {}/{} · {}",
+                    snapshot.quickfix.index, snapshot.quickfix.count,
+                    crate::review_text::visible_bounded(&snapshot.quickfix.title, 1024)))
+                    .on_hover_text("The current Vim quickfix list. Window-local diagnostics may also appear below.");
+                ui.separator();
+            }
             if !snapshot.search.query.is_empty() {
                 ui.strong(format!("Project search · {}", snapshot.search.query));
+                ui.weak(search_options_summary(&snapshot.search.options));
                 if snapshot.search.running {
                     ui.label(format!("Searching… {} matches so far. Previous quickfix entries remain until search completes.", snapshot.search.count));
+                } else if snapshot.search.cancelled {
+                    ui.label(format!("Search cancelled · {} matches found before cancellation", snapshot.search.count));
                 } else if (0..=1).contains(&snapshot.search.exit_code) {
                     ui.label(format!("Search completed · {} matches", snapshot.search.count));
                 } else {
@@ -839,6 +970,12 @@ impl TerminalApp {
         if editor.focus_input.is_some() {
             return true;
         }
+        // Menus can extend beyond the toolbar, and egui closes a popup before
+        // application logic sees its cancelling Escape. Retain that previous
+        // owner so Escape + Enter cannot leak from an options field into Vim.
+        if editor.chrome_popup_open || egui::Popup::is_any_open(ctx) {
+            return true;
+        }
         // Escape clears egui focus in begin_pass, before application logic.
         // Keep the previous owner so its cancellation batch cannot submit a
         // form or fall through to Vim after that early focus transition.
@@ -880,9 +1017,12 @@ impl TerminalApp {
         match command {
             Command::Vim9QuickOpen => editor.open_dialog(DialogKind::QuickOpen),
             Command::Vim9Goto => editor.open_dialog(DialogKind::Goto),
+            Command::Vim9NavigateBack => editor.send(Vim9Command::NavigateBack),
+            Command::Vim9NavigateForward => editor.send(Vim9Command::NavigateForward),
             Command::Vim9Save => editor.send(Vim9Command::Save),
             Command::Vim9SaveAll => editor.send(Vim9Command::SaveAll),
             Command::Vim9Search => editor.focus_input = Some(ToolInput::Search),
+            Command::Vim9CancelSearch => editor.send(Vim9Command::CancelSearch),
             Command::Vim9Build => editor.focus_input = Some(ToolInput::Build),
             Command::Vim9PreviousBuffer => editor.send(Vim9Command::PreviousBuffer),
             Command::Vim9NextBuffer => editor.send(Vim9Command::NextBuffer),
@@ -965,6 +1105,7 @@ impl TerminalApp {
         };
         editor.render_dialog(ctx, &id);
         let return_focus = std::mem::take(&mut editor.return_focus);
+        editor.chrome_popup_open = !return_focus && egui::Popup::is_any_open(ctx);
         editor.chrome_focus = if return_focus {
             None
         } else {
@@ -1102,7 +1243,7 @@ impl TerminalApp {
         if editor.problems_open {
             let problems = egui::Panel::bottom(egui::Id::new(("vim9_problems_panel", &id)))
                 .resizable(true)
-                .default_size(160.0)
+                .default_size(240.0)
                 .min_size(70.0)
                 .max_size(300.0)
                 .show(root_ui, |ui| {
@@ -1256,7 +1397,13 @@ mod tests {
 
     #[test]
     fn native_shortcuts_preserve_vim_control_keys() {
-        for key in [egui::Key::P, egui::Key::G, egui::Key::W] {
+        for key in [
+            egui::Key::P,
+            egui::Key::G,
+            egui::Key::W,
+            egui::Key::O,
+            egui::Key::I,
+        ] {
             assert_eq!(shortcut_command(key, egui::Modifiers::CTRL), None);
         }
         assert_eq!(
@@ -1278,6 +1425,20 @@ mod tests {
             ),
             None
         );
+        for (key, command) in [
+            (egui::Key::ArrowLeft, Command::Vim9NavigateBack),
+            (egui::Key::ArrowRight, Command::Vim9NavigateForward),
+        ] {
+            assert_eq!(shortcut_command(key, egui::Modifiers::ALT), Some(command));
+            for modifiers in [
+                egui::Modifiers::NONE,
+                egui::Modifiers::CTRL,
+                egui::Modifiers::ALT | egui::Modifiers::CTRL,
+                egui::Modifiers::ALT | egui::Modifiers::SHIFT,
+            ] {
+                assert_eq!(shortcut_command(key, modifiers), None);
+            }
+        }
     }
 
     #[test]
@@ -1341,9 +1502,12 @@ mod tests {
         for name in [
             "ide:quick_open",
             "ide:goto",
+            "ide:back",
+            "ide:forward",
             "ide:save",
             "ide:save_all",
             "ide:search",
+            "ide:cancel_search",
             "ide:build",
             "ide:previous_buffer",
             "ide:next_buffer",

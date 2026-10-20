@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import select
+import shutil
 import subprocess
 import time
 
@@ -109,8 +110,8 @@ class Input:
         for char in value:
             self.key(ord(char))
 
-    def chord(self, symbol, *, ctrl=False, shift=False):
-        modifiers = ([0xFFE3] if ctrl else []) + ([0xFFE1] if shift else [])
+    def chord(self, symbol, *, ctrl=False, shift=False, alt=False):
+        modifiers = ([0xFFE3] if ctrl else []) + ([0xFFE1] if shift else []) + ([0xFFE9] if alt else [])
         codes = [self.x.XKeysymToKeycode(self.d, key) for key in modifiers]
         keycode = self.x.XKeysymToKeycode(self.d, symbol)
         assert keycode and all(codes)
@@ -151,9 +152,14 @@ def main():
     (project / "Cargo.toml").write_text('[package]\nname = "native-smoke"\nversion = "0.1.0"\n')
     source = project / "main.rs"
     source.write_text("original-native-text\n")
+    symbols = project / "symbols.txt"
+    symbols.write_text("symbols\n")
     nested = project / "src" / "target file.rs"
     nested.parent.mkdir()
     nested.write_text("first\nsecond\nthird\n")
+    search_fixture = project / "src" / "search cases.txt"
+    search_fixture.write_text("Token1\nTOKEN2\nToken10\npreToken3\nToken4 extra\nother\n")
+    (project / "src" / "wrong-search-file.rs").write_text("Token1\nTOKEN2\nToken4 extra\n")
     (project / ".git").mkdir()
     (project / ".gitignore").write_text("ignored.rs\n")
     (project / "ignored.rs").write_text("ignored\n")
@@ -162,6 +168,18 @@ def main():
     env = os.environ.copy()
     env.pop("WAYLAND_DISPLAY", None)
     env.update(XDG_CONFIG_HOME=str(config.parent), XDG_STATE_HOME=str(out / "state"), XDG_DATA_HOME=str(out / "data"), XDG_CACHE_HOME=str(out / "cache"), XDG_RUNTIME_DIR=str(runtime), LIBGL_ALWAYS_SOFTWARE="1", WGPU_BACKEND=env.get("WGPU_BACKEND", "gl"), VIMINIT=r"set nocompatible viminfofile=NONE noswapfile nomore | set makeprg=printf\ native-build-output")
+    # Delay only the cancellation fixture. Real ripgrep still owns indexing
+    # and successful searches, so the matching result remains an independent oracle.
+    real_rg = shutil.which("rg")
+    assert real_rg, "ripgrep is required"
+    fixture_bin = out / "bin"
+    fixture_bin.mkdir()
+    fixture_rg = fixture_bin / "rg"
+    fixture_rg.write_text("#!/usr/bin/env python3\nimport os, sys, time\n"
+                          "if 'slow-native-search' in sys.argv:\n    time.sleep(20)\n"
+                          f"os.execv({real_rg!r}, [{real_rg!r}] + sys.argv[1:])\n")
+    fixture_rg.chmod(0o700)
+    env["PATH"] = str(fixture_bin) + os.pathsep + env.get("PATH", "")
     logs, processes, xinput = [], [], None
     result = {"status": "fail"}
 
@@ -208,6 +226,16 @@ def main():
         top = min(int(row["top"]) for row in rows)
         bottom = max(int(row["top"]) + int(row["height"]) for row in rows)
         xinput.click((left + right) / 2, (top + bottom) / 2)
+        return (left + right) / 2, (top + bottom) / 2
+
+    def vim_json(expression, filename):
+        """Read Vim's own state after native UI navigation, via normal PTY input."""
+        destination = project / filename
+        destination.unlink(missing_ok=True)
+        xinput.text(f":call writefile([json_encode({expression})], '{filename}')")
+        xinput.key(0xFF0D)
+        wait_for(destination.exists, "Vim state oracle: " + filename)
+        return json.loads(destination.read_text())
 
     try:
         read_fd, write_fd = os.pipe()
@@ -235,6 +263,22 @@ def main():
         click_word("before-save", "Save")
         wait_for(lambda: source.read_text() == "native original-native-text\n", "Native Save writes real Vim buffer")
         result["edit_and_native_save"] = True
+
+        # Real Vim enables modifyOtherKeys. Shift punctuation must be written
+        # once as the OS character, without an extra unshifted digit/keycode.
+        xinput.chord(ord("p"), ctrl=True, shift=True)
+        xinput.text("symbols.txt")
+        time.sleep(0.3)
+        xinput.key(0xFF0D)
+        time.sleep(0.3)
+        punctuation = 'Symbols: % ^ & * ( ) { } " ? ! < > _ + | ~ '
+        xinput.text("gg0i" + punctuation)
+        xinput.key(0xFF1B)
+        xinput.chord(ord("s"), ctrl=True)
+        wait_for(lambda: symbols.read_text() == punctuation + "symbols\n", "Shift punctuation writes exactly once")
+        xinput.chord(ord("w"), ctrl=True, shift=True)
+        time.sleep(0.3)
+        result["native_shift_punctuation_round_trip"] = True
         # Rightmost is Save + Build; the next is the ordinary Build button.
         # The input's placeholder also contains the word Build.
         click_word("before-build", "Build", rightmost=True, occurrence=1)
@@ -270,6 +314,63 @@ def main():
         xinput.chord(ord("s"), ctrl=True)
         wait_for(lambda: nested.read_text() == "quick-open:first\nsecond\nline-three:third\n", "Go to line:column")
         result["goto_keyboard"] = True
+
+        # Native history must move through Vim's own jumplist. The oracle reads
+        # real current buffer/line, rather than inferring success from a button.
+        xinput.chord(0xFF51, alt=True)
+        time.sleep(0.35)
+        previous_location = vim_json("[expand('%:p'), line('.') ]", "native-back.json")
+        assert previous_location == [str(nested), 1], previous_location
+        xinput.chord(0xFF53, alt=True)
+        time.sleep(0.35)
+        next_location = vim_json("[expand('%:p'), line('.') ]", "native-forward.json")
+        assert next_location == [str(nested), 3], next_location
+        result["native_jump_history_back_forward"] = True
+
+        click_phrase("before-search-options", "Search options")
+        click_phrase("search-case-menu", "Ignore case")
+        click_phrase("search-regex-option", "Regular expression")
+        click_phrase("search-whole-word-option", "Whole word")
+        glob_x, glob_y = click_phrase("search-glob-label", "File glob")
+        xinput.click(glob_x + 70, glob_y + 27)
+        xinput.text("**/search cases.txt")
+        xinput.key_batch(0xFF1B, 0xFF0D)
+        options_location = vim_json("[expand('%:p'), line('.') ]", "native-options-focus.json")
+        assert options_location == next_location, options_location
+        result["search_options_cancel_owns_enter_batch"] = True
+        xinput.chord(ord("f"), ctrl=True, shift=True)
+        xinput.text("token[0-9]")
+        xinput.key(0xFF0D)
+        time.sleep(0.6)
+        search_results = vim_json("getqflist()", "native-search.json")
+        assert [entry["lnum"] for entry in search_results] == [1, 2, 5], search_results
+        assert [entry["text"] for entry in search_results] == ["Token1", "TOKEN2", "Token4 extra"], search_results
+        search_rendered = " ".join(row["text"] for row in words("advanced-search-results"))
+        assert "3 matches" in search_rendered, search_rendered
+        assert "ignore case" in search_rendered and "whole word" in search_rendered, search_rendered
+        result["native_regex_case_word_and_space_glob_search"] = True
+
+        # A focused search field owns Alt+Left. It must not navigate Vim away
+        # from the line selected above or submit a query until Enter is pressed.
+        xinput.chord(ord("f"), ctrl=True, shift=True)
+        xinput.chord(0xFF51, alt=True)
+        xinput.key(0xFF1B)
+        untouched_location = vim_json("[expand('%:p'), line('.') ]", "native-search-focus.json")
+        assert untouched_location == next_location, untouched_location
+        result["search_field_retains_navigation_chord"] = True
+
+        xinput.chord(ord("f"), ctrl=True, shift=True)
+        xinput.chord(ord("a"), ctrl=True)
+        xinput.text("slow-native-search")
+        xinput.key(0xFF0D)
+        time.sleep(0.4)
+        click_phrase("before-stop-search", "Stop search")
+        time.sleep(0.4)
+        cancelled_search = " ".join(row["text"] for row in words("search-cancelled"))
+        assert "Search cancelled" in cancelled_search, cancelled_search
+        retained_results = vim_json("getqflist()", "native-search-retained.json")
+        assert retained_results == search_results, retained_results
+        result["native_cancel_search_preserves_quickfix"] = True
 
         # Escape closes a native modal without inserting a query in Vim.
         xinput.chord(ord("p"), ctrl=True, shift=True)

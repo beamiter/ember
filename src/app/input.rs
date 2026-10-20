@@ -1432,9 +1432,12 @@ impl TerminalApp {
             keybindings::Command::Vim9Open => self.open_vim9_ide(None),
             command @ (keybindings::Command::Vim9QuickOpen
             | keybindings::Command::Vim9Goto
+            | keybindings::Command::Vim9NavigateBack
+            | keybindings::Command::Vim9NavigateForward
             | keybindings::Command::Vim9Save
             | keybindings::Command::Vim9SaveAll
             | keybindings::Command::Vim9Search
+            | keybindings::Command::Vim9CancelSearch
             | keybindings::Command::Vim9Build
             | keybindings::Command::Vim9PreviousBuffer
             | keybindings::Command::Vim9NextBuffer

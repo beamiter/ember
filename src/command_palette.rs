@@ -714,6 +714,16 @@ impl CommandPalette {
                 crate::keybindings::Command::Vim9Goto,
             ),
             (
+                "Navigate Back",
+                "Return to the previous location in the active Vim window's jump list",
+                crate::keybindings::Command::Vim9NavigateBack,
+            ),
+            (
+                "Navigate Forward",
+                "Move forward in the active Vim window's jump list",
+                crate::keybindings::Command::Vim9NavigateForward,
+            ),
+            (
                 "Save",
                 "Write the current Vim buffer",
                 crate::keybindings::Command::Vim9Save,
@@ -727,6 +737,11 @@ impl CommandPalette {
                 "Project Search",
                 "Focus the active editor's project search field",
                 crate::keybindings::Command::Vim9Search,
+            ),
+            (
+                "Cancel Project Search",
+                "Stop the active Vim project's running search",
+                crate::keybindings::Command::Vim9CancelSearch,
             ),
             (
                 "Build Command",

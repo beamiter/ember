@@ -491,6 +491,28 @@ fn pty_text_payload(text: &str) -> Option<String> {
     (!filtered.is_empty()).then_some(filtered)
 }
 
+/// Text belongs to this key only until another text-producing input begins.
+/// Use the OS character, rather than guessing a US-layout shifted digit.
+fn paired_printable_key_text(events: &[egui::Event], key_index: usize) -> Option<(usize, char)> {
+    for (index, event) in events.iter().enumerate().skip(key_index + 1) {
+        match event {
+            egui::Event::Text(text) => {
+                let mut characters = text.chars();
+                let character = characters.next()?;
+                return (characters.next().is_none()
+                    && !character.is_control()
+                    && !jterm_core::review_input::is_visual_spoofing_character(character))
+                .then_some((index, character));
+            }
+            egui::Event::Key { pressed: true, .. }
+            | egui::Event::Paste(_)
+            | egui::Event::Ime(_) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 fn text_key_code(key: egui::Key, modifiers: egui::Modifiers) -> Option<u32> {
     let codepoint = kitty_text_key_code(key)?;
     if modifiers.shift {
@@ -603,8 +625,11 @@ fn xterm_encode_modify_other_keys(
     modify_other_keys: u16,
     format_other_keys: u16,
     report_all_keys: bool,
+    text_character: Option<char>,
 ) -> Option<String> {
-    let codepoint = text_key_code(key, modifiers)?;
+    let codepoint = text_character
+        .map(u32::from)
+        .or_else(|| text_key_code(key, modifiers))?;
     let modifier_value = kitty_modifier_value(modifiers);
     let has_non_shift_modifier = modifiers.ctrl || modifiers.alt || modifiers.command;
     let should_encode = if report_all_keys {
@@ -6428,10 +6453,11 @@ impl TerminalRenderer {
             }
         }
 
-        for event in events {
+        let mut encoded_text_index = None;
+        for (event_index, event) in events.iter().enumerate() {
             match event {
                 egui::Event::Text(text) => {
-                    if suppress_text_events {
+                    if suppress_text_events || encoded_text_index == Some(event_index) {
                         continue;
                     }
                     if let Some(filtered) = pty_text_payload(text) {
@@ -6490,14 +6516,31 @@ impl TerminalRenderer {
                         continue;
                     }
 
+                    // Vim enables modifyOtherKeys. A shifted digit/punctuation
+                    // can arrive as Key(Num5, Shift) followed by Text("%").
+                    // Encode the actual character once, retaining the requested
+                    // xterm modifier format. Ctrl/Alt and Kitty handling above
+                    // keep their existing protocol paths; a key without Text
+                    // still uses its normal keycode fallback.
+                    let shifted_text = (!report_all_keys
+                        && !suppress_text_events
+                        && modifiers.shift
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && !modifiers.command
+                        && !modifiers.mac_cmd)
+                        .then(|| paired_printable_key_text(events, event_index))
+                        .flatten();
                     if let Some(encoded) = xterm_encode_modify_other_keys(
                         *key,
                         effective_modifiers,
                         xterm_modify_other_keys,
                         xterm_format_other_keys,
                         report_all_keys_mode,
+                        shifted_text.map(|(_, character)| character),
                     ) {
                         input.extend(encoded.as_bytes());
+                        encoded_text_index = shifted_text.map(|(index, _)| index);
                         continue;
                     }
 
@@ -8315,6 +8358,125 @@ mod tests {
             &[ctrl_d],
         );
         assert_eq!(encoded, [0x04]);
+    }
+
+    #[test]
+    fn shifted_printable_keys_emit_one_layout_correct_xterm_message() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let press = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let encode = |events: &[egui::Event], kitty, modify, format| {
+            let mut bytes = Vec::new();
+            renderer.handle_keyboard_input(
+                &egui::Context::default(),
+                &mut bytes,
+                &std::collections::HashSet::new(),
+                false,
+                kitty,
+                false,
+                modify,
+                format,
+                false,
+                false,
+                true,
+                false,
+                events,
+            );
+            bytes
+        };
+        for (key, text) in [
+            (egui::Key::Num5, "%"),
+            (egui::Key::Num6, "^"),
+            (egui::Key::Num9, "("),
+            (egui::Key::OpenBracket, "{"),
+            (egui::Key::Quote, "\""),
+            (egui::Key::A, "A"),
+        ] {
+            let events = [
+                press(key, egui::Modifiers::SHIFT),
+                egui::Event::Text(text.into()),
+            ];
+            for modify in [0, 1] {
+                assert_eq!(encode(&events, 0, modify, 0), text.as_bytes());
+            }
+            let codepoint = u32::from(text.chars().next().unwrap());
+            assert_eq!(
+                encode(&events, 0, 2, 0),
+                format!("\x1b[27;2;{codepoint}~").as_bytes()
+            );
+            assert_eq!(
+                encode(&events, 0, 2, 1),
+                format!("\x1b[{codepoint};2u").as_bytes()
+            );
+        }
+
+        // No Text means no character may be borrowed from a later key. The
+        // existing fallback and key order must survive both same-frame inputs.
+        assert_eq!(
+            encode(
+                &[
+                    press(egui::Key::Num5, egui::Modifiers::SHIFT),
+                    press(egui::Key::A, egui::Modifiers::NONE),
+                    egui::Event::Text("a".into()),
+                ],
+                0,
+                2,
+                0
+            ),
+            b"\x1b[27;2;53~a"
+        );
+        assert_eq!(
+            encode(
+                &[
+                    press(egui::Key::Num5, egui::Modifiers::SHIFT),
+                    egui::Event::Text("%".into()),
+                    press(egui::Key::Num6, egui::Modifiers::SHIFT),
+                    egui::Event::Text("^".into()),
+                    press(egui::Key::Enter, egui::Modifiers::NONE),
+                ],
+                0,
+                2,
+                0
+            ),
+            b"\x1b[27;2;37~\x1b[27;2;94~\r"
+        );
+
+        for (modifiers, expected) in [
+            (egui::Modifiers::CTRL, b"\x1b[27;5;97~".as_slice()),
+            (egui::Modifiers::ALT, b"\x1b[27;3;97~".as_slice()),
+        ] {
+            assert_eq!(encode(&[press(egui::Key::A, modifiers)], 0, 2, 0), expected);
+        }
+        assert_eq!(
+            encode(&[press(egui::Key::A, egui::Modifiers::CTRL)], 1, 2, 0),
+            b"\x1b[97;5u"
+        );
+        assert_eq!(
+            encode(&[press(egui::Key::Num5, egui::Modifiers::SHIFT)], 8, 2, 0),
+            b"\x1b[53;2u"
+        );
+        assert_eq!(
+            paired_printable_key_text(
+                &[
+                    press(egui::Key::Num5, egui::Modifiers::SHIFT),
+                    egui::Event::Ime(egui::ImeEvent::Commit("你".into())),
+                    egui::Event::Text("%".into()),
+                ],
+                0
+            ),
+            None
+        );
     }
 
     #[test]
