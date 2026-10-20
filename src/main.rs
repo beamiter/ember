@@ -25,6 +25,7 @@ mod help;
 mod history_persistence;
 mod history_picker;
 mod image_drop;
+mod immersive_command;
 mod jsh_ui;
 mod keybindings;
 mod kitty_graphics;
