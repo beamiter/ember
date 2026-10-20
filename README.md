@@ -11,11 +11,16 @@ claimed.
 ## Native Vim9 IDE
 
 Run `ember --ide /path/to/project` (or `ember --ide file.rs`) to open a real
-Vim9 editor in the GPU terminal grid with an egui workbench: file navigation,
+Vim9 editor with a native egui buffer surface and workbench: file navigation,
 buffers, saving, project search, asynchronous builds, output and clickable
 diagnostics. The **Vim9** title-bar button and **Vim9 IDE: Open Project**
 command-palette action open a new editor tab in an existing terminal workspace.
 Your Vim configuration, mappings, registers and undo remain Vim's.
+Buffer text and `guifg`/`guibg`/`guisp` styles arrive over the authenticated
+bridge and are drawn directly with native glyphs, RGB colors, bold/italic and
+decorations. Buffer zoom stays local to the editor. A **GUI buffer · RGB**
+indicator identifies this path; unsupported Vim views switch explicitly to
+the compatible terminal display, with the reason available on hover.
 See [the Vim9 IDE guide](docs/vim9-ide.md).
 
 The native workbench includes fuzzy **Quick Open** (`Ctrl+Shift+P`),

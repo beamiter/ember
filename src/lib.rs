@@ -37,6 +37,7 @@ pub mod tab_manager;
 pub mod terminal;
 pub mod theme;
 pub mod ui;
+mod vim9_buffer;
 pub mod watch_adapter;
 pub mod windows_compat;
 pub mod workflows;

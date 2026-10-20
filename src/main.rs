@@ -55,6 +55,7 @@ mod terminal;
 mod terminal_ime;
 mod theme;
 mod ui;
+mod vim9_buffer;
 mod vim9_ide;
 mod watch_adapter;
 mod windows_compat;
@@ -624,6 +625,10 @@ fn configure_fonts_and_gpu(
         );
         organism_bold_fallbacks.insert(0, "organism-monospace-bold".to_owned());
     }
+    fonts.families.insert(
+        egui::FontFamily::Name("vim9-buffer-bold".into()),
+        organism_bold_fallbacks.clone(),
+    );
     fonts.families.insert(
         egui::FontFamily::Name("organism-monospace-bold".into()),
         organism_bold_fallbacks,
@@ -2604,7 +2609,10 @@ impl TerminalApp {
         if let Some(editor) = startup_editor {
             session.purpose = crate::session::SessionPurpose::EphemeralCommand;
             session.metadata.name = "Vim9 IDE".to_string();
-            vim9_editors.insert(first_session_id, vim9_ide::Workbench::new(editor));
+            vim9_editors.insert(
+                first_session_id,
+                vim9_ide::Workbench::new(editor, cfg.font_size),
+            );
         }
         let mut session_manager = SessionManager::new(session, repaint_ctx, configured_shell);
 
@@ -5960,6 +5968,7 @@ impl eframe::App for TerminalApp {
         self.frame_events.clear();
         ctx.input(|i| self.frame_events.extend(i.events.iter().cloned()));
         self.discard_stale_frame_ime();
+        self.advance_vim9_deferred_input(ctx);
         app::input::guard_prompt_fill_enter(
             ctx,
             &mut self.prompt_fill_enter_down,

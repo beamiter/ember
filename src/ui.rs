@@ -1327,6 +1327,10 @@ pub struct TerminalRenderer {
     projected_kitty_rows_remaining: Option<usize>,
     /// The content rect from the last render, used for mouse-to-grid coordinate conversion
     pub last_content_rect: Option<egui::Rect>,
+    /// Authenticated buffer text/GUI styles. Terminal cells remain only the
+    /// compatibility surface outside this frame's buffer rectangle.
+    pub native_vim9_frame: Option<std::sync::Arc<jterm_core::vim9::Vim9RenderFrame>>,
+    pub native_vim9_font_size: Option<f32>,
     /// Same-frame native active-card free space; never terminal or PTY allocation.
     pub companion_surface: Option<(String, ProjectionCacheKey, egui::Rect)>,
     pub companion_enabled: bool,
@@ -1501,6 +1505,8 @@ impl TerminalRenderer {
             requested_initial_focus: false,
             ime_enabled: false,
             last_content_rect: None,
+            native_vim9_frame: None,
+            native_vim9_font_size: None,
             companion_surface: None,
             companion_enabled: false,
             companion_status_surface: None,
@@ -1733,7 +1739,7 @@ impl TerminalRenderer {
         // When GPU rendering is active, derive cell size from the GPU atlas font
         // metrics (ascent + |descent| and advance width) which give tighter spacing
         // than egui's row_height (which includes extra leading).
-        if self.gpu_rendering {
+        if self.gpu_rendering && self.native_vim9_font_size.is_none() {
             if let Some(render_state) = &self.wgpu_render_state {
                 let ppp = ctx.pixels_per_point();
                 let renderer = render_state.renderer.read();
@@ -4225,6 +4231,15 @@ impl TerminalRenderer {
         let mut grid = viewport.cells_arc();
         let rows = viewport.rows();
         let cols = viewport.columns();
+        let native_buffer = self
+            .native_vim9_frame
+            .as_ref()
+            .filter(|frame| {
+                crate::vim9_buffer::usable(frame, rows, cols)
+                    && viewport.scroll_offset() == 0
+                    && terminal.selection.is_none()
+            })
+            .cloned();
 
         // eprintln!("[UI] Rect: {:?}", rect);
 
@@ -4304,7 +4319,11 @@ impl TerminalRenderer {
             Vec::new()
         };
         let cursor_point = viewport.cursor();
-        let cursor_pos = (cursor_point.row, cursor_point.column);
+        let cursor_pos = native_buffer
+            .as_ref()
+            .filter(|frame| frame.cursor.visible)
+            .map(|frame| (frame.cursor.row, frame.cursor.column))
+            .unwrap_or((cursor_point.row, cursor_point.column));
         let ime_rect = cursor_rect(
             content_rect,
             cursor_pos.0,
@@ -4956,7 +4975,9 @@ impl TerminalRenderer {
         );
 
         // GPU-accelerated grid rendering via wgpu instanced draw
-        let gpu_rendered = if self.gpu_rendering {
+        // The native buffer uses egui's GPU text pipeline. Only Vim's command
+        // line / compatible margins use terminal-cell rendering in this mode.
+        let gpu_rendered = if self.gpu_rendering && self.native_vim9_font_size.is_none() {
             self.render_grid_gpu(
                 ui,
                 terminal,
@@ -5003,6 +5024,7 @@ impl TerminalRenderer {
                 content_rect,
                 char_width,
                 line_height,
+                native_buffer.as_deref(),
             );
         }
 
@@ -5064,8 +5086,24 @@ impl TerminalRenderer {
             KittyImageLayer::AboveText,
         );
 
+        if let Some(frame) = &native_buffer {
+            crate::vim9_buffer::paint(
+                &painter,
+                frame,
+                content_rect,
+                char_width,
+                line_height,
+                self.font_size,
+                focus_enabled,
+                cursor_visible,
+            );
+        }
+
         // Render cursor - direct O(1) positioning instead of full grid scan
         if cursor_visible
+            && native_buffer
+                .as_ref()
+                .is_none_or(|frame| !crate::vim9_buffer::covers(frame, cursor_pos.0, cursor_pos.1))
             && terminal.is_projected_cursor_visible(&viewport)
             && cursor_pos.0 < rows
             && cursor_pos.1 < cols
@@ -6159,6 +6197,7 @@ impl TerminalRenderer {
         content_rect: egui::Rect,
         char_width: f32,
         line_height: f32,
+        native_buffer: Option<&jterm_core::vim9::Vim9RenderFrame>,
     ) {
         // Gate on is_open. `SearchState::close` deliberately keeps `matches`
         // and `query` (so reopening restores the last search), so deriving this
@@ -6187,6 +6226,11 @@ impl TerminalRenderer {
             let sel_cols = terminal.row_selection_cols_projected(viewport, row_idx);
 
             for (col_idx, cell) in row.iter().enumerate().take(cols) {
+                if native_buffer
+                    .is_some_and(|frame| crate::vim9_buffer::covers(frame, row_idx, col_idx))
+                {
+                    continue;
+                }
                 if cell.flags.wide_continuation() {
                     continue;
                 }
@@ -6296,6 +6340,12 @@ impl TerminalRenderer {
 
             let mut col_idx = 0;
             while col_idx < cols {
+                if native_buffer
+                    .is_some_and(|frame| crate::vim9_buffer::covers(frame, row_idx, col_idx))
+                {
+                    col_idx += 1;
+                    continue;
+                }
                 let cell = &row[col_idx];
                 if cell.flags.wide_continuation() || cell.character == ' ' {
                     col_idx += 1;

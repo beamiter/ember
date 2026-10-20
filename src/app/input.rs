@@ -596,6 +596,7 @@ pub(crate) fn clear_terminal_preedit_for_ui_owner(
 
 #[derive(Clone, Debug)]
 struct OrderedKeyPress {
+    event_index: usize,
     event: egui::Event,
     key: egui::Key,
     modifiers: egui::Modifiers,
@@ -653,6 +654,7 @@ fn ordered_key_presses(
                 let command = build_keybinding_string(*key, *modifiers)
                     .and_then(|chord| bindings.get_command(&chord));
                 batch.presses.push(OrderedKeyPress {
+                    event_index,
                     event: event.clone(),
                     key: *key,
                     modifiers: *modifiers,
@@ -1378,6 +1380,14 @@ impl TerminalApp {
     }
 
     fn set_font_size_from_command(&mut self, ctx: &egui::Context, target_size: f32, action: &str) {
+        if self.set_vim9_buffer_font_size(target_size) {
+            ctx.request_repaint();
+            self.set_status(format!(
+                "Vim buffer {action}: {:.0} pt",
+                self.vim9_buffer_font_size()
+            ));
+            return;
+        }
         let new_font_size = config::Config::clamp_font_size(target_size);
         if (new_font_size - self.config.font_size).abs() <= 0.01 {
             self.set_status(format!(
@@ -1573,12 +1583,16 @@ impl TerminalApp {
             keybindings::Command::BlockExportSelectedJson => {
                 self.block_export_selected(crate::block_export::SessionExportFormat::Json)
             }
-            keybindings::Command::FontIncrease => {
-                self.set_font_size_from_command(ctx, self.config.font_size + 1.0, "Font increased")
-            }
-            keybindings::Command::FontDecrease => {
-                self.set_font_size_from_command(ctx, self.config.font_size - 1.0, "Font decreased")
-            }
+            keybindings::Command::FontIncrease => self.set_font_size_from_command(
+                ctx,
+                self.vim9_buffer_font_size() + 1.0,
+                "Font increased",
+            ),
+            keybindings::Command::FontDecrease => self.set_font_size_from_command(
+                ctx,
+                self.vim9_buffer_font_size() - 1.0,
+                "Font decreased",
+            ),
             keybindings::Command::FontReset => {
                 self.set_font_size_from_command(ctx, config::DEFAULT_FONT_SIZE, "Font size reset")
             }
@@ -2612,7 +2626,8 @@ impl TerminalApp {
         let mut selection_postdates_terminal_input = false;
         let mut accepted_ime_input = false;
         let mut handled_ime_event_indices = Vec::new();
-        let dispatch = dispatch_ordered_key_presses(&batch.presses, |press| {
+        let mut deferred_vim9 = None;
+        let mut dispatch = dispatch_ordered_key_presses(&batch.presses, |press| {
             if !terminal_input_blocked {
                 for commit in &press.ime_commits_before {
                     if !ime_commit_can_queue_now(terminal_input_seen, commit) {
@@ -2651,17 +2666,25 @@ impl TerminalApp {
                 if ui_input_blocked && !self.command_belongs_to_open_modal(&command) {
                     return OrderedPressOutcome::Ignored;
                 }
+                if crate::vim9_ide::is_editor_command(&command)
+                    && self.active_vim9_editor().is_some()
+                {
+                    if matches!(press.event, egui::Event::Key { repeat: true, .. }) {
+                        return OrderedPressOutcome::Consumed;
+                    }
+                    // A native command is not a terminal control byte. Keep
+                    // its input suffix behind both the PTY writer and Vim's
+                    // eventual command response instead of dropping Ctrl+S
+                    // into the encoder when Escape preceded it in this batch.
+                    deferred_vim9 = Some((press.event_index, command, press.event.clone()));
+                    return OrderedPressOutcome::ClaimRest;
+                }
                 if terminal_input_seen {
                     // Leave every later chord in frame_events once older input
                     // awaits the deferred encoder. Besides direct block replay,
                     // this prevents a newly opened modal from suppressing the
                     // older bytes when input blocking is recomputed below.
                     return OrderedPressOutcome::Ignored;
-                }
-                if crate::vim9_ide::is_editor_command(&command)
-                    && matches!(press.event, egui::Event::Key { repeat: true, .. })
-                {
-                    return OrderedPressOutcome::Consumed;
                 }
                 let has_contextual_target = match command {
                     keybindings::Command::BlockToggleCollapse => {
@@ -2778,6 +2801,34 @@ impl TerminalApp {
             if batch.trailing_terminal_input {
                 selection_postdates_terminal_input = false;
             }
+        }
+
+        if let Some((event_index, command, press)) = deferred_vim9 {
+            let mut suffix = self.frame_events.split_off(event_index);
+            if let egui::Event::Key { key, modifiers, .. } = &press {
+                consume_bound_key_event(&mut suffix, *key, *modifiers);
+            }
+            let mut following = Vec::new();
+            for event in suffix {
+                if crate::vim9_ide::is_deferred_input(&event) {
+                    following.push(event);
+                } else {
+                    self.frame_events.push(event);
+                }
+            }
+            self.defer_vim9_action(ctx, command, following);
+            ctx.input_mut(|input| {
+                if let Some(boundary) = input.events.iter().position(|event| event == &press) {
+                    let mut index = 0;
+                    input.events.retain(|event| {
+                        let keep = index < boundary || !crate::vim9_ide::is_deferred_input(event);
+                        index += 1;
+                        keep
+                    });
+                }
+            });
+            // The action itself has already been removed with its suffix.
+            dispatch.consumed.pop();
         }
 
         // Commits queued above must not be encoded a second time by the later
@@ -2960,9 +3011,45 @@ impl TerminalApp {
 
     /// Apply pointer-owned zoom after layout, independently of keyboard focus.
     pub fn handle_font_zoom(&mut self, ctx: &egui::Context) {
-        let [ui_delta, main_delta] = self
-            .font_zoom
-            .drain(|pos| crate::font_zoom::workspace_layer_at(ctx, pos));
+        let editor_panes: Vec<_> = self
+            .layout()
+            .panes()
+            .iter()
+            .filter_map(|pane| {
+                let session = self.session_manager.sessions().get(pane.session_idx)?;
+                let id = &session.metadata.session_id;
+                self.vim9_editors
+                    .contains_key(id)
+                    .then(|| (pane.rect, id.clone()))
+            })
+            .collect();
+        let mut editor_deltas = std::collections::HashMap::<String, f64>::new();
+        let [ui_delta, main_delta] = self.font_zoom.drain_with_main(
+            |pos| crate::font_zoom::workspace_layer_at(ctx, pos),
+            |pos, points| {
+                let Some((_, id)) = editor_panes.iter().find(|(rect, _)| {
+                    pos.x >= rect.min.x
+                        && pos.x < rect.max.x
+                        && pos.y >= rect.min.y
+                        && pos.y < rect.max.y
+                }) else {
+                    return false;
+                };
+                *editor_deltas.entry(id.clone()).or_default() += f64::from(points);
+                true
+            },
+        );
+        for (id, delta) in editor_deltas {
+            let Some(editor) = self.vim9_editors.get_mut(&id) else {
+                continue;
+            };
+            let size = f64::from(editor.buffer_font_size.unwrap_or(self.config.font_size)) + delta;
+            editor.buffer_font_size = Some(config::Config::clamp_font_size(
+                size.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32,
+            ));
+            self.force_resize_session = true;
+            ctx.request_repaint();
+        }
         let old_main = self.config.font_size;
         let old_ui = self.config.effective_ui_font_size();
         let new_ui = config::Config::clamp_font_size(old_ui + ui_delta);

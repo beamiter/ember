@@ -308,6 +308,17 @@ impl WriteQueue {
         state.accounted_messages = state.accounted_messages.saturating_sub(1);
     }
 
+    fn drained(&self) -> Result<bool, ShellWriteError> {
+        let state = self.state.lock();
+        if state.closed {
+            Err(ShellWriteError::Closed)
+        } else {
+            // `take()` does not release this accounting: an empty pending
+            // deque alone would allow a native command to overtake OS writes.
+            Ok(state.accounted_bytes == 0 && state.accounted_messages == 0)
+        }
+    }
+
     fn close(&self) {
         let mut state = self.state.lock();
         if state.closed {
@@ -952,6 +963,11 @@ impl ShellSession {
         self.write_tx.queue.try_enqueue_slice(data)
     }
 
+    /// True only after every queued and in-flight PTY write has completed.
+    pub fn input_drained(&self) -> Result<bool, ShellWriteError> {
+        self.write_tx.queue.drained()
+    }
+
     /// Observe the actual PTY foreground owner for a rendered Chat gesture.
     /// Missing or contended native state disables the optional control.
     pub fn foreground_pgid(&self) -> Option<i32> {
@@ -1265,6 +1281,22 @@ mod tests {
             queue: Arc::clone(&queue),
         };
         (queue, sender)
+    }
+
+    #[test]
+    fn native_action_barrier_waits_for_inflight_write_and_rejects_closed_writer() {
+        let (queue, sender) = test_sender(tiny_limits());
+        assert_eq!(queue.drained(), Ok(true));
+        sender.try_send(b"edit".to_vec()).unwrap();
+        assert_eq!(queue.drained(), Ok(false));
+        let bytes = queue.take().unwrap();
+        // No pending message remains, but the OS write has not completed.
+        assert!(queue.state.lock().pending.is_empty());
+        assert_eq!(queue.drained(), Ok(false));
+        queue.finish(bytes.len());
+        assert_eq!(queue.drained(), Ok(true));
+        queue.close();
+        assert_eq!(queue.drained(), Err(ShellWriteError::Closed));
     }
 
     #[test]

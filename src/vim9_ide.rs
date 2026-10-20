@@ -1,4 +1,4 @@
-//! Native workbench controls around a real Vim9 process in the terminal grid.
+//! Native Vim9 workbench and GUI buffer rendering around a real Vim process.
 //! Editing, undo, registers, plugins and modified-buffer protection belong to Vim.
 
 use crate::app::state::TerminalApp;
@@ -12,6 +12,46 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const QUICK_OPEN_LIMIT: usize = 40;
+
+/// Wake the native surface only when the shared immutable frame changes.
+/// Metadata keeps its existing slower poll; idle buffers do not repaint at 60Hz.
+struct RenderWake {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RenderWake {
+    fn start(session: Vim9Session, ctx: egui::Context) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("vim9-gui-repaint".into())
+            .spawn(move || {
+                let mut previous = None;
+                while !worker_stop.load(Ordering::Acquire) {
+                    let revision = session.render_snapshot().map(|frame| frame.revision);
+                    if revision != previous {
+                        previous = revision;
+                        ctx.request_repaint();
+                    }
+                    std::thread::park_timeout(Duration::from_millis(16));
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for RenderWake {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DialogKind {
@@ -283,8 +323,65 @@ pub(crate) fn is_editor_command(command: &crate::keybindings::Command) -> bool {
     )
 }
 
+pub(crate) fn is_deferred_input(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::Paste(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Ime(_)
+    )
+}
+
+struct DeferredAction {
+    action: Option<crate::keybindings::Command>,
+    request: Option<u64>,
+    following: Vec<egui::Event>,
+    bytes: usize,
+    opens_chrome: bool,
+}
+
+impl DeferredAction {
+    fn new(action: crate::keybindings::Command) -> Self {
+        use crate::keybindings::Command;
+        let opens_chrome = matches!(
+            action,
+            Command::Vim9QuickOpen | Command::Vim9Goto | Command::Vim9Search | Command::Vim9Build
+        );
+        Self {
+            action: Some(action),
+            request: None,
+            following: Vec::new(),
+            bytes: 0,
+            opens_chrome,
+        }
+    }
+
+    fn append(&mut self, event: egui::Event) -> bool {
+        let bytes = match &event {
+            egui::Event::Text(text)
+            | egui::Event::Paste(text)
+            | egui::Event::Ime(egui::ImeEvent::Commit(text))
+            | egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => text.len(),
+            _ => 1,
+        };
+        if self.following.len() >= 8192 || self.bytes.saturating_add(bytes) > 8 * 1024 * 1024 {
+            return false;
+        }
+        self.bytes += bytes;
+        self.following.push(event);
+        true
+    }
+}
+
 pub(crate) struct Workbench {
     pub(crate) session: Vim9Session,
+    pub(crate) buffer_font_size: Option<f32>,
+    render_subscribed: bool,
+    render_wake: Option<RenderWake>,
+    deferred_action: Option<DeferredAction>,
     snapshot: Arc<Vim9Snapshot>,
     refreshed_at: Instant,
     file_input: String,
@@ -304,10 +401,14 @@ pub(crate) struct Workbench {
 }
 
 impl Workbench {
-    pub(crate) fn new(session: Vim9Session) -> Self {
+    pub(crate) fn new(session: Vim9Session, font_size: f32) -> Self {
         let snapshot = Arc::new(session.snapshot());
         Self {
             session,
+            buffer_font_size: Some(crate::config::Config::clamp_font_size(font_size)),
+            render_subscribed: false,
+            render_wake: None,
+            deferred_action: None,
             snapshot,
             refreshed_at: Instant::now(),
             file_input: String::new(),
@@ -328,8 +429,55 @@ impl Workbench {
     }
 
     pub(crate) fn send(&mut self, command: Vim9Command) {
-        self.error = self.session.send(command).err().map(|e| e.to_string());
+        let _ = self.send_tracked(command);
+    }
+
+    fn send_tracked(&mut self, command: Vim9Command) -> Option<u64> {
         self.return_focus = true;
+        match self.session.send(command) {
+            Ok(id) => {
+                self.error = None;
+                Some(id)
+            }
+            Err(error) => {
+                self.error = Some(error.to_string());
+                None
+            }
+        }
+    }
+
+    fn dispatch_action(&mut self, command: crate::keybindings::Command) -> Option<u64> {
+        use crate::keybindings::Command;
+        let request = match command {
+            Command::Vim9QuickOpen => {
+                self.open_dialog(DialogKind::QuickOpen);
+                None
+            }
+            Command::Vim9Goto => {
+                self.open_dialog(DialogKind::Goto);
+                None
+            }
+            Command::Vim9Search => {
+                self.focus_input = Some(ToolInput::Search);
+                None
+            }
+            Command::Vim9Build => {
+                self.focus_input = Some(ToolInput::Build);
+                None
+            }
+            Command::Vim9NavigateBack => Some(Vim9Command::NavigateBack),
+            Command::Vim9NavigateForward => Some(Vim9Command::NavigateForward),
+            Command::Vim9Save => Some(Vim9Command::Save),
+            Command::Vim9SaveAll => Some(Vim9Command::SaveAll),
+            Command::Vim9CancelSearch => Some(Vim9Command::CancelSearch),
+            Command::Vim9PreviousBuffer => Some(Vim9Command::PreviousBuffer),
+            Command::Vim9NextBuffer => Some(Vim9Command::NextBuffer),
+            Command::Vim9CloseBuffer => Some(Vim9Command::CloseCurrentBuffer),
+            Command::Vim9NextProblem => Some(Vim9Command::NextDiagnostic),
+            Command::Vim9PreviousProblem => Some(Vim9Command::PreviousDiagnostic),
+            _ => None,
+        };
+        request.and_then(|request| self.send_tracked(request))
     }
 
     fn open_dialog(&mut self, kind: DialogKind) {
@@ -348,6 +496,14 @@ impl Workbench {
     fn refresh(&mut self) {
         if self.refreshed_at.elapsed() >= Duration::from_millis(100) {
             self.snapshot = Arc::new(self.session.snapshot());
+            if !self.snapshot.connected {
+                self.render_subscribed = false;
+            } else if !self.render_subscribed {
+                self.render_subscribed = self
+                    .session
+                    .send(Vim9Command::SetRender { enabled: true })
+                    .is_ok();
+            }
             self.refreshed_at = Instant::now();
         }
     }
@@ -357,6 +513,14 @@ impl Workbench {
         ui.horizontal_wrapped(|ui| {
             ui.strong("VIM9 IDE");
             ui.separator();
+            if let Some(frame) = self.session.render_snapshot() {
+                if frame.supported {
+                    ui.small("GUI buffer · RGB").on_hover_text("Vim buffer text and GUI highlight attributes are drawn directly by egui.");
+                } else {
+                    ui.small("Compatible view").on_hover_text(&frame.fallback_reason);
+                }
+                ui.separator();
+            }
             ui.label(if snapshot.connected {
                 snapshot.mode.to_uppercase()
             } else {
@@ -951,6 +1115,145 @@ pub(crate) fn launch_button(ui: &egui::Ui, rect: egui::Rect, font_size: f32) -> 
 }
 
 impl TerminalApp {
+    pub(crate) fn defer_vim9_action(
+        &mut self,
+        ctx: &egui::Context,
+        command: crate::keybindings::Command,
+        following: Vec<egui::Event>,
+    ) {
+        let id = &self.session_manager.sessions()[self.session_manager.active_index()]
+            .metadata
+            .session_id;
+        let Some(editor) = self.vim9_editors.get_mut(id) else {
+            return;
+        };
+        let mut deferred = DeferredAction::new(command);
+        for event in following {
+            if !deferred.append(event) {
+                editor.error =
+                    Some("Vim input buffer is full; wait before entering more input".into());
+                break;
+            }
+        }
+        editor.deferred_action = Some(deferred);
+        ctx.request_repaint();
+    }
+
+    /// One owner spans keyboard admission, the actual PTY writer, and the
+    /// channel reply. A tab change cannot retarget the action or its suffix.
+    pub(crate) fn advance_vim9_deferred_input(&mut self, ctx: &egui::Context) {
+        let active = self.session_manager.sessions()[self.session_manager.active_index()]
+            .metadata
+            .session_id
+            .clone();
+        let ui_owns_input = self.terminal_input_blocked(ctx);
+        let focused = ctx.input(|input| input.focused);
+        if !ui_owns_input {
+            if let Some(editor) = self.vim9_editors.get_mut(&active) {
+                if let Some(deferred) = &mut editor.deferred_action {
+                    let mut full = false;
+                    self.frame_events.retain(|event| {
+                        if is_deferred_input(event) {
+                            full |= !deferred.append(event.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    ctx.input_mut(|input| input.events.retain(|event| !is_deferred_input(event)));
+                    if full {
+                        editor.error = Some(
+                            "Vim input buffer is full; wait before entering more input".into(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut replay = Vec::new();
+        for (id, editor) in &mut self.vim9_editors {
+            let Some(mut deferred) = editor.deferred_action.take() else {
+                continue;
+            };
+            let Some(index) = self.session_manager.index_of(id) else {
+                continue;
+            };
+            let session = &self.session_manager.sessions()[index];
+            if deferred.action.is_some() {
+                if !session.pending_input.is_empty() || self.osc_paste_input_barriers.blocks(id) {
+                    editor.deferred_action = Some(deferred);
+                    ctx.request_repaint_after(Duration::from_millis(5));
+                    continue;
+                }
+                match session.shell.input_drained() {
+                    Ok(false) => {
+                        editor.deferred_action = Some(deferred);
+                        ctx.request_repaint_after(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => {
+                        editor.error = Some(format!("Vim action cancelled: {error}"));
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+                if let Some(action) = deferred.action.take() {
+                    deferred.request = editor.dispatch_action(action);
+                }
+                // The UI must first paint a newly opened input field/dialog.
+                // Its queued query/Enter then sees the established owner.
+                editor.deferred_action = Some(deferred);
+                ctx.request_repaint();
+                continue;
+            }
+            let complete = deferred
+                .request
+                .is_none_or(|request| !editor.session.command_pending(request));
+            if complete && deferred.following.is_empty() {
+                continue;
+            }
+            if complete && id == &active && focused && (!ui_owns_input || deferred.opens_chrome) {
+                replay.append(&mut deferred.following);
+            } else {
+                editor.deferred_action = Some(deferred);
+                if !complete {
+                    ctx.request_repaint_after(Duration::from_millis(5));
+                }
+            }
+        }
+        if !replay.is_empty() {
+            ctx.input_mut(|input| {
+                let mut events = replay.clone();
+                events.append(&mut input.events);
+                input.events = events;
+            });
+            replay.append(&mut self.frame_events);
+            self.frame_events = replay;
+        }
+    }
+
+    pub(crate) fn vim9_buffer_font_size(&self) -> f32 {
+        self.active_vim9_editor()
+            .and_then(|editor| editor.buffer_font_size)
+            .unwrap_or(self.config.font_size)
+    }
+
+    pub(crate) fn set_vim9_buffer_font_size(&mut self, size: f32) -> bool {
+        let Some(session) = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+        else {
+            return false;
+        };
+        let Some(editor) = self.vim9_editors.get_mut(&session.metadata.session_id) else {
+            return false;
+        };
+        editor.buffer_font_size = Some(crate::config::Config::clamp_font_size(size));
+        self.force_resize_session = true;
+        true
+    }
+
     pub(crate) fn active_vim9_editor(&self) -> Option<&Workbench> {
         self.session_manager
             .sessions()
@@ -1000,7 +1303,6 @@ impl TerminalApp {
     }
 
     pub(crate) fn dispatch_vim9_command(&mut self, command: crate::keybindings::Command) {
-        use crate::keybindings::Command;
         let id = self
             .session_manager
             .get_active_session_mut()
@@ -1014,23 +1316,7 @@ impl TerminalApp {
             );
             return;
         };
-        match command {
-            Command::Vim9QuickOpen => editor.open_dialog(DialogKind::QuickOpen),
-            Command::Vim9Goto => editor.open_dialog(DialogKind::Goto),
-            Command::Vim9NavigateBack => editor.send(Vim9Command::NavigateBack),
-            Command::Vim9NavigateForward => editor.send(Vim9Command::NavigateForward),
-            Command::Vim9Save => editor.send(Vim9Command::Save),
-            Command::Vim9SaveAll => editor.send(Vim9Command::SaveAll),
-            Command::Vim9Search => editor.focus_input = Some(ToolInput::Search),
-            Command::Vim9CancelSearch => editor.send(Vim9Command::CancelSearch),
-            Command::Vim9Build => editor.focus_input = Some(ToolInput::Build),
-            Command::Vim9PreviousBuffer => editor.send(Vim9Command::PreviousBuffer),
-            Command::Vim9NextBuffer => editor.send(Vim9Command::NextBuffer),
-            Command::Vim9CloseBuffer => editor.close_current_buffer(),
-            Command::Vim9NextProblem => editor.send(Vim9Command::NextDiagnostic),
-            Command::Vim9PreviousProblem => editor.send(Vim9Command::PreviousDiagnostic),
-            _ => {}
-        }
+        let _ = editor.dispatch_action(command);
     }
 
     /// Reserve dialog navigation before the terminal encoder. Confirmation is
@@ -1173,8 +1459,10 @@ impl TerminalApp {
                 return;
             }
         };
-        self.vim9_editors
-            .insert(created.session_id, Workbench::new(session));
+        self.vim9_editors.insert(
+            created.session_id,
+            Workbench::new(session, self.config.font_size),
+        );
         self.tabs.on_session_inserted(created.session_index);
         self.tabs.insert_tab_after_active(created.session_index);
         self.activate_session(created.session_index);
@@ -1232,6 +1520,12 @@ impl TerminalApp {
         let Some(editor) = self.vim9_editors.get_mut(&id) else {
             return;
         };
+        if editor.render_wake.is_none() {
+            editor.render_wake = Some(RenderWake::start(
+                editor.session.clone(),
+                root_ui.ctx().clone(),
+            ));
+        }
         editor.refresh();
         editor.chrome_rects.clear();
         let toolbar = egui::Panel::top(egui::Id::new(("vim9_workbench", &id)))

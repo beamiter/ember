@@ -2465,6 +2465,23 @@ impl TerminalApp {
         if !terminal_interaction_enabled {
             self.dragging_divider = None;
         }
+        // Each IDE owns its text size and GUI frame; switching back to a shell
+        // restores that shell's configured font without changing any settings.
+        let active_id = self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            .clone();
+        let native_editor = self.vim9_editors.get(&active_id);
+        self.renderer.native_vim9_frame =
+            native_editor.and_then(|editor| editor.session.render_snapshot());
+        self.renderer.native_vim9_font_size =
+            native_editor.map(|editor| editor.buffer_font_size.unwrap_or(self.config.font_size));
+        self.renderer.font_size = self
+            .renderer
+            .native_vim9_font_size
+            .unwrap_or(self.config.font_size);
         // 终端显示区域
         self.renderer.sync_font_metrics(ctx);
         // Toolbar space is reserved before BOTH pane layout and PTY sizing;
@@ -2552,6 +2569,20 @@ impl TerminalApp {
 
                 let content_rect = pane_chrome[pane_idx].1;
                 let session_idx = pane.session_idx;
+                let native_editor = self
+                    .session_manager
+                    .sessions()
+                    .get(session_idx)
+                    .and_then(|session| self.vim9_editors.get(&session.metadata.session_id));
+                let renderer = &mut self.pane_renderers[pane_idx];
+                renderer.native_vim9_frame =
+                    native_editor.and_then(|editor| editor.session.render_snapshot());
+                renderer.native_vim9_font_size = native_editor
+                    .map(|editor| editor.buffer_font_size.unwrap_or(self.config.font_size));
+                renderer.font_size = renderer
+                    .native_vim9_font_size
+                    .unwrap_or(self.config.font_size);
+                renderer.sync_font_metrics(ctx);
                 // 按本窗格 rect 的尺寸 resize 该窗格会话的 shell + 终端 grid,
                 // 否则窗格内的 shell 仍以为自己拥有整窗口宽高,导致换行/清屏错乱。
                 let (pane_cols, pane_rows) =

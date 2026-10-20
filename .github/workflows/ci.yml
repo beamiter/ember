@@ -247,7 +247,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             xvfb openbox xdotool xclip x11-utils sway wtype wl-clipboard grim \
-            dbus python3-dbus at-spi2-core imagemagick tesseract-ocr fonts-dejavu-core fonts-noto-cjk mesa-vulkan-drivers mesa-utils libxkbcommon-x11-0 libwayland-bin
+            dbus python3-dbus python3-pil at-spi2-core imagemagick tesseract-ocr fonts-dejavu-core fonts-noto-cjk mesa-vulkan-drivers mesa-utils libxkbcommon-x11-0 libwayland-bin vim ripgrep
 
       - name: Stage optimized desktop candidate
         id: desktop-install
@@ -270,6 +270,14 @@ jobs:
       - name: Gate X11 installed release interactions
         if: steps.desktop-install.outcome == 'success'
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend x11 --output native-smoke-artifacts/x11
+
+      - name: Gate native Vim buffer GUI colors and real editing
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          xvfb-run -a -s '-screen 0 1600x1100x24' /usr/bin/python3 scripts/native-vim9-buffer-smoke.py \
+            --binary "$RUNNER_TEMP/ember-installed/bin/ember" --app ember \
+            --output native-smoke-artifacts/vim9-buffer-gui
 
       - name: Probe owned Block Search accessibility on isolated X11
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}

@@ -5,6 +5,27 @@ owns text editing, modes, internal splits, registers, undo, completion, syntax
 and plugins. Keyboard input goes directly to its PTY. Native buttons use the
 shared `jterm_core::vim9` typed channel.
 
+The buffer itself is a native egui text surface. Vim supplies buffer text,
+logical positions and GUI highlight attributes over the authenticated channel;
+Ember shapes and draws those text runs directly. `guifg`, `guibg` and `guisp`
+retain exact RGB values even with `notermguicolors` or conflicting `ctermfg`.
+Bold uses a real bold face, italic uses native text styling, and underline,
+undercurl, strikethrough, cursor and Visual selection are GUI decorations.
+The native path does not repaint the buffer from ANSI cells or sample colors
+from the terminal palette.
+
+**GUI buffer · RGB** marks the supported buffer view. Vim's command and status
+rows remain in the compatibility surface outside that buffer rectangle.
+Complex views (including multiple Vim windows, folds, diff, popup completion,
+conceal and unsupported shaping) temporarily use **Compatible view**; hover
+the label for the runtime's reason. A disconnected bridge or a resized frame
+never leaves an old native frame over the terminal. The logical cell geometry
+is retained for correct Vim mouse/IME positions; proportional text layout,
+arbitrary line heights and native completion popups are not yet implemented.
+
+Ctrl+wheel and font-size actions over an editor adjust that editor's font
+without changing shell tabs, workbench/sidebar sizes or the saved config.
+
 ## Start
 
 ```sh
@@ -89,6 +110,12 @@ text fields own their input; Escape returns focus to Vim. Opening the build
 field never starts a command. The ordinary **Build** button keeps its previous
 behavior; writing buffers first requires the explicit **Save + Build** action.
 
+Native keyboard actions preserve their order with Vim input, including an
+Escape and Save received in the same input batch. Earlier input drains to the
+PTY before the action is sent, and later text waits for that action's reply.
+The pending action and text remain bound to their original editor session
+when focus or tabs change.
+
 Quick Open indexes the current project's files in the background using
 `rg --files`, including hidden files while honoring ignore files and excluding
 `.git`. The index is bounded; scan errors and the file limit are visible.
@@ -146,14 +173,30 @@ Window close waits for editor exit, so modified buffers retain the window.
 Each workbench is bound to its stable terminal session ID; reordering or
 closing other tabs cannot redirect an editor action to another PTY.
 
-The editing surface uses the existing native GPU terminal renderer. Vim
-renders its completion menus and internal windows. Native controls cover
+The native buffer uses egui's text pipeline; Vim still renders unsupported
+completion menus and internal-window layouts in the compatible view. Native controls cover
 files, buffers, saving, search, builds/tests, quickfix, output and supported
 code actions. Debug-adapter UI, a dedicated Git editor and remote editor
 bridges are future extensions. Remote Files retain their existing workflow;
 this bridge opens local files. Non-UTF8 paths are rejected with a diagnostic.
 
 ## Native acceptance test
+
+The focused GUI-buffer check uses actual window pixels with `termguicolors`
+disabled and intentionally conflicting GUI/terminal colors. It also exercises
+editing, Ctrl+S, undo, and switching into/out of the compatible split view.
+The Save check queues Escape, Ctrl+S and a subsequent edit in one OS batch,
+then verifies that Save was handled natively and persisted the text before
+that later edit:
+
+```sh
+xvfb-run -a -s '-screen 0 1600x1000x24' python3 scripts/native-vim9-buffer-smoke.py \
+  --binary target/debug/ember --app ember --output /tmp/ember-native-buffer
+```
+
+This check requires xdotool, ImageMagick and Pillow. Screenshots and the result
+JSON remain in the chosen output directory. It is an X11/software-GPU check,
+not a Wayland, physical-GPU or interactive IME certification.
 
 On Linux with Xvfb, libX11/libXtst, ImageMagick, Tesseract and Vim 9 installed:
 

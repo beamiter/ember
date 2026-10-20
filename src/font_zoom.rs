@@ -80,7 +80,18 @@ impl FontZoom {
 
     /// Half-open bounds give shared edges a single owner. Topmost-layer checking
     /// prevents a popup/window from zooming a pane hidden underneath it.
-    pub fn drain(&mut self, mut layer_at: impl FnMut(Pos2) -> Option<LayerId>) -> [f32; 2] {
+    #[cfg(test)]
+    pub fn drain(&mut self, layer_at: impl FnMut(Pos2) -> Option<LayerId>) -> [f32; 2] {
+        self.drain_with_main(layer_at, |_, _| false)
+    }
+
+    /// Let a main-pane owner consume its own zoom before accumulating the shell
+    /// font delta. The callback runs only after the normal layer/region checks.
+    pub fn drain_with_main(
+        &mut self,
+        mut layer_at: impl FnMut(Pos2) -> Option<LayerId>,
+        mut on_main: impl FnMut(Pos2, f32) -> bool,
+    ) -> [f32; 2] {
         // Accumulate in f64 so finite extreme input cannot overflow into NaN.
         let mut delta = [0.0_f64; 2];
         for wheel in self.wheels.drain(..) {
@@ -95,7 +106,12 @@ impl FontZoom {
             }) {
                 let index = match region.group {
                     FontGroup::Ui => 0,
-                    FontGroup::Main => 1,
+                    FontGroup::Main => {
+                        if on_main(wheel.position, wheel.points) {
+                            continue;
+                        }
+                        1
+                    }
                 };
                 delta[index] += f64::from(wheel.points);
             }
@@ -173,6 +189,37 @@ mod tests {
         layout(&mut router);
         assert_eq!(router.drain(|_| Some(layer())), [4.0, -2.0]);
         assert_eq!(router.drain(|_| Some(layer())), [0.0, 0.0]);
+    }
+    #[test]
+    fn editor_zoom_keeps_each_pointer_owner_and_leaves_shell_and_ui_independent() {
+        let mut router = FontZoom::default();
+        layout(&mut router);
+        router.collect(
+            &mut vec![
+                Event::PointerMoved(Pos2::new(250.0, 100.0)),
+                wheel(MouseWheelUnit::Line, 2.0),
+                Event::PointerMoved(Pos2::new(450.0, 100.0)),
+                wheel(MouseWheelUnit::Line, -1.0),
+                Event::PointerMoved(Pos2::new(650.0, 100.0)),
+                wheel(MouseWheelUnit::Line, 3.0),
+                Event::PointerMoved(Pos2::new(20.0, 100.0)),
+                wheel(MouseWheelUnit::Line, 4.0),
+            ],
+            true,
+        );
+        let mut editor_delta = [0.0; 2];
+        let global = router.drain_with_main(
+            |_| Some(layer()),
+            |position, points| {
+                if position.x >= 600.0 {
+                    return false;
+                }
+                editor_delta[usize::from(position.x >= 400.0)] += points;
+                true
+            },
+        );
+        assert_eq!(editor_delta, [2.0, -1.0]);
+        assert_eq!(global, [4.0, 3.0]);
     }
     #[test]
     fn smooth_wheel_is_frame_rate_independent_and_symmetric() {
