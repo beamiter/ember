@@ -84,7 +84,7 @@
     {
       "source": "src/app/input.rs",
       "marker": "    pub fn handle_font_zoom(",
-      "sha256": "39873e6b3da76a82209ab101fe40b4bf9ed9f3c308cdd5a8e4bbe79b527854f9"
+      "sha256": "1f80fb06a8c0c87f59c4987dc62f7f6c4b0e78557724ecc9f92946f671db7b8e"
     },
     {
       "source": "src/theme.rs",
@@ -110,10 +110,12 @@
     "font scanning",
     "organism preview storage",
     "theme storage",
+    "pane/session/editor storage",
     "unrelated defaults"
   ],
   "not_covered": [
     "renderer rebuild and async save scheduling side effects",
+    "real pane/session lifecycle",
     "full app compile",
     "native window/GPU rendering",
     "remote/security behavior",

@@ -587,10 +587,27 @@ use crate::config::Config;
 
 
     use crate::{config, font_zoom::{FontGroup, FontZoom}};
+    // Storage-only substitutes for native app state. Pane-to-session lookup,
+    // editor ownership, accumulation and all font changes remain in the exact
+    // production handler below.
+    struct Pane { rect: egui::Rect, session_idx: usize }
+    #[derive(Default)]
+    struct Layout { panes: Vec<Pane> }
+    impl Layout { fn panes(&self) -> &[Pane] { &self.panes } }
+    struct Metadata { session_id: String }
+    struct Session { metadata: Metadata }
+    #[derive(Default)]
+    struct SessionManager { sessions: Vec<Session> }
+    impl SessionManager { fn sessions(&self) -> &[Session] { &self.sessions } }
+    struct Editor { buffer_font_size: Option<f32> }
     struct TerminalApp {
         config: Config,
         config_panel: ConfigPanel,
         font_zoom: FontZoom,
+        layout: Layout,
+        session_manager: SessionManager,
+        vim9_editors: std::collections::HashMap<String, Editor>,
+        force_resize_session: bool,
         main_apply_count: usize,
         save_count: usize,
     }
@@ -599,16 +616,58 @@ use crate::config::Config;
             let config = Config { font_size: main, ui_font_size: Some(chrome), ..Config::default() };
             let mut config_panel = ConfigPanel::new();
             config_panel.sync_from_config(&config);
-            Self { config, config_panel, font_zoom: FontZoom::default(), main_apply_count: 0, save_count: 0 }
+            Self {
+                config, config_panel, font_zoom: FontZoom::default(),
+                layout: Layout::default(), session_manager: SessionManager::default(),
+                vim9_editors: Default::default(), force_resize_session: false,
+                main_apply_count: 0, save_count: 0,
+            }
         }
+        fn layout(&self) -> &Layout { &self.layout }
         // The handler is production code; only renderer/persistence scheduling
         // side effects are counted instead of constructing a native app or PTY.
         fn apply_font_size_change(&mut self, _: &egui::Context) { self.main_apply_count += 1; }
         fn schedule_config_save(&mut self) { self.save_count += 1; }
     pub fn handle_font_zoom(&mut self, ctx: &egui::Context) {
-        let [ui_delta, main_delta] = self
-            .font_zoom
-            .drain(|pos| crate::font_zoom::workspace_layer_at(ctx, pos));
+        let editor_panes: Vec<_> = self
+            .layout()
+            .panes()
+            .iter()
+            .filter_map(|pane| {
+                let session = self.session_manager.sessions().get(pane.session_idx)?;
+                let id = &session.metadata.session_id;
+                self.vim9_editors
+                    .contains_key(id)
+                    .then(|| (pane.rect, id.clone()))
+            })
+            .collect();
+        let mut editor_deltas = std::collections::HashMap::<String, f64>::new();
+        let [ui_delta, main_delta] = self.font_zoom.drain_with_main(
+            |pos| crate::font_zoom::workspace_layer_at(ctx, pos),
+            |pos, points| {
+                let Some((_, id)) = editor_panes.iter().find(|(rect, _)| {
+                    pos.x >= rect.min.x
+                        && pos.x < rect.max.x
+                        && pos.y >= rect.min.y
+                        && pos.y < rect.max.y
+                }) else {
+                    return false;
+                };
+                *editor_deltas.entry(id.clone()).or_default() += f64::from(points);
+                true
+            },
+        );
+        for (id, delta) in editor_deltas {
+            let Some(editor) = self.vim9_editors.get_mut(&id) else {
+                continue;
+            };
+            let size = f64::from(editor.buffer_font_size.unwrap_or(self.config.font_size)) + delta;
+            editor.buffer_font_size = Some(config::Config::clamp_font_size(
+                size.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32,
+            ));
+            self.force_resize_session = true;
+            ctx.request_repaint();
+        }
         let old_main = self.config.font_size;
         let old_ui = self.config.effective_ui_font_size();
         let new_ui = config::Config::clamp_font_size(old_ui + ui_delta);
@@ -653,6 +712,121 @@ use crate::config::Config;
     }
     fn warm(app: &mut TerminalApp, ctx: &egui::Context) {
         for _ in 0..3 { zoom_frame(app, ctx, FontGroup::Main, 0.0); }
+    }
+    fn install_editor_panes(app: &mut TerminalApp) {
+        // Session order deliberately differs from pane order, and a hidden
+        // editor has no pane. Pointer ownership must resolve each stable ID.
+        app.session_manager.sessions = ["shell", "editor-b", "editor-a", "hidden"]
+            .map(|id| Session { metadata: Metadata { session_id: id.into() } }).into();
+        app.layout.panes = [(100.0, 300.0, 2), (300.0, 500.0, 1), (500.0, 800.0, 0)]
+            .map(|(left, right, session_idx)| Pane {
+                rect: egui::Rect::from_min_max(egui::pos2(left, 0.0), egui::pos2(right, 600.0)),
+                session_idx,
+            }).into();
+        app.vim9_editors = [("editor-a", 14.0), ("editor-b", 24.0), ("hidden", 64.0)]
+            .into_iter().map(|(id, size)| (id.into(), Editor { buffer_font_size: Some(size) })).collect();
+    }
+    fn editor_zoom_frame(
+        app: &mut TerminalApp, ctx: &egui::Context, wheels: &[(egui::Pos2, f32)], cover: bool,
+    ) {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            events: wheels.iter().flat_map(|(position, points)| [
+                egui::Event::PointerMoved(*position),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, *points),
+                    modifiers: egui::Modifiers::CTRL, phase: egui::TouchPhase::Move,
+                },
+            ]).collect(),
+            ..Default::default()
+        };
+        app.font_zoom.collect(&mut input.events, input.focused);
+        let output = ctx.run_ui(input, |ui| {
+            app.font_zoom.begin_layout();
+            let side = egui::Panel::left("editor-chrome").exact_size(100.0).show(ui, |ui| {
+                // Keyboard focus in chrome must not redirect editor wheel input.
+                ui.text_edit_singleline(&mut String::new()).request_focus();
+            }).response.rect;
+            app.font_zoom.register(side, ui.layer_id(), FontGroup::Ui);
+            let main = egui::CentralPanel::default().show(ui, |_| {}).response.rect;
+            app.font_zoom.register(main, ui.layer_id(), FontGroup::Main);
+            if cover {
+                egui::Area::new(egui::Id::new("vim-dialog-cover"))
+                    .order(egui::Order::Foreground).fixed_pos(egui::pos2(150.0, 150.0))
+                    .show(ctx, |ui| {
+                        ui.allocate_exact_size(egui::vec2(200.0, 200.0), egui::Sense::hover());
+                    });
+            }
+            app.handle_font_zoom(ctx);
+            ctx.input(|input| {
+                assert!(!input.raw.events.iter().any(|event| matches!(event, egui::Event::MouseWheel { .. })));
+                assert_eq!(input.smooth_scroll_delta, egui::Vec2::ZERO);
+                assert_eq!(input.zoom_delta(), 1.0);
+            });
+        });
+        output.drop_without_applying_deltas();
+    }
+    fn warm_editors(app: &mut TerminalApp, ctx: &egui::Context) {
+        for _ in 0..3 { editor_zoom_frame(app, ctx, &[], false); }
+    }
+    #[test]
+    fn production_font_zoom_editor_only_preserves_shell_ui_and_settings() {
+        let ctx = egui::Context::default();
+        let mut app = TerminalApp::fixture(20.0, 13.0);
+        install_editor_panes(&mut app);
+        app.config_panel.is_open = true;
+        app.config_panel.edit_font_size = 29.0;
+        app.config_panel.edit_ui_font_size = 19.0;
+        app.config_panel.has_changes = true;
+        warm_editors(&mut app, &ctx);
+        editor_zoom_frame(&mut app, &ctx, &[(egui::pos2(200.0, 200.0), 2.0)], false);
+        assert_eq!(app.vim9_editors["editor-a"].buffer_font_size, Some(16.0));
+        assert_eq!(app.vim9_editors["editor-b"].buffer_font_size, Some(24.0));
+        assert_eq!(app.vim9_editors["hidden"].buffer_font_size, Some(64.0));
+        assert_eq!((app.config.font_size, app.config.effective_ui_font_size()), (20.0, 13.0));
+        assert_eq!((app.main_apply_count, app.save_count), (0, 0));
+        assert!(app.force_resize_session);
+        assert_eq!((app.config_panel.edit_font_size, app.config_panel.edit_ui_font_size), (29.0, 19.0));
+        assert!(app.config_panel.has_changes);
+    }
+    #[test]
+    fn production_font_zoom_mixed_panes_follow_each_pointer_and_stable_session() {
+        let ctx = egui::Context::default();
+        let mut app = TerminalApp::fixture(20.0, 13.0);
+        install_editor_panes(&mut app);
+        warm_editors(&mut app, &ctx);
+        editor_zoom_frame(&mut app, &ctx, &[
+            (egui::pos2(200.0, 200.0), 2.0),
+            (egui::pos2(400.0, 200.0), -1.0),
+            (egui::pos2(600.0, 200.0), 3.0),
+            (egui::pos2(50.0, 200.0), 4.0),
+            (egui::pos2(300.0, 200.0), 2.0), // The shared edge belongs to editor-b.
+        ], false);
+        assert_eq!(app.vim9_editors["editor-a"].buffer_font_size, Some(16.0));
+        assert_eq!(app.vim9_editors["editor-b"].buffer_font_size, Some(25.0));
+        assert_eq!(app.vim9_editors["hidden"].buffer_font_size, Some(64.0));
+        assert_eq!((app.config.font_size, app.config.effective_ui_font_size()), (23.0, 17.0));
+        assert_eq!((app.config_panel.edit_font_size, app.config_panel.edit_ui_font_size), (23.0, 17.0));
+        assert_eq!((app.main_apply_count, app.save_count), (1, 1));
+        assert!(app.force_resize_session);
+        app.force_resize_session = false;
+        app.handle_font_zoom(&ctx);
+        assert!(!app.force_resize_session, "editor wheel is consumed once");
+        assert_eq!((app.main_apply_count, app.save_count), (1, 1), "global wheel is consumed once");
+    }
+    #[test]
+    fn production_font_zoom_overlay_blocks_editor_on_sizing_and_visible_frames() {
+        let ctx = egui::Context::default();
+        let mut app = TerminalApp::fixture(20.0, 13.0);
+        install_editor_panes(&mut app);
+        warm_editors(&mut app, &ctx);
+        for _ in 0..4 {
+            editor_zoom_frame(&mut app, &ctx, &[(egui::pos2(200.0, 200.0), 3.0)], true);
+            assert_eq!(app.vim9_editors["editor-a"].buffer_font_size, Some(14.0));
+            assert_eq!((app.config.font_size, app.config.effective_ui_font_size()), (20.0, 13.0));
+            assert_eq!((app.main_apply_count, app.save_count), (0, 0));
+            assert!(!app.force_resize_session);
+        }
     }
     #[test]
     fn production_font_zoom_ui_only_persists_without_rebuilding_main() {
