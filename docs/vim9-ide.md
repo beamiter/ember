@@ -15,8 +15,11 @@ The native path does not repaint the buffer from ANSI cells or sample colors
 from the terminal palette.
 
 **GUI buffer · RGB** marks the supported buffer view. Vim's command and status
-rows remain in the compatibility surface outside that buffer rectangle.
-Complex views (including multiple Vim windows, folds, diff, popup completion,
+rows and split separators remain in the compatibility surface between buffer
+rectangles. Horizontal, vertical and mixed Vim splits paint every supported
+window through the same native RGB path, including inactive windows. Each
+window has its own clipping rectangle so italic overhang cannot cover a split
+separator or another buffer. Complex views (folds, diff, popup completion,
 conceal and unsupported shaping) temporarily use **Compatible view**; hover
 the label for the runtime's reason. A disconnected bridge or a resized frame
 never leaves an old native frame over the terminal. The logical cell geometry
@@ -25,6 +28,9 @@ arbitrary line heights and native completion popups are not yet implemented.
 
 Ctrl+wheel and font-size actions over an editor adjust that editor's font
 without changing shell tabs, workbench/sidebar sizes or the saved config.
+Missing named font families are rejected by both regular and bold font
+resolution, allowing an actual installed monospace fallback to supply matching
+advances instead of substituting an unrelated proportional face.
 
 ## Start
 
@@ -174,7 +180,7 @@ Each workbench is bound to its stable terminal session ID; reordering or
 closing other tabs cannot redirect an editor action to another PTY.
 
 The native buffer uses egui's text pipeline; Vim still renders unsupported
-completion menus and internal-window layouts in the compatible view. Native controls cover
+completion menus and unsupported display options in the compatible view. Native controls cover
 files, buffers, saving, search, builds/tests, quickfix, output and supported
 code actions. Debug-adapter UI, a dedicated Git editor and remote editor
 bridges are future extensions. Remote Files retain their existing workflow;
@@ -184,7 +190,11 @@ this bridge opens local files. Non-UTF8 paths are rejected with a diagnostic.
 
 The focused GUI-buffer check uses actual window pixels with `termguicolors`
 disabled and intentionally conflicting GUI/terminal colors. It also exercises
-editing, Ctrl+S, undo, and switching into/out of the compatible split view.
+editing, Ctrl+S, undo, native RGB pixels in vertical/mixed splits, editing in
+another active Vim window, resizing those splits, and font zoom. It verifies
+the explicit fallback reason when a real Vim horizontal scroll clips a CJK
+glyph, recovery after Vim returns to column zero, and fallback/restoration
+when an unsupported window-local display option is toggled.
 The Save check queues Escape, Ctrl+S and a subsequent edit in one OS batch,
 then verifies that Save was handled natively and persisted the text before
 that later edit:
@@ -217,3 +227,10 @@ that the saved shell layout is unchanged. Screenshots, OCR, logs and
 `result.json` remain available. It uses WGPU's GLES backend by default;
 set `WGPU_BACKEND` to choose another available backend. `JTERM_VIM9_BIN` also
 applies to this test.
+
+
+### Recovery validation — 2026-10-20
+
+Pinned shared core: `c387ab33caff52a0bd4f759fb20a35aae2586cd0`.
+Passed 15 focused tests (3 library + 12 binary) and the real X11/WGPU window smoke: RGB in all three panes, Unicode, edit/save/undo, resize, font zoom, compatibility fallback/recovery and normal quit.
+These runs use Xvfb/software graphics; physical GPU, Wayland and OS IME candidate windows are not certified.

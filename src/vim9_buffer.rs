@@ -5,23 +5,22 @@
 //! egui owns glyph shaping, RGB backgrounds and all text decorations.
 
 use eframe::egui::{self, Color32, FontId, Rect, Stroke};
-use jterm_core::vim9::{Vim9RenderFrame, Vim9RenderStyle};
+use jterm_core::vim9::{Vim9RenderFrame, Vim9RenderRect, Vim9RenderStyle};
 
 pub(crate) fn usable(frame: &Vim9RenderFrame, rows: usize, columns: usize) -> bool {
     frame.supported
         && frame.rows == rows
         && frame.columns == columns
-        && frame.view.rows > 0
-        && frame.view.columns > 0
-        && frame.view.row.saturating_add(frame.view.rows) <= rows
-        && frame.view.column.saturating_add(frame.view.columns) <= columns
+        && frame.paint_views().all(|view| {
+            view.rows > 0
+                && view.columns > 0
+                && view.row.saturating_add(view.rows) <= rows
+                && view.column.saturating_add(view.columns) <= columns
+        })
 }
 
 pub(crate) fn covers(frame: &Vim9RenderFrame, row: usize, column: usize) -> bool {
-    row >= frame.view.row
-        && row < frame.view.row.saturating_add(frame.view.rows)
-        && column >= frame.view.column
-        && column < frame.view.column.saturating_add(frame.view.columns)
+    frame.covers(row, column)
 }
 
 fn rgb(value: u32) -> Color32 {
@@ -39,8 +38,8 @@ fn colors(style: &Vim9RenderStyle, normal: &Vim9RenderStyle) -> (Color32, Color3
     (fg, bg, style.special.map(rgb).unwrap_or(fg))
 }
 
-/// Paint only the buffer rectangle. Vim's command line and unsupported views
-/// remain in the compatibility renderer outside this rectangle.
+/// Paint each buffer rectangle independently. Vim's command/status rows and
+/// split separators remain in the compatibility renderer between rectangles.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint(
     painter: &egui::Painter,
@@ -52,15 +51,42 @@ pub(crate) fn paint(
     focused: bool,
     cursor_on: bool,
 ) {
+    for view in frame.paint_views() {
+        paint_view(
+            painter,
+            frame,
+            view,
+            content,
+            cell_width,
+            line_height,
+            font_size,
+            focused,
+            cursor_on,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_view(
+    painter: &egui::Painter,
+    frame: &Vim9RenderFrame,
+    logical_view: &Vim9RenderRect,
+    content: Rect,
+    cell_width: f32,
+    line_height: f32,
+    font_size: f32,
+    focused: bool,
+    cursor_on: bool,
+) {
     let view = Rect::from_min_size(
         content.min
             + egui::vec2(
-                frame.view.column as f32 * cell_width,
-                frame.view.row as f32 * line_height,
+                logical_view.column as f32 * cell_width,
+                logical_view.row as f32 * line_height,
             ),
         egui::vec2(
-            frame.view.columns as f32 * cell_width,
-            frame.view.rows as f32 * line_height,
+            logical_view.columns as f32 * cell_width,
+            logical_view.rows as f32 * line_height,
         ),
     )
     .intersect(content);
@@ -70,7 +96,7 @@ pub(crate) fn paint(
     // Backgrounds precede every glyph so a later style run cannot erase the
     // preceding italic glyph's natural overhang.
     for run in &frame.runs {
-        if covers(frame, run.row, run.column) && run.cells > 0 {
+        if logical_view.contains(run.row, run.column) && run.cells > 0 {
             let (_, bg, _) = colors(&run.style, &frame.default_style);
             painter.rect_filled(
                 Rect::from_min_size(
@@ -84,7 +110,7 @@ pub(crate) fn paint(
         }
     }
     for run in &frame.runs {
-        if !covers(frame, run.row, run.column) || run.cells == 0 {
+        if !logical_view.contains(run.row, run.column) || run.cells == 0 {
             continue;
         }
         let (fg, _, special) = colors(&run.style, &frame.default_style);
@@ -170,7 +196,7 @@ pub(crate) fn paint(
         }
     }
     if frame.cursor.visible
-        && covers(frame, frame.cursor.row, frame.cursor.column)
+        && logical_view.contains(frame.cursor.row, frame.cursor.column)
         && (!focused || cursor_on)
     {
         let cursor = Rect::from_min_size(
@@ -248,5 +274,59 @@ mod tests {
         assert!(covers(&frame, 22, 79));
         assert!(!covers(&frame, 1, 3));
         assert!(!covers(&frame, 23, 4));
+    }
+
+    #[test]
+    fn mixed_splits_paint_all_buffers_without_covering_separator_or_status_cells() {
+        let frame: Vim9RenderFrame = serde_json::from_value(serde_json::json!({
+            "supported": true, "rows": 10, "columns": 40,
+            "default_style": {"foreground": 0xabcdef, "background": 0x102030},
+            "view": {"row": 0, "column": 0, "rows": 5, "columns": 20},
+            "windows": [
+                {"window": 1, "view": {"row": 0, "column": 0, "rows": 5, "columns": 20}},
+                {"window": 2, "view": {"row": 0, "column": 21, "rows": 5, "columns": 19}},
+                {"window": 3, "view": {"row": 6, "column": 0, "rows": 3, "columns": 40}}
+            ],
+            "runs": [
+                {"row": 1, "column": 1, "text": "first", "cells": 5},
+                {"row": 1, "column": 22, "text": "second", "cells": 6},
+                {"row": 7, "column": 1, "text": "third", "cells": 5}
+            ]
+        }))
+        .unwrap();
+        assert!(usable(&frame, 10, 40));
+        assert!(covers(&frame, 1, 22), "inactive right split is native");
+        assert!(covers(&frame, 7, 1), "bottom split is native");
+        assert!(!covers(&frame, 1, 20), "vertical separator stays in Vim");
+        assert!(!covers(&frame, 5, 1), "split status row stays in Vim");
+        assert!(!covers(&frame, 9, 1), "command row stays in Vim");
+
+        // Check the actual egui paint list, not merely the geometry helper.
+        // Fractional metrics model a font size / HiDPI rounding boundary.
+        let content = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.ctx().layer_painter(egui::LayerId::background());
+            paint(&painter, &frame, content, 8.25, 17.5, 14.0, true, true);
+        });
+        output.textures_delta.clear();
+        let expected: Vec<_> = frame
+            .paint_views()
+            .map(|v| {
+                Rect::from_min_size(
+                    egui::pos2(v.column as f32 * 8.25, v.row as f32 * 17.5),
+                    egui::vec2(v.columns as f32 * 8.25, v.rows as f32 * 17.5),
+                )
+            })
+            .collect();
+        for view in expected {
+            assert!(
+                output.shapes.iter().any(|clipped| {
+                    matches!(&clipped.shape, egui::Shape::Rect(shape)
+                    if shape.rect == view && shape.fill == rgb(0x102030))
+                }),
+                "missing native background for {view:?}"
+            );
+        }
     }
 }

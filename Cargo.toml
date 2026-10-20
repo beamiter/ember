@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "gui"]
 [dependencies]
 libc = "0.2"
 # Pin the shared contract so a branch move cannot silently change a release build.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a5f055be8672de13f5070955418d1d2d84a4b868" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "c387ab33caff52a0bd4f759fb20a35aae2586cd0" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -51,7 +51,7 @@ mundy = { version = "=0.2.3", default-features = false, features = ["async-io", 
 harfrust = "0.13.3"
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a5f055be8672de13f5070955418d1d2d84a4b868", features = ["session-parity-tests"] }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "c387ab33caff52a0bd4f759fb20a35aae2586cd0", features = ["session-parity-tests"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]

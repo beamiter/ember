@@ -199,14 +199,10 @@ fn load_font_from_path(
 
 #[cfg(target_os = "linux")]
 fn fontconfig_match_file(family: &str) -> Option<String> {
-    let output = jterm_core::helper::fc_match(&["-f", "%{file}\n", family]).ok()?;
-
-    String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .map(str::trim)
-        .find(|path| !path.is_empty())
-        .map(ToOwned::to_owned)
+    // A missing named font can resolve to a proportional sans face. Loading
+    // that into the Monospace slot makes native Vim's fixed columns overlap.
+    // Reject substitutions so the next actual monospace candidate is tried.
+    fontconfig_match_family_file(family)
 }
 
 /// fontconfig's SemiBold/DemiBold weight (OS/2 600).
@@ -224,8 +220,17 @@ const FC_WEIGHT_MEDIUM: f64 = 100.0;
 #[cfg(target_os = "linux")]
 fn fontconfig_match_bold_file(family: &str) -> Option<String> {
     let query = format!("{}:weight={}", family, FC_WEIGHT_SEMIBOLD);
-    let output = jterm_core::helper::fc_match(&["-f", "%{weight}\t%{file}\n", &query]).ok()?;
-    parse_bold_match(&String::from_utf8(output.stdout).ok()?)
+    let output =
+        jterm_core::helper::fc_match(&["-f", "%{family}\t%{weight}\t%{file}\n", &query]).ok()?;
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let (families, weight_and_path) = stdout.lines().find_map(|line| line.split_once('\t'))?;
+    if !families
+        .split(',')
+        .any(|candidate| candidate.trim().eq_ignore_ascii_case(family.trim()))
+    {
+        return None;
+    }
+    parse_bold_match(weight_and_path)
 }
 
 /// Accept an `fc-match` answer only when it is really a heavier face.
@@ -248,7 +253,7 @@ fn fontconfig_match_file(_family: &str) -> Option<String> {
 /// Resolve `family` to a file, but only when fontconfig really has that family.
 ///
 /// `fc-match` always answers with *something*, so an unverified lookup for a
-/// font that is not installed quietly returns the default monospace file. In a
+/// font that is not installed quietly returns an unrelated fallback face. In a
 /// fallback stack that is worse than no answer: the substitute takes the slot
 /// the icon or CJK font was meant to fill, and every glyph it lacks falls
 /// through to whatever fontconfig happens to sort next.
@@ -10498,7 +10503,7 @@ mod tests {
     /// A fallback slot must stay empty when its font is missing.
     ///
     /// `fc-match` answers every query with *something*, so the unverified
-    /// lookup hands back the default monospace file for a font nobody
+    /// lookup hands back an unrelated fallback file for a font nobody
     /// installed. That substitute would then occupy the icon or CJK slot while
     /// carrying none of the glyphs the slot exists to supply.
     #[test]
@@ -10506,6 +10511,16 @@ mod tests {
         assert_eq!(
             fontconfig_match_family_file("Definitely Not An Installed Family 4f2b"),
             None
+        );
+        assert_eq!(
+            super::fontconfig_match_file("Definitely Not An Installed Family 4f2b"),
+            None,
+            "primary monospace lookup must not accept a proportional substitute"
+        );
+        assert_eq!(
+            super::fontconfig_match_bold_file("Definitely Not An Installed Family 4f2b"),
+            None,
+            "bold must not silently select a different family"
         );
     }
 

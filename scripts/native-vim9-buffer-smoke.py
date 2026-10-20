@@ -67,8 +67,18 @@ def main():
         "autocmd BufEnter * syntax match NativeRgb /^GUI_TRUECOLOR.*/\n"
         "autocmd BufEnter * syntax match NativeDecoration /^Styled_underlines/\n"
         "augroup END\n"
+        "function! NativeFixtureRender() abort\n"
+        "let scripts = getscriptinfo({'name': 'vim9-ide-bridge.vim$'})\n"
+        "if empty(scripts) | return {} | endif\n"
+        "let info = getscriptinfo({'sid': scripts[-1].sid})\n"
+        "let encoded = get(get(info[0], 'variables', {}), 'previousRender', '')\n"
+        "if empty(encoded) | return {} | endif\n"
+        "let frame = json_decode(encoded)\n"
+        "return {'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0)}\n"
+        "endfunction\n"
         "function! NativeFixtureState(timer) abort\n"
-        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'line': line('.'), 'column': col('.'), 'text': getline('.'), 'modified': &modified}})], {quoted(state_file)})\n"
+        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
+        f"call rename({quoted(str(state_file) + '.tmp')}, {quoted(state_file)})\n"
         "endfunction\n"
         "call timer_start(60, function('NativeFixtureState'), {'repeat': -1})\n",
         encoding="utf-8",
@@ -96,11 +106,43 @@ def main():
             return json.loads(state_file.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
-    def color_count(name):
+    def capture(name):
         image = out / f"{name}.png"
         subprocess.run(["import", "-window", str(window), str(image)], env=env, check=True, timeout=5)
-        counts = Image.open(image).convert("RGB").getcolors(1400 * 950 * 2) or []
+        return Image.open(image).convert("RGB")
+    def color_count(name):
+        image = capture(name)
+        counts = image.getcolors(image.width * image.height) or []
         return sum(count for count, color in counts if color == (0x19, 0xc3, 0xa7))
+    def color_regions(name):
+        image = capture(name)
+        pixels = image.get_flattened_data() if hasattr(image, "get_flattened_data") else image.getdata()
+        spots = [(i % image.width, i // image.width) for i, color in enumerate(pixels)
+                 if color == (0x19, 0xc3, 0xa7)]
+        def groups(axis):
+            values = sorted({point[axis] for point in spots})
+            result = []
+            for value in values:
+                if not result or value - result[-1][1] > 35:
+                    result.append([value, value])
+                else:
+                    result[-1][1] = value
+            return result
+        xs, ys = groups(0), groups(1)
+        panes = {}
+        for x, y in spots:
+            xi = next(i for i, (lo, hi) in enumerate(xs) if lo <= x <= hi)
+            yi = next(i for i, (lo, hi) in enumerate(ys) if lo <= y <= hi)
+            key = f"{xi},{yi}"
+            panes[key] = panes.get(key, 0) + 1
+        return {"pixels": len(spots), "x_regions": xs, "y_regions": ys, "panes": panes}
+    def native_splits(name, horizontal_regions, vertical_regions):
+        regions = color_regions(name)
+        expected_panes = horizontal_regions + vertical_regions - 1
+        return regions if (len(regions["x_regions"]) == horizontal_regions
+                           and len(regions["y_regions"]) == vertical_regions
+                           and len(regions["panes"]) == expected_panes
+                           and all(count > 30 for count in regions["panes"].values())) else None
     def command(value):
         xdo("key", "Escape")
         xdo("type", "--clearmodifiers", "--delay", "8", ":" + value)
@@ -143,9 +185,80 @@ def main():
         xdo("key", "ctrl+s")
         wait_for(lambda: source.read_text(encoding="utf-8") == original, "real Vim undo and save", app)
         command("vsplit")
-        wait_for(lambda: state().get("windows") == 2, "Vim split", app)
-        wait_for(lambda: color_count("compatible") == 0, "compatible split removed native RGB", app)
+        wait_for(lambda: state().get("windows") == 2, "Vim vertical split", app)
+        report["vertical_split_rgb"] = wait_for(
+            lambda: native_splits("vertical-splits", 2, 1), "native RGB in both Vim splits", app)
+        command("split")
+        wait_for(lambda: state().get("windows") == 3, "Vim mixed splits", app)
+        report["mixed_split_rgb"] = wait_for(
+            lambda: native_splits("mixed-splits", 2, 2), "native RGB in three mixed splits", app)
+        # Native input still goes to Vim's active window after a real split move.
+        command("wincmd l")
+        xdo("type", "--clearmodifiers", "--delay", "20", "ggA_split_edit")
+        wait_for(lambda: state().get("text", "").endswith("_split_edit"), "edit in right Vim split", app)
+        xdo("key", "Escape")
+        wait_for(lambda: state().get("mode") == "n", "right split normal mode", app)
+        xdo("key", "ctrl+s")
+        wait_for(lambda: source.read_text(encoding="utf-8").splitlines()[0].endswith("_split_edit"),
+                 "save from right Vim split", app)
+        xdo("key", "u")
+        wait_for(lambda: state().get("text") == original.splitlines()[0], "undo split edit", app)
+        xdo("key", "ctrl+s")
+        wait_for(lambda: source.read_text(encoding="utf-8") == original, "save split undo", app)
+        report["split_edit_save_undo"] = "passed"
+        before_resize = (state()["screen_columns"], state()["screen_rows"])
+        xdo("windowsize", window, 1100, 820)
+        resized = wait_for(lambda: state() if (state().get("screen_columns"), state().get("screen_rows")) != before_resize else None,
+                           "Vim acknowledged resized PTY geometry", app)
+        report["window_resize"] = {"before": list(before_resize),
+                                   "after": [resized["screen_columns"], resized["screen_rows"]]}
+        report["resized_split_rgb"] = wait_for(
+            lambda: native_splits("resized-splits", 2, 2), "native splits after window resize", app)
+        # Balance through real Vim before checking zoom. Keeping the old
+        # left pane width can leave a narrow right pane horizontally scrolled
+        # through half a CJK character, which intentionally uses fallback.
+        command("wincmd =")
+        command("normal! 0")
+        report["balanced_split_rgb"] = wait_for(
+            lambda: native_splits("balanced-splits", 2, 2), "balanced native Vim splits", app)
+        before_zoom = state()["screen_columns"]
+        first_region = report["balanced_split_rgb"]
+        xdo("mousemove", "--window", window,
+            first_region["x_regions"][0][0] + 12, first_region["y_regions"][0][0] + 30)
+        xdo("keydown", "ctrl")
+        try:
+            xdo("click", 4)
+        finally:
+            xdo("keyup", "ctrl")
+        zoomed = wait_for(lambda: state() if state().get("screen_columns", before_zoom) < before_zoom else None,
+                          "editor font zoom changed Vim geometry", app)
+        report["font_zoom"] = {"before_columns": before_zoom, "after_columns": zoomed["screen_columns"]}
+        report["zoomed_split_rgb"] = wait_for(
+            lambda: native_splits("zoomed-splits", 2, 2), "native splits at enlarged font", app)
+        assert source.read_text(encoding="utf-8") == original, "font zoom must not change the Vim document"
+        # A real Vim horizontal scroll can cut through a CJK character.
+        # Assert its explicit compatibility reason and that the same windows
+        # recover after real Vim input returns the viewport to column zero.
+        command("normal! gg0zl")
+        clipped = wait_for(lambda: state().get("render")
+                           if not state().get("render", {}).get("supported", True)
+                           and "clipped or zero-width" in state().get("render", {}).get("reason", "")
+                           else None, "explicit clipped-CJK compatibility reason", app)
+        wait_for(lambda: color_count("clipped-cjk") == 0, "clipped CJK uses compatibility pixels", app)
+        report["clipped_cjk_fallback"] = clipped
+        assert state()["leftcol"] == 1
+        command("normal! 0")
+        report["clipped_cjk_recovery_rgb"] = wait_for(
+            lambda: native_splits("clipped-cjk-recovered", 2, 2), "native RGB restored after CJK boundary scroll", app)
+        assert state()["leftcol"] == 0
+        # A supported split layout must still fail closed for unsupported
+        # decorations in any participating window and recover afterwards.
+        command("setlocal list")
+        wait_for(lambda: color_count("compatible") == 0, "unsupported list view removed native RGB", app)
         report["fallback_rgb_pixels"] = 0
+        command("setlocal nolist")
+        report["restored_split_rgb"] = wait_for(
+            lambda: native_splits("restored-splits", 2, 2), "native splits restored after fallback", app)
         command("only")
         wait_for(lambda: state().get("windows") == 1, "single Vim window", app)
         report["restored_rgb_pixels"] = wait_for(lambda: color_count("restored") > 30 and color_count("restored"), "native RGB restored", app)
