@@ -9,5 +9,6 @@
 # An older config without ui_font_size inherits font_size once when loaded.
 # font_size = 14.0
 # ui_font_size = 14.0
-# ascii_organism_enabled = true
+# ASCII organism is enabled by default; uncomment to turn it off.
+# ascii_organism_enabled = false
 # terminal_mode = "block"

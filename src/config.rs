@@ -124,8 +124,8 @@ pub enum TerminalMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Opt-in ASCII organism in local terminal chrome, with or without command cards.
-    #[serde(default)]
+    /// ASCII organism in local terminal chrome, enabled unless explicitly disabled.
+    #[serde(default = "default_true")]
     pub ascii_organism_enabled: bool,
 
     /// Show the full companion card unless explicitly collapsed.
@@ -647,7 +647,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            ascii_organism_enabled: false,
+            ascii_organism_enabled: true,
             ascii_organism_expanded: true,
             ascii_organism_motion: None,
             jsh_update_check: default_jsh_update_check(),
@@ -1616,13 +1616,13 @@ mod tests {
         assert!(expanded.ascii_organism_expanded);
         let restored: Config = toml::from_str(&toml::to_string(&expanded).unwrap()).unwrap();
         assert!(restored.ascii_organism_expanded);
-        assert!(!restored.ascii_organism_enabled);
+        assert!(restored.ascii_organism_enabled);
     }
 
     #[test]
-    fn organism_preferences_default_off_and_round_trip_all_motion_modes() {
+    fn organism_preferences_default_on_and_round_trip_all_motion_modes() {
         let default: Config = toml::from_str("").unwrap();
-        assert!(!default.ascii_organism_enabled);
+        assert!(default.ascii_organism_enabled);
         assert!(default.ascii_organism_expanded);
         assert_eq!(default.ascii_organism_motion, None);
         for (text, mode) in [
@@ -1675,7 +1675,7 @@ mod tests {
             toml::from_str("").unwrap(),
             serde_json::from_str("{}").unwrap(),
         ] {
-            assert!(!config.ascii_organism_enabled);
+            assert!(config.ascii_organism_enabled);
             assert!(config.ascii_organism_expanded);
         }
         let off: Config = serde_json::from_str(r#"{"ascii_organism_enabled":false}"#).unwrap();

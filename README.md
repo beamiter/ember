@@ -112,7 +112,8 @@ cards use a small four-pixel edge gap at normal density, without reserving a
 full blank terminal row between commands. Metadata rows have no terminal copy, selection or
 application mouse origin.
 
-When ASCII Organism is enabled, its compact status card appears between history
+ASCII Organism is enabled by default; set `ascii_organism_enabled = false` to
+disable it. Its compact status card appears between history
 and the current input block, rather than duplicating the bottom companion strip.
 The separate live body uses only fully visible, proven empty space in the active
 card. Its font follows terminal scaling; its rounded border, subdued background
