@@ -2466,7 +2466,7 @@ impl TerminalApp {
         repaint_ctx: egui::Context,
         wgpu_render_state: Option<egui_wgpu::RenderState>,
     ) -> std::result::Result<Self, String> {
-        let startup_editor = vim9_ide::startup_target()
+        let startup_editor = vim9_ide::startup_target()?
             .map(jterm_core::vim9::Vim9Session::start)
             .transpose()
             .map_err(|e| format!("Vim9 IDE could not start: {e}"))?;
@@ -5944,7 +5944,9 @@ impl eframe::App for TerminalApp {
             .map(|exited| (exited.session_id, exited.exit_code))
             .collect();
         for (session_id, exit_code) in exited_sessions {
-            self.vim9_editors.remove(&session_id);
+            if let Some(editor) = self.vim9_editors.remove(&session_id) {
+                editor.session.revoke();
+            }
             let terminal_role = self.task_manager.terminal_role_for_session(&session_id);
             let task_terminal = self.handle_task_terminal_exit(&session_id, exit_code);
             let Some(session_idx) = self.session_manager.index_of(&session_id) else {
@@ -6637,7 +6639,10 @@ impl eframe::App for TerminalApp {
                         }
                     }
                     Ok(ShellEvent::Exit(code)) => {
-                        self.vim9_editors.remove(&session.metadata.session_id);
+                        if let Some(editor) = self.vim9_editors.remove(&session.metadata.session_id)
+                        {
+                            editor.session.revoke();
+                        }
                         crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
                         shell_exit_observed = true;
                         shell_exit_code = Some(code);

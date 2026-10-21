@@ -4,8 +4,8 @@
 use crate::app::state::TerminalApp;
 use eframe::egui;
 use jterm_core::vim9::{
-    Vim9Command, Vim9ProjectFile, Vim9ProjectIndex, Vim9SearchCase, Vim9SearchOptions, Vim9Session,
-    Vim9Snapshot,
+    Vim9Command, Vim9EntryRequest, Vim9ProjectFile, Vim9ProjectIndex, Vim9SearchCase,
+    Vim9SearchOptions, Vim9Session, Vim9Snapshot,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1084,18 +1084,10 @@ impl Workbench {
 /// Only `--ide` consumes a following path; other terminal invocations retain
 /// their previous behavior. OsString keeps non-UTF8 input intact until core
 /// can report a proper path diagnostic.
-pub(crate) fn startup_target() -> Option<PathBuf> {
-    let mut args = std::env::args_os().skip(1);
-    while let Some(argument) = args.next() {
-        if argument == "--ide" {
-            return Some(
-                args.next()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(".")),
-            );
-        }
-    }
-    None
+pub(crate) fn startup_target() -> Result<Option<Vim9EntryRequest>, String> {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    jterm_core::vim9::explicit_ide_target(&args)
+        .map(|target| target.map(Vim9EntryRequest::command_line))
 }
 
 pub(crate) fn launch_button(ui: &egui::Ui, rect: egui::Rect, font_size: f32) -> bool {
@@ -1112,6 +1104,12 @@ pub(crate) fn launch_button(ui: &egui::Ui, rect: egui::Rect, font_size: f32) -> 
     response
         .on_hover_text("Open this project in the native Vim9 IDE")
         .clicked()
+}
+
+impl Drop for Workbench {
+    fn drop(&mut self) {
+        self.session.revoke();
+    }
 }
 
 impl TerminalApp {
@@ -1417,15 +1415,16 @@ impl TerminalApp {
         }
     }
 
-    pub(crate) fn open_vim9_ide(&mut self, target: Option<PathBuf>) {
-        let target = target.unwrap_or_else(|| {
-            let session = self.session_manager.get_active_session_mut();
-            jterm_core::process::process_cwd(session.get_shell_pid())
-                .map(PathBuf::from)
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
-        let session = match Vim9Session::start(&target) {
+    pub(crate) fn vim9_project_target(&mut self) -> PathBuf {
+        let session = self.session_manager.get_active_session_mut();
+        jterm_core::process::process_cwd(session.get_shell_pid())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    pub(crate) fn open_vim9_ide(&mut self, request: Vim9EntryRequest) {
+        let session = match Vim9Session::start(request) {
             Ok(session) => session,
             Err(error) => {
                 self.set_status_for(

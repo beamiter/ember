@@ -1538,7 +1538,8 @@ impl TerminalApp {
             egui::Sense::hover(),
         );
         if vim9_launch_clicked && !workspace_drag_in_flight {
-            self.open_vim9_ide(None);
+            let target = self.vim9_project_target();
+            self.open_vim9_ide(jterm_core::vim9::Vim9EntryRequest::user_action(target));
         }
     }
 
@@ -2583,7 +2584,8 @@ impl TerminalApp {
         }
 
         if vim9_launch_clicked && !any_tab_drag_in_flight && !pane_drag_in_flight {
-            self.open_vim9_ide(None);
+            let target = self.vim9_project_target();
+            self.open_vim9_ide(jterm_core::vim9::Vim9EntryRequest::user_action(target));
         }
         false
     }

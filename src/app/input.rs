@@ -1439,7 +1439,10 @@ impl TerminalApp {
         command: keybindings::Command,
     ) -> bool {
         match command {
-            keybindings::Command::Vim9Open => self.open_vim9_ide(None),
+            keybindings::Command::Vim9Open => {
+                let target = self.vim9_project_target();
+                self.open_vim9_ide(jterm_core::vim9::Vim9EntryRequest::user_action(target));
+            }
             command @ (keybindings::Command::Vim9QuickOpen
             | keybindings::Command::Vim9Goto
             | keybindings::Command::Vim9NavigateBack
