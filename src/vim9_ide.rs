@@ -1139,6 +1139,34 @@ impl Drop for Workbench {
 }
 
 impl TerminalApp {
+    pub(crate) fn poll_shell_vim(&mut self, ctx: &egui::Context) {
+        // A shell may be waiting without producing any terminal output.
+        ctx.request_repaint_after(Duration::from_millis(100));
+        for invocation in jterm_core::vim9::take_shell_vim_requests() {
+            let origin = self
+                .session_manager
+                .sessions()
+                .iter()
+                .find(|session| invocation.matches_pid(session.get_shell_pid()))
+                .map(|session| session.metadata.session_id.clone());
+            let Some(origin) = origin else { continue };
+            if let Some(index) = self.session_manager.index_of(&origin) {
+                self.activate_session(index);
+            }
+            self.open_vim9_ide(invocation.request);
+            let editor = self
+                .session_manager
+                .get_active_session_mut()
+                .metadata
+                .session_id
+                .clone();
+            if editor != origin && self.vim9_editors.contains_key(&editor) {
+                self.vim9_shell_tabs
+                    .insert(editor, (origin, invocation.completion));
+            }
+        }
+    }
+
     /// A shell launch is a synchronous editor command: its original shell
     /// resumes when this process returns Vim's real status, not a replacement
     /// shell tab. Other ordinary editor launches keep their workspace behavior.
@@ -1148,6 +1176,17 @@ impl TerminalApp {
         code: Option<i32>,
         ctx: &egui::Context,
     ) -> bool {
+        if let Some((origin, completion)) = self.vim9_shell_tabs.remove(id) {
+            completion.finish(shell_exit_status(code));
+            if let Some(index) = self.session_manager.index_of(id) {
+                self.close_session_or_owning_tab(index);
+            }
+            if let Some(index) = self.session_manager.index_of(&origin) {
+                self.activate_session(index);
+            }
+            self.schedule_session_save();
+            return true;
+        }
         if self.vim9_shell_entry_session.as_deref() != Some(id) {
             return false;
         }

@@ -17,6 +17,7 @@ from PIL import Image
 
 
 def main():
+    os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
@@ -103,7 +104,9 @@ def main():
         status=project/'return-status.txt'
         status_command="; printf '%s\\n' \"$?\" > "+shlex.quote(str(status))
         type_line('vim +42 '+shlex.quote(first.name)+' '+shlex.quote(second.name)+status_command)
-        child=wait(lambda: next(iter(windows()-initial),None),'automatically opened native editor')
+        child=root
+        wait(lambda: state().get('native'), 'native editor tab in original GUI')
+        assert windows()==initial, windows()
         xdo('windowfocus','--sync',child)
         launch=wait(lambda: state() if state().get('native') and state().get('line')==42 else None,'native Vim received +42')
         assert launch['cwd']==str(project),launch
@@ -163,20 +166,24 @@ def main():
         xdo('key','ctrl+s')
         wait(lambda: first.read_text().startswith('auto_native_'),'native save')
         vim_command('qa')
-        wait(lambda: child not in windows(),'editor exit')
+        wait(status.exists,'editor exit returns to original shell')
+        assert windows()==initial, windows()
         xdo('windowfocus','--sync',root)
         wait(status.exists,'shell resumed')
         assert status.read_text().strip()=='0',status.read_text()
         report['shell_return_status']=0
+        report['same_gui_window']=True
         old_pid=state()['pid']
         status.unlink()
         type_line('vim '+shlex.quote(second.name)+status_command)
-        child=wait(lambda: next(iter(windows()-initial),None),'second native editor')
+        child=root
+        assert windows()==initial, windows()
         xdo('windowfocus','--sync',child)
         wait(lambda: state().get('native') and state().get('pid')!=old_pid,'second native bridge')
         assert not status.exists(),'the shell must wait for the second editor too'
         vim_command('cq7')
-        wait(lambda: child not in windows(),'nonzero editor exit')
+        wait(status.exists,'nonzero editor exit returns to original shell')
+        assert windows()==initial, windows()
         xdo('windowfocus','--sync',root)
         wait(status.exists,'shell resumed after :cq7')
         assert status.read_text().strip()=='7',status.read_text()

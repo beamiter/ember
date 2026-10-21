@@ -710,6 +710,15 @@ fn apply_theme_visuals(ctx: &egui::Context, theme: &theme::Theme) {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    if let Some(result) =
+        jterm_core::vim9::forward_shell_vim(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    {
+        let status = result.unwrap_or_else(|error| {
+            eprintln!("ember: {error}");
+            1
+        });
+        std::process::exit(status);
+    }
     // Keep operational failures observable by default while allowing
     // `RUST_LOG=ember=debug` (or any normal env_logger filter) to opt into
     // deeper diagnostics.
@@ -2730,6 +2739,7 @@ impl TerminalApp {
             vim9_window_close_pending: false,
             vim9_pending_tab_closes: Vec::new(),
             vim9_shell_entry_session,
+            vim9_shell_tabs: Default::default(),
             renderer,
             clipboard,
             clipboard_request_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5712,6 +5722,7 @@ impl eframe::App for TerminalApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_shell_vim(ctx);
         self.guard_vim9_window_close(ctx);
         self.observe_organism_visibility(ctx);
     }

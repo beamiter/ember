@@ -53,8 +53,8 @@ vim -p first.rs second.rs
 ```
 
 The shell-expanded arguments, working directory and existing Vim configuration
-are preserved. A focused native editor window opens and the invoking shell waits
-until it closes, then returns the editor's exit status. The shell's command line
+are preserved. A native editor tab opens in the same Ember window and the
+invoking shell waits until Vim exits, then receives the editor's exit status. The shell's command line
 is not parsed or rewritten by the GUI. This also means shell quoting, globs and
 Vim startup options retain their normal meaning.
 
