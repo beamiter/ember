@@ -28,6 +28,11 @@ is retained for correct Vim mouse/IME positions; proportional text layout,
 arbitrary line heights are not yet implemented. Ordinary fully visible
 completion menus use native GUI paint; complex lists retain compatibility.
 
+Native completion menus have a subtle shadow and an inside border that stays
+one physical pixel wide when zoomed. Their Vim-owned position, row backgrounds
+and text colors remain exact, including when a menu crosses editor splits.
+Decoration colors inherit `Normal.guisp` when no explicit special color is set.
+
 Native paint rectangles, wide-character carets and the OS IME candidate anchor
 now share the same coordinate mapping. Fractional font metrics and an editor
 inside an offset split no longer send the candidate window through a separately
@@ -81,6 +86,9 @@ uses the nearest ancestor with a project marker (`.git`, `Cargo.toml`,
 falling back to the file's parent. The **Vim9** title-bar button opens a new
 editor at the active terminal's local working directory. The command palette
 also has **Vim9 IDE: Open Project**; custom keybindings can target `ide:open`.
+
+The title-bar launcher does not retain keyboard focus. Space and Enter continue
+to reach the shell or Vim after opening or switching editor tabs.
 
 Vim 9 requires `+vim9script`, `+channel`, `+job`, `+timers` and `+quickfix`.
 For explicit editor launches, use `JTERM_VIM9_BIN` to select an executable.

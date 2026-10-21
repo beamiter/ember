@@ -1117,7 +1117,20 @@ pub(crate) fn startup_target() -> Result<Option<Vim9EntryRequest>, String> {
 }
 
 pub(crate) fn launch_button(ui: &egui::Ui, rect: egui::Rect, font_size: f32) -> bool {
-    let response = ui.interact(rect, ui.id().with("vim9_launch"), egui::Sense::click());
+    let id = ui.id().with("vim9_launch");
+    // Terminal Space/Enter must never become a launcher activation. Retire
+    // focus from an older frame before egui can synthesize a keyboard click,
+    // and keep this mouse shortcut out of keyboard focus navigation. Explicit
+    // accessibility clicks still work through Response::clicked().
+    ui.memory_mut(|memory| memory.surrender_focus(id));
+    let response = ui.interact(rect, id, egui::Sense::CLICK);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            "Open native Vim9 IDE",
+        )
+    });
     let visuals = ui.style().interact(&response);
     ui.painter().rect_filled(rect, 5.0, visuals.weak_bg_fill);
     ui.painter().text(
@@ -1962,6 +1975,125 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    #[test]
+    fn launcher_never_activates_from_terminal_space_or_enter() {
+        for activation in [egui::Key::Space, egui::Key::Enter] {
+            let ctx = egui::Context::default();
+            let rect = egui::Rect::from_min_size(egui::pos2(8.0, 8.0), egui::vec2(52.0, 24.0));
+            let mut launcher = None;
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                assert!(!launch_button(ui, rect, 14.0));
+                let id = ui.id().with("vim9_launch");
+                // Reproduce the stale focus left by a previous launcher click.
+                ui.memory_mut(|memory| memory.request_focus(id));
+                launcher = Some(id);
+            })
+            .drop_without_applying_deltas();
+            let events = vec![key(activation), egui::Event::Text(" ".into())];
+            ctx.run_ui(
+                egui::RawInput {
+                    events: events.clone(),
+                    ..Default::default()
+                },
+                |ui| {
+                    assert!(!launch_button(ui, rect, 14.0), "{activation:?} opened Vim9");
+                    assert!(!ui.memory(|memory| memory.has_focus(launcher.unwrap())));
+                    assert_eq!(ui.input(|input| input.events.clone()), events);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn launcher_click_opens_once_and_leaves_terminal_focus_available() {
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(8.0, 8.0), egui::vec2(52.0, 24.0));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(200.0, 100.0),
+            )),
+            ..Default::default()
+        };
+        let mut launches = 0;
+        for events in [
+            vec![],
+            vec![
+                egui::Event::PointerMoved(rect.center()),
+                egui::Event::PointerButton {
+                    pos: rect.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            vec![egui::Event::PointerButton {
+                pos: rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![],
+            vec![key(egui::Key::Space), egui::Event::Text(" ".into())],
+            vec![key(egui::Key::Enter)],
+        ] {
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..input.clone()
+                },
+                |ui| {
+                    launches += usize::from(launch_button(ui, rect, 14.0));
+                    assert!(!ui.memory(|memory| memory.has_focus(ui.id().with("vim9_launch"))));
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(launches, 1);
+    }
+
+    #[test]
+    fn launcher_keeps_an_explicit_accessibility_click_action() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let rect = egui::Rect::from_min_size(egui::pos2(8.0, 8.0), egui::vec2(52.0, 24.0));
+        let mut id = None;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            assert!(!launch_button(ui, rect, 14.0));
+            id = Some(ui.id().with("vim9_launch"));
+        });
+        output.textures_delta.clear();
+        let id = id.unwrap();
+        let node = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| (*node_id == id.accesskit_id()).then_some(node))
+            .expect("the pointer launcher remains available to assistive technology");
+        assert_eq!(node.role(), egui::accesskit::Role::Button);
+        assert_eq!(node.label(), Some("Open native Vim9 IDE"));
+        assert!(node.supports_action(egui::accesskit::Action::Click));
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target_tree: egui::accesskit::TreeId::ROOT,
+                        target_node: id.accesskit_id(),
+                        data: None,
+                    },
+                )],
+                ..Default::default()
+            },
+            |ui| assert!(launch_button(ui, rect, 14.0)),
+        )
+        .drop_without_applying_deltas();
     }
 
     #[test]

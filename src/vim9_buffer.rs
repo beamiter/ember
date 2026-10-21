@@ -800,7 +800,11 @@ fn colors(style: &Vim9RenderStyle, normal: &Vim9RenderStyle) -> (Color32, Color3
     if style.reverse {
         std::mem::swap(&mut fg, &mut bg);
     }
-    (fg, bg, style.special.map(rgb).unwrap_or(fg))
+    (
+        fg,
+        bg,
+        style.special.or(normal.special).map(rgb).unwrap_or(fg),
+    )
 }
 
 /// Paint each buffer rectangle independently. Vim's command/status rows and
@@ -912,12 +916,19 @@ fn paint_completion(
     let Some(view) = geometry.rect(&completion.view).map(gui_rect) else {
         return;
     };
-    let view = view.intersect(content);
-    if !view.is_positive() {
+    let clip = view.intersect(content);
+    if !clip.is_positive() {
         return;
     }
-    let painter = painter.with_clip_rect(view);
-    let (_, background, _) = colors(&completion.default_style, &frame.default_style);
+    // Elevation belongs to the editor overlay, not to any scrolling split.
+    // Keep Vim's menu rectangle unchanged; its opaque fill masks the shadow's
+    // interior while the editor clip contains the four-point outer falloff.
+    let overlay = painter.with_clip_rect(content);
+    for (spread, alpha) in [(4.0, 4), (3.0, 5), (2.0, 7), (1.0, 10)] {
+        overlay.rect_filled(view.expand(spread), 0.0, Color32::from_black_alpha(alpha));
+    }
+    let painter = overlay.with_clip_rect(clip);
+    let (foreground, background, _) = colors(&completion.default_style, &frame.default_style);
     painter.rect_filled(view, 0.0, background);
     for run in &completion.runs {
         if let Some(rect) = geometry.cell_rect(run.row, run.column, run.cells) {
@@ -932,13 +943,20 @@ fn paint_completion(
                 run,
                 &completion.default_style,
                 gui_rect(rect),
-                view,
+                clip,
                 cell_width,
                 line_height,
                 font_size,
             );
         }
     }
+    let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
+    painter.rect_stroke(
+        view,
+        0.0,
+        Stroke::new(pixel, foreground.gamma_multiply(0.20)),
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// The direct fractional transform owns both sampled edge rows and the caret.
@@ -1205,20 +1223,7 @@ fn paint_view(
         ) {
             return;
         }
-        if focused && (frame.mode.starts_with('i') || frame.mode.starts_with('R')) {
-            let caret = Rect::from_min_size(cursor.min, egui::vec2(2.0, line_height));
-            painter.rect_filled(caret, 0.0, normal_fg);
-        } else {
-            if focused {
-                painter.rect_filled(cursor, 1.0, normal_fg.gamma_multiply(0.22));
-            }
-            painter.rect_stroke(
-                cursor.shrink(0.5),
-                1.0,
-                Stroke::new(1.0, normal_fg),
-                egui::StrokeKind::Inside,
-            );
-        }
+        paint_caret(&painter, cursor, &frame.mode, focused, normal_fg);
     }
 }
 
@@ -1526,6 +1531,114 @@ mod tests {
                 }),
                 "selected menu row must retain its GUI background"
             );
+            let shadow_index = output
+                .shapes
+                .iter()
+                .position(|clipped| {
+                    clipped.clip_rect == content
+                        && matches!(&clipped.shape, egui::Shape::Rect(shape)
+                        if shape.rect == popup.expand(4.0)
+                            && shape.fill == Color32::from_black_alpha(4))
+                })
+                .expect("popup elevation must use the full editor clip");
+            assert!(shadow_index < popup_index);
+            assert!(output.shapes[..shadow_index].iter().any(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Rect(shape)
+                    if shape.fill == rgb(0x101820))
+            }));
+            let border_index = output
+                .shapes
+                .iter()
+                .position(|clipped| {
+                    matches!(&clipped.shape, egui::Shape::Rect(shape)
+                    if shape.rect == popup && shape.stroke.color == rgb(0x19c3a7).gamma_multiply(0.20))
+                })
+                .expect("the menu has a restrained outline");
+            assert!(output.shapes[popup_index..border_index]
+                .iter()
+                .any(|clipped| matches!(&clipped.shape, egui::Shape::Text(_))));
+        }
+    }
+
+    #[test]
+    fn completion_elevation_preserves_clipped_menu_geometry_at_high_dpi() {
+        for scale in [1.0, 1.25, 2.0] {
+            let mut frame = (*direct_frame(10)).clone();
+            frame.completion = Some(
+                serde_json::from_value(serde_json::json!({
+                    "view": {"row":5,"column":20,"rows":2,"columns":4},
+                    "default_style": {"foreground":0x19c3a7,"background":0x294761},
+                    "runs": [{"row":5,"column":20,"cells":4,"text":"menu"}]
+                }))
+                .unwrap(),
+            );
+            // Model an editor clipped midway through a menu's right/bottom
+            // edge, as can happen while its container is being resized.
+            let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(220.0, 120.0));
+            let popup = Rect::from_min_size(
+                content.min + egui::vec2(200.0, 100.0),
+                egui::vec2(40.0, 40.0),
+            );
+            let clip = popup.intersect(content);
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                assert_eq!(ui.ctx().pixels_per_point(), scale);
+                paint_completion(
+                    &ui.ctx().layer_painter(egui::LayerId::background()),
+                    &frame,
+                    content,
+                    10.0,
+                    20.0,
+                    14.0,
+                );
+            });
+            output.textures_delta.clear();
+            assert!(output.shapes.iter().any(|clipped| {
+                clipped.clip_rect == clip
+                    && matches!(&clipped.shape, egui::Shape::Rect(shape)
+                    if shape.rect == popup && shape.fill == rgb(0x294761))
+            }));
+            for (spread, alpha) in [(4.0, 4), (3.0, 5), (2.0, 7), (1.0, 10)] {
+                assert!(output.shapes.iter().any(|clipped| {
+                    clipped.clip_rect == content
+                        && matches!(&clipped.shape, egui::Shape::Rect(shape)
+                        if shape.rect == popup.expand(spread)
+                            && shape.fill == Color32::from_black_alpha(alpha))
+                }));
+            }
+            assert!(
+                output.shapes.iter().any(|clipped| {
+                    clipped.clip_rect == clip
+                        && matches!(&clipped.shape, egui::Shape::Rect(shape)
+                    if shape.rect == popup
+                        && shape.stroke_kind == egui::StrokeKind::Inside
+                        && shape.stroke.width == 1.0 / scale
+                        && shape.stroke.color == rgb(0x19c3a7).gamma_multiply(0.20))
+                }),
+                "clipping must not move the outline to a false menu edge"
+            );
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(shape) => Some(shape),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text[0].pos.x, popup.left());
+            assert_eq!(
+                text.iter()
+                    .map(|shape| shape.galley.job.text.as_str())
+                    .collect::<String>(),
+                "menu"
+            );
+            assert!(text.iter().all(|shape| shape
+                .galley
+                .job
+                .sections
+                .iter()
+                .all(|section| section.format.color == rgb(0x19c3a7))));
         }
     }
 
@@ -2035,6 +2148,7 @@ mod tests {
         let normal = Vim9RenderStyle {
             foreground: Some(0x142536),
             background: Some(0x102030),
+            special: Some(0x8a9bac),
             ..Default::default()
         };
         let mut style = Vim9RenderStyle {
@@ -2051,6 +2165,63 @@ mod tests {
             colors(&style, &normal),
             (rgb(0x102030), rgb(0x19c3a7), rgb(0xe83967))
         );
+        style.special = None;
+        assert_eq!(
+            colors(&style, &normal),
+            (rgb(0x102030), rgb(0x19c3a7), rgb(0x8a9bac)),
+            "unset underline/undercurl color inherits GUI Normal's special color"
+        );
+        assert_eq!(
+            colors(
+                &style,
+                &Vim9RenderStyle {
+                    special: None,
+                    ..normal
+                }
+            )
+            .2,
+            rgb(0x102030),
+            "without a special color, decoration follows the resolved foreground"
+        );
+    }
+
+    #[test]
+    fn legacy_and_direct_replace_modes_paint_the_same_underline_caret() {
+        let mut frame = direct_frame(10);
+        Arc::make_mut(&mut frame).mode = "R".into();
+        let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(220.0, 120.0));
+        let cursor = cursor_rect(&frame, content, 10.0, 20.0, 0.0).unwrap();
+        let expected =
+            Rect::from_min_max(egui::pos2(cursor.left(), cursor.bottom() - 4.0), cursor.max);
+        let direct = DirectInput::default();
+        for direct_path in [false, true] {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                paint(
+                    ui.painter(),
+                    &frame,
+                    content,
+                    10.0,
+                    20.0,
+                    14.0,
+                    true,
+                    true,
+                    &ScrollPresentation::default(),
+                    0.0,
+                    direct_path.then_some(&direct),
+                );
+            });
+            output.textures_delta.clear();
+            let carets: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(shape) if shape.fill == rgb(0xddeeff) => Some(shape.rect),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(carets, vec![expected], "direct path: {direct_path}");
+        }
     }
 
     #[test]
