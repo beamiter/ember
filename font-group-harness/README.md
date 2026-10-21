@@ -28,6 +28,9 @@ versions. CARGO_HOME and CARGO_TARGET_DIR can point to shared caches.
   Storage-only pane/session/editor fixtures exercise independent editor fonts,
   mixed editor/shell/chrome wheel batches, stable session IDs, shared pane
   edges, dirty Settings drafts and first-frame floating overlay protection.
+  A mutable native-input stub counts cancellation so the same tests verify
+  that zoom invalidates only its editor once per batch, with no replay or
+  cancellation through a covering overlay.
 - Static assertions for the actual raw-input/layout/style/renderer wiring,
   including the ordered render_ui tail: floating panels, Vim dialog, then font
   zoom. Both kinds of overlay establish ownership before any zoom is drained.
@@ -43,6 +46,7 @@ metadata are explicitly stubbed only to compile the production config methods.
 Do not run all config_harness tests: unrelated tests included from those full
 production files are outside this fixture's scope. run.py selects only the
 font-group tests. Actual renderer rebuilding and debounced save scheduling are
-counted, not executed. This is not a full Ember application build, native GUI
+counted, not executed; native-input cancellation is counted at its call boundary.
+This is not a full Ember application build, native GUI
 visual validation, real pane/session lifecycle test, PTY-resize test, or
 desktop input-method test.

@@ -136,7 +136,18 @@ consumer_tests = r'''
     #[derive(Default)]
     struct SessionManager { sessions: Vec<Session> }
     impl SessionManager { fn sessions(&self) -> &[Session] { &self.sessions } }
-    struct Editor { buffer_font_size: Option<f32> }
+    // Count the native viewport invalidation boundary without constructing a
+    // Vim session. The extracted handler still takes a mutable lock guard.
+    #[derive(Default)]
+    struct NativeInput { cancel_count: usize }
+    impl NativeInput { fn cancel(&mut self) { self.cancel_count += 1; } }
+    #[derive(Default)]
+    struct NativeInputHandle(std::cell::RefCell<NativeInput>);
+    impl NativeInputHandle {
+        fn lock(&self) -> std::cell::RefMut<'_, NativeInput> { self.0.borrow_mut() }
+    }
+    #[derive(Default)]
+    struct Editor { buffer_font_size: Option<f32>, native_input: NativeInputHandle }
     struct TerminalApp {
         config: Config,
         config_panel: ConfigPanel,
@@ -202,7 +213,13 @@ __PRODUCTION_ZOOM_HANDLER__
                 session_idx,
             }).into();
         app.vim9_editors = [("editor-a", 14.0), ("editor-b", 24.0), ("hidden", 64.0)]
-            .into_iter().map(|(id, size)| (id.into(), Editor { buffer_font_size: Some(size) })).collect();
+            .into_iter().map(|(id, size)| (id.into(), Editor {
+                buffer_font_size: Some(size), ..Editor::default()
+            })).collect();
+    }
+    fn editor_cancellations(app: &TerminalApp) -> [usize; 3] {
+        ["editor-a", "editor-b", "hidden"]
+            .map(|id| app.vim9_editors[id].native_input.lock().cancel_count)
     }
     fn editor_zoom_frame(
         app: &mut TerminalApp, ctx: &egui::Context, wheels: &[(egui::Pos2, f32)], cover: bool,
@@ -261,6 +278,7 @@ __PRODUCTION_ZOOM_HANDLER__
         assert_eq!(app.vim9_editors["editor-a"].buffer_font_size, Some(16.0));
         assert_eq!(app.vim9_editors["editor-b"].buffer_font_size, Some(24.0));
         assert_eq!(app.vim9_editors["hidden"].buffer_font_size, Some(64.0));
+        assert_eq!(editor_cancellations(&app), [1, 0, 0], "only the zoomed editor is invalidated");
         assert_eq!((app.config.font_size, app.config.effective_ui_font_size()), (20.0, 13.0));
         assert_eq!((app.main_apply_count, app.save_count), (0, 0));
         assert!(app.force_resize_session);
@@ -283,6 +301,7 @@ __PRODUCTION_ZOOM_HANDLER__
         assert_eq!(app.vim9_editors["editor-a"].buffer_font_size, Some(16.0));
         assert_eq!(app.vim9_editors["editor-b"].buffer_font_size, Some(25.0));
         assert_eq!(app.vim9_editors["hidden"].buffer_font_size, Some(64.0));
+        assert_eq!(editor_cancellations(&app), [1, 1, 0], "each zoomed editor is invalidated once per batch");
         assert_eq!((app.config.font_size, app.config.effective_ui_font_size()), (23.0, 17.0));
         assert_eq!((app.config_panel.edit_font_size, app.config_panel.edit_ui_font_size), (23.0, 17.0));
         assert_eq!((app.main_apply_count, app.save_count), (1, 1));
@@ -290,6 +309,7 @@ __PRODUCTION_ZOOM_HANDLER__
         app.force_resize_session = false;
         app.handle_font_zoom(&ctx);
         assert!(!app.force_resize_session, "editor wheel is consumed once");
+        assert_eq!(editor_cancellations(&app), [1, 1, 0], "consumed zoom must not cancel again");
         assert_eq!((app.main_apply_count, app.save_count), (1, 1), "global wheel is consumed once");
     }
     #[test]
@@ -304,6 +324,7 @@ __PRODUCTION_ZOOM_HANDLER__
             assert_eq!((app.config.font_size, app.config.effective_ui_font_size()), (20.0, 13.0));
             assert_eq!((app.main_apply_count, app.save_count), (0, 0));
             assert!(!app.force_resize_session);
+            assert_eq!(editor_cancellations(&app), [0, 0, 0], "an overlay owns the wheel before editor invalidation");
         }
     }
     #[test]
