@@ -1346,15 +1346,36 @@ impl TerminalApp {
                 let rows = window
                     .map_or(frame.view.rows, |window| window.view.rows)
                     .max(1);
-                let (count, delta) = self
+                let (count, delta, discrete) = self
                     .frame_events
                     .iter()
                     .filter_map(|event| {
-                        crate::vim9_buffer::wheel_lines(event, geometry.line_height, rows)
+                        crate::vim9_buffer::wheel_lines(event, geometry.line_height, rows).map(
+                            |delta| {
+                                (
+                                    delta,
+                                    matches!(
+                                        event,
+                                        egui::Event::MouseWheel {
+                                            unit: egui::MouseWheelUnit::Line
+                                                | egui::MouseWheelUnit::Page,
+                                            ..
+                                        }
+                                    ),
+                                )
+                            },
+                        )
                     })
-                    .fold((0usize, 0.0f64), |(count, total), delta| {
-                        (count + 1, (total + delta).clamp(-120.0, 120.0))
-                    });
+                    .fold(
+                        (0usize, 0.0f64, true),
+                        |(count, total, discrete), (delta, notch)| {
+                            (
+                                count + 1,
+                                (total + delta).clamp(-120.0, 120.0),
+                                discrete && notch,
+                            )
+                        },
+                    );
                 let accepted = if count == 0 {
                     false
                 } else if direct.stale_presentation_at(frame, geometry, point) {
@@ -1362,7 +1383,17 @@ impl TerminalApp {
                     true
                 } else {
                     window.is_some_and(|window| {
-                        direct.wheel(frame, window.window, geometry, delta, &editor.session)
+                        if discrete {
+                            direct.wheel_discrete(
+                                frame,
+                                window.window,
+                                geometry,
+                                delta,
+                                &editor.session,
+                            )
+                        } else {
+                            direct.wheel(frame, window.window, geometry, delta, &editor.session)
+                        }
                     })
                 };
                 if accepted {
@@ -1384,7 +1415,9 @@ impl TerminalApp {
         if !direct.pointer_captured() && !claimed && frame.mode == "n" {
             direct.flush_scroll(&editor.session);
         }
-        if direct.needs_wake(&editor.session) {
+        if direct.animating() {
+            ctx.request_repaint();
+        } else if direct.needs_wake(&editor.session) {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
         claimed

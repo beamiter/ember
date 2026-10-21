@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "gui"]
 [dependencies]
 libc = "0.2"
 # Pin the shared shell GUI entry and precise scrolling contract.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "feae27f7cd965332253a81723095f75850241e81" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "2b00c1d3d92f4f5555969d6b62a410866d4acb34" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -51,7 +51,7 @@ mundy = { version = "=0.2.3", default-features = false, features = ["async-io", 
 harfrust = "0.13.3"
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "feae27f7cd965332253a81723095f75850241e81", features = ["session-parity-tests"] }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "2b00c1d3d92f4f5555969d6b62a410866d4acb34", features = ["session-parity-tests"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
@@ -74,5 +74,7 @@ codegen-units = 1
 opt-level = 3
 
 [patch.crates-io]
+# X11 legacy wheel release must not emit a second scroll notch.
+winit = { path = "vendor/winit" }
 eframe = { path = "vendor/eframe" }
 egui-winit = { path = "vendor/egui-winit" }

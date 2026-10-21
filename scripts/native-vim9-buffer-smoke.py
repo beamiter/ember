@@ -13,7 +13,7 @@ import signal
 import subprocess
 import time
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageGrab
 
 
 def wait_for(probe, label, process, timeout=25):
@@ -75,10 +75,10 @@ def main():
         "let encoded = get(get(info[0], 'variables', {}), 'previousRender', '')\n"
         "if empty(encoded) | return {} | endif\n"
         "let frame = json_decode(encoded)\n"
-        "return {'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0)}\n"
+        "return {'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0), 'native_pointer': get(get(get(frame, 'windows', []), 0, {}), 'native_pointer', 0), 'scroll_ack': get(get(get(frame, 'windows', []), 0, {}), 'scroll_ack', 0)}\n"
         "endfunction\n"
         "function! NativeFixtureState(timer) abort\n"
-        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
+        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
         f"call rename({quoted(str(state_file) + '.tmp')}, {quoted(state_file)})\n"
         "endfunction\n"
         "call timer_start(60, function('NativeFixtureState'), {'repeat': -1})\n",
@@ -172,6 +172,47 @@ def main():
             wait_for(lambda: state().get("render", {}).get("supported")
                      and color_count("plugin-" + kind + "-removed", plugin_rgb) == 0,
                      "removed plugin " + kind + " paint", app)
+        # Trace a real wheel notch through window pixels in a disposable Vim
+        # buffer. A distinctive source line supplies the visual position oracle.
+        command("enew | call setline(1, map(range(1,200), {_, n -> printf('WHEEL_%03d native scroll', n)})) | setlocal nowrap scrolloff=0")
+        command("syntax match NativePlugin /^WHEEL_065.*/ | normal! 50Gzt")
+        wait_for(lambda: state().get("topline") == 50 and state().get("render", {}).get("supported"),
+                 "wheel source viewport", app)
+        geometry = dict(line.split("=", 1) for line in xdo("getwindowgeometry", "--shell", window).stdout.splitlines() if "=" in line)
+        box = (int(geometry["X"]), int(geometry["Y"]),
+               int(geometry["X"]) + int(geometry["WIDTH"]), int(geometry["Y"]) + int(geometry["HEIGHT"]))
+        wheel_images = []
+        def wheel_y(name):
+            # XCB memory capture avoids ImageMagick process/PNG latency inside
+            # the 100 ms gesture. Encode artifacts after sampling has finished.
+            image = ImageGrab.grab(bbox=box, xdisplay=env["DISPLAY"]).convert("RGB")
+            wheel_images.append((name, image))
+            mask = None
+            for channel, value in zip(image.split(), (0x30, 0x40, 0x50)):
+                part = channel.point([255 if v == value else 0 for v in range(256)])
+                mask = part if mask is None else ImageChops.multiply(mask, part)
+            bounds = mask.getbbox()
+            assert bounds is not None, "wheel source highlight disappeared"
+            return bounds[1]
+        xdo("mousemove", "--window", window, "200", "200")
+        start_y = wheel_y("wheel-before")
+        started = time.monotonic()
+        xdo("click", "--delay", "0", "5")
+        trace = []
+        for index in range(8):
+            trace.append([round(time.monotonic() - started, 4), wheel_y("wheel-step-" + str(index))])
+            time.sleep(0.008)
+        wait_for(lambda: state().get("topline") == 53, "one wheel notch moves exactly three Vim rows", app)
+        end_y = wheel_y("wheel-after")
+        for name, image in wheel_images:
+            image.save(out / (name + ".png"))
+        assert end_y < start_y, (start_y, trace, end_y)
+        assert any(end_y < y < start_y for _, y in trace), ("wheel skipped its intermediate GUI pixels", start_y, trace, end_y)
+        report["wheel_notch"] = {"source_topline": [50, 53], "start_y": start_y,
+                                  "end_y": end_y, "trace": trace}
+        command("bwipeout!")
+        wait_for(lambda: state().get("text") == original.splitlines()[0] and state().get("modified") == 0,
+                 "return from disposable wheel buffer", app)
         # No [vim9] settings are supplied: the text must begin near the normal
         # tab bar, without an automatically opened project tree or IDE rows.
         focused = color_regions("focused-buffer-defaults")

@@ -417,3 +417,39 @@ including 43 exact plugin-regex RGB pixels and 37 positional CJK RGB pixels
 with `notermguicolors`, removal without editing, same-batch Escape/Save/input,
 split edit/save/undo, resize, zoom and compatibility recovery. Screenshots were
 inspected. Artifacts: `/tmp/ember-vim9-plugin-feae27f-v2` on the validation host.
+
+
+## Continuous wheel scrolling — 2026-10-21
+
+Pinned shared core: `2b00c1d3d92f4f5555969d6b62a410866d4acb34`.
+Supported Normal-mode buffer views now turn each three-line wheel notch into
+a 100 ms continuous input transition. New notches retain their own completion
+deadlines; reversing cancels the old direction's unplayed tail. The GUI frame
+clock advances motion even without new Vim render messages. Trackpad pixels
+continue following OS input directly. Source-checked acknowledgements rebase
+paint, hit testing and caret/IME together; a captured press freezes future
+wheel animation. Editing, preedit, focus changes, zoom and changed layout
+retain their cancellation rules. Turning smooth scrolling off keeps the
+existing compatibility behavior.
+
+Render protocol 4 prefetches eight real source rows on each edge (protocol 3
+hosts retain two). This gives ordinary notches and short bursts text to expose
+while Vim handles the request. File boundaries, unsupported views and missing
+margin coverage remain bounded by the actual Vim source.
+
+The shared runtime passes 93 real-Vim regressions. The core Rust Vim9 suite
+passes 77 regular checks plus its explicit real-PTY round trip; deterministic
+wheel tests cover 60/120/240 Hz timelines, exact distance, acknowledgement
+continuity, reversal, file edges and pointer capture.
+
+The vendored Winit 0.30.13 patch ignores legacy X11 wheel-button releases,
+which otherwise turn one press/release pair into two notches. See the
+[upstream package provenance and patch](../vendor/winit/JTERM_PATCH.md).
+The locked build, all-target/all-feature Clippy with `-D warnings`, and full
+Xvfb/software-GPU buffer smoke pass. The smoke injects an actual complete X11
+wheel notch, observes Vim's topline change from 50 to 53, and captures
+intermediate native GUI pixels before checking save/undo, splits, resize,
+font zoom and compatibility recovery. PNG encoding is deferred until after
+XCB pixel sampling to keep screenshot I/O out of the gesture.
+
+Observed highlight Y positions: 438 → 437 → 383 → 359 pixels. These sparse samples verify actual intermediate positions, not a frame-rate guarantee. Artifacts: `/tmp/ember-vim9-wheel-2b00c1d-v4`.

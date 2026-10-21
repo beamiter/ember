@@ -1953,7 +1953,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=feae27f7cd965332253a81723095f75850241e81#feae27f7cd965332253a81723095f75850241e81"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=2b00c1d3d92f4f5555969d6b62a410866d4acb34#2b00c1d3d92f4f5555969d6b62a410866d4acb34"
 dependencies = [
  "crossbeam-channel",
  "dirs",
@@ -4457,8 +4457,6 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"
 dependencies = [
  "ahash",
  "android-activity",

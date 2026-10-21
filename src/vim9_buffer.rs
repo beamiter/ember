@@ -145,10 +145,14 @@ impl DirectInput {
         }
     }
 
+    pub fn animating(&self) -> bool {
+        self.scrolls.values().any(Vim9PixelScroll::is_animating)
+    }
+
     pub fn needs_wake(&self, session: &Vim9Session) -> bool {
         self.scrolls
             .values()
-            .any(|scroll| scroll.request_id().is_some())
+            .any(|scroll| scroll.request_id().is_some() || scroll.is_animating())
             || self.pointer.as_ref().is_some_and(|pointer| {
                 !pointer.cancelled
                     && (pointer.queued.is_some() || session.command_pending(pointer.request))
@@ -180,6 +184,29 @@ impl DirectInput {
         delta: f64,
         session: &Vim9Session,
     ) -> bool {
+        self.wheel_with(frame, window, geometry, delta, session, false)
+    }
+
+    pub fn wheel_discrete(
+        &mut self,
+        frame: &Vim9RenderFrame,
+        window: i64,
+        geometry: Vim9RenderMetrics,
+        delta: f64,
+        session: &Vim9Session,
+    ) -> bool {
+        self.wheel_with(frame, window, geometry, delta, session, true)
+    }
+
+    fn wheel_with(
+        &mut self,
+        frame: &Vim9RenderFrame,
+        window: i64,
+        geometry: Vim9RenderMetrics,
+        delta: f64,
+        session: &Vim9Session,
+        discrete: bool,
+    ) -> bool {
         let Some(view) = frame.windows.iter().find(|view| view.window == window) else {
             return false;
         };
@@ -193,7 +220,11 @@ impl DirectInput {
             .scrolls
             .get_mut(&window)
             .expect("bound window inserted above");
-        scroll.push(delta);
+        if discrete && !self.suppress_fraction {
+            scroll.push_wheel(delta);
+        } else {
+            scroll.push(delta);
+        }
         if let Some(command) = scroll.command() {
             match session.send(command) {
                 Ok(id) => scroll.submitted(id),
@@ -396,6 +427,9 @@ impl DirectInput {
             self.discard_press();
             return true;
         };
+        for scroll in self.scrolls.values_mut() {
+            scroll.stop_animation();
+        }
         self.pointer = Some(NativePointer {
             gesture,
             target: anchor.position,
