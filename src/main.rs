@@ -6111,9 +6111,8 @@ impl eframe::App for TerminalApp {
             }
         }
 
-        if !ui_input_blocked && !terminal_input_blocked {
-            self.handle_vim9_scroll(ctx);
-        }
+        let native_vim9_pointer_claimed =
+            self.handle_vim9_input(ctx, !ui_input_blocked && !terminal_input_blocked);
         self.prepare_organism(ctx);
         let active_session_idx = self.session_manager.active_index();
         let active_pane_renderer_idx = (self.layout().panes().len() > 1).then(|| {
@@ -6419,6 +6418,8 @@ impl eframe::App for TerminalApp {
             ui_input_blocked,
             semantic_paste_blocks_pointer,
         );
+
+        terminal_pointer_input_blocked |= native_vim9_pointer_claimed;
 
         // Step 4: 处理普通键盘输入
         // 当搜索面板或配置面板打开时，不处理普通键盘输入（面板会处理输入）

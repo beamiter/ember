@@ -152,7 +152,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            dbus libglib2.0-bin python3-dbus python3-gi \
+            dbus libglib2.0-bin python3-dbus python3-gi vim \
             pkg-config \
             libfontconfig1-dev \
             libwayland-dev \
@@ -197,6 +197,13 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Gate native Vim fractional selection against a real PTY
+        timeout-minutes: 3
+        run: >-
+          cargo test --lib --all-features --locked
+          vim9_buffer::native_input_tests::real_vim_fractional_click_drag_yank_and_cancel_use_the_presented_source
+          -- --ignored --exact --nocapture
 
       - name: Gate isolated native organism preference events
         run: /usr/bin/python3 scripts/test-organism-system-motion.py

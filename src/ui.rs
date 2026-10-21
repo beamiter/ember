@@ -1330,9 +1330,12 @@ pub struct TerminalRenderer {
     /// Authenticated buffer text/GUI styles. Terminal cells remain only the
     /// compatibility surface outside this frame's buffer rectangle.
     pub native_vim9_frame: Option<std::sync::Arc<jterm_core::vim9::Vim9RenderFrame>>,
+    pub native_vim9_input_snapshot: Option<jterm_core::vim9::Vim9InputSnapshot>,
     pub native_vim9_font_size: Option<f32>,
     pub(crate) native_vim9_identity: Option<uuid::Uuid>,
     pub(crate) native_vim9_smooth_scroll: bool,
+    pub native_vim9_input:
+        Option<std::sync::Arc<parking_lot::Mutex<crate::vim9_buffer::DirectInput>>>,
     native_vim9_scroll: crate::vim9_buffer::ScrollPresentation,
     /// Same-frame native active-card free space; never terminal or PTY allocation.
     pub companion_surface: Option<(String, ProjectionCacheKey, egui::Rect)>,
@@ -1509,9 +1512,11 @@ impl TerminalRenderer {
             ime_enabled: false,
             last_content_rect: None,
             native_vim9_frame: None,
+            native_vim9_input_snapshot: None,
             native_vim9_font_size: None,
             native_vim9_identity: None,
             native_vim9_smooth_scroll: true,
+            native_vim9_input: None,
             native_vim9_scroll: Default::default(),
             companion_surface: None,
             companion_enabled: false,
@@ -4246,6 +4251,11 @@ impl TerminalRenderer {
                     && terminal.selection.is_none()
             })
             .cloned();
+        if native_buffer.is_none() {
+            if let Some(input) = &self.native_vim9_input {
+                input.lock().cancel();
+            }
+        }
         let native_time = ui.ctx().input(|input| input.time);
         let direct_input = ui.ctx().input(|input| {
             input.pointer.any_pressed()
@@ -4264,7 +4274,7 @@ impl TerminalRenderer {
             native_buffer.as_ref(),
             line_height,
             native_time,
-            self.native_vim9_smooth_scroll,
+            self.native_vim9_smooth_scroll && self.native_vim9_input.is_none(),
             direct_input,
         );
         if self.native_vim9_scroll.active(native_time) {
@@ -4289,6 +4299,21 @@ impl TerminalRenderer {
 
         let (content_rect, scrollbar_rect) = self.layout_rects(rect);
         self.last_content_rect = Some(content_rect);
+        if let (Some(_), Some(input), Some(snapshot)) = (
+            &native_buffer,
+            &self.native_vim9_input,
+            &self.native_vim9_input_snapshot,
+        ) {
+            input.lock().reconcile(
+                snapshot,
+                jterm_core::vim9::Vim9RenderMetrics {
+                    origin_x: content_rect.left(),
+                    origin_y: content_rect.top(),
+                    cell_width: char_width,
+                    line_height,
+                },
+            );
+        }
         // Owned per-frame snapshot of visible command blocks, shared by the
         // gutter hit test below and the chrome painting after the grid.
         // `None` while chrome is gated off (config, alt screen, reflow).
@@ -4356,23 +4381,33 @@ impl TerminalRenderer {
             .unwrap_or((cursor_point.row, cursor_point.column));
         let ime_rect = native_buffer
             .as_ref()
-            .and_then(|frame| {
-                crate::vim9_buffer::cursor_rect(
-                    frame,
-                    content_rect,
-                    char_width,
-                    line_height,
-                    self.native_vim9_scroll.offset(frame.window, native_time),
-                )
+            .map(|frame| {
+                if let Some(input) = &self.native_vim9_input {
+                    crate::vim9_buffer::direct_cursor_rect(
+                        frame,
+                        content_rect,
+                        char_width,
+                        line_height,
+                        &input.lock(),
+                    )
+                } else {
+                    crate::vim9_buffer::cursor_rect(
+                        frame,
+                        content_rect,
+                        char_width,
+                        line_height,
+                        self.native_vim9_scroll.offset(frame.window, native_time),
+                    )
+                }
             })
             .unwrap_or_else(|| {
-                cursor_rect(
+                Some(cursor_rect(
                     content_rect,
                     cursor_pos.0,
                     cursor_pos.1,
                     char_width,
                     line_height,
-                )
+                ))
             });
 
         let ctx = ui.ctx();
@@ -4409,13 +4444,15 @@ impl TerminalRenderer {
         }
 
         if focus_enabled {
-            let ime_rect_changed = self
-                .last_ime_rect
-                .map(|prev| prev != ime_rect)
-                .unwrap_or(true);
-            if ime_rect_changed {
-                ctx.send_viewport_cmd(egui::ViewportCommand::IMERect(ime_rect));
-                self.last_ime_rect = Some(ime_rect);
+            if let Some(ime_rect) = ime_rect {
+                if self.last_ime_rect != Some(ime_rect) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::IMERect(ime_rect));
+                    self.last_ime_rect = Some(ime_rect);
+                }
+            } else {
+                // A native caret clipped outside its split has no candidate
+                // anchor. Never replace it with the stationary PTY cursor.
+                self.last_ime_rect = None;
             }
         } else {
             self.dragging_scrollbar = false;
@@ -5141,7 +5178,25 @@ impl TerminalRenderer {
                 cursor_visible,
                 &self.native_vim9_scroll,
                 native_time,
+                self.native_vim9_input
+                    .as_ref()
+                    .map(|input| input.lock())
+                    .as_deref(),
             );
+            if let Some(input) = &self.native_vim9_input {
+                input.lock().remember_presentation(
+                    std::sync::Arc::clone(frame),
+                    jterm_core::vim9::Vim9RenderMetrics {
+                        origin_x: content_rect.left(),
+                        origin_y: content_rect.top(),
+                        cell_width: char_width,
+                        line_height,
+                    },
+                    ui.ctx(),
+                );
+            }
+        } else if let Some(input) = &self.native_vim9_input {
+            input.lock().forget_presentation();
         }
 
         // Render cursor - direct O(1) positioning instead of full grid scan

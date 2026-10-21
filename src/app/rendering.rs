@@ -2500,10 +2500,17 @@ impl TerminalApp {
             .clone();
         let native_editor = self.vim9_editors.get(&active_id);
         self.renderer.native_vim9_identity = native_editor.map(|editor| editor.session.entry_id());
+        self.renderer.native_vim9_input =
+            native_editor.map(|editor| std::sync::Arc::clone(&editor.native_input));
         self.renderer.native_vim9_smooth_scroll = self.config.vim9.smooth_scroll;
-        self.renderer.native_vim9_frame = native_editor
+        self.renderer.native_vim9_input_snapshot = native_editor
             .filter(|_| self.config.vim9.native_buffer)
-            .and_then(|editor| editor.session.render_snapshot());
+            .map(|editor| editor.session.input_snapshot());
+        self.renderer.native_vim9_frame = self
+            .renderer
+            .native_vim9_input_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.frame.clone());
         self.renderer.native_vim9_font_size =
             native_editor.map(|editor| editor.buffer_font_size.unwrap_or(self.config.font_size));
         self.renderer.font_size = self
@@ -2605,10 +2612,16 @@ impl TerminalApp {
                 let renderer = &mut self.pane_renderers[pane_idx];
                 renderer.native_vim9_identity =
                     native_editor.map(|editor| editor.session.entry_id());
+                renderer.native_vim9_input =
+                    native_editor.map(|editor| std::sync::Arc::clone(&editor.native_input));
                 renderer.native_vim9_smooth_scroll = self.config.vim9.smooth_scroll;
-                renderer.native_vim9_frame = native_editor
+                renderer.native_vim9_input_snapshot = native_editor
                     .filter(|_| self.config.vim9.native_buffer)
-                    .and_then(|editor| editor.session.render_snapshot());
+                    .map(|editor| editor.session.input_snapshot());
+                renderer.native_vim9_frame = renderer
+                    .native_vim9_input_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.frame.clone());
                 renderer.native_vim9_font_size = native_editor
                     .map(|editor| editor.buffer_font_size.unwrap_or(self.config.font_size));
                 renderer.font_size = renderer

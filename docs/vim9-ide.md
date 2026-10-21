@@ -133,14 +133,43 @@ by the actual line height, preserving fractional movement independently in each
 split. Ctrl+wheel retains editor font zoom. Input mixed with keyboard activity
 keeps its ordinary terminal route so semantic requests cannot overtake text.
 
-After Vim acknowledges a viewport change, Ember eases that split's native text
-over 100 ms using elapsed time, independent of monitor refresh rate. Previous
-edge rows remain clipped beneath the new content during the transition, so a
-scroll does not reveal a blank band. The cursor and IME anchor use the same
-translation. Keyboard input, mouse presses, edits, zoom, layout changes,
-unsupported views and changing editors settle the surface immediately. Large
-jumps remain immediate. Set `[vim9] smooth_scroll = false` for no animation;
-precision wheel accumulation remains available.
+Fractions move the native text immediately, using Vim's prefetched source rows
+at the split edges. Each split has at most one viewport command in flight;
+further wheel motion accumulates locally until that exact command is
+acknowledged. The acknowledged topline rebases the remaining fraction instead
+of starting a second animation. Vim's file boundaries retire excess movement.
+The renderer reads the frame and command completion set atomically, including
+when an acknowledgement arrives between input handling and painting.
+
+The text, clipped edge rows, selection highlights, caret and IME candidate
+anchor use the same viewport translation. A pointer hit uses the frame,
+geometry and offsets actually submitted for display, even if a newer frame has
+already arrived. New wheel input also checks that the displayed split still
+owns the same buffer generation; an unseen replacement buffer cannot inherit
+the old picture's wheel gesture.
+
+While a nonzero fraction is displayed, a plain left click and drag use source
+line and UTF-8 byte positions when Vim advertises native pointer support.
+Pointer commands have one request in flight and coalesce later motion, with
+release kept behind the outstanding press/drag. This preserves positions in
+wide and combining text and lets Vim own the real Visual selection. At rest,
+clicks keep Vim's normal mouse behavior. Modified clicks, unsupported pointer
+semantics, or a second nearby click on a fractional image first settle the
+image and consume that press and its release. Retry after it settles. A native
+first click is not part of Vim's legacy multi-click history; fractional
+double/triple-click parity is not claimed. Dragging outside a supported split
+retains the last valid source position; edge autoscroll and cross-split source
+selection are not implemented.
+
+Keyboard input, preedit, edits, zoom, layout changes, unsupported views, focus
+or editor changes cancel the local fraction and any queued pointer target.
+A cancelled native press still owns its physical release, so it cannot become
+an unrelated terminal mouse report. Once a replacement frame has been drawn,
+hidden editors and removed panes stop owning new clicks in their old area.
+Set `[vim9] smooth_scroll = false` to keep
+whole-line rendering; precision wheel accumulation remains available. Insert
+mode uses a narrow caret, Replace mode an underline, and Normal mode the block
+caret.
 
 Undercurls use a continuous antialiased wave with physical-pixel sampling and
 shared phase across adjoining syntax runs. Decoration thickness follows display
@@ -303,6 +332,28 @@ This check requires xdotool, ImageMagick and Pillow. Screenshots and the result
 JSON remain in the chosen output directory. It is an X11/software-GPU check,
 not a Wayland, physical-GPU or interactive IME certification.
 
+The focused unit tests include direct fractional paint/overscan, caret and IME
+geometry, acknowledgement rebasing, frozen source hit testing, wheel source
+identity, and cancelled gesture ownership:
+
+```sh
+cargo test --lib --locked vim9_buffer::tests
+```
+
+The ignored real-Vim test opens a private PTY and bridge, performs a fractional
+click and coalesced drag through CJK/combining text, checks Vim's actual Visual
+selection and yank, and verifies that cancellation never replays a release:
+
+```sh
+cargo test --lib --locked \
+  vim9_buffer::native_input_tests::real_vim_fractional_click_drag_yank_and_cancel_use_the_presented_source \
+  -- --ignored --exact --nocapture
+```
+
+It requires Vim 9, local sockets and PTY access. This verifies the native input
+controller against Vim; desktop trackpad hardware and OS candidate windows
+still require interactive validation.
+
 On Linux with Xvfb, libX11/libXtst, ImageMagick, Tesseract and Vim 9 installed:
 
 ```sh
@@ -329,3 +380,15 @@ applies to this test.
 Pinned shared core: `c387ab33caff52a0bd4f759fb20a35aae2586cd0`.
 Passed 15 focused tests (3 library + 12 binary) and the real X11/WGPU window smoke: RGB in all three panes, Unicode, edit/save/undo, resize, font zoom, compatibility fallback/recovery and normal quit.
 These runs use Xvfb/software graphics; physical GPU, Wayland and OS IME candidate windows are not certified.
+
+### Direct input validation — 2026-10-21
+
+Pinned shared core: `9dc44d8bb521b4d8ad9435e2bd6e09aecdf090b0`.
+The 18 focused native-buffer library tests and the real-Vim PTY selection test
+pass. All-target/all-feature `cargo check` and the CI Clippy command with
+`-D warnings` pass against that locked Git revision. The CI tests job now runs
+the real-Vim regression explicitly after its ordinary test suite.
+
+The PTY test exercises the frontend controller and Vim's real selection/yank;
+it does not certify a desktop trackpad, hardware GPU, Wayland compositor or OS
+IME candidate window. Those interactive environments remain separate checks.

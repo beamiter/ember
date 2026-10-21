@@ -6,11 +6,517 @@
 
 use egui::{self, Color32, FontId, Rect, Stroke};
 use jterm_core::vim9::{
-    Vim9PixelRect, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderStyle,
-    Vim9ScrollAnimation,
+    Vim9BufferPosition, Vim9Command, Vim9InputSnapshot, Vim9PixelRect, Vim9PixelScroll,
+    Vim9PointerPhase, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderStyle,
+    Vim9RenderWindow, Vim9ScrollAnimation, Vim9Session, Vim9Viewport, Vim9ViewportAnchor,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+
+#[cfg(all(test, unix))]
+#[path = "vim9_native_input_tests.rs"]
+mod native_input_tests;
+
+/// A single source-bound transform shared by native input and paint. The
+/// application owns admission; the painter only samples these bounded offsets.
+#[derive(Default)]
+pub struct DirectInput {
+    scrolls: HashMap<i64, Vim9PixelScroll>,
+    suppress_fraction: bool,
+    pointer: Option<NativePointer>,
+    discarded_pointer: bool,
+    next_gesture: u64,
+    last_press: Option<(f64, egui::Pos2)>,
+    presented: Option<PresentedFrame>,
+    presentation_retired: bool,
+}
+
+struct PresentedFrame {
+    frame: Arc<Vim9RenderFrame>,
+    metrics: Vim9RenderMetrics,
+    offsets: HashMap<i64, f32>,
+    viewport: egui::ViewportId,
+    frame_number: u64,
+}
+
+struct NativePointer {
+    gesture: u64,
+    target: Vim9BufferPosition,
+    metrics: Vim9RenderMetrics,
+    cancelled: bool,
+    request: u64,
+    queued: Option<(Vim9BufferPosition, Vim9PointerPhase)>,
+    released: bool,
+}
+
+impl DirectInput {
+    pub fn set_smooth(&mut self, enabled: bool) {
+        if self.suppress_fraction == enabled {
+            self.cancel();
+            self.suppress_fraction = !enabled;
+        }
+    }
+
+    /// A cancelled press still owns its physical release. Never turn the tail
+    /// of a semantic drag into an orphan legacy mouse report after Escape.
+    pub fn cancel(&mut self) {
+        self.scrolls.clear();
+        // Keep the visible image's ownership until its replacement is painted.
+        // A key/toolbar action may cancel before this frame's pointer admission.
+        self.presentation_retired = true;
+        if let Some(pointer) = &mut self.pointer {
+            pointer.cancelled = true;
+            pointer.queued = None;
+        }
+    }
+
+    pub fn pointer_captured(&self) -> bool {
+        self.pointer.is_some() || self.discarded_pointer
+    }
+
+    pub fn finish_cancelled_pointer(&mut self, down: bool) -> bool {
+        let captured = self.pointer_captured();
+        if !down {
+            self.pointer = None;
+            self.discarded_pointer = false;
+        }
+        captured
+    }
+
+    /// Unsupported clicks over a translated image settle it first. Their
+    /// press and physical tail must never become legacy cells in a new image.
+    pub fn discard_press(&mut self) {
+        self.cancel();
+        self.pointer = None;
+        self.discarded_pointer = true;
+    }
+
+    pub fn discarding_pointer(&self) -> bool {
+        self.discarded_pointer
+    }
+
+    /// The frame and completion set must be one bridge observation. A newer
+    /// completion paired with an old frame would falsely retire its fraction.
+    /// Painting repeats this reconciliation so a late exact ack is rebased
+    /// before the acknowledged image is submitted.
+    pub fn reconcile(&mut self, snapshot: &Vim9InputSnapshot, geometry: Vim9RenderMetrics) {
+        let Some(frame) = &snapshot.frame else {
+            self.cancel();
+            return;
+        };
+        self.reconcile_with(frame, geometry, |id| snapshot.command_pending(id));
+    }
+
+    fn reconcile_with(
+        &mut self,
+        frame: &Vim9RenderFrame,
+        geometry: Vim9RenderMetrics,
+        pending: impl Fn(u64) -> bool,
+    ) {
+        let topology_changed = self
+            .presented
+            .as_ref()
+            .is_some_and(|presented| !same_layout(presented, frame, geometry));
+        if topology_changed || !frame.supported {
+            self.cancel();
+            return;
+        }
+        self.scrolls.retain(|window, scroll| {
+            frame
+                .windows
+                .iter()
+                .find(|view| view.window == *window)
+                .is_some_and(|view| {
+                    let in_flight = scroll.request_id().is_some_and(&pending);
+                    scroll.reconcile(view, geometry, in_flight)
+                })
+        });
+        if let Some(pointer) = &mut self.pointer {
+            let source_current = frame.windows.iter().any(|window| {
+                window.native_pointer
+                    && (window.window, window.buffer, window.changedtick)
+                        == (
+                            pointer.target.window,
+                            pointer.target.buffer,
+                            pointer.target.changedtick,
+                        )
+            });
+            pointer.cancelled |= !source_current || pointer.metrics != geometry;
+        }
+    }
+
+    pub fn needs_wake(&self, session: &Vim9Session) -> bool {
+        self.scrolls
+            .values()
+            .any(|scroll| scroll.request_id().is_some())
+            || self.pointer.as_ref().is_some_and(|pointer| {
+                !pointer.cancelled
+                    && (pointer.queued.is_some() || session.command_pending(pointer.request))
+            })
+    }
+
+    /// Retry only unsent motion from this gesture, after its exact semantic
+    /// acknowledgement. A rejected request drops the local transform.
+    pub fn flush_scroll(&mut self, session: &Vim9Session) {
+        self.scrolls.retain(|_, scroll| {
+            let Some(command) = scroll.command() else {
+                return true;
+            };
+            match session.send(command) {
+                Ok(id) => {
+                    scroll.submitted(id);
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+    }
+
+    pub fn wheel(
+        &mut self,
+        frame: &Vim9RenderFrame,
+        window: i64,
+        geometry: Vim9RenderMetrics,
+        delta: f64,
+        session: &Vim9Session,
+    ) -> bool {
+        let Some(view) = frame.windows.iter().find(|view| view.window == window) else {
+            return false;
+        };
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.scrolls.entry(window) {
+            let Some(scroll) = Vim9PixelScroll::new(view, geometry) else {
+                return false;
+            };
+            entry.insert(scroll);
+        }
+        let scroll = self
+            .scrolls
+            .get_mut(&window)
+            .expect("bound window inserted above");
+        scroll.push(delta);
+        if let Some(command) = scroll.command() {
+            match session.send(command) {
+                Ok(id) => scroll.submitted(id),
+                Err(_) => {
+                    self.scrolls.remove(&window);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub fn offset(&self, frame: &Vim9RenderFrame, window: i64, geometry: Vim9RenderMetrics) -> f32 {
+        if self.suppress_fraction {
+            return 0.0;
+        }
+        self.scrolls
+            .get(&window)
+            .map_or(0.0, |scroll| scroll.offset(frame, geometry))
+    }
+
+    pub fn remember_presentation(
+        &mut self,
+        frame: Arc<Vim9RenderFrame>,
+        geometry: Vim9RenderMetrics,
+        ctx: &egui::Context,
+    ) {
+        let offsets = frame
+            .windows
+            .iter()
+            .map(|window| (window.window, self.offset(&frame, window.window, geometry)))
+            .collect();
+        self.presented = Some(PresentedFrame {
+            frame,
+            metrics: geometry,
+            offsets,
+            viewport: ctx.viewport_id(),
+            frame_number: ctx.cumulative_frame_nr(),
+        });
+        self.presentation_retired = false;
+    }
+
+    pub fn forget_presentation(&mut self) {
+        self.presented = None;
+        self.presentation_retired = false;
+    }
+
+    /// Hidden tabs and removed panes do not paint a replacement into this
+    /// editor. Their old image stops owning new input once another completed
+    /// egui frame has replaced it. An already captured release still belongs
+    /// to its original gesture, including across an editor switch.
+    pub fn retire_unpainted(&mut self, ctx: &egui::Context) {
+        let obsolete = self.presented.as_ref().is_some_and(|presented| {
+            presented.viewport != ctx.viewport_id()
+                || presented.frame_number.saturating_add(1) < ctx.cumulative_frame_nr()
+        });
+        if obsolete {
+            self.cancel();
+            self.forget_presentation();
+        }
+    }
+
+    pub fn presented_fraction_at(&self, point: egui::Pos2) -> bool {
+        self.presented.as_ref().is_some_and(|presented| {
+            presented.frame.windows.iter().any(|window| {
+                presented
+                    .offsets
+                    .get(&window.window)
+                    .copied()
+                    .unwrap_or(0.0)
+                    != 0.0
+                    && presented
+                        .metrics
+                        .rect(&window.view)
+                        .is_some_and(|rect| rect.contains(point.x, point.y))
+            })
+        })
+    }
+
+    /// A wheel over an obsolete source must not fall through to PTY cells in
+    /// its unseen replacement. Unsupported but unchanged sources still use
+    /// Vim's normal mouse route.
+    pub fn stale_presentation_at(
+        &self,
+        current: &Vim9RenderFrame,
+        geometry: Vim9RenderMetrics,
+        point: egui::Pos2,
+    ) -> bool {
+        let Some(presented) = &self.presented else {
+            return false;
+        };
+        let Some(old) = presented.frame.windows.iter().find(|window| {
+            presented
+                .metrics
+                .rect(&window.view)
+                .is_some_and(|rect| rect.contains(point.x, point.y))
+        }) else {
+            return false;
+        };
+        self.presentation_retired
+            || !same_layout(presented, current, geometry)
+            || !current.windows.iter().any(|new| same_source(old, new))
+    }
+
+    /// Source hits are frozen with the image submitted to egui. A newer bridge
+    /// frame or scroll acknowledgement cannot move a click before repaint.
+    fn presented_anchor(
+        &self,
+        current: &Vim9RenderFrame,
+        geometry: Vim9RenderMetrics,
+        point: egui::Pos2,
+    ) -> Option<Vim9ViewportAnchor> {
+        let presented = self.presented.as_ref()?;
+        if self.presentation_retired
+            || !current.supported
+            || !same_layout(presented, current, geometry)
+        {
+            return None;
+        }
+        presented
+            .frame
+            .windows
+            .iter()
+            .filter(|window| window.native_pointer)
+            .find_map(|window| {
+                let still_current = current
+                    .windows
+                    .iter()
+                    .any(|new| new.native_pointer && same_source(window, new));
+                if !still_current {
+                    return None;
+                }
+                let offset = presented
+                    .offsets
+                    .get(&window.window)
+                    .copied()
+                    .unwrap_or(0.0);
+                Vim9Viewport::new(&presented.frame, window.window, geometry, offset)?
+                    .anchor_at(point.x, point.y)
+            })
+    }
+
+    pub fn wheel_window_at(
+        &self,
+        current: &Vim9RenderFrame,
+        geometry: Vim9RenderMetrics,
+        point: egui::Pos2,
+    ) -> Option<i64> {
+        let presented = self.presented.as_ref()?;
+        if self.presentation_retired
+            || !current.supported
+            || !same_layout(presented, current, geometry)
+        {
+            return None;
+        }
+        presented.frame.windows.iter().find_map(|old| {
+            let same_source = current
+                .windows
+                .iter()
+                .any(|new| new.native_pointer && same_source(old, new));
+            (old.native_pointer
+                && same_source
+                && geometry.rect(&old.view)?.contains(point.x, point.y))
+            .then_some(old.window)
+        })
+    }
+
+    pub fn press(
+        &mut self,
+        frame: &Vim9RenderFrame,
+        geometry: Vim9RenderMetrics,
+        point: egui::Pos2,
+        now: f64,
+        session: &Vim9Session,
+    ) -> bool {
+        let repeated = self.last_press.is_some_and(|(time, pos)| {
+            now >= time && now - time <= 0.5 && pos.distance(point) <= 6.0
+        });
+        self.last_press = Some((now, point));
+        // Static clicks keep Vim's existing mouse mappings and multi-click
+        // behavior. Source bytes are needed while a fraction is actually shown.
+        if !self.presented_fraction_at(point) {
+            return false;
+        }
+        if repeated {
+            self.discard_press();
+            return true;
+        }
+        let Some(anchor) = self.presented_anchor(frame, geometry, point) else {
+            self.discard_press();
+            return true;
+        };
+        self.next_gesture = self.next_gesture.saturating_add(1).max(1);
+        let gesture = self.next_gesture;
+        let Ok(request) = session.send(pointer_command(
+            &anchor.position,
+            gesture,
+            Vim9PointerPhase::Press,
+        )) else {
+            self.discard_press();
+            return true;
+        };
+        self.pointer = Some(NativePointer {
+            gesture,
+            target: anchor.position,
+            metrics: geometry,
+            cancelled: false,
+            request,
+            queued: None,
+            released: false,
+        });
+        true
+    }
+
+    pub fn pointer(
+        &mut self,
+        frame: &Vim9RenderFrame,
+        geometry: Vim9RenderMetrics,
+        point: Option<egui::Pos2>,
+        released: bool,
+        session: &Vim9Session,
+    ) -> bool {
+        let Some(mut pointer) = self.pointer.take() else {
+            return false;
+        };
+        if !pointer.cancelled && !pointer.released {
+            let target = point.and_then(|point| self.presented_anchor(frame, geometry, point));
+            let target = target
+                .filter(|anchor| {
+                    (
+                        anchor.position.window,
+                        anchor.position.buffer,
+                        anchor.position.changedtick,
+                    ) == (
+                        pointer.target.window,
+                        pointer.target.buffer,
+                        pointer.target.changedtick,
+                    )
+                })
+                .map(|anchor| anchor.position);
+            if released {
+                pointer.queued =
+                    Some((target.unwrap_or(pointer.target), Vim9PointerPhase::Release));
+                pointer.released = true;
+            } else if let Some(target) = target.filter(|target| *target != pointer.target) {
+                pointer.queued = Some((target, Vim9PointerPhase::Drag));
+                pointer.target = target;
+            }
+        }
+        let mut complete = pointer.cancelled && released;
+        if !pointer.cancelled && !session.command_pending(pointer.request) {
+            if let Some((target, phase)) = pointer.queued.take() {
+                match session.send(pointer_command(&target, pointer.gesture, phase)) {
+                    Ok(id) => {
+                        pointer.request = id;
+                        pointer.target = target;
+                    }
+                    Err(_) => {
+                        pointer.cancelled = true;
+                        complete = pointer.released;
+                    }
+                }
+            } else if pointer.released {
+                complete = true;
+            }
+        }
+        if !complete {
+            self.pointer = Some(pointer);
+        }
+        true
+    }
+}
+
+fn same_layout(
+    presented: &PresentedFrame,
+    current: &Vim9RenderFrame,
+    geometry: Vim9RenderMetrics,
+) -> bool {
+    presented.metrics == geometry
+        && presented.frame.rows == current.rows
+        && presented.frame.columns == current.columns
+        && presented.frame.windows.len() == current.windows.len()
+        && presented
+            .frame
+            .windows
+            .iter()
+            .zip(&current.windows)
+            .all(|(old, new)| old.window == new.window && old.view == new.view)
+}
+
+fn same_source(old: &Vim9RenderWindow, new: &Vim9RenderWindow) -> bool {
+    (
+        old.window,
+        old.buffer,
+        old.changedtick,
+        &old.view,
+        old.leftcol,
+        old.textoff,
+    ) == (
+        new.window,
+        new.buffer,
+        new.changedtick,
+        &new.view,
+        new.leftcol,
+        new.textoff,
+    )
+}
+
+fn pointer_command(
+    position: &Vim9BufferPosition,
+    gesture: u64,
+    phase: Vim9PointerPhase,
+) -> Vim9Command {
+    Vim9Command::Pointer {
+        window: position.window,
+        buffer: position.buffer,
+        changedtick: position.changedtick,
+        line: position.line,
+        byte_column: position.byte_column,
+        gesture,
+        phase,
+    }
+}
 
 /// Acknowledged Vim frames are the source of truth. While a short scroll
 /// settles, retain its old edge rows so no empty band flashes at the boundary.
@@ -162,6 +668,7 @@ fn metrics(content: Rect, cell_width: f32, line_height: f32) -> Vim9RenderMetric
 
 /// Egui reports movement of the content, while Vim expects positive lines
 /// towards the end of the file. Precision devices keep their pixel distance.
+#[allow(dead_code)] // The application binary admits events; the library exposes the painter.
 pub(crate) fn wheel_lines(event: &egui::Event, line_height: f32, rows: usize) -> Option<f64> {
     let egui::Event::MouseWheel {
         unit,
@@ -259,12 +766,27 @@ pub(crate) fn paint(
     cursor_on: bool,
     scroll: &ScrollPresentation,
     now: f64,
+    direct: Option<&DirectInput>,
 ) {
     if !metrics(content, cell_width, line_height).is_valid()
         || !content.is_positive()
         || !font_size.is_finite()
         || font_size <= 0.0
     {
+        return;
+    }
+    if let Some(direct) = direct.filter(|_| !frame.windows.is_empty()) {
+        paint_direct(
+            painter,
+            frame,
+            content,
+            cell_width,
+            line_height,
+            font_size,
+            focused,
+            cursor_on,
+            direct,
+        );
         return;
     }
     for view in frame.paint_views() {
@@ -310,6 +832,117 @@ pub(crate) fn paint(
     }
 }
 
+/// The direct fractional transform owns both sampled edge rows and the caret.
+pub(crate) fn direct_cursor_rect(
+    frame: &Vim9RenderFrame,
+    content: Rect,
+    cell_width: f32,
+    line_height: f32,
+    direct: &DirectInput,
+) -> Option<Rect> {
+    let geometry = metrics(content, cell_width, line_height);
+    Vim9Viewport::new(
+        frame,
+        frame.window,
+        geometry,
+        direct.offset(frame, frame.window, geometry),
+    )?
+    .cursor_rect()
+    .map(gui_rect)
+    .map(|rect| rect.intersect(content))
+    .filter(Rect::is_positive)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_direct(
+    painter: &egui::Painter,
+    frame: &Vim9RenderFrame,
+    content: Rect,
+    cell_width: f32,
+    line_height: f32,
+    font_size: f32,
+    focused: bool,
+    cursor_on: bool,
+    direct: &DirectInput,
+) {
+    let geometry = metrics(content, cell_width, line_height);
+    let (normal_fg, normal_bg, _) = colors(&frame.default_style, &frame.default_style);
+    for window in &frame.windows {
+        let Some(viewport) = Vim9Viewport::new(
+            frame,
+            window.window,
+            geometry,
+            direct.offset(frame, window.window, geometry),
+        ) else {
+            continue;
+        };
+        let view = gui_rect(viewport.clip()).intersect(content);
+        if !view.is_positive() {
+            continue;
+        }
+        let painter = painter.with_clip_rect(view);
+        // Fill the stationary split once, including empty sampled margin rows.
+        // Glyph rectangles retain their full height while only clipping changes.
+        painter.rect_filled(view, 0.0, normal_bg);
+        for projected in viewport.runs() {
+            let (_, bg, _) = colors(&projected.run.style, &frame.default_style);
+            painter.rect_filled(gui_rect(projected.rect), 0.0, bg);
+        }
+        for projected in viewport.runs() {
+            paint_run(
+                &painter,
+                projected.run,
+                &frame.default_style,
+                gui_rect(projected.rect),
+                view,
+                cell_width,
+                line_height,
+                font_size,
+            );
+        }
+        if window.window == frame.window && (!focused || cursor_on) {
+            if let Some(cursor) = viewport.cursor_rect().map(gui_rect) {
+                paint_caret(&painter, cursor, &frame.mode, focused, normal_fg);
+            }
+        }
+    }
+}
+
+fn paint_caret(painter: &egui::Painter, cursor: Rect, mode: &str, focused: bool, color: Color32) {
+    if focused && mode.starts_with('i') {
+        let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
+        let width = (2.0 / pixel).round().max(1.0) * pixel;
+        painter.rect_filled(
+            Rect::from_min_size(
+                cursor.min,
+                egui::vec2(width.min(cursor.width()), cursor.height()),
+            ),
+            0.0,
+            color,
+        );
+    } else if focused && mode.starts_with('R') {
+        let height = (cursor.height() * 0.2).max(2.0).min(cursor.height());
+        painter.rect_filled(
+            Rect::from_min_max(
+                egui::pos2(cursor.left(), cursor.bottom() - height),
+                cursor.max,
+            ),
+            0.0,
+            color,
+        );
+    } else {
+        if focused {
+            painter.rect_filled(cursor, 1.0, color.gamma_multiply(0.22));
+        }
+        painter.rect_stroke(
+            cursor.shrink(0.5),
+            1.0,
+            Stroke::new(1.0, color),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_view(
     painter: &egui::Painter,
@@ -350,78 +983,22 @@ fn paint_view(
         if !logical_view.contains(run.row, run.column) || run.cells == 0 {
             continue;
         }
-        let (fg, _, special) = colors(&run.style, &frame.default_style);
         let Some(run_rect) = geometry
             .cell_rect(run.row, run.column, run.cells)
             .map(gui_rect)
         else {
             continue;
         };
-        let clip = run_rect
-            .expand2(egui::vec2(font_size * 0.25, 0.0))
-            .intersect(view);
-        let run_painter = painter.with_clip_rect(clip);
-        let font = if run.style.bold {
-            FontId::new(font_size, egui::FontFamily::Name("vim9-buffer-bold".into()))
-        } else {
-            FontId::monospace(font_size)
-        };
-        let format = egui::TextFormat {
-            font_id: font,
-            color: fg,
-            italics: run.style.italic,
-            ..Default::default()
-        };
-        let mut job = egui::text::LayoutJob::default();
-        job.append(&run.text, 0.0, format.clone());
-        let galley = run_painter.layout_job(job);
-        // A configured or bold fallback face can be proportional even though
-        // the family is named Monospace. Keep Vim's cursor/hit testing aligned
-        // instead of letting the shaped advances accumulate across that run.
-        let place_ascii_cells = run.text.is_ascii()
-            && run.text.len() == run.cells
-            && !ascii_columns_match(&galley, run.cells, cell_width);
-        if place_ascii_cells {
-            for (column, ch) in run.text.chars().enumerate() {
-                let mut job = egui::text::LayoutJob::default();
-                let mut utf8 = [0; 4];
-                job.append(ch.encode_utf8(&mut utf8), 0.0, format.clone());
-                let glyph = run_painter.layout_job(job);
-                let y = run_rect.top() + (line_height - glyph.size().y) * 0.5;
-                run_painter.galley(
-                    egui::pos2(run_rect.left() + column as f32 * cell_width, y),
-                    glyph,
-                    fg,
-                );
-            }
-        } else {
-            let text_y = run_rect.top() + (line_height - galley.size().y) * 0.5;
-            run_painter.galley(egui::pos2(run_rect.left(), text_y), galley, fg);
-        }
-        let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
-        let thickness = ((font_size / 14.0).clamp(1.0, 2.0) / pixel).round() * pixel;
-        let underline_y = run_rect.bottom() - thickness * 1.5;
-        if run.style.undercurl {
-            let points = undercurl_points(run_rect, underline_y, thickness, pixel);
-            run_painter.add(egui::Shape::line(points, Stroke::new(thickness, special)));
-        } else if run.style.underline {
-            run_painter.line_segment(
-                [
-                    egui::pos2(run_rect.left(), underline_y),
-                    egui::pos2(run_rect.right(), underline_y),
-                ],
-                Stroke::new(thickness, special),
-            );
-        }
-        if run.style.strikethrough {
-            run_painter.line_segment(
-                [
-                    egui::pos2(run_rect.left(), run_rect.center().y),
-                    egui::pos2(run_rect.right(), run_rect.center().y),
-                ],
-                Stroke::new(thickness, special),
-            );
-        }
+        paint_run(
+            &painter,
+            run,
+            &frame.default_style,
+            run_rect,
+            view,
+            cell_width,
+            line_height,
+            font_size,
+        );
     }
     if draw_cursor
         && frame.cursor.visible
@@ -445,6 +1022,85 @@ fn paint_view(
                 egui::StrokeKind::Inside,
             );
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_run(
+    painter: &egui::Painter,
+    run: &jterm_core::vim9::Vim9RenderRun,
+    normal: &Vim9RenderStyle,
+    run_rect: Rect,
+    view: Rect,
+    cell_width: f32,
+    line_height: f32,
+    font_size: f32,
+) {
+    let (fg, _, special) = colors(&run.style, normal);
+    let clip = run_rect
+        .expand2(egui::vec2(font_size * 0.25, 0.0))
+        .intersect(view);
+    let run_painter = painter.with_clip_rect(clip);
+    let font = if run.style.bold {
+        FontId::new(font_size, egui::FontFamily::Name("vim9-buffer-bold".into()))
+    } else {
+        FontId::monospace(font_size)
+    };
+    let format = egui::TextFormat {
+        font_id: font,
+        color: fg,
+        italics: run.style.italic,
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&run.text, 0.0, format.clone());
+    let galley = run_painter.layout_job(job);
+    // A configured or bold fallback face can be proportional even though
+    // the family is named Monospace. Keep Vim's cursor/hit testing aligned
+    // instead of letting the shaped advances accumulate across that run.
+    let place_ascii_cells = run.text.is_ascii()
+        && run.text.len() == run.cells
+        && !ascii_columns_match(&galley, run.cells, cell_width);
+    if place_ascii_cells {
+        for (column, ch) in run.text.chars().enumerate() {
+            let mut job = egui::text::LayoutJob::default();
+            let mut utf8 = [0; 4];
+            job.append(ch.encode_utf8(&mut utf8), 0.0, format.clone());
+            let glyph = run_painter.layout_job(job);
+            let y = run_rect.top() + (line_height - glyph.size().y) * 0.5;
+            run_painter.galley(
+                egui::pos2(run_rect.left() + column as f32 * cell_width, y),
+                glyph,
+                fg,
+            );
+        }
+    } else {
+        let text_y = run_rect.top() + (line_height - galley.size().y) * 0.5;
+        run_painter.galley(egui::pos2(run_rect.left(), text_y), galley, fg);
+    }
+    let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
+    let thickness = ((font_size / 14.0).clamp(1.0, 2.0) / pixel).round() * pixel;
+    let underline_y = run_rect.bottom() - thickness * 1.5;
+    if run.style.undercurl {
+        let points = undercurl_points(run_rect, underline_y, thickness, pixel);
+        run_painter.add(egui::Shape::line(points, Stroke::new(thickness, special)));
+    } else if run.style.underline {
+        run_painter.line_segment(
+            [
+                egui::pos2(run_rect.left(), underline_y),
+                egui::pos2(run_rect.right(), underline_y),
+            ],
+            Stroke::new(thickness, special),
+        );
+    }
+    if run.style.strikethrough {
+        run_painter.line_segment(
+            [
+                egui::pos2(run_rect.left(), run_rect.center().y),
+                egui::pos2(run_rect.right(), run_rect.center().y),
+            ],
+            Stroke::new(thickness, special),
+        );
     }
 }
 
@@ -476,6 +1132,390 @@ fn ascii_columns_match(galley: &egui::Galley, cells: usize, cell_width: f32) -> 
 mod tests {
     use super::*;
 
+    fn direct_frame(top: u64) -> Arc<Vim9RenderFrame> {
+        use jterm_core::vim9::{
+            Vim9RenderCursor, Vim9RenderMarginRow, Vim9RenderRun, Vim9RenderWindow,
+        };
+        let view = Vim9RenderRect {
+            row: 0,
+            column: 0,
+            rows: 4,
+            columns: 10,
+        };
+        let cursor = Vim9RenderCursor {
+            row: 1,
+            column: 1,
+            width: 1,
+            visible: true,
+            line: top + 1,
+            byte_column: 1,
+        };
+        let primary = Vim9RenderWindow {
+            window: 1,
+            buffer: 1,
+            changedtick: 3,
+            view: view.clone(),
+            native_pointer: true,
+            topline: top,
+            botline: top + 3,
+            line_count: 100,
+            line_lengths: vec![4; 4],
+            cursor: cursor.clone(),
+            overscan: vec![
+                Vim9RenderMarginRow {
+                    row: 4,
+                    line: top + 4,
+                    byte_length: 4,
+                    runs: vec![Vim9RenderRun {
+                        window: 1,
+                        column: 0,
+                        text: "edge".into(),
+                        cells: 4,
+                        line: top + 4,
+                        byte_start: 0,
+                        byte_end: 4,
+                        style: Vim9RenderStyle {
+                            foreground: Some(0x19c3a7),
+                            background: Some(0x123456),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }],
+                },
+                Vim9RenderMarginRow {
+                    row: 5,
+                    line: top + 5,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let secondary = Vim9RenderWindow {
+            window: 2,
+            buffer: 2,
+            changedtick: 1,
+            view: Vim9RenderRect {
+                column: 11,
+                ..view.clone()
+            },
+            topline: 1,
+            botline: 4,
+            line_count: 20,
+            line_lengths: vec![4; 4],
+            native_pointer: true,
+            ..Default::default()
+        };
+        Arc::new(Vim9RenderFrame {
+            revision: top,
+            supported: true,
+            rows: 6,
+            columns: 22,
+            mode: "i".into(),
+            window: 1,
+            buffer: 1,
+            changedtick: 3,
+            default_style: Vim9RenderStyle {
+                foreground: Some(0xddeeff),
+                background: Some(0x101820),
+                ..Default::default()
+            },
+            view,
+            cursor,
+            windows: vec![primary, secondary],
+            runs: (0..4)
+                .map(|row| Vim9RenderRun {
+                    window: 1,
+                    row,
+                    column: 0,
+                    text: "ABCD".into(),
+                    cells: 4,
+                    line: top + row as u64,
+                    byte_start: 0,
+                    byte_end: 4,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    fn direct_fixture(
+        frame: &Arc<Vim9RenderFrame>,
+        geometry: Vim9RenderMetrics,
+        lines: f64,
+    ) -> DirectInput {
+        let mut direct = DirectInput::default();
+        let mut scroll = Vim9PixelScroll::new(&frame.windows[0], geometry).unwrap();
+        scroll.push(lines);
+        direct.scrolls.insert(1, scroll);
+        direct.remember_presentation(Arc::clone(frame), geometry, &egui::Context::default());
+        direct
+    }
+
+    #[test]
+    fn direct_projection_paints_margin_and_ime_at_the_same_fraction() {
+        let frame = direct_frame(10);
+        let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(220.0, 120.0));
+        let geometry = metrics(content, 10.0, 20.0);
+        let direct = direct_fixture(&frame, geometry, 0.3125);
+        assert_eq!(direct.offset(&frame, 1, geometry), -6.25);
+        assert_eq!(direct.offset(&frame, 2, geometry), 0.0);
+        let ime = direct_cursor_rect(&frame, content, 10.0, 20.0, &direct).unwrap();
+        assert_eq!(ime.min, content.min + egui::vec2(10.0, 13.75));
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            paint(
+                &ui.ctx().layer_painter(egui::LayerId::background()),
+                &frame,
+                content,
+                10.0,
+                20.0,
+                14.0,
+                true,
+                true,
+                &ScrollPresentation::default(),
+                0.0,
+                Some(&direct),
+            );
+        });
+        output.textures_delta.clear();
+        let view = gui_rect(geometry.rect(&frame.windows[0].view).unwrap());
+        assert!(
+            output.shapes.iter().any(|clipped| matches!(&clipped.shape,
+            egui::Shape::Rect(shape) if shape.fill == rgb(0x123456)
+                && shape.rect.top() == view.bottom() - 6.25 && clipped.clip_rect == view)),
+            "the sampled bottom edge must paint inside the owning split"
+        );
+        assert!(
+            output.shapes.iter().any(|clipped| matches!(&clipped.shape,
+            egui::Shape::Text(shape) if shape.galley.job.sections.iter().any(|section| section.format.color == rgb(0x19c3a7))
+                && clipped.clip_rect.bottom() == view.bottom())),
+            "fractional input must show real margin glyphs before a whole-line command"
+        );
+        assert!(
+            output.shapes.iter().any(|clipped| matches!(&clipped.shape,
+            egui::Shape::Rect(shape) if shape.fill == rgb(0xddeeff) && shape.rect.min == ime.min)),
+            "the candidate anchor and painted caret must agree exactly"
+        );
+    }
+
+    #[test]
+    fn source_hit_keeps_the_presented_image_across_a_newer_acknowledgement() {
+        let old = direct_frame(10);
+        let content = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(220.0, 120.0));
+        let geometry = metrics(content, 10.0, 20.0);
+        let mut direct = direct_fixture(&old, geometry, 1.5);
+        // The live scroll transaction can settle before egui paints again.
+        direct.scrolls.clear();
+        let newer = direct_frame(11);
+        let anchor = direct
+            .presented_anchor(&newer, geometry, egui::pos2(15.0, 15.0))
+            .unwrap();
+        assert_eq!((anchor.position.line, anchor.position.byte_column), (12, 1));
+        assert_eq!(
+            direct.wheel_window_at(&newer, geometry, egui::pos2(15.0, 15.0)),
+            Some(1)
+        );
+        assert!(
+            direct
+                .presented_anchor(&newer, geometry, egui::pos2(105.0, 15.0))
+                .is_none(),
+            "split gutter is not text"
+        );
+        let mut changed = (*newer).clone();
+        changed.windows[0].changedtick += 1;
+        assert!(
+            direct
+                .wheel_window_at(&changed, geometry, egui::pos2(15.0, 15.0))
+                .is_none(),
+            "old-image wheel events cannot target an unseen buffer generation"
+        );
+        assert!(direct
+            .presented_anchor(&changed, geometry, egui::pos2(15.0, 15.0))
+            .is_none());
+        assert!(direct.stale_presentation_at(&changed, geometry, egui::pos2(15.0, 15.0)));
+        changed.windows[0].changedtick -= 1;
+        changed.windows[0].native_pointer = false;
+        assert!(
+            !direct.stale_presentation_at(&changed, geometry, egui::pos2(15.0, 15.0)),
+            "unchanged sources with mouse mappings keep their legacy wheel route"
+        );
+        assert!(direct
+            .presented_anchor(
+                &newer,
+                Vim9RenderMetrics {
+                    cell_width: 11.0,
+                    ..geometry
+                },
+                egui::pos2(15.0, 15.0)
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn acknowledgement_between_input_and_paint_rebases_without_a_one_frame_jump() {
+        let old = direct_frame(10);
+        let geometry = Vim9RenderMetrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        };
+        let mut direct = direct_fixture(&old, geometry, 1.5);
+        direct.scrolls.get_mut(&1).unwrap().submitted(7);
+        let mut acknowledged = (*direct_frame(11)).clone();
+        acknowledged.windows[0].scroll_ack = 7;
+        direct.reconcile_with(&acknowledged, geometry, |_| true);
+        assert_eq!(
+            direct.offset(&acknowledged, 1, geometry),
+            -10.0,
+            "the renderer must apply the remaining half line in the first acknowledged frame"
+        );
+        assert_eq!(direct.scrolls[&1].request_id(), None);
+        assert_eq!(
+            direct
+                .presented_anchor(&acknowledged, geometry, egui::pos2(9.0, 15.0))
+                .unwrap()
+                .position
+                .line,
+            12,
+            "input still addresses the old submitted image until it is replaced"
+        );
+    }
+
+    #[test]
+    fn cancelled_native_drag_owns_its_release_without_replaying_a_target() {
+        let mut direct = DirectInput {
+            pointer: Some(NativePointer {
+                gesture: 1,
+                request: 7,
+                target: Vim9BufferPosition {
+                    window: 1,
+                    buffer: 1,
+                    changedtick: 3,
+                    line: 10,
+                    byte_column: 1,
+                },
+                metrics: Vim9RenderMetrics {
+                    origin_x: 0.0,
+                    origin_y: 0.0,
+                    cell_width: 8.0,
+                    line_height: 20.0,
+                },
+                cancelled: false,
+                queued: None,
+                released: false,
+            }),
+            ..Default::default()
+        };
+        direct.cancel();
+        assert!(direct.finish_cancelled_pointer(true));
+        assert!(direct.pointer.as_ref().unwrap().cancelled);
+        assert!(direct.finish_cancelled_pointer(false));
+        assert!(!direct.pointer_captured());
+    }
+
+    #[test]
+    fn settling_an_unsupported_fractional_press_owns_its_physical_tail() {
+        let frame = direct_frame(10);
+        let geometry = Vim9RenderMetrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        };
+        let mut direct = direct_fixture(&frame, geometry, 0.3125);
+        assert!(direct.presented_fraction_at(egui::pos2(9.0, 15.0)));
+        assert!(!direct.presented_fraction_at(egui::pos2(105.0, 15.0)));
+        direct.discard_press();
+        assert!(direct.discarding_pointer());
+        assert!(direct.finish_cancelled_pointer(true));
+        assert!(direct.finish_cancelled_pointer(false));
+        assert!(!direct.pointer_captured());
+        assert!(direct.scrolls.is_empty());
+        assert!(direct.presentation_retired);
+        assert!(direct.presented_fraction_at(egui::pos2(9.0, 15.0)));
+        direct.remember_presentation(frame, geometry, &egui::Context::default());
+        assert!(!direct.presented_fraction_at(egui::pos2(9.0, 15.0)));
+        assert!(!direct.presentation_retired);
+    }
+
+    #[test]
+    fn replacing_a_fractional_editor_drops_new_press_ownership_but_keeps_captured_release() {
+        let frame = direct_frame(10);
+        let content = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(220.0, 120.0));
+        let geometry = metrics(content, 10.0, 20.0);
+        let point = egui::pos2(15.0, 15.0);
+        let ctx = egui::Context::default();
+        let draw = |input: &mut DirectInput| {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                paint(
+                    &ui.ctx().layer_painter(egui::LayerId::background()),
+                    &frame,
+                    content,
+                    10.0,
+                    20.0,
+                    14.0,
+                    true,
+                    true,
+                    &ScrollPresentation::default(),
+                    0.0,
+                    Some(input),
+                );
+                input.remember_presentation(Arc::clone(&frame), geometry, ui.ctx());
+            });
+            output.textures_delta.clear();
+        };
+        let mut previous = direct_fixture(&frame, geometry, 0.3125);
+        let mut replacement = DirectInput::default();
+        draw(&mut previous);
+        previous.cancel();
+        previous.retire_unpainted(&ctx);
+        assert!(
+            previous.presented_fraction_at(point),
+            "switching owners cannot forget the old image before replacement paint"
+        );
+        draw(&mut replacement);
+        previous.retire_unpainted(&ctx);
+        replacement.retire_unpainted(&ctx);
+        assert!(previous.presented.is_none());
+        assert!(!previous.presented_fraction_at(point));
+        assert!(!replacement.presented_fraction_at(point));
+        assert!(
+            !previous.finish_cancelled_pointer(true),
+            "a hidden fractional editor must not swallow the new editor's ordinary press"
+        );
+
+        // A removed pane has the same expiration rule, but a press it already
+        // captured must still consume its eventual physical release.
+        let mut captured = direct_fixture(&frame, geometry, 0.3125);
+        draw(&mut captured);
+        captured.discard_press();
+        draw(&mut replacement);
+        captured.retire_unpainted(&ctx);
+        assert!(captured.presented.is_none());
+        assert!(captured.finish_cancelled_pointer(true));
+        assert!(captured.finish_cancelled_pointer(false));
+        assert!(!captured.pointer_captured());
+    }
+
+    #[test]
+    fn disabling_smooth_motion_retires_the_fraction_and_presented_source() {
+        let frame = direct_frame(10);
+        let geometry = Vim9RenderMetrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        };
+        let mut direct = direct_fixture(&frame, geometry, 0.5);
+        direct.set_smooth(false);
+        assert_eq!(direct.offset(&frame, 1, geometry), 0.0);
+        assert!(direct.presentation_retired);
+        assert!(direct.presented.is_some());
+        assert!(direct.scrolls.is_empty());
+    }
+
     fn scroll_frame(revision: u64, top: u64) -> Arc<Vim9RenderFrame> {
         Arc::new(
             serde_json::from_value(serde_json::json!({
@@ -504,7 +1544,7 @@ mod tests {
         assert_eq!(presentation.offset(1, 1.02), 60.0);
         assert_eq!(presentation.offset(2, 1.02), 0.0);
         assert!(
-            presentation.windows.get(&1).is_some(),
+            presentation.windows.contains_key(&1),
             "old edge rows remain until settling"
         );
         assert!(presentation.offset(1, 1.06) > 0.0);
@@ -684,6 +1724,7 @@ mod tests {
                 true,
                 &presentation,
                 now,
+                None,
             );
         });
         output.textures_delta.clear();
@@ -792,6 +1833,7 @@ mod tests {
                 true,
                 &ScrollPresentation::default(),
                 0.0,
+                None,
             );
         });
         output.textures_delta.clear();
@@ -845,6 +1887,7 @@ mod tests {
                 true,
                 &ScrollPresentation::default(),
                 0.0,
+                None,
             );
         });
         output.textures_delta.clear();

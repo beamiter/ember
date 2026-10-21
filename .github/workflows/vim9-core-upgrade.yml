@@ -9,7 +9,7 @@ on:
       core_revision:
         description: Full jterm_core commit SHA
         required: true
-        default: 338011a4d0bb889df6e4116ac5221b50efca0620
+        default: 9dc44d8bb521b4d8ad9435e2bd6e09aecdf090b0
 
 permissions:
   contents: write
@@ -19,7 +19,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      required: ${{ steps.pin.outputs.required }}
+      revision: ${{ steps.pin.outputs.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check whether the exact core revision is already pinned
+        id: pin
+        env:
+          REQUESTED_REVISION: ${{ inputs.core_revision }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          target = os.environ.get('REQUESTED_REVISION', '')
+          if not target:
+              # A push uses the dispatch default from this checked-out workflow.
+              # Changing only that default must still prepare a future upgrade.
+              workflow = Path('.github/workflows/vim9-core-upgrade.yml').read_text()
+              defaults = re.findall(r'(?m)^        default: [\'"]?([0-9a-f]{40})[\'"]?\s*$', workflow)
+              if len(defaults) != 1:
+                  raise SystemExit('Expected one full-SHA core_revision default')
+              target = defaults[0]
+          if re.fullmatch(r'[0-9a-f]{40}', target) is None:
+              raise SystemExit('core_revision must be a full lowercase commit SHA')
+
+          manifest = tomllib.loads(Path('Cargo.toml').read_text())
+          pins = []
+          for section in ('dependencies', 'dev-dependencies'):
+              item = manifest.get(section, {}).get('jterm_core')
+              if not isinstance(item, dict) or item.get('git') != 'https://github.com/beamiter/jterm_core.git':
+                  raise SystemExit(f'Unexpected core dependency in {section}')
+              pins.append(item.get('rev'))
+          if len(set(pins)) != 1 or re.fullmatch(r'[0-9a-f]{40}', pins[0] or '') is None:
+              raise SystemExit('Expected one consistent immutable core revision')
+          packages = tomllib.loads(Path('Cargo.lock').read_text())['package']
+          core = [package for package in packages if package['name'] == 'jterm_core']
+          expected = f'git+https://github.com/beamiter/jterm_core.git?rev={pins[0]}#{pins[0]}'
+          if len(core) != 1 or core[0].get('source') != expected:
+              raise SystemExit('Unexpected core lock source')
+
+          required = pins[0] != target
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'required={str(required).lower()}\nrevision={target}\n')
+          print(f'Core upgrade required: {required} ({pins[0]} -> {target})')
+          PY
+
   prepare:
-    uses: beamiter/jterm_core/.github/workflows/prepare-vim9-core.yml@338011a4d0bb889df6e4116ac5221b50efca0620
+    needs: preflight
+    if: needs.preflight.outputs.required == 'true'
+    uses: beamiter/jterm_core/.github/workflows/prepare-vim9-core.yml@9dc44d8bb521b4d8ad9435e2bd6e09aecdf090b0
     with:
-      core_revision: ${{ inputs.core_revision || '338011a4d0bb889df6e4116ac5221b50efca0620' }}
+      core_revision: ${{ needs.preflight.outputs.revision }}

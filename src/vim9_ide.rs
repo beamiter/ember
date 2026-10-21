@@ -379,7 +379,7 @@ impl DeferredAction {
 pub(crate) struct Workbench {
     pub(crate) session: Vim9Session,
     pub(crate) buffer_font_size: Option<f32>,
-    scroll_input: jterm_core::vim9::Vim9ScrollAccumulator,
+    pub(crate) native_input: Arc<parking_lot::Mutex<crate::vim9_buffer::DirectInput>>,
     render_subscribed: bool,
     render_wake: Option<RenderWake>,
     deferred_action: Option<DeferredAction>,
@@ -408,7 +408,7 @@ impl Workbench {
         Self {
             session,
             buffer_font_size: Some(crate::config::Config::clamp_font_size(font_size)),
-            scroll_input: Default::default(),
+            native_input: Arc::new(parking_lot::Mutex::new(Default::default())),
             render_subscribed: false,
             render_wake: None,
             deferred_action: None,
@@ -437,6 +437,7 @@ impl Workbench {
     }
 
     fn send_tracked(&mut self, command: Vim9Command) -> Option<u64> {
+        self.native_input.lock().cancel();
         self.return_focus = true;
         match self.session.send(command) {
             Ok(id) => {
@@ -1160,19 +1161,48 @@ impl TerminalApp {
         true
     }
 
-    /// Coalesce native wheel events once per UI frame. The bridge targets the
-    /// hovered Vim split, preserves fractional trackpad motion and avoids a
-    /// burst of legacy mouse reports with Vim's per-report line multiplier.
-    pub(crate) fn handle_vim9_scroll(&mut self, ctx: &egui::Context) {
-        if !self.config.vim9.native_buffer
-            || self.frame_events.iter().any(is_keyboard_event)
-            || ctx.input(|input| input.pointer.any_pressed() || input.pointer.any_down())
-        {
-            return;
+    /// Bind direct input to the exact native image last painted in this pane.
+    /// Every split keeps a single scroll transaction; native pointer ownership
+    /// suppresses the parallel PTY/local-selection path for its entire gesture.
+    pub(crate) fn handle_vim9_input(&mut self, ctx: &egui::Context, enabled: bool) -> bool {
+        let keyboard = self.frame_events.iter().any(is_keyboard_event)
+            || ctx.input(|input| input.events.iter().any(is_keyboard_event));
+        let (point, down, pressed, released, any_down, any_pressed, now, modifiers, focused) = ctx
+            .input(|input| {
+                (
+                    input.pointer.interact_pos().or(input.pointer.hover_pos()),
+                    input.pointer.button_down(egui::PointerButton::Primary),
+                    input.pointer.button_pressed(egui::PointerButton::Primary),
+                    input.pointer.button_released(egui::PointerButton::Primary),
+                    input.pointer.any_down(),
+                    input.pointer.any_pressed(),
+                    input.time,
+                    input.modifiers,
+                    input.viewport().focused.unwrap_or(true),
+                )
+            });
+        let active_id = self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            .clone();
+        let blocked = !enabled || !focused || keyboard || !self.config.vim9.native_buffer;
+        let mut claimed = false;
+        for (id, editor) in &self.vim9_editors {
+            let mut input = editor.native_input.lock();
+            input.retire_unpainted(ctx);
+            if blocked || id != &active_id {
+                if any_pressed && point.is_some_and(|point| input.presented_fraction_at(point)) {
+                    input.discard_press();
+                }
+                input.cancel();
+                claimed |= input.finish_cancelled_pointer(any_down);
+            }
         }
-        let Some(pointer) = ctx.input(|input| input.pointer.hover_pos()) else {
-            return;
-        };
+        if blocked {
+            return claimed;
+        }
         let renderer = if self.layout().panes().len() > 1 {
             let Some(index) = self
                 .layout()
@@ -1180,96 +1210,145 @@ impl TerminalApp {
                 .iter()
                 .position(|pane| pane.id == self.layout().focused_pane_id)
             else {
-                return;
+                return claimed;
             };
             let Some(renderer) = self.pane_renderers.get(index) else {
-                return;
+                return claimed;
             };
             renderer
         } else {
             &self.renderer
         };
-        let Some(content) = renderer
-            .last_content_rect
-            .filter(|rect| rect.contains(pointer))
-        else {
-            return;
+        let Some(content) = renderer.last_content_rect else {
+            return claimed;
         };
-        let (cell_width, line_height) = (renderer.char_width, renderer.line_height);
-        if cell_width <= 0.0 || line_height <= 0.0 {
-            return;
-        }
+        let geometry = jterm_core::vim9::Vim9RenderMetrics {
+            origin_x: content.left(),
+            origin_y: content.top(),
+            cell_width: renderer.char_width,
+            line_height: renderer.line_height,
+        };
         let session = self.session_manager.get_active_session_mut();
-        if session.purpose == crate::session::SessionPurpose::RetainedCommand
-            || !session.pending_input.is_empty()
-            || !matches!(session.shell.input_drained(), Ok(true))
-            || session.terminal.lock().selection.is_some()
-        {
-            return;
+        let terminal = session.terminal.lock();
+        let (columns, rows) = terminal.get_dimensions();
+        let owns_native = session.purpose != crate::session::SessionPurpose::RetainedCommand
+            && terminal.selection.is_none()
+            && terminal.scroll_offset == 0
+            && terminal.preedit_text.is_empty()
+            && session.pending_input.is_empty()
+            && matches!(session.shell.input_drained(), Ok(true));
+        drop(terminal);
+        let Some(editor) = self.vim9_editors.get_mut(&active_id) else {
+            return claimed;
+        };
+        let mut direct = editor.native_input.lock();
+        let fractional_press =
+            any_pressed && point.is_some_and(|point| direct.presented_fraction_at(point));
+        let snapshot = editor.session.input_snapshot();
+        let Some(frame) = snapshot.frame.as_ref().filter(|frame| {
+            owns_native
+                && editor.deferred_action.is_none()
+                && geometry.is_valid()
+                && renderer.native_vim9_identity == Some(editor.session.entry_id())
+                && crate::vim9_buffer::usable(frame, rows, columns)
+        }) else {
+            if fractional_press {
+                direct.discard_press();
+            }
+            direct.cancel();
+            return claimed | direct.finish_cancelled_pointer(any_down);
+        };
+        direct.set_smooth(self.config.vim9.smooth_scroll);
+        direct.reconcile(&snapshot, geometry);
+        let plain = !modifiers.ctrl && !modifiers.command && !modifiers.shift && !modifiers.alt;
+        if !plain || (any_pressed && !pressed) {
+            if fractional_press {
+                direct.discard_press();
+            }
+            direct.cancel();
+            return claimed | direct.finish_cancelled_pointer(any_down);
         }
-        let Some(editor) = self.vim9_editors.get_mut(&session.metadata.session_id) else {
-            return;
-        };
-        if editor.deferred_action.is_some() {
-            return;
+        // Reconciliation can invalidate the image's source or geometry before
+        // the press is dispatched. Swallow that old-image gesture as a whole.
+        if fractional_press && point.is_some_and(|point| !direct.presented_fraction_at(point)) {
+            direct.discard_press();
         }
-        let Some(frame) = editor
-            .session
-            .render_snapshot()
-            .filter(|frame| frame.supported)
-        else {
-            editor.scroll_input.clear();
-            return;
-        };
-        let row = ((pointer.y - content.top()) / line_height) as usize;
-        let column = ((pointer.x - content.left()) / cell_width) as usize;
-        let Some(window) = frame
-            .windows
-            .iter()
-            .find(|window| window.view.contains(row, column))
-        else {
-            return;
-        };
-        let mut next_input = editor.scroll_input.clone();
-        let mut lines: i32 = 0;
-        let mut consumed = false;
-        for event in &self.frame_events {
-            if let Some(delta) =
-                crate::vim9_buffer::wheel_lines(event, line_height, window.view.rows)
-            {
-                consumed = true;
-                lines = lines
-                    .saturating_add(next_input.add(window.window, delta))
-                    .clamp(-120, 120);
+        if direct.discarding_pointer() {
+            return claimed | direct.finish_cancelled_pointer(any_down);
+        }
+        if pressed && direct.pointer_captured() {
+            direct.cancel();
+        }
+        if pressed && !direct.pointer_captured() && self.terminal_mouse_capture.is_none() {
+            if let Some(point) = point.filter(|point| content.contains(*point)) {
+                claimed |= direct.press(frame, geometry, point, now, &editor.session);
             }
         }
-        if !consumed {
-            return;
+        if direct.discarding_pointer() {
+            return claimed | direct.finish_cancelled_pointer(any_down);
         }
-        if lines != 0
-            && editor
-                .session
-                .send(Vim9Command::Scroll {
-                    window: window.window,
-                    lines,
-                })
-                .is_err()
-        {
-            // Nothing was admitted, so the original events retain the normal
-            // terminal fallback and the fractional state is not committed.
-            return;
+        if direct.pointer_captured() {
+            claimed |= direct.pointer(
+                frame,
+                geometry,
+                if down || released { point } else { None },
+                released || !down,
+                &editor.session,
+            );
+        } else if pressed || any_down {
+            direct.cancel();
+            return claimed;
         }
-        editor.scroll_input = next_input;
-        self.frame_events.retain(|event| {
-            crate::vim9_buffer::wheel_lines(event, line_height, window.view.rows).is_none()
-        });
-        ctx.input_mut(|input| {
-            input.events.retain(|event| {
-                crate::vim9_buffer::wheel_lines(event, line_height, window.view.rows).is_none()
-            });
-            input.smooth_scroll_delta.y = 0.0;
-        });
-        ctx.request_repaint();
+        if !down && !pressed && frame.mode == "n" {
+            if let Some(point) = point.filter(|point| content.contains(*point)) {
+                let window = direct
+                    .wheel_window_at(frame, geometry, point)
+                    .and_then(|id| frame.windows.iter().find(|window| window.window == id));
+                let rows = window
+                    .map_or(frame.view.rows, |window| window.view.rows)
+                    .max(1);
+                let (count, delta) = self
+                    .frame_events
+                    .iter()
+                    .filter_map(|event| {
+                        crate::vim9_buffer::wheel_lines(event, geometry.line_height, rows)
+                    })
+                    .fold((0usize, 0.0f64), |(count, total), delta| {
+                        (count + 1, (total + delta).clamp(-120.0, 120.0))
+                    });
+                let accepted = if count == 0 {
+                    false
+                } else if direct.stale_presentation_at(frame, geometry, point) {
+                    direct.cancel();
+                    true
+                } else {
+                    window.is_some_and(|window| {
+                        direct.wheel(frame, window.window, geometry, delta, &editor.session)
+                    })
+                };
+                if accepted {
+                    self.frame_events.retain(|event| {
+                        crate::vim9_buffer::wheel_lines(event, geometry.line_height, rows).is_none()
+                    });
+                    ctx.input_mut(|input| {
+                        input.events.retain(|event| {
+                            crate::vim9_buffer::wheel_lines(event, geometry.line_height, rows)
+                                .is_none()
+                        });
+                        input.smooth_scroll_delta.y = 0.0;
+                    });
+                    ctx.request_repaint();
+                }
+            }
+        }
+        // Pointer-owned fractions stay fixed until the real selection settles.
+        if !direct.pointer_captured() && !claimed && frame.mode == "n" {
+            direct.flush_scroll(&editor.session);
+        }
+        if direct.needs_wake(&editor.session) {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        claimed
     }
 
     pub(crate) fn defer_vim9_action(
@@ -1406,6 +1485,7 @@ impl TerminalApp {
         let Some(editor) = self.vim9_editors.get_mut(&session.metadata.session_id) else {
             return false;
         };
+        editor.native_input.lock().cancel();
         editor.buffer_font_size = Some(crate::config::Config::clamp_font_size(size));
         self.force_resize_session = true;
         true
