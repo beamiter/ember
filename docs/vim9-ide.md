@@ -20,12 +20,13 @@ rows and split separators remain in the compatibility surface between buffer
 rectangles. Horizontal, vertical and mixed Vim splits paint every supported
 window through the same native RGB path, including inactive windows. Each
 window has its own clipping rectangle so italic overhang cannot cover a split
-separator or another buffer. Complex views (folds, diff, popup completion,
+separator or another buffer. Complex views (folds, diff, complex/scrolling completion,
 conceal and unsupported shaping) temporarily use **Compatible view**; hover
 the label for the runtime's reason. A disconnected bridge or a resized frame
 never leaves an old native frame over the terminal. The logical cell geometry
 is retained for correct Vim mouse/IME positions; proportional text layout,
-arbitrary line heights and native completion popups are not yet implemented.
+arbitrary line heights are not yet implemented. Ordinary fully visible
+completion menus use native GUI paint; complex lists retain compatibility.
 
 Native paint rectangles, wide-character carets and the OS IME candidate anchor
 now share the same coordinate mapping. Fractional font metrics and an editor
@@ -304,7 +305,7 @@ Each workbench is bound to its stable terminal session ID; reordering or
 closing other tabs cannot redirect an editor action to another PTY.
 
 The native buffer uses egui's text pipeline; Vim still renders unsupported
-completion menus and unsupported display options in the compatible view. Native controls cover
+complex completion menus and unsupported display options in the compatible view. Native controls cover
 files, buffers, saving, search, builds/tests, quickfix, output and supported
 code actions. Debug-adapter UI, a dedicated Git editor and remote editor
 bridges are future extensions. Remote Files retain their existing workflow;
@@ -496,3 +497,45 @@ checks remain passing. Artifacts: `/tmp/ember-vim9-cursor-2fa9112-v3`.
 The shared core passes 80 Rust Vim9 checks plus the explicit real-PTY round
 trip and 99 real-Vim runtime regressions. These are X11/software-renderer
 checks, not a physical-display or Wayland performance certification.
+
+
+## Native Insert completion — 2026-10-21
+
+Pinned core: `20a1c694792f5737c8b92b32ef02e40f6e2c08d9` (render protocol 5).
+Ordinary Insert completion menus now paint above the native GUI buffer, with
+Vim's GUI `Pmenu`/`PmenuSel`, kind and extra-column colors. Word/abbreviation,
+kind/menu labels, CJK and combining characters use the existing native glyph
+path. The menu keeps Vim's screen geometry and padding and can cross split
+separators without being clipped to one editing pane.
+
+Vim still owns candidate generation and keyboard/mouse behavior. Ctrl-N/P
+select, Ctrl-Y accepts and Ctrl-E cancels through the original PTY; the menu
+never takes keyboard or IME focus. Its appearance cancels old buffer scroll
+transforms, and completion mouse/wheel input bypasses semantic buffer actions.
+Previously captured native gestures retain their cancelled physical tails.
+Closing the menu clears the overlay and restores the same source buffer.
+
+The list must fit fully without a scrollbar, use default column order and
+contain unclipped ordinary labels. Long/filtered/fuzzy menus, separate info
+popups, borders, opacity, custom `pumopt` and distinct `PmenuMatch[Sel]` styles
+retain explicit compatibility reasons. Available per-item highlight metadata
+is applied, but older Vim builds (including this host's 9.2.0858) omit those
+fields from `complete_info()` and expose only standard menu highlight groups.
+Hosts using render protocols 1–4 always retain their live compatibility menu.
+
+Shared validation: 82 focused core Rust checks and the explicit real-PTY round
+trip pass. The real-Vim runtime suite runs 106 checks: 105 pass, with one
+per-item highlight test skipped because this Vim omits that optional metadata.
+Menu GUI RGB, Unicode, selection, acceptance/cancellation, cross-split geometry,
+row-delta closing and old-protocol/scrolled-menu compatibility are covered.
+
+Ember passes 19 native-buffer checks plus the explicit real-PTY pointer/yank
+regression, locked build, all-target/all-feature Clippy (`-D warnings`), fmt
+and diff checks. The full Xvfb/software-GPU smoke passes menu normal/selected
+RGB, CJK, Ctrl-N/P/Y/E, cross-split overlay and long-menu fallback/recovery,
+plus all existing plugin/cursor/wheel/save/undo/split/resize/zoom checks. Its
+Pmenu/PmenuSel backgrounds contain 22571/7018 exact GUI RGB pixels; both
+buffer panes retain native RGB under the crossing menu. The real-PTY fixture
+now waits for parsable yank JSON instead of observing a just-created file.
+Artifacts: `/tmp/ember-vim9-completion-20a1c69-v2`. These checks use headless X11
+and software rendering, not a physical-display or Wayland performance test.

@@ -1297,6 +1297,12 @@ impl TerminalApp {
             direct.cancel();
             return claimed | direct.finish_cancelled_pointer(any_down);
         };
+        if frame.completion.is_some() {
+            // Vim owns completion mouse selection and wheel behavior. Stop
+            // obsolete buffer motion before allowing its original PTY input.
+            direct.cancel();
+            return claimed | direct.finish_cancelled_pointer(any_down);
+        }
         direct.set_smooth(self.config.vim9.smooth_scroll);
         direct.reconcile(&snapshot, geometry);
         let plain = !modifiers.ctrl && !modifiers.command && !modifiers.shift && !modifiers.alt;

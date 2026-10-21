@@ -118,7 +118,7 @@ impl DirectInput {
             .presented
             .as_ref()
             .is_some_and(|presented| !same_layout(presented, frame, geometry));
-        if topology_changed || !frame.supported {
+        if topology_changed || !frame.supported || frame.completion.is_some() {
             self.cancel();
             return;
         }
@@ -208,6 +208,10 @@ impl DirectInput {
         session: &Vim9Session,
         discrete: bool,
     ) -> bool {
+        if frame.completion.is_some() {
+            self.cancel();
+            return false;
+        }
         let Some(view) = frame.windows.iter().find(|view| view.window == window) else {
             return false;
         };
@@ -341,6 +345,7 @@ impl DirectInput {
         let presented = self.presented.as_ref()?;
         if self.presentation_retired
             || !current.supported
+            || current.completion.is_some()
             || !same_layout(presented, current, geometry)
         {
             return None;
@@ -377,6 +382,7 @@ impl DirectInput {
         let presented = self.presented.as_ref()?;
         if self.presentation_retired
             || !current.supported
+            || current.completion.is_some()
             || !same_layout(presented, current, geometry)
         {
             return None;
@@ -401,6 +407,10 @@ impl DirectInput {
         now: f64,
         session: &Vim9Session,
     ) -> bool {
+        if frame.completion.is_some() {
+            self.cancel();
+            return false;
+        }
         let repeated = self.last_press.is_some_and(|(time, pos)| {
             now >= time && now - time <= 0.5 && pos.distance(point) <= 6.0
         });
@@ -598,7 +608,8 @@ impl ScrollPresentation {
             || identity.is_none()
             || self.identity != identity
             || self.line_height != line_height
-            || frame.is_none();
+            || frame.is_none()
+            || frame.is_some_and(|frame| frame.completion.is_some());
         if reset {
             self.windows.clear();
         } else if let (Some(old), Some(new)) = (&self.current, frame) {
@@ -837,6 +848,7 @@ pub(crate) fn paint(
             cursor_on,
             direct,
         );
+        paint_completion(painter, frame, content, cell_width, line_height, font_size);
         return;
     }
     for view in frame.paint_views() {
@@ -879,6 +891,53 @@ pub(crate) fn paint(
             offset,
             true,
         );
+    }
+    paint_completion(painter, frame, content, cell_width, line_height, font_size);
+}
+
+/// Completion owns a screen rectangle above every split, including Vim's
+/// status and separator rows. It never inherits a buffer's scrolling offset.
+fn paint_completion(
+    painter: &egui::Painter,
+    frame: &Vim9RenderFrame,
+    content: Rect,
+    cell_width: f32,
+    line_height: f32,
+    font_size: f32,
+) {
+    let Some(completion) = &frame.completion else {
+        return;
+    };
+    let geometry = metrics(content, cell_width, line_height);
+    let Some(view) = geometry.rect(&completion.view).map(gui_rect) else {
+        return;
+    };
+    let view = view.intersect(content);
+    if !view.is_positive() {
+        return;
+    }
+    let painter = painter.with_clip_rect(view);
+    let (_, background, _) = colors(&completion.default_style, &frame.default_style);
+    painter.rect_filled(view, 0.0, background);
+    for run in &completion.runs {
+        if let Some(rect) = geometry.cell_rect(run.row, run.column, run.cells) {
+            let (_, background, _) = colors(&run.style, &completion.default_style);
+            painter.rect_filled(gui_rect(rect), 0.0, background);
+        }
+    }
+    for run in &completion.runs {
+        if let Some(rect) = geometry.cell_rect(run.row, run.column, run.cells) {
+            paint_run(
+                &painter,
+                run,
+                &completion.default_style,
+                gui_rect(rect),
+                view,
+                cell_width,
+                line_height,
+                font_size,
+            );
+        }
     }
 }
 
@@ -1389,6 +1448,85 @@ mod tests {
         direct.scrolls.insert(1, scroll);
         direct.remember_presentation(Arc::clone(frame), geometry, &egui::Context::default());
         direct
+    }
+
+    #[test]
+    fn completion_cancels_buffer_motion_and_paints_above_every_split() {
+        let mut frame = direct_frame(10);
+        let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(220.0, 120.0));
+        let geometry = metrics(content, 10.0, 20.0);
+        let mut direct = direct_fixture(&frame, geometry, 0.3125);
+        assert_ne!(direct.offset(&frame, 1, geometry), 0.0);
+        Arc::make_mut(&mut frame).completion = Some(
+            serde_json::from_value(serde_json::json!({
+                "view": {"row":1,"column":8,"rows":2,"columns":10},
+                "default_style": {"foreground":0x19c3a7,"background":0x294761},
+                "runs": [
+                    {"row":1,"column":8,"cells":10,"text":"          ",
+                     "style":{"background":0x8351a7}},
+                    {"row":1,"column":8,"cells":4,"text":"menu"},
+                    {"row":2,"column":8,"cells":4,"text":"中文"}
+                ]
+            }))
+            .unwrap(),
+        );
+        direct.reconcile_with(&frame, geometry, |_| false);
+        assert_eq!(direct.offset(&frame, 1, geometry), 0.0);
+        assert!(direct
+            .wheel_window_at(&frame, geometry, content.center())
+            .is_none());
+        let popup = Rect::from_min_size(
+            content.min + egui::vec2(80.0, 20.0),
+            egui::vec2(100.0, 40.0),
+        );
+        for direct_path in [false, true] {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                paint(
+                    &ui.ctx().layer_painter(egui::LayerId::background()),
+                    &frame,
+                    content,
+                    10.0,
+                    20.0,
+                    14.0,
+                    true,
+                    true,
+                    &ScrollPresentation::default(),
+                    0.0,
+                    direct_path.then_some(&direct),
+                );
+            });
+            output.textures_delta.clear();
+            let popup_index = output
+                .shapes
+                .iter()
+                .position(|clipped| {
+                    clipped.clip_rect == popup
+                        && matches!(&clipped.shape, egui::Shape::Rect(shape)
+                        if shape.rect == popup && shape.fill == rgb(0x294761))
+                })
+                .expect("completion must span both splits and their separator");
+            let buffer_indices = output
+                .shapes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, clipped)| {
+                    matches!(&clipped.shape, egui::Shape::Rect(shape)
+                    if shape.fill == rgb(0x101820))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert!(!buffer_indices.is_empty());
+            assert!(buffer_indices.into_iter().all(|index| index < popup_index));
+            assert!(
+                output.shapes.iter().any(|clipped| {
+                    clipped.clip_rect == popup
+                        && matches!(&clipped.shape, egui::Shape::Rect(shape)
+                        if shape.fill == rgb(0x8351a7))
+                }),
+                "selected menu row must retain its GUI background"
+            );
+        }
     }
 
     #[test]

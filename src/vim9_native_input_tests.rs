@@ -186,7 +186,12 @@ fn real_vim_fractional_click_drag_yank_and_cancel_use_the_presented_source() {
             .as_bytes(),
         )
         .unwrap();
-    wait(|| yank_file.exists());
+    // writefile() creates the path before its bytes are visible to this
+    // process. Wait for a complete JSON value rather than the creation alone.
+    wait(|| {
+        fs::read_to_string(&yank_file)
+            .is_ok_and(|text| serde_json::from_str::<String>(&text).is_ok())
+    });
     let yank: String = serde_json::from_str(&fs::read_to_string(yank_file).unwrap()).unwrap();
     assert_eq!(yank, "ond ordinary row\nA中e\u{301}");
 

@@ -75,10 +75,10 @@ def main():
         "let encoded = get(get(info[0], 'variables', {}), 'previousRender', '')\n"
         "if empty(encoded) | return {} | endif\n"
         "let frame = json_decode(encoded)\n"
-        "return {'cursor': get(frame, 'cursor', {}), 'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0), 'native_pointer': get(get(get(frame, 'windows', []), 0, {}), 'native_pointer', 0), 'scroll_ack': get(get(get(frame, 'windows', []), 0, {}), 'scroll_ack', 0)}\n"
+        "return {'cursor': get(frame, 'cursor', {}), 'completion': get(frame, 'completion', v:null), 'views': map(copy(get(frame, 'windows', [])), {_, w -> w.view}), 'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0), 'native_pointer': get(get(get(frame, 'windows', []), 0, {}), 'native_pointer', 0), 'scroll_ack': get(get(get(frame, 'windows', []), 0, {}), 'scroll_ack', 0)}\n"
         "endfunction\n"
         "function! NativeFixtureState(timer) abort\n"
-        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
+        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'completion': complete_info(['selected', 'pum_visible']), 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
         f"call rename({quoted(str(state_file) + '.tmp')}, {quoted(state_file)})\n"
         "endfunction\n"
         "call timer_start(60, function('NativeFixtureState'), {'repeat': -1})\n",
@@ -257,6 +257,90 @@ def main():
         command("let &guicursor = g:saved_gui_cursor | bwipeout!")
         wait_for(lambda: state().get("text") == original.splitlines()[0] and state().get("modified") == 0,
                  "return from disposable cursor buffer", app)
+        # The ordinary Insert menu stays above the native buffers. Its GUI
+        # colors deliberately differ from cterm, with termguicolors disabled.
+        command("let g:saved_completeopt = &completeopt | let g:saved_pumheight = &pumheight | enew | call setline(1, ['GUI_TRUECOLOR_19C3A7', '', '']) | set completeopt=menuone,noinsert,noselect pumheight=20")
+        command("highlight Pmenu guifg=#d4e5f6 guibg=#284763 gui=NONE ctermfg=196 ctermbg=21 | highlight PmenuSel guifg=#172635 guibg=#c28a49 gui=NONE ctermfg=15 ctermbg=1 | highlight! link PmenuMatch Pmenu | highlight! link PmenuMatchSel PmenuSel | highlight! link PmenuKind Pmenu | highlight! link PmenuKindSel PmenuSel | highlight! link PmenuExtra Pmenu | highlight! link PmenuExtraSel PmenuSel")
+        command("inoremap <silent> <F5> <Cmd>call complete(col('.'), [{'word':'alpha', 'abbr':'Alpha_Complete', 'kind':'f', 'menu':'[function]'}, {'word':'bravo', 'abbr':'Bravo_Complete', 'kind':'v', 'menu':'[value]'}, {'word':'charlie', 'abbr':nr2char(20013).nr2char(25991), 'kind':'t', 'menu':'[type]'}])<CR>")
+        command("normal! 2G0")
+        menu_bg, selected_bg = (0x28, 0x47, 0x63), (0xc2, 0x8a, 0x49)
+        def native_completion(selected):
+            current = state()
+            return (current if current.get("completion", {}).get("pum_visible")
+                    and current.get("completion", {}).get("selected") == selected
+                    and current.get("render", {}).get("supported")
+                    and current.get("render", {}).get("completion") else None)
+        xdo("key", "A", "F5")
+        wait_for(lambda: native_completion(-1), "unselected native completion menu", app)
+        report["completion_menu_gui_pixels"] = wait_for(
+            lambda: color_count("completion-menu", menu_bg) > 100 and color_count("completion-menu", menu_bg),
+            "native Pmenu GUI background", app)
+        assert color_count("completion-foreground", (0xd4, 0xe5, 0xf6)) > 10
+        assert color_count("completion-native-buffer") > 30, "completion must retain native buffer RGB"
+        xdo("key", "ctrl+n")
+        wait_for(lambda: native_completion(0), "Ctrl-N selects first Vim candidate", app)
+        report["completion_selected_gui_pixels"] = wait_for(
+            lambda: color_count("completion-selected", selected_bg) > 100 and color_count("completion-selected", selected_bg),
+            "native PmenuSel GUI background", app)
+        xdo("key", "ctrl+n")
+        wait_for(lambda: native_completion(1), "Ctrl-N selects second Vim candidate", app)
+        xdo("key", "ctrl+p")
+        wait_for(lambda: native_completion(0), "Ctrl-P returns to first Vim candidate", app)
+        xdo("key", "ctrl+y")
+        wait_for(lambda: state().get("text") == "alpha"
+                 and not state().get("completion", {}).get("pum_visible")
+                 and not state().get("render", {}).get("completion"),
+                 "Ctrl-Y commits the real Vim completion", app)
+        command("call setline(2, '') | normal! 2G0")
+        xdo("key", "A", "F5", "ctrl+n", "ctrl+e")
+        wait_for(lambda: state().get("text") == ""
+                 and not state().get("completion", {}).get("pum_visible")
+                 and state().get("render", {}).get("supported")
+                 and not state().get("render", {}).get("completion"),
+                 "Ctrl-E cancels without changing Vim text", app)
+        wait_for(lambda: color_count("completion-closed", menu_bg) == 0
+                 and color_count("completion-selection-closed", selected_bg) == 0,
+                 "completion pixels disappear after cancellation", app)
+        command("set pumheight=2 | normal! 2G0")
+        xdo("key", "A", "F5")
+        wait_for(lambda: state().get("completion", {}).get("pum_visible")
+                 and not state().get("render", {}).get("supported", True),
+                 "scrolling completion menu explicitly uses compatibility", app)
+        assert color_count("completion-scrolling-fallback", menu_bg) == 0
+        assert color_count("completion-buffer-fallback") == 0
+        xdo("key", "ctrl+e")
+        command("set pumheight=20")
+        wait_for(lambda: state().get("render", {}).get("supported")
+                 and color_count("completion-fallback-recovered") > 30,
+                 "native buffers recover after unsupported completion closes", app)
+        # The menu can cover a sibling split and its separator without being
+        # clipped to the source window's native buffer rectangle.
+        command("vsplit | wincmd h | call setline(2, repeat(' ', max([1, winwidth(0)-8]))) | normal! 2G$")
+        xdo("key", "A", "F5")
+        def crossing_completion():
+            current = native_completion(-1)
+            if not current:
+                return None
+            render = current["render"]
+            menu = render["completion"]["view"]
+            views = sorted(render["views"], key=lambda view: view["column"])
+            boundary = views[0]["column"] + views[0]["columns"]
+            return menu if menu["column"] < boundary < menu["column"] + menu["columns"] else None
+        report["completion_cross_split_view"] = wait_for(crossing_completion, "completion crosses the Vim split separator", app)
+        report["completion_split_buffers"] = wait_for(
+            lambda: native_splits("completion-cross-split-buffers", 2, 1),
+            "both split buffers retain native RGB under completion", app)
+        assert color_count("completion-cross-split", menu_bg) > 100
+        xdo("key", "ctrl+e")
+        command("only")
+        # :iunmap consumes bars as mapping text; keep it a separate command.
+        command("iunmap <F5>")
+        command("let &completeopt = g:saved_completeopt | let &pumheight = g:saved_pumheight | bwipeout!")
+        wait_for(lambda: state().get("text") == original.splitlines()[0] and state().get("modified") == 0
+                 and state().get("render", {}).get("supported")
+                 and not state().get("render", {}).get("completion"),
+                 "return from disposable completion buffer", app)
+        report["completion_navigation_confirm_cancel"] = "passed"
         # No [vim9] settings are supplied: the text must begin near the normal
         # tab bar, without an automatically opened project tree or IDE rows.
         def focused_native():
