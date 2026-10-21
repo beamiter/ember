@@ -12,3 +12,14 @@
 # ASCII organism is enabled by default; uncomment to turn it off.
 # ascii_organism_enabled = false
 # terminal_mode = "block"
+
+# Vim uses the native GUI buffer by default. Extra workbench panels are opt-in.
+# These settings apply only to explicitly opened Vim editors, not shell tabs.
+# [vim9]
+# native_buffer = true
+# toolbar = false
+# buffer_tabs = false
+# status_bar = false
+# project_panel = false
+# tool_panel = false
+# Search/Build commands can still open a temporary tool row; Escape closes it.

@@ -4324,13 +4324,20 @@ impl TerminalRenderer {
             .filter(|frame| frame.cursor.visible)
             .map(|frame| (frame.cursor.row, frame.cursor.column))
             .unwrap_or((cursor_point.row, cursor_point.column));
-        let ime_rect = cursor_rect(
-            content_rect,
-            cursor_pos.0,
-            cursor_pos.1,
-            char_width,
-            line_height,
-        );
+        let ime_rect = native_buffer
+            .as_ref()
+            .and_then(|frame| {
+                crate::vim9_buffer::cursor_rect(frame, content_rect, char_width, line_height)
+            })
+            .unwrap_or_else(|| {
+                cursor_rect(
+                    content_rect,
+                    cursor_pos.0,
+                    cursor_pos.1,
+                    char_width,
+                    line_height,
+                )
+            });
 
         let ctx = ui.ctx();
         if focus_enabled

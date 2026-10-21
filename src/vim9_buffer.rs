@@ -5,7 +5,42 @@
 //! egui owns glyph shaping, RGB backgrounds and all text decorations.
 
 use eframe::egui::{self, Color32, FontId, Rect, Stroke};
-use jterm_core::vim9::{Vim9RenderFrame, Vim9RenderRect, Vim9RenderStyle};
+use jterm_core::vim9::{
+    Vim9PixelRect, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderStyle,
+};
+
+fn gui_rect(rect: Vim9PixelRect) -> Rect {
+    Rect::from_min_size(
+        egui::pos2(rect.x, rect.y),
+        egui::vec2(rect.width, rect.height),
+    )
+}
+
+fn metrics(content: Rect, cell_width: f32, line_height: f32) -> Vim9RenderMetrics {
+    Vim9RenderMetrics {
+        origin_x: content.left(),
+        origin_y: content.top(),
+        cell_width,
+        line_height,
+    }
+}
+
+/// The native caret and the OS IME candidate window share the same fractional
+/// coordinates. Terminal-grid rounding must not move a GUI overlay by a cell.
+pub(crate) fn cursor_rect(
+    frame: &Vim9RenderFrame,
+    content: Rect,
+    cell_width: f32,
+    line_height: f32,
+) -> Option<Rect> {
+    let rect = metrics(content, cell_width, line_height).cursor_rect(&frame.cursor)?;
+    let view = frame
+        .paint_views()
+        .find(|view| view.contains(frame.cursor.row, frame.cursor.column))?;
+    let clip = gui_rect(metrics(content, cell_width, line_height).rect(view)?).intersect(content);
+    let rect = gui_rect(rect).intersect(clip);
+    rect.is_positive().then_some(rect)
+}
 
 pub(crate) fn usable(frame: &Vim9RenderFrame, rows: usize, columns: usize) -> bool {
     frame.supported
@@ -51,6 +86,13 @@ pub(crate) fn paint(
     focused: bool,
     cursor_on: bool,
 ) {
+    if !metrics(content, cell_width, line_height).is_valid()
+        || !content.is_positive()
+        || !font_size.is_finite()
+        || font_size <= 0.0
+    {
+        return;
+    }
     for view in frame.paint_views() {
         paint_view(
             painter,
@@ -78,18 +120,14 @@ fn paint_view(
     focused: bool,
     cursor_on: bool,
 ) {
-    let view = Rect::from_min_size(
-        content.min
-            + egui::vec2(
-                logical_view.column as f32 * cell_width,
-                logical_view.row as f32 * line_height,
-            ),
-        egui::vec2(
-            logical_view.columns as f32 * cell_width,
-            logical_view.rows as f32 * line_height,
-        ),
-    )
-    .intersect(content);
+    let geometry = metrics(content, cell_width, line_height);
+    let Some(view) = geometry.rect(logical_view).map(gui_rect) else {
+        return;
+    };
+    let view = view.intersect(content);
+    if !view.is_positive() {
+        return;
+    }
     let painter = painter.with_clip_rect(view);
     let (normal_fg, normal_bg, _) = colors(&frame.default_style, &frame.default_style);
     painter.rect_filled(view, 0.0, normal_bg);
@@ -98,15 +136,9 @@ fn paint_view(
     for run in &frame.runs {
         if logical_view.contains(run.row, run.column) && run.cells > 0 {
             let (_, bg, _) = colors(&run.style, &frame.default_style);
-            painter.rect_filled(
-                Rect::from_min_size(
-                    content.min
-                        + egui::vec2(run.column as f32 * cell_width, run.row as f32 * line_height),
-                    egui::vec2(run.cells as f32 * cell_width, line_height),
-                ),
-                0.0,
-                bg,
-            );
+            if let Some(rect) = geometry.cell_rect(run.row, run.column, run.cells) {
+                painter.rect_filled(gui_rect(rect), 0.0, bg);
+            }
         }
     }
     for run in &frame.runs {
@@ -114,10 +146,12 @@ fn paint_view(
             continue;
         }
         let (fg, _, special) = colors(&run.style, &frame.default_style);
-        let run_rect = Rect::from_min_size(
-            content.min + egui::vec2(run.column as f32 * cell_width, run.row as f32 * line_height),
-            egui::vec2(run.cells as f32 * cell_width, line_height),
-        );
+        let Some(run_rect) = geometry
+            .cell_rect(run.row, run.column, run.cells)
+            .map(gui_rect)
+        else {
+            continue;
+        };
         let clip = run_rect
             .expand2(egui::vec2(font_size * 0.25, 0.0))
             .intersect(view);
@@ -199,14 +233,9 @@ fn paint_view(
         && logical_view.contains(frame.cursor.row, frame.cursor.column)
         && (!focused || cursor_on)
     {
-        let cursor = Rect::from_min_size(
-            content.min
-                + egui::vec2(
-                    frame.cursor.column as f32 * cell_width,
-                    frame.cursor.row as f32 * line_height,
-                ),
-            egui::vec2(frame.cursor.width.max(1) as f32 * cell_width, line_height),
-        );
+        let Some(cursor) = geometry.cursor_rect(&frame.cursor).map(gui_rect) else {
+            return;
+        };
         if focused && (frame.mode.starts_with('i') || frame.mode.starts_with('R')) {
             let caret = Rect::from_min_size(cursor.min, egui::vec2(2.0, line_height));
             painter.rect_filled(caret, 0.0, normal_fg);
@@ -303,7 +332,7 @@ mod tests {
 
         // Check the actual egui paint list, not merely the geometry helper.
         // Fractional metrics model a font size / HiDPI rounding boundary.
-        let content = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
+        let content = Rect::from_min_size(egui::pos2(13.25, 7.75), egui::vec2(400.0, 200.0));
         let ctx = egui::Context::default();
         let mut output = ctx.run_ui(Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
@@ -314,7 +343,7 @@ mod tests {
             .paint_views()
             .map(|v| {
                 Rect::from_min_size(
-                    egui::pos2(v.column as f32 * 8.25, v.row as f32 * 17.5),
+                    content.min + egui::vec2(v.column as f32 * 8.25, v.row as f32 * 17.5),
                     egui::vec2(v.columns as f32 * 8.25, v.rows as f32 * 17.5),
                 )
             })
@@ -328,5 +357,40 @@ mod tests {
                 "missing native background for {view:?}"
             );
         }
+    }
+
+    #[test]
+    fn native_caret_and_ime_rect_share_fractional_split_geometry() {
+        let frame: Vim9RenderFrame = serde_json::from_value(serde_json::json!({
+            "supported": true, "rows": 8, "columns": 40, "mode": "i",
+            "default_style": {"foreground": 0xa1b2c3},
+            "view": {"row": 1, "column": 21, "rows": 5, "columns": 19},
+            "windows": [
+                {"window": 1, "view": {"row": 0, "column": 0, "rows": 6, "columns": 20}},
+                {"window": 2, "view": {"row": 1, "column": 21, "rows": 5, "columns": 19}}
+            ],
+            "cursor": {"row": 2, "column": 25, "width": 2, "visible": true}
+        }))
+        .unwrap();
+        let content = Rect::from_min_size(egui::pos2(11.5, 23.25), egui::vec2(400.0, 200.0));
+        let ime = cursor_rect(&frame, content, 8.25, 17.5).unwrap();
+        assert_eq!(ime.min, content.min + egui::vec2(25.0 * 8.25, 2.0 * 17.5));
+        assert_eq!(ime.size(), egui::vec2(16.5, 17.5));
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            paint(ui.painter(), &frame, content, 8.25, 17.5, 14.0, true, true);
+        });
+        output.textures_delta.clear();
+        assert!(
+            output.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Rect(shape)
+                if shape.rect.min == ime.min
+                    && shape.rect.size() == egui::vec2(2.0, ime.height())
+                    && shape.fill == rgb(0xa1b2c3))
+            }),
+            "the native caret must use the same origin as the IME candidate anchor"
+        );
+        assert!(cursor_rect(&frame, content, f32::NAN, 17.5).is_none());
+        assert!(cursor_rect(&frame, content, 8.25, 0.0).is_none());
     }
 }

@@ -144,7 +144,9 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     config = out / "config" / "ember"
     config.mkdir(parents=True)
-    (config / "config.toml").write_text('shell = "/bin/bash"\nterminal_mode = "normal"\napp_renderer = "wgpu"\nfont_size = 16.0\nui_font_size = 15.0\ninitial_width = 1500.0\ninitial_height = 950.0\nrestore_session = true\njsh_update_check = "never"\n')
+    # This suite exercises opt-in workbench controls; the separate buffer
+    # smoke keeps default settings and verifies the focused native surface.
+    (config / "config.toml").write_text('shell = "/bin/bash"\nterminal_mode = "normal"\napp_renderer = "wgpu"\nfont_size = 16.0\nui_font_size = 15.0\ninitial_width = 1500.0\ninitial_height = 950.0\nrestore_session = true\njsh_update_check = "never"\n[vim9]\ntoolbar = true\nbuffer_tabs = true\nstatus_bar = true\nproject_panel = true\ntool_panel = true\n')
     original_layout = '{"version": 4, "sessions": []}\n'
     (config / "session_history.json").write_text(original_layout)
     project = out / "project"

@@ -6,7 +6,8 @@ Run from the repository root with a Rust toolchain on PATH:
 python3 font-group-harness/run.py
 ```
 
-This small package builds egui 0.36.1, serde/TOML and filesystem helpers only.
+This small package builds egui 0.36.1, serde/TOML, filesystem helpers and the
+shared-core configuration type (so nested Vim settings survive save/reload).
 It never builds eframe/wgpu, launches Ember, opens a display, creates a Unix
 socket, or uses DBus/Xvfb. Cargo.lock retains the repository's relevant pinned
 versions. CARGO_HOME and CARGO_TARGET_DIR can point to shared caches.

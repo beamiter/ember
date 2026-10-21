@@ -5,7 +5,7 @@ use crate::app::state::TerminalApp;
 use eframe::egui;
 use jterm_core::vim9::{
     Vim9Command, Vim9EntryRequest, Vim9ProjectFile, Vim9ProjectIndex, Vim9SearchCase,
-    Vim9SearchOptions, Vim9Session, Vim9Snapshot,
+    Vim9SearchOptions, Vim9Session, Vim9Snapshot, Vim9UiConfig,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -389,6 +389,7 @@ pub(crate) struct Workbench {
     search_options: Vim9SearchOptions,
     build_input: String,
     rename_input: String,
+    tools_open: bool,
     problems_open: bool,
     error: Option<String>,
     project_index: Option<Vim9ProjectIndex>,
@@ -401,7 +402,7 @@ pub(crate) struct Workbench {
 }
 
 impl Workbench {
-    pub(crate) fn new(session: Vim9Session, font_size: f32) -> Self {
+    pub(crate) fn new(session: Vim9Session, font_size: f32, config: &Vim9UiConfig) -> Self {
         let snapshot = Arc::new(session.snapshot());
         Self {
             session,
@@ -416,7 +417,8 @@ impl Workbench {
             search_options: Vim9SearchOptions::default(),
             build_input: String::new(),
             rename_input: String::new(),
-            problems_open: false,
+            tools_open: false,
+            problems_open: config.tool_panel,
             error: None,
             project_index: None,
             dialog: None,
@@ -458,10 +460,12 @@ impl Workbench {
                 None
             }
             Command::Vim9Search => {
+                self.tools_open = true;
                 self.focus_input = Some(ToolInput::Search);
                 None
             }
             Command::Vim9Build => {
+                self.tools_open = true;
                 self.focus_input = Some(ToolInput::Build);
                 None
             }
@@ -493,277 +497,294 @@ impl Workbench {
         self.send(Vim9Command::CloseCurrentBuffer);
     }
 
-    fn refresh(&mut self) {
+    fn refresh(&mut self, native_buffer: bool) {
         if self.refreshed_at.elapsed() >= Duration::from_millis(100) {
             self.snapshot = Arc::new(self.session.snapshot());
             if !self.snapshot.connected {
                 self.render_subscribed = false;
-            } else if !self.render_subscribed {
-                self.render_subscribed = self
+            } else if self.render_subscribed != native_buffer
+                && self
                     .session
-                    .send(Vim9Command::SetRender { enabled: true })
-                    .is_ok();
+                    .send(Vim9Command::SetRender {
+                        enabled: native_buffer,
+                    })
+                    .is_ok()
+            {
+                self.render_subscribed = native_buffer;
             }
             self.refreshed_at = Instant::now();
         }
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
+    fn toolbar(&mut self, ui: &mut egui::Ui, config: &Vim9UiConfig) {
         let snapshot = Arc::clone(&self.snapshot);
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("VIM9 IDE");
-            ui.separator();
-            if let Some(frame) = self.session.render_snapshot() {
-                if frame.supported {
-                    ui.small("GUI buffer · RGB").on_hover_text("Vim buffer text and GUI highlight attributes are drawn directly by egui.");
-                } else {
-                    ui.small("Compatible view").on_hover_text(&frame.fallback_reason);
-                }
+        if config.toolbar {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("VIM9 IDE");
                 ui.separator();
-            }
-            ui.label(if snapshot.connected {
-                snapshot.mode.to_uppercase()
-            } else {
-                "Connecting to Vim…".to_string()
-            });
-            ui.add_enabled_ui(snapshot.connected, |ui| {
-                if ui.add_enabled(snapshot.navigation.can_go_back, egui::Button::new("Back"))
-                    .on_hover_text("Previous Vim jump location · Alt+Left")
-                    .on_disabled_hover_text("No earlier location in this Vim window's jump list")
-                    .clicked() {
-                    self.send(Vim9Command::NavigateBack);
-                }
-                if ui.add_enabled(snapshot.navigation.can_go_forward, egui::Button::new("Forward"))
-                    .on_hover_text("Next Vim jump location · Alt+Right")
-                    .on_disabled_hover_text("No later location in this Vim window's jump list")
-                    .clicked() {
-                    self.send(Vim9Command::NavigateForward);
-                }
-                if ui.button("Quick Open").on_hover_text("Find project files · Ctrl+Shift+P").clicked() {
-                    self.open_dialog(DialogKind::QuickOpen);
-                }
-                if ui.button("Go to line").on_hover_text("Jump to line:column · Ctrl+Shift+G").clicked() {
-                    self.open_dialog(DialogKind::Goto);
-                }
-                if ui.button("Save").on_hover_text("Ctrl+S").clicked() { self.send(Vim9Command::Save); }
-                if ui.button("Save all").on_hover_text("Ctrl+Shift+S").clicked() { self.send(Vim9Command::SaveAll); }
-                ui.menu_button("Windows", |ui| {
-                    if ui.button("Vertical split").clicked() {
-                        self.send(Vim9Command::Split { vertical: true });
-                        ui.close();
-                    }
-                    if ui.button("Horizontal split").clicked() {
-                        self.send(Vim9Command::Split { vertical: false });
-                        ui.close();
+                if let Some(frame) = self.session.render_snapshot() {
+                    if frame.supported {
+                        ui.small("GUI buffer · RGB").on_hover_text("Vim buffer text and GUI highlight attributes are drawn directly by egui.");
+                    } else {
+                        ui.small("Compatible view").on_hover_text(&frame.fallback_reason);
                     }
                     ui.separator();
-                    if ui.button("Previous buffer · Ctrl+Shift+PageUp").clicked() {
-                        self.send(Vim9Command::PreviousBuffer);
-                        ui.close();
-                    }
-                    if ui.button("Next buffer · Ctrl+Shift+PageDown").clicked() {
-                        self.send(Vim9Command::NextBuffer);
-                        ui.close();
-                    }
-                    if ui.button("Close buffer · Ctrl+Shift+W").on_hover_text("Keeps modified buffers open; never forces a discard").clicked() {
-                        self.close_current_buffer();
-                        ui.close();
-                    }
+                }
+                ui.label(if snapshot.connected {
+                    snapshot.mode.to_uppercase()
+                } else {
+                    "Connecting to Vim…".to_string()
                 });
-                ui.menu_button("Code", |ui| {
-                    for (label, capability, command) in [
-                        ("Go to definition", "definition", Vim9Command::Definition),
-                        ("Hover documentation", "hover", Vim9Command::Hover),
-                        ("Find references", "references", Vim9Command::References),
-                        ("Format buffer", "format", Vim9Command::Format),
-                    ] {
-                        if ui.add_enabled(snapshot.capabilities.iter().any(|s| s == capability), egui::Button::new(label))
-                            .on_disabled_hover_text("Configure a supported Vim language server plugin to enable this action")
-                            .clicked() {
-                            self.send(command);
+                ui.add_enabled_ui(snapshot.connected, |ui| {
+                    if ui.add_enabled(snapshot.navigation.can_go_back, egui::Button::new("Back"))
+                        .on_hover_text("Previous Vim jump location · Alt+Left")
+                        .on_disabled_hover_text("No earlier location in this Vim window's jump list")
+                        .clicked() {
+                        self.send(Vim9Command::NavigateBack);
+                    }
+                    if ui.add_enabled(snapshot.navigation.can_go_forward, egui::Button::new("Forward"))
+                        .on_hover_text("Next Vim jump location · Alt+Right")
+                        .on_disabled_hover_text("No later location in this Vim window's jump list")
+                        .clicked() {
+                        self.send(Vim9Command::NavigateForward);
+                    }
+                    if ui.button("Quick Open").on_hover_text("Find project files · Ctrl+Shift+P").clicked() {
+                        self.open_dialog(DialogKind::QuickOpen);
+                    }
+                    if ui.button("Go to line").on_hover_text("Jump to line:column · Ctrl+Shift+G").clicked() {
+                        self.open_dialog(DialogKind::Goto);
+                    }
+                    if ui.button("Save").on_hover_text("Ctrl+S").clicked() { self.send(Vim9Command::Save); }
+                    if ui.button("Save all").on_hover_text("Ctrl+Shift+S").clicked() { self.send(Vim9Command::SaveAll); }
+                    ui.menu_button("Windows", |ui| {
+                        if ui.button("Vertical split").clicked() {
+                            self.send(Vim9Command::Split { vertical: true });
                             ui.close();
                         }
-                    }
-                    ui.separator();
-                    ui.add(egui::TextEdit::singleline(&mut self.rename_input).hint_text("New symbol name").char_limit(256));
-                    if ui.add_enabled(!self.rename_input.is_empty() && snapshot.capabilities.iter().any(|s| s == "rename"), egui::Button::new("Rename symbol"))
-                        .on_disabled_hover_text("Enter a name and configure a supported Vim language server plugin")
-                        .clicked() {
-                        self.send(Vim9Command::Rename { name: self.rename_input.clone() });
-                        ui.close();
-                    }
-                });
-                if ui.selectable_label(self.problems_open, format!("Problems ({})", snapshot.diagnostics.len())).clicked() {
-                    self.problems_open = !self.problems_open;
-                }
-                if ui.button("Previous issue").on_hover_text("Shift+F8").clicked() { self.send(Vim9Command::PreviousDiagnostic); }
-                if ui.button("Next issue").on_hover_text("F8").clicked() { self.send(Vim9Command::NextDiagnostic); }
-                if ui.button("Close editor").on_hover_text("Ask Vim to quit; modified buffers are protected").clicked() {
-                    self.send(Vim9Command::Quit);
-                }
-            });
-        });
-        egui::ScrollArea::horizontal()
-            .id_salt("vim9_tools")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let edit = ui.add(
-                        egui::TextEdit::singleline(&mut self.file_input)
-                            .hint_text("Open file · relative to project")
-                            .desired_width(230.0)
-                            .char_limit(4096),
-                    );
-                    let enter = form_submitted(&edit);
-                    if (ui
-                        .add_enabled(
-                            snapshot.connected && !self.file_input.is_empty(),
-                            egui::Button::new("Open"),
-                        )
-                        .clicked()
-                        || enter)
-                        && !self.file_input.is_empty()
-                    {
-                        self.send(Vim9Command::Open {
-                            path: self.file_input.clone(),
-                            line: None,
-                            column: None,
-                        });
-                    }
-                    let build = ui.add(
-                        egui::TextEdit::singleline(&mut self.build_input)
-                            .hint_text("Build command · blank uses Vim makeprg")
-                            .desired_width(240.0)
-                            .char_limit(4096),
-                    );
-                    if self.focus_input == Some(ToolInput::Build) {
-                        build.request_focus();
-                        self.focus_input = None;
-                    }
-                    let build_enter = form_submitted(&build);
-                    if snapshot.build.running {
-                        if ui.button("Stop build").clicked() {
-                            self.send(Vim9Command::CancelBuild);
+                        if ui.button("Horizontal split").clicked() {
+                            self.send(Vim9Command::Split { vertical: false });
+                            ui.close();
                         }
-                    } else if ui
-                        .add_enabled(snapshot.connected, egui::Button::new("Build"))
-                        .clicked()
-                        || (snapshot.connected && build_enter)
-                    {
-                        self.send(Vim9Command::Build {
-                            command: self.build_input.clone(),
-                        });
-                        self.problems_open = true;
+                        ui.separator();
+                        if ui.button("Previous buffer · Ctrl+Shift+PageUp").clicked() {
+                            self.send(Vim9Command::PreviousBuffer);
+                            ui.close();
+                        }
+                        if ui.button("Next buffer · Ctrl+Shift+PageDown").clicked() {
+                            self.send(Vim9Command::NextBuffer);
+                            ui.close();
+                        }
+                        if ui.button("Close buffer · Ctrl+Shift+W").on_hover_text("Keeps modified buffers open; never forces a discard").clicked() {
+                            self.close_current_buffer();
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Code", |ui| {
+                        for (label, capability, command) in [
+                            ("Go to definition", "definition", Vim9Command::Definition),
+                            ("Hover documentation", "hover", Vim9Command::Hover),
+                            ("Find references", "references", Vim9Command::References),
+                            ("Format buffer", "format", Vim9Command::Format),
+                        ] {
+                            if ui.add_enabled(snapshot.capabilities.iter().any(|s| s == capability), egui::Button::new(label))
+                                .on_disabled_hover_text("Configure a supported Vim language server plugin to enable this action")
+                                .clicked() {
+                                self.send(command);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        ui.add(egui::TextEdit::singleline(&mut self.rename_input).hint_text("New symbol name").char_limit(256));
+                        if ui.add_enabled(!self.rename_input.is_empty() && snapshot.capabilities.iter().any(|s| s == "rename"), egui::Button::new("Rename symbol"))
+                            .on_disabled_hover_text("Enter a name and configure a supported Vim language server plugin")
+                            .clicked() {
+                            self.send(Vim9Command::Rename { name: self.rename_input.clone() });
+                            ui.close();
+                        }
+                    });
+                    if ui.selectable_label(self.problems_open, format!("Problems ({})", snapshot.diagnostics.len())).clicked() {
+                        self.problems_open = !self.problems_open;
                     }
-                    if ui
-                        .add_enabled(
-                            snapshot.connected && !snapshot.build.running,
-                            egui::Button::new("Save + Build"),
-                        )
-                        .on_hover_text(
-                            "Save all modified buffers first; abort the build if a write fails",
-                        )
-                        .clicked()
-                    {
-                        self.send(Vim9Command::SaveAndBuild {
-                            command: self.build_input.clone(),
-                        });
-                        self.problems_open = true;
+                    if ui.button("Previous issue").on_hover_text("Shift+F8").clicked() { self.send(Vim9Command::PreviousDiagnostic); }
+                    if ui.button("Next issue").on_hover_text("F8").clicked() { self.send(Vim9Command::NextDiagnostic); }
+                    if ui.button("Close editor").on_hover_text("Ask Vim to quit; modified buffers are protected").clicked() {
+                        self.send(Vim9Command::Quit);
                     }
                 });
             });
-        self.search_tools(ui, &snapshot);
-        egui::ScrollArea::horizontal()
-            .id_salt("vim9_buffers")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for buffer in &snapshot.buffers {
-                        ui.push_id(("buffer", buffer.id), |ui| {
-                            let name = Path::new(&buffer.name)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .filter(|n| !n.is_empty())
-                                .unwrap_or("[No Name]");
-                            let label =
-                                format!("{}{}", name, if buffer.modified { " •" } else { "" });
-                            if ui
-                                .selectable_label(buffer.current, label)
-                                .on_hover_text(&buffer.name)
-                                .clicked()
-                            {
-                                self.send(Vim9Command::Buffer { buffer: buffer.id });
+        }
+        if config.tool_panel || self.tools_open {
+            egui::ScrollArea::horizontal()
+                .id_salt("vim9_tools")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut self.file_input)
+                                .hint_text("Open file · relative to project")
+                                .desired_width(230.0)
+                                .char_limit(4096),
+                        );
+                        let enter = form_submitted(&edit);
+                        if (ui
+                            .add_enabled(
+                                snapshot.connected && !self.file_input.is_empty(),
+                                egui::Button::new("Open"),
+                            )
+                            .clicked()
+                            || enter)
+                            && !self.file_input.is_empty()
+                        {
+                            self.send(Vim9Command::Open {
+                                path: self.file_input.clone(),
+                                line: None,
+                                column: None,
+                            });
+                        }
+                        let build = ui.add(
+                            egui::TextEdit::singleline(&mut self.build_input)
+                                .hint_text("Build command · blank uses Vim makeprg")
+                                .desired_width(240.0)
+                                .char_limit(4096),
+                        );
+                        if self.focus_input == Some(ToolInput::Build) {
+                            build.request_focus();
+                            self.focus_input = None;
+                        }
+                        let build_enter = form_submitted(&build);
+                        if snapshot.build.running {
+                            if ui.button("Stop build").clicked() {
+                                self.send(Vim9Command::CancelBuild);
                             }
-                            if ui
-                                .small_button("×")
-                                .on_hover_text(format!(
-                                    "Close {name}; modified buffers remain protected"
-                                ))
-                                .clicked()
-                            {
-                                self.send(Vim9Command::CloseBuffer { buffer: buffer.id });
-                            }
-                        });
-                    }
-                    if snapshot.buffers_truncated {
-                        ui.weak("More buffers in :ls");
-                    }
+                        } else if ui
+                            .add_enabled(snapshot.connected, egui::Button::new("Build"))
+                            .clicked()
+                            || (snapshot.connected && build_enter)
+                        {
+                            self.send(Vim9Command::Build {
+                                command: self.build_input.clone(),
+                            });
+                            self.problems_open = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                snapshot.connected && !snapshot.build.running,
+                                egui::Button::new("Save + Build"),
+                            )
+                            .on_hover_text(
+                                "Save all modified buffers first; abort the build if a write fails",
+                            )
+                            .clicked()
+                        {
+                            self.send(Vim9Command::SaveAndBuild {
+                                command: self.build_input.clone(),
+                            });
+                            self.problems_open = true;
+                        }
+                    });
                 });
-            });
-        ui.horizontal_wrapped(|ui| {
-            let file = if snapshot.file.is_empty() {
-                "[No Name]"
-            } else {
-                &snapshot.file
-            };
-            ui.small(format!(
-                "{}{}   Ln {}/{}, Col {}",
-                file,
-                if snapshot.modified {
-                    "  • modified"
+            self.search_tools(ui, &snapshot);
+            if !config.tool_panel && ui.small_button("Close tools · Esc").clicked() {
+                self.tools_open = false;
+                self.focus_input = None;
+                self.return_focus = true;
+            }
+        }
+        if config.buffer_tabs {
+            egui::ScrollArea::horizontal()
+                .id_salt("vim9_buffers")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for buffer in &snapshot.buffers {
+                            ui.push_id(("buffer", buffer.id), |ui| {
+                                let name = Path::new(&buffer.name)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .filter(|n| !n.is_empty())
+                                    .unwrap_or("[No Name]");
+                                let label =
+                                    format!("{}{}", name, if buffer.modified { " •" } else { "" });
+                                if ui
+                                    .selectable_label(buffer.current, label)
+                                    .on_hover_text(&buffer.name)
+                                    .clicked()
+                                {
+                                    self.send(Vim9Command::Buffer { buffer: buffer.id });
+                                }
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text(format!(
+                                        "Close {name}; modified buffers remain protected"
+                                    ))
+                                    .clicked()
+                                {
+                                    self.send(Vim9Command::CloseBuffer { buffer: buffer.id });
+                                }
+                            });
+                        }
+                        if snapshot.buffers_truncated {
+                            ui.weak("More buffers in :ls");
+                        }
+                    });
+                });
+        }
+        if config.status_bar {
+            ui.horizontal_wrapped(|ui| {
+                let file = if snapshot.file.is_empty() {
+                    "[No Name]"
                 } else {
-                    ""
-                },
-                snapshot.line,
-                snapshot.line_count,
-                snapshot.column
-            ));
-            if !snapshot.filetype.is_empty() {
-                ui.small(&snapshot.filetype);
-            }
-            if !snapshot.encoding.is_empty() {
-                ui.small(&snapshot.encoding);
-            }
-            ui.small(format!("{} Vim window(s)", snapshot.window_count));
-            if snapshot.build.running {
-                ui.small(format!("Building: {}", snapshot.build.command));
-            } else if snapshot.build.cancelled {
-                ui.small("Build cancelled");
-            } else if let Some(code) = snapshot.build.exit_code {
-                ui.small(format!("Build exit: {code}"));
-            }
-            if snapshot.search.running {
+                    &snapshot.file
+                };
                 ui.small(format!(
-                    "Searching: {} · {} matches",
-                    snapshot.search.query, snapshot.search.count
+                    "{}{}   Ln {}/{}, Col {}",
+                    file,
+                    if snapshot.modified {
+                        "  • modified"
+                    } else {
+                        ""
+                    },
+                    snapshot.line,
+                    snapshot.line_count,
+                    snapshot.column
                 ));
-            } else if snapshot.search.cancelled {
-                ui.small("Search cancelled");
-            } else if !snapshot.search.query.is_empty() {
-                if (0..=1).contains(&snapshot.search.exit_code) {
-                    ui.small(format!("Search: {} matches", snapshot.search.count));
-                } else {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!("Search failed (exit {})", snapshot.search.exit_code),
-                    );
+                if !snapshot.filetype.is_empty() {
+                    ui.small(&snapshot.filetype);
                 }
-            }
-            if snapshot.waiting_for_input {
-                ui.small("Waiting for Vim input to finish…");
-            }
-            if snapshot.pending > 0 {
-                ui.small(format!("{} pending", snapshot.pending));
-            }
-        });
+                if !snapshot.encoding.is_empty() {
+                    ui.small(&snapshot.encoding);
+                }
+                ui.small(format!("{} Vim window(s)", snapshot.window_count));
+                if snapshot.build.running {
+                    ui.small(format!("Building: {}", snapshot.build.command));
+                } else if snapshot.build.cancelled {
+                    ui.small("Build cancelled");
+                } else if let Some(code) = snapshot.build.exit_code {
+                    ui.small(format!("Build exit: {code}"));
+                }
+                if snapshot.search.running {
+                    ui.small(format!(
+                        "Searching: {} · {} matches",
+                        snapshot.search.query, snapshot.search.count
+                    ));
+                } else if snapshot.search.cancelled {
+                    ui.small("Search cancelled");
+                } else if !snapshot.search.query.is_empty() {
+                    if (0..=1).contains(&snapshot.search.exit_code) {
+                        ui.small(format!("Search: {} matches", snapshot.search.count));
+                    } else {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!("Search failed (exit {})", snapshot.search.exit_code),
+                        );
+                    }
+                }
+                if snapshot.waiting_for_input {
+                    ui.small("Waiting for Vim input to finish…");
+                }
+                if snapshot.pending > 0 {
+                    ui.small(format!("{} pending", snapshot.pending));
+                }
+            });
+        }
         if let Some(error) = self.error.clone().or_else(|| snapshot.error.clone()) {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, error);
@@ -1338,6 +1359,7 @@ impl TerminalApp {
                 egui::Event::Key { key: egui::Key::Escape, pressed: true, modifiers, .. } if !modifiers.any()));
             if escape {
                 editor.focus_input = None;
+                editor.tools_open = false;
                 editor.return_focus = true;
                 // The cancelling frame still belongs to the form. In
                 // particular, an Enter after Escape must not submit a build
@@ -1460,19 +1482,21 @@ impl TerminalApp {
         };
         self.vim9_editors.insert(
             created.session_id,
-            Workbench::new(session, self.config.font_size),
+            Workbench::new(session, self.config.font_size, &self.config.vim9),
         );
         self.tabs.on_session_inserted(created.session_index);
         self.tabs.insert_tab_after_active(created.session_index);
         self.activate_session(created.session_index);
         self.force_resize_session = true;
-        self.sidebar.visible = true;
-        self.sidebar.view = crate::sidebar::SidebarView::Files;
-        if let Some(error) = self.sidebar.set_current_dir(root) {
-            self.set_status_for(
-                format!("Vim9 opened; file tree: {error}"),
-                Duration::from_secs(8),
-            );
+        if self.config.vim9.project_panel {
+            self.sidebar.visible = true;
+            self.sidebar.view = crate::sidebar::SidebarView::Files;
+            if let Some(error) = self.sidebar.set_current_dir(root) {
+                self.set_status_for(
+                    format!("Vim9 opened; file tree: {error}"),
+                    Duration::from_secs(8),
+                );
+            }
         }
         self.schedule_session_save();
     }
@@ -1505,11 +1529,6 @@ impl TerminalApp {
     pub(crate) fn render_vim9_workbench(&mut self, root_ui: &mut egui::Ui) {
         self.vim9_editors
             .retain(|id, _| self.session_manager.index_of(id).is_some());
-        if !self.vim9_editors.is_empty() {
-            root_ui
-                .ctx()
-                .request_repaint_after(Duration::from_millis(100));
-        }
         let id = self
             .session_manager
             .get_active_session_mut()
@@ -1525,14 +1544,45 @@ impl TerminalApp {
                 root_ui.ctx().clone(),
             ));
         }
-        editor.refresh();
+        editor.refresh(self.config.vim9.native_buffer);
         editor.chrome_rects.clear();
-        let toolbar = egui::Panel::top(egui::Id::new(("vim9_workbench", &id)))
-            .resizable(false)
-            .show(root_ui, |ui| {
-                editor.toolbar(ui);
-            });
-        editor.chrome_rects.push(toolbar.response.rect);
+        let config = &self.config.vim9;
+        let chrome_visible = config.toolbar
+            || config.buffer_tabs
+            || config.status_bar
+            || config.tool_panel
+            || editor.tools_open
+            || editor.error.is_some()
+            || editor.snapshot.error.is_some();
+        // Frame revisions wake the native renderer directly. Hidden workbench
+        // metadata need not redraw the whole app ten times per second, and an
+        // editor in a background tab must not keep a shell tab repainting.
+        let metadata_interval = if chrome_visible
+            || editor.problems_open
+            || editor.dialog.is_some()
+            || editor.deferred_action.is_some()
+            || editor.snapshot.pending > 0
+            || !editor.render_subscribed
+            || editor
+                .session
+                .render_snapshot()
+                .is_none_or(|frame| !frame.supported)
+        {
+            100
+        } else {
+            500
+        };
+        root_ui
+            .ctx()
+            .request_repaint_after(Duration::from_millis(metadata_interval));
+        if chrome_visible {
+            let toolbar = egui::Panel::top(egui::Id::new(("vim9_workbench", &id)))
+                .resizable(false)
+                .show(root_ui, |ui| {
+                    editor.toolbar(ui, config);
+                });
+            editor.chrome_rects.push(toolbar.response.rect);
+        }
         if editor.problems_open {
             let problems = egui::Panel::bottom(egui::Id::new(("vim9_problems_panel", &id)))
                 .resizable(true)

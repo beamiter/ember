@@ -124,6 +124,11 @@ pub enum TerminalMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Native Vim buffer rendering is independent from the optional workbench.
+    /// Existing configurations get a focused editor with no extra IDE panels.
+    #[serde(default)]
+    pub vim9: jterm_core::vim9::Vim9UiConfig,
+
     /// ASCII organism in local terminal chrome, enabled unless explicitly disabled.
     #[serde(default = "default_true")]
     pub ascii_organism_enabled: bool,
@@ -647,6 +652,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            vim9: jterm_core::vim9::Vim9UiConfig::default(),
             ascii_organism_enabled: true,
             ascii_organism_expanded: true,
             ascii_organism_motion: None,

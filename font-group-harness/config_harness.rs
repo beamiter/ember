@@ -4,6 +4,9 @@
 // Exact production includes below, with explicitly bounded unrelated stubs.
 extern crate self as jterm_core;
 
+// Keep nested Vim GUI settings identical to the production shared-core type
+// when the font tests serialize and reload the entire configuration.
+pub mod vim9 { pub use shared_core::vim9::Vim9UiConfig; }
 pub mod bottom_bar { pub const ENABLED_BY_DEFAULT: bool = true; }
 pub mod click_cursor { pub const ENABLED_BY_DEFAULT: bool = true; }
 pub mod jsh_install {

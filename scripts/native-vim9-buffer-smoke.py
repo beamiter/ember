@@ -54,7 +54,7 @@ def main():
     quoted = lambda value: "'" + str(value).replace("'", "''") + "'"
     vimrc.write_text(
         "set nocompatible viminfofile=NONE noswapfile nomore notermguicolors\n"
-        "set runtimepath=$VIMRUNTIME packpath=\n"
+        "set runtimepath=$VIMRUNTIME packpath= noloadplugins\n"
         "set nowrap mouse=a laststatus=0 nonumber norelativenumber\n"
         "set nospell nolist conceallevel=0\n"
         f"nnoremap <silent> <C-S> <Cmd>call writefile(['raw_ctrl_s'], {quoted(out / 'raw-control-s.txt')}, 'a')<CR>\n"
@@ -154,6 +154,12 @@ def main():
         xdo("windowfocus", "--sync", window)
         wait_for(lambda: state().get("termguicolors") == 0, "Vim notermguicolors fixture", app)
         report["native_rgb_pixels"] = wait_for(lambda: color_count("native") > 30 and color_count("native"), "GUI RGB pixels", app)
+        # No [vim9] settings are supplied: the text must begin near the normal
+        # tab bar, without an automatically opened project tree or IDE rows.
+        focused = color_regions("focused-buffer-defaults")
+        assert focused["x_regions"][0][0] < 80, focused
+        assert focused["y_regions"][0][0] < 120, focused
+        report["focused_buffer_defaults"] = focused
         xdo("key", "Escape")
         xdo("type", "--clearmodifiers", "--delay", "20", "ggIsaved_native_")
         wait_for(lambda: state().get("text", "").startswith("saved_native_"), "Vim received insert text", app)

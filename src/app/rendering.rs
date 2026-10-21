@@ -2499,8 +2499,9 @@ impl TerminalApp {
             .session_id
             .clone();
         let native_editor = self.vim9_editors.get(&active_id);
-        self.renderer.native_vim9_frame =
-            native_editor.and_then(|editor| editor.session.render_snapshot());
+        self.renderer.native_vim9_frame = native_editor
+            .filter(|_| self.config.vim9.native_buffer)
+            .and_then(|editor| editor.session.render_snapshot());
         self.renderer.native_vim9_font_size =
             native_editor.map(|editor| editor.buffer_font_size.unwrap_or(self.config.font_size));
         self.renderer.font_size = self
@@ -2600,8 +2601,9 @@ impl TerminalApp {
                     .get(session_idx)
                     .and_then(|session| self.vim9_editors.get(&session.metadata.session_id));
                 let renderer = &mut self.pane_renderers[pane_idx];
-                renderer.native_vim9_frame =
-                    native_editor.and_then(|editor| editor.session.render_snapshot());
+                renderer.native_vim9_frame = native_editor
+                    .filter(|_| self.config.vim9.native_buffer)
+                    .and_then(|editor| editor.session.render_snapshot());
                 renderer.native_vim9_font_size = native_editor
                     .map(|editor| editor.buffer_font_size.unwrap_or(self.config.font_size));
                 renderer.font_size = renderer

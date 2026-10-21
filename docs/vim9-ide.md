@@ -1,6 +1,7 @@
 # Native Vim9 IDE
 
-Ember combines a real Vim9 process with native egui workbench controls. Vim
+Ember opens a real Vim9 process with a native egui buffer surface. Optional workbench controls
+are hidden by default so the editing surface owns the available space. Vim
 owns text editing, modes, internal splits, registers, undo, completion, syntax
 and plugins. Keyboard input goes directly to its PTY. Native buttons use the
 shared `jterm_core::vim9` typed channel.
@@ -14,7 +15,7 @@ undercurl, strikethrough, cursor and Visual selection are GUI decorations.
 The native path does not repaint the buffer from ANSI cells or sample colors
 from the terminal palette.
 
-**GUI buffer · RGB** marks the supported buffer view. Vim's command and status
+When the optional toolbar is enabled, **GUI buffer · RGB** marks the supported buffer view. Vim's command and status
 rows and split separators remain in the compatibility surface between buffer
 rectangles. Horizontal, vertical and mixed Vim splits paint every supported
 window through the same native RGB path, including inactive windows. Each
@@ -25,6 +26,15 @@ the label for the runtime's reason. A disconnected bridge or a resized frame
 never leaves an old native frame over the terminal. The logical cell geometry
 is retained for correct Vim mouse/IME positions; proportional text layout,
 arbitrary line heights and native completion popups are not yet implemented.
+
+Native paint rectangles, wide-character carets and the OS IME candidate anchor
+now share the same coordinate mapping. Fractional font metrics and an editor
+inside an offset split no longer send the candidate window through a separately
+rounded terminal-cell rectangle. Pixel coordinates remain clipped to the owning
+buffer window. The shared core also resolves screen cells and buffer byte
+positions to revision-bound anchors, providing the coordinate foundation for
+future floating documentation, Markdown/image previews and color controls.
+Those richer preview widgets are not implemented by this change.
 
 Ctrl+wheel and font-size actions over an editor adjust that editor's font
 without changing shell tabs, workbench/sidebar sizes or the saved config.
@@ -57,7 +67,40 @@ restore or overwrite the saved terminal layout. Editors opened in an ordinary
 workspace coexist with shell tabs and are excluded from shell replay. Save
 your files in Vim before exiting; terminal snapshots do not save editor text.
 
+## Focused buffer defaults
+
+Existing configuration files automatically get the following settings:
+
+```toml
+[vim9]
+native_buffer = true
+toolbar = false
+buffer_tabs = false
+status_bar = false
+project_panel = false
+tool_panel = false
+```
+
+Set only the panels you want to `true` in `~/.config/ember/config.toml`.
+`toolbar` controls the IDE action row, `buffer_tabs` the native buffer strip,
+`status_bar` the extra editor metadata, `project_panel` automatic opening of the
+Files sidebar, and `tool_panel` the file/search/build fields plus initial
+Problems/output panel. The ordinary terminal sidebar remains under its existing
+user controls. Vim's own splits, status line, commands, plugins and modified-file
+protection continue to work when all optional panels are hidden.
+
+The native buffer is independent of these panels. Set `native_buffer = false`
+only to select the compatibility renderer. Ctrl+S, editor font zoom, Quick Open
+and Go to line continue to work in the focused editor. Explicit Search/Build
+commands open a temporary tool row; Escape from its controls or **Close tools**
+hides it again. Search/build results appear only after the action is requested,
+and their **Hide** button returns the space to the buffer. Errors remain visible
+on demand even when the metadata/status panel is disabled.
+
 ## Controls
+
+These controls are available when their corresponding panel is enabled or an
+explicit command opens the temporary tool row.
 
 | Control | Behavior |
 | --- | --- |
@@ -84,7 +127,10 @@ clicking **Build**. Configure Vim `errorformat` for compiler-specific output.
 Successful commands also retain recent output. Lists and output are bounded;
 inspect a truncated quickfix list with `:copen` in Vim. Status shows mode,
 file, modifications, line/column, pending actions, build state and errors.
-Snapshots refresh every 100 ms while an editor is open.
+Workbench metadata refreshes at 100 ms while controls or actions are active.
+An idle focused buffer reduces that metadata repaint to 500 ms; buffer revision
+notifications still wake the renderer immediately, and background editor tabs
+do not add a periodic workbench repaint to shell tabs.
 
 The status line also shows the buffer's line count, file type, encoding and
 number of Vim windows. Cancelled builds are labelled explicitly. Build output

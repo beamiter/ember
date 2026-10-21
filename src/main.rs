@@ -2617,7 +2617,7 @@ impl TerminalApp {
             session.metadata.name = "Vim9 IDE".to_string();
             vim9_editors.insert(
                 first_session_id,
-                vim9_ide::Workbench::new(editor, cfg.font_size),
+                vim9_ide::Workbench::new(editor, cfg.font_size, &cfg.vim9),
             );
         }
         let mut session_manager = SessionManager::new(session, repaint_ctx, configured_shell);
@@ -2752,7 +2752,7 @@ impl TerminalApp {
                 // 三个视图在两种 tab 栏布局下都可用：Top 模式下侧边栏的
                 // Sessions 列表与顶部 tab 栏并存(与 frost 一致)。
                 sb.view = sidebar::effective_view(cfg.sidebar_view, cfg.experimental_task_sidebar);
-                if let Some(root) = startup_root {
+                if let Some(root) = startup_root.filter(|_| cfg.vim9.project_panel) {
                     sb.visible = true;
                     sb.view = sidebar::SidebarView::Files;
                     if let Some(error) = sb.set_current_dir(root) {
