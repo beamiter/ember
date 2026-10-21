@@ -46,6 +46,7 @@ def main():
         + ('app_renderer = "wgpu"\nui_font_size = 14.0\njsh_update_check = "never"\n' if args.app == "ember" else ''),
         encoding="utf-8",
     )
+    (config / "config.toml").chmod(0o600)
     source = out / "project" / "native-buffer.txt"
     original = "GUI_TRUECOLOR_19C3A7\nASCII -> != ==\n中文与组合字 e\u0301\nStyled_underlines\n"
     source.write_text(original, encoding="utf-8")
@@ -110,10 +111,10 @@ def main():
         image = out / f"{name}.png"
         subprocess.run(["import", "-window", str(window), str(image)], env=env, check=True, timeout=5)
         return Image.open(image).convert("RGB")
-    def color_count(name):
+    def color_count(name, rgb=(0x19, 0xc3, 0xa7)):
         image = capture(name)
         counts = image.getcolors(image.width * image.height) or []
-        return sum(count for count, color in counts if color == (0x19, 0xc3, 0xa7))
+        return sum(count for count, color in counts if color == rgb)
     def color_regions(name):
         image = capture(name)
         pixels = image.get_flattened_data() if hasattr(image, "get_flattened_data") else image.getdata()
@@ -154,6 +155,23 @@ def main():
         xdo("windowfocus", "--sync", window)
         wait_for(lambda: state().get("termguicolors") == 0, "Vim notermguicolors fixture", app)
         report["native_rgb_pixels"] = wait_for(lambda: color_count("native") > 30 and color_count("native"), "GUI RGB pixels", app)
+        # These are real plugin decorations, not syntax rules or ANSI colors.
+        command("highlight NativePlugin guifg=#f1a234 guibg=#304050 guisp=#ee3344 gui=italic,undercurl ctermfg=196 ctermbg=21")
+        plugin_rgb = (0xf1, 0xa2, 0x34)
+        for kind, expression in (("regex", "matchadd('NativePlugin', 'ASCII')"),
+                                 ("position", "matchaddpos('NativePlugin', [[3,1,6]])")):
+            command("let g:native_plugin = " + expression)
+            report["plugin_" + kind + "_rgb_pixels"] = wait_for(
+                lambda: state().get("render", {}).get("supported")
+                and color_count("plugin-" + kind, plugin_rgb) > 15
+                and color_count("plugin-" + kind, plugin_rgb),
+                "native plugin " + kind + " GUI pixels", app)
+            assert source.read_text(encoding="utf-8") == original
+            assert state().get("modified") == 0
+            command("call matchdelete(g:native_plugin)")
+            wait_for(lambda: state().get("render", {}).get("supported")
+                     and color_count("plugin-" + kind + "-removed", plugin_rgb) == 0,
+                     "removed plugin " + kind + " paint", app)
         # No [vim9] settings are supplied: the text must begin near the normal
         # tab bar, without an automatically opened project tree or IDE rows.
         focused = color_regions("focused-buffer-defaults")

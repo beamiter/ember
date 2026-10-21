@@ -392,3 +392,28 @@ the real-Vim regression explicitly after its ordinary test suite.
 The PTY test exercises the frontend controller and Vim's real selection/yank;
 it does not certify a desktop trackpad, hardware GPU, Wayland compositor or OS
 IME candidate window. Those interactive environments remain separate checks.
+
+
+## Native plugin highlights
+
+Single-line `matchadd()` / `:match` patterns and byte-based `matchaddpos()`
+positions now use native GUI RGB paint, including the built-in `matchparen`
+plugin. Match priorities, equal-priority insertion order, search precedence,
+Visual selection and independent split-window ownership follow Vim. Plugin
+matches update and disappear without editing the buffer or emitting a special
+invalidation hook. Syntax, properties, text, undo and input remain Vim-owned.
+
+Multiline/context-dependent/zero-width regexes and conceal matches retain an
+explicit compatibility reason. Native paint is bounded to 64 matches and 2048
+positions per window and 512 match/search ranges per source line; exceeding a
+budget shows the real Vim compatibility view instead of partial decoration.
+
+### Plugin validation — 2026-10-21
+
+Pinned shared core: `feae27f7cd965332253a81723095f75850241e81`.
+The 18 native-buffer library tests pass (one opt-in real-input test omitted).
+The locked development build and Xvfb/software-WGPU buffer smoke pass,
+including 43 exact plugin-regex RGB pixels and 37 positional CJK RGB pixels
+with `notermguicolors`, removal without editing, same-batch Escape/Save/input,
+split edit/save/undo, resize, zoom and compatibility recovery. Screenshots were
+inspected. Artifacts: `/tmp/ember-vim9-plugin-feae27f-v2` on the validation host.
