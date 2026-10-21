@@ -75,7 +75,7 @@ def main():
         "let encoded = get(get(info[0], 'variables', {}), 'previousRender', '')\n"
         "if empty(encoded) | return {} | endif\n"
         "let frame = json_decode(encoded)\n"
-        "return {'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0), 'native_pointer': get(get(get(frame, 'windows', []), 0, {}), 'native_pointer', 0), 'scroll_ack': get(get(get(frame, 'windows', []), 0, {}), 'scroll_ack', 0)}\n"
+        "return {'cursor': get(frame, 'cursor', {}), 'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0), 'native_pointer': get(get(get(frame, 'windows', []), 0, {}), 'native_pointer', 0), 'scroll_ack': get(get(get(frame, 'windows', []), 0, {}), 'scroll_ack', 0)}\n"
         "endfunction\n"
         "function! NativeFixtureState(timer) abort\n"
         f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
@@ -192,10 +192,9 @@ def main():
                 part = channel.point([255 if v == value else 0 for v in range(256)])
                 mask = part if mask is None else ImageChops.multiply(mask, part)
             bounds = mask.getbbox()
-            assert bounds is not None, "wheel source highlight disappeared"
-            return bounds[1]
+            return bounds[1] if bounds is not None else None
         xdo("mousemove", "--window", window, "200", "200")
-        start_y = wheel_y("wheel-before")
+        start_y = wait_for(lambda: wheel_y("wheel-before"), "painted wheel source highlight", app)
         started = time.monotonic()
         xdo("click", "--delay", "0", "5")
         trace = []
@@ -213,9 +212,57 @@ def main():
         command("bwipeout!")
         wait_for(lambda: state().get("text") == original.splitlines()[0] and state().get("modified") == 0,
                  "return from disposable wheel buffer", app)
+        # Exercise the actual GUI caret, not the PTY's DECSCUSR drawing.
+        command("let g:saved_gui_cursor = &guicursor | enew | call setline(1, ['M' . nr2char(30028) . 'e' . nr2char(769), ''])")
+        command("highlight GuiTestCursor guifg=#102030 guibg=#e1a273 gui=NONE | highlight GuiTestInsert guifg=#102030 guibg=#73a2e1 gui=NONE | highlight GuiTestReplace guifg=#102030 guibg=#aa44dd gui=NONE")
+        command("set guicursor=n-v:block-GuiTestCursor,i:ver25-GuiTestInsert,r:hor30-GuiTestReplace,a:blinkon0 | normal! gg0")
+        def cursor_region(name, rgb):
+            image = capture(name)
+            pixels = image.getdata()
+            spots = [(i % image.width, i // image.width) for i, color in enumerate(pixels) if color == rgb]
+            if not spots:
+                return None
+            xs, ys = zip(*spots)
+            return {"x": min(xs), "y": min(ys), "width": max(xs)-min(xs)+1,
+                    "height": max(ys)-min(ys)+1, "pixels": len(spots)}
+        def cursor_shape(shape):
+            return state().get("render", {}).get("cursor", {}).get("appearance", {}).get("shape") == shape
+        block_rgb, insert_rgb, replace_rgb = (0xe1, 0xa2, 0x73), (0x73, 0xa2, 0xe1), (0xaa, 0x44, 0xdd)
+        block_cursor = wait_for(lambda: cursor_shape("block") and cursor_region("cursor-block", block_rgb), "native block cursor RGB", app)
+        report["cursor_foreground_pixels"] = color_count("cursor-readable-ink", (0x10, 0x20, 0x30))
+        assert report["cursor_foreground_pixels"] > 0, "solid block must repaint its glyph in the cursor foreground"
+        xdo("key", "Right")
+        wide = wait_for(lambda: state().get("render", {}).get("cursor", {}).get("width") == 2
+                        and cursor_region("cursor-wide", block_rgb), "wide native cursor", app)
+        assert wide["width"] >= block_cursor["width"] * 1.8, (block_cursor, wide)
+        xdo("key", "Left", "i")
+        insert_cursor = wait_for(lambda: cursor_shape("vertical") and cursor_region("cursor-insert", insert_rgb), "native insertion bar RGB", app)
+        assert insert_cursor["width"] < block_cursor["width"] * 0.6, (block_cursor, insert_cursor)
+        assert abs(insert_cursor["height"] - block_cursor["height"]) <= 1, (block_cursor, insert_cursor)
+        xdo("key", "Escape", "R")
+        replace_cursor = wait_for(lambda: cursor_shape("horizontal") and cursor_region("cursor-replace", replace_rgb), "native replacement underline RGB", app)
+        assert replace_cursor["height"] <= block_cursor["height"] * 0.5, (block_cursor, replace_cursor)
+        report["native_cursor"] = {"block": block_cursor, "wide": wide, "insert": insert_cursor, "replace": replace_cursor}
+        command("set guicursor=a:block-GuiTestCursor-blinkwait250-blinkoff180-blinkon180")
+        wait_for(lambda: cursor_shape("block") and state().get("render", {}).get("cursor", {}).get("appearance", {}).get("blinkwait") == 250,
+                 "native blink policy", app)
+        blink_trace = []
+        for _ in range(16):
+            image = ImageGrab.grab(bbox=box, xdisplay=env["DISPLAY"]).convert("RGB")
+            count = sum(count for count, color in (image.getcolors(image.width*image.height) or []) if color == block_rgb)
+            blink_trace.append(count)
+            time.sleep(0.04)
+        assert any(blink_trace) and 0 in blink_trace, ("native blink never alternated", blink_trace)
+        report["native_cursor"]["blink_pixels"] = blink_trace
+        command("let &guicursor = g:saved_gui_cursor | bwipeout!")
+        wait_for(lambda: state().get("text") == original.splitlines()[0] and state().get("modified") == 0,
+                 "return from disposable cursor buffer", app)
         # No [vim9] settings are supplied: the text must begin near the normal
         # tab bar, without an automatically opened project tree or IDE rows.
-        focused = color_regions("focused-buffer-defaults")
+        def focused_native():
+            regions = color_regions("focused-buffer-defaults")
+            return regions if regions["x_regions"] and regions["y_regions"] else None
+        focused = wait_for(focused_native, "native buffer repainted after cursor fixture", app)
         assert focused["x_regions"][0][0] < 80, focused
         assert focused["y_regions"][0][0] < 120, focused
         report["focused_buffer_defaults"] = focused

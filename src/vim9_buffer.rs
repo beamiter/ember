@@ -6,9 +6,10 @@
 
 use egui::{self, Color32, FontId, Rect, Stroke};
 use jterm_core::vim9::{
-    Vim9BufferPosition, Vim9Command, Vim9InputSnapshot, Vim9PixelRect, Vim9PixelScroll,
-    Vim9PointerPhase, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderStyle,
-    Vim9RenderWindow, Vim9ScrollAnimation, Vim9Session, Vim9Viewport, Vim9ViewportAnchor,
+    Vim9BufferPosition, Vim9Command, Vim9CursorBlink, Vim9InputSnapshot, Vim9PixelRect,
+    Vim9PixelScroll, Vim9PointerPhase, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect,
+    Vim9RenderStyle, Vim9RenderWindow, Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
+    Vim9ViewportAnchor,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -557,6 +558,7 @@ fn pointer_command(
 /// State is bound to the editor's identity, never a renderer's reused pane.
 #[derive(Default)]
 pub(crate) struct ScrollPresentation {
+    cursor_blink: std::cell::RefCell<Vim9CursorBlink>,
     identity: Option<uuid::Uuid>,
     current: Option<Arc<Vim9RenderFrame>>,
     windows: HashMap<i64, WindowScroll>,
@@ -580,7 +582,11 @@ impl ScrollPresentation {
         enabled: bool,
         direct_input: bool,
     ) {
+        if self.identity != identity || frame.is_none() {
+            self.cursor_blink.borrow_mut().reset();
+        }
         if direct_input {
+            self.cursor_blink.borrow_mut().reset();
             // A click must address the cells actually visible in Vim. Do not
             // animate a delayed acknowledgement of keyboard navigation either.
             self.suspend_until = now + 0.15;
@@ -809,6 +815,16 @@ pub(crate) fn paint(
     {
         return;
     }
+    let cursor_on = if frame.cursor.appearance.is_some() {
+        let mut blink = scroll.cursor_blink.borrow_mut();
+        let (on, next) = blink.sample(frame, focused, std::time::Instant::now());
+        if let Some(delay) = next {
+            painter.ctx().request_repaint_after(delay);
+        }
+        on
+    } else {
+        cursor_on
+    };
     if let Some(direct) = direct.filter(|_| !frame.windows.is_empty()) {
         paint_direct(
             painter,
@@ -936,10 +952,79 @@ fn paint_direct(
         }
         if window.window == frame.window && (!focused || cursor_on) {
             if let Some(cursor) = viewport.cursor_rect().map(gui_rect) {
-                paint_caret(&painter, cursor, &frame.mode, focused, normal_fg);
+                if !paint_native_cursor(
+                    &painter,
+                    frame,
+                    cursor,
+                    geometry,
+                    font_size,
+                    focused,
+                    viewport.runs().map(|p| (p.run, gui_rect(p.rect))),
+                ) {
+                    paint_caret(&painter, cursor, &frame.mode, focused, normal_fg);
+                }
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_native_cursor<'a>(
+    painter: &egui::Painter,
+    frame: &Vim9RenderFrame,
+    cell: Rect,
+    geometry: Vim9RenderMetrics,
+    font_size: f32,
+    focused: bool,
+    runs: impl Iterator<Item = (&'a jterm_core::vim9::Vim9RenderRun, Rect)>,
+) -> bool {
+    let Some(appearance) = &frame.cursor.appearance else {
+        return false;
+    };
+    let runs: Vec<_> = runs.filter(|(_, rect)| rect.intersects(cell)).collect();
+    let under = runs
+        .iter()
+        .find(|(_, rect)| rect.contains(cell.center()))
+        .map_or(&frame.default_style, |(run, _)| &run.style);
+    let (fg, bg) = appearance.colors(under, &frame.default_style);
+    if !focused {
+        painter.rect_stroke(
+            cell.shrink(0.5),
+            0.0,
+            Stroke::new(1.0, rgb(bg)),
+            egui::StrokeKind::Inside,
+        );
+        return true;
+    }
+    let caret = gui_rect(appearance.paint_rect(
+        Vim9PixelRect {
+            x: cell.left(),
+            y: cell.top(),
+            width: cell.width(),
+            height: cell.height(),
+        },
+        geometry.cell_width,
+        painter.ctx().pixels_per_point(),
+    ));
+    painter.rect_filled(caret, 0.0, rgb(bg));
+    for (run, rect) in runs {
+        let mut ink = run.clone();
+        ink.style.foreground = Some(fg);
+        ink.style.background = Some(bg);
+        ink.style.special = Some(fg);
+        ink.style.reverse = false;
+        paint_run(
+            painter,
+            &ink,
+            &frame.default_style,
+            rect,
+            caret,
+            geometry.cell_width,
+            geometry.line_height,
+            font_size,
+        );
+    }
+    true
 }
 
 fn paint_caret(painter: &egui::Painter, cursor: Rect, mode: &str, focused: bool, color: Color32) {
@@ -1042,6 +1127,25 @@ fn paint_view(
         let Some(cursor) = geometry.cursor_rect(&frame.cursor).map(gui_rect) else {
             return;
         };
+        if paint_native_cursor(
+            &painter,
+            frame,
+            cursor,
+            geometry,
+            font_size,
+            focused,
+            frame
+                .runs
+                .iter()
+                .filter(|r| logical_view.contains(r.row, r.column))
+                .filter_map(|r| {
+                    geometry
+                        .cell_rect(r.row, r.column, r.cells)
+                        .map(|rect| (r, gui_rect(rect)))
+                }),
+        ) {
+            return;
+        }
         if focused && (frame.mode.starts_with('i') || frame.mode.starts_with('R')) {
             let caret = Rect::from_min_size(cursor.min, egui::vec2(2.0, line_height));
             painter.rect_filled(caret, 0.0, normal_fg);
@@ -1177,6 +1281,7 @@ mod tests {
             columns: 10,
         };
         let cursor = Vim9RenderCursor {
+            appearance: None,
             row: 1,
             column: 1,
             width: 1,

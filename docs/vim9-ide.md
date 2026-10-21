@@ -453,3 +453,46 @@ font zoom and compatibility recovery. PNG encoding is deferred until after
 XCB pixel sampling to keep screenshot I/O out of the gesture.
 
 Observed highlight Y positions: 438 → 437 → 383 → 359 pixels. These sparse samples verify actual intermediate positions, not a frame-rate guarantee. Artifacts: `/tmp/ember-vim9-wheel-2b00c1d-v4`.
+
+
+## Vim-owned native cursor — 2026-10-21
+
+Shared core: `2fa91124b7890acb97b2d628c57b84e92d9b6d38`. The native buffer
+now follows Vim's `guicursor` shape, percentage, GUI RGB highlight and blink
+timings. Normal/Visual, exclusive Visual, operator-pending, Insert and Replace
+have independent settings. Ordered `a:` overlays and linked highlight groups
+are preserved; the second highlight applies when language mappings are active
+in Insert/Replace. An unspecified group reverses the actual syntax/selection
+colors; an explicitly cleared group retains its configured appearance.
+
+A solid block repaints the source glyph in the cursor foreground so Latin,
+CJK and combining text remain readable. Thin bars change only cursor paint;
+source hit testing and the IME anchor retain their full character rectangle.
+Cursor-only updates retain the existing text-shaping cache. Unfocused cursors
+use steady outlines. Blink timing follows `blinkwait`, then `blinkoff`/`blinkon`;
+any zero value disables blinking. Input, source and mode changes restart the
+wait, while unrelated render revisions do not.
+
+For a steady block in Normal/Visual, a 25% insertion bar and a 20% replacement
+underline, put this in the usual vimrc:
+
+```vim
+highlight Cursor guifg=#20242c guibg=#d8dee9
+highlight InsertCursor guifg=#20242c guibg=#73a2e1
+set guicursor=n-v:block-Cursor,i:ver25-InsertCursor,r:hor20-Cursor,a:blinkon0
+```
+
+Existing frames without `appearance` retain their compatibility cursor.
+Command-line, popup and other unsupported views still use Vim's live terminal
+surface. Native showmatch timing is not inferred from terminal output.
+
+Validation: locked build, all-target/all-feature Clippy (`-D warnings`), focused
+native-buffer tests and the full Xvfb/software-GPU smoke pass. The window test
+measured block 12×26, CJK 24×26, insertion 3×26
+and replacement 12×8 pixel rectangles, with 34 exact cursor-foreground pixels
+under the solid block. XCB samples alternate visible/hidden cursor pixels.
+Existing plugin RGB, wheel, edit/save/undo, split, resize, font-zoom and fallback
+checks remain passing. Artifacts: `/tmp/ember-vim9-cursor-2fa9112-v3`.
+The shared core passes 80 Rust Vim9 checks plus the explicit real-PTY round
+trip and 99 real-Vim runtime regressions. These are X11/software-renderer
+checks, not a physical-display or Wayland performance certification.
