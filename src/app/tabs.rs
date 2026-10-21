@@ -1462,7 +1462,7 @@ impl TerminalApp {
         let vim9_launch_clicked = crate::vim9_ide::launch_button(
             ui,
             egui::Rect::from_min_size(
-                egui::pos2(tab_rect.left() + 65.0, tab_rect.top() + 5.0),
+                egui::pos2(tab_rect.right() - 120.0, tab_rect.top() + 5.0),
                 egui::vec2(52.0, tab_height - 10.0),
             ),
             font_size,
@@ -1525,7 +1525,7 @@ impl TerminalApp {
             self.render_blocks_nav_toggle(
                 ui,
                 egui::Rect::from_min_size(
-                    egui::pos2(tab_rect.left() + 123.0, tab_rect.top() + 5.0),
+                    egui::pos2(tab_rect.right() - 62.0, tab_rect.top() + 5.0),
                     egui::vec2(26.0, tab_height - 10.0),
                 ),
                 font_size,
@@ -1584,10 +1584,10 @@ impl TerminalApp {
         let active_min_width: f32 = min_tab_width * 2.0; // 当前 session 最小宽度，更突出
         let tab_spacing: f32 = 1.0;
         let base_left_margin: f32 = 5.0;
-        // 顶栏左侧预留侧边栏、标签栏位置和 Vim9 启动控件，避免遮挡标签。
+        // 左侧保留侧边栏和标签栏位置开关，右侧预留 Vim9、Blocks 及窗口控件。
         let ctrl_btn_w: f32 = font_size + 16.0;
-        let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0 + 90.0;
-        let reserved_right: f32 = 80.0; // "+"按钮 + 关闭窗口按钮 + margin
+        let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0;
+        let reserved_right: f32 = 170.0; // "+"、Vim9、Blocks、关闭窗口按钮及间距
         let tab_clip_rect = egui::Rect::from_min_max(
             egui::pos2(tab_rect.left() + left_margin, tab_rect.top()),
             egui::pos2(tab_rect.right() - reserved_right, tab_rect.bottom()),
@@ -1800,10 +1800,7 @@ impl TerminalApp {
         let vim9_launch_clicked = crate::vim9_ide::launch_button(
             ui,
             egui::Rect::from_min_size(
-                egui::pos2(
-                    tab_rect.left() + base_left_margin + ctrl_btn_w * 2.0,
-                    tab_rect.top() + 5.0,
-                ),
+                egui::pos2(tab_rect.right() - 120.0, tab_rect.top() + 5.0),
                 egui::vec2(52.0, tab_height - 10.0),
             ),
             font_size,
@@ -1812,10 +1809,7 @@ impl TerminalApp {
             self.render_blocks_nav_toggle(
                 ui,
                 egui::Rect::from_min_size(
-                    egui::pos2(
-                        tab_rect.left() + base_left_margin + ctrl_btn_w * 2.0 + 58.0,
-                        tab_rect.top() + 5.0,
-                    ),
+                    egui::pos2(tab_rect.right() - 62.0, tab_rect.top() + 5.0),
                     egui::vec2(26.0, tab_height - 10.0),
                 ),
                 font_size,
