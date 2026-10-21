@@ -2499,6 +2499,8 @@ impl TerminalApp {
             .session_id
             .clone();
         let native_editor = self.vim9_editors.get(&active_id);
+        self.renderer.native_vim9_identity = native_editor.map(|editor| editor.session.entry_id());
+        self.renderer.native_vim9_smooth_scroll = self.config.vim9.smooth_scroll;
         self.renderer.native_vim9_frame = native_editor
             .filter(|_| self.config.vim9.native_buffer)
             .and_then(|editor| editor.session.render_snapshot());
@@ -2601,6 +2603,9 @@ impl TerminalApp {
                     .get(session_idx)
                     .and_then(|session| self.vim9_editors.get(&session.metadata.session_id));
                 let renderer = &mut self.pane_renderers[pane_idx];
+                renderer.native_vim9_identity =
+                    native_editor.map(|editor| editor.session.entry_id());
+                renderer.native_vim9_smooth_scroll = self.config.vim9.smooth_scroll;
                 renderer.native_vim9_frame = native_editor
                     .filter(|_| self.config.vim9.native_buffer)
                     .and_then(|editor| editor.session.render_snapshot());

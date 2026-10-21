@@ -144,6 +144,7 @@ pub struct TerminalApp {
     pub(crate) vim9_editors: std::collections::HashMap<String, crate::vim9_ide::Workbench>,
     pub(crate) vim9_window_close_pending: bool,
     pub(crate) vim9_pending_tab_closes: Vec<Vec<String>>,
+    pub(crate) vim9_shell_entry_session: Option<String>,
     pub renderer: TerminalRenderer,
     pub clipboard: Option<ClipboardManager>,
     /// Serializes OSC 5522 clipboard reads. Clipboard owners are external

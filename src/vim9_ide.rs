@@ -379,6 +379,7 @@ impl DeferredAction {
 pub(crate) struct Workbench {
     pub(crate) session: Vim9Session,
     pub(crate) buffer_font_size: Option<f32>,
+    scroll_input: jterm_core::vim9::Vim9ScrollAccumulator,
     render_subscribed: bool,
     render_wake: Option<RenderWake>,
     deferred_action: Option<DeferredAction>,
@@ -407,6 +408,7 @@ impl Workbench {
         Self {
             session,
             buffer_font_size: Some(crate::config::Config::clamp_font_size(font_size)),
+            scroll_input: Default::default(),
             render_subscribed: false,
             render_wake: None,
             deferred_action: None,
@@ -1102,11 +1104,13 @@ impl Workbench {
     }
 }
 
-/// Only `--ide` consumes a following path; other terminal invocations retain
-/// their previous behavior. OsString keeps non-UTF8 input intact until core
-/// can report a proper path diagnostic.
+/// The managed shell's Vim launcher and explicit `--ide` actions enter the
+/// same native editor. OsString preserves every shell-expanded Vim argument.
 pub(crate) fn startup_target() -> Result<Option<Vim9EntryRequest>, String> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(request) = jterm_core::vim9::shell_vim_request(&args)? {
+        return Ok(Some(request));
+    }
     jterm_core::vim9::explicit_ide_target(&args)
         .map(|target| target.map(Vim9EntryRequest::command_line))
 }
@@ -1134,6 +1138,140 @@ impl Drop for Workbench {
 }
 
 impl TerminalApp {
+    /// A shell launch is a synchronous editor command: its original shell
+    /// resumes when this process returns Vim's real status, not a replacement
+    /// shell tab. Other ordinary editor launches keep their workspace behavior.
+    pub(crate) fn finish_shell_vim_exit(
+        &mut self,
+        id: &str,
+        code: Option<i32>,
+        ctx: &egui::Context,
+    ) -> bool {
+        if self.vim9_shell_entry_session.as_deref() != Some(id) {
+            return false;
+        }
+        self.vim9_shell_entry_session = None;
+        self.vim9_window_close_pending = false;
+        crate::VIM9_SHELL_EXIT_STATUS.store(
+            shell_exit_status(code),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        true
+    }
+
+    /// Coalesce native wheel events once per UI frame. The bridge targets the
+    /// hovered Vim split, preserves fractional trackpad motion and avoids a
+    /// burst of legacy mouse reports with Vim's per-report line multiplier.
+    pub(crate) fn handle_vim9_scroll(&mut self, ctx: &egui::Context) {
+        if !self.config.vim9.native_buffer
+            || self.frame_events.iter().any(is_keyboard_event)
+            || ctx.input(|input| input.pointer.any_pressed() || input.pointer.any_down())
+        {
+            return;
+        }
+        let Some(pointer) = ctx.input(|input| input.pointer.hover_pos()) else {
+            return;
+        };
+        let renderer = if self.layout().panes().len() > 1 {
+            let Some(index) = self
+                .layout()
+                .panes()
+                .iter()
+                .position(|pane| pane.id == self.layout().focused_pane_id)
+            else {
+                return;
+            };
+            let Some(renderer) = self.pane_renderers.get(index) else {
+                return;
+            };
+            renderer
+        } else {
+            &self.renderer
+        };
+        let Some(content) = renderer
+            .last_content_rect
+            .filter(|rect| rect.contains(pointer))
+        else {
+            return;
+        };
+        let (cell_width, line_height) = (renderer.char_width, renderer.line_height);
+        if cell_width <= 0.0 || line_height <= 0.0 {
+            return;
+        }
+        let session = self.session_manager.get_active_session_mut();
+        if session.purpose == crate::session::SessionPurpose::RetainedCommand
+            || !session.pending_input.is_empty()
+            || !matches!(session.shell.input_drained(), Ok(true))
+            || session.terminal.lock().selection.is_some()
+        {
+            return;
+        }
+        let Some(editor) = self.vim9_editors.get_mut(&session.metadata.session_id) else {
+            return;
+        };
+        if editor.deferred_action.is_some() {
+            return;
+        }
+        let Some(frame) = editor
+            .session
+            .render_snapshot()
+            .filter(|frame| frame.supported)
+        else {
+            editor.scroll_input.clear();
+            return;
+        };
+        let row = ((pointer.y - content.top()) / line_height) as usize;
+        let column = ((pointer.x - content.left()) / cell_width) as usize;
+        let Some(window) = frame
+            .windows
+            .iter()
+            .find(|window| window.view.contains(row, column))
+        else {
+            return;
+        };
+        let mut next_input = editor.scroll_input.clone();
+        let mut lines: i32 = 0;
+        let mut consumed = false;
+        for event in &self.frame_events {
+            if let Some(delta) =
+                crate::vim9_buffer::wheel_lines(event, line_height, window.view.rows)
+            {
+                consumed = true;
+                lines = lines
+                    .saturating_add(next_input.add(window.window, delta))
+                    .clamp(-120, 120);
+            }
+        }
+        if !consumed {
+            return;
+        }
+        if lines != 0
+            && editor
+                .session
+                .send(Vim9Command::Scroll {
+                    window: window.window,
+                    lines,
+                })
+                .is_err()
+        {
+            // Nothing was admitted, so the original events retain the normal
+            // terminal fallback and the fractional state is not committed.
+            return;
+        }
+        editor.scroll_input = next_input;
+        self.frame_events.retain(|event| {
+            crate::vim9_buffer::wheel_lines(event, line_height, window.view.rows).is_none()
+        });
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                crate::vim9_buffer::wheel_lines(event, line_height, window.view.rows).is_none()
+            });
+            input.smooth_scroll_delta.y = 0.0;
+        });
+        ctx.request_repaint();
+    }
+
     pub(crate) fn defer_vim9_action(
         &mut self,
         ctx: &egui::Context,
@@ -1642,6 +1780,14 @@ impl TerminalApp {
             self.set_status_for("Vim is checking modified buffers. Save your changes or use :qa! in Vim to discard them.", Duration::from_secs(8));
         }
         requested
+    }
+}
+
+fn shell_exit_status(code: Option<i32>) -> i32 {
+    match code {
+        Some(code) if code >= 0 => code.min(255),
+        Some(signal) => 128i32.saturating_add(signal.saturating_abs()).min(255),
+        None => 1,
     }
 }
 

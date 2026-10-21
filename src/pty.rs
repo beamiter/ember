@@ -1,6 +1,14 @@
 use anyhow::{anyhow, Result};
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static AUTO_VIM_GUI: AtomicBool = AtomicBool::new(true);
+
+/// Child-only shell integration; no global environment or shell files change.
+pub fn set_auto_vim_gui(enabled: bool) {
+    AUTO_VIM_GUI.store(enabled, Ordering::Relaxed);
+}
 
 /// The descriptor-pinning capability now lives in
 /// [`jterm_core::agent_task::pinned_dir`], which is where the agent-task
@@ -642,16 +650,36 @@ mod unix_pty {
                     };
 
                     if let Some(bash_path) = bash_path {
-                        let exec_cmd =
-                            jterm_core::process::build_jsh_exec_command(&shell_path, session_id);
-                        (
-                            CString::new(bash_path).map_err(|_| anyhow!("Invalid bash path"))?,
+                        let args = if AUTO_VIM_GUI.load(Ordering::Relaxed) {
+                            let mut args = vec![
+                                CString::new("bash").unwrap(),
+                                CString::new("-ic").unwrap(),
+                                CString::new(jterm_core::vim9::VIM9_SHELL_EXEC).unwrap(),
+                                CString::new(shell_path.as_str())
+                                    .map_err(|_| anyhow!("Invalid wrapped shell path"))?,
+                            ];
+                            if let Some(sid) = session_id {
+                                args.push(CString::new("--session").unwrap());
+                                args.push(
+                                    CString::new(sid).map_err(|_| anyhow!("Invalid session ID"))?,
+                                );
+                            }
+                            args
+                        } else {
+                            let exec_cmd = jterm_core::process::build_jsh_exec_command(
+                                &shell_path,
+                                session_id,
+                            );
                             vec![
                                 CString::new("bash").unwrap(),
                                 CString::new("-ic").unwrap(),
                                 CString::new(exec_cmd)
                                     .map_err(|_| anyhow!("Invalid wrapped shell command"))?,
-                            ],
+                            ]
+                        };
+                        (
+                            CString::new(bash_path).map_err(|_| anyhow!("Invalid bash path"))?,
+                            args,
                         )
                     } else {
                         // argv[0] prefixed with '-' requests login-shell
@@ -697,13 +725,44 @@ mod unix_pty {
                 // 非异步信号安全的 setenv)。直接把构建好的 envp 传给 execve。
                 // 策略与变量集合由 jterm_core::child_env 持有,四个终端共用;这里
                 // 只声明 ember 的选择 —— LESS=FR、UTF-8 locale 修正、不接管 ls 颜色。
-                let command_environment =
-                    cwd_directory.is_some().then(validation_command_environment);
-                let env_cstrings = jterm_core::child_env::envp(
-                    &child_environment(),
-                    command_environment.as_ref().map_or(&[], |extra| extra),
-                )
-                .map_err(|error| anyhow!("Invalid child environment: {error}"))?;
+                let shell_vim = if command_argv.is_none()
+                    && cwd_directory.is_none()
+                    && AUTO_VIM_GUI.load(Ordering::Relaxed)
+                {
+                    std::env::current_exe()
+                        .and_then(|exe| jterm_core::vim9::Vim9ShellIntegration::prepare(&exe))
+                        .inspect_err(|error| {
+                            eprintln!("[Vim9] Automatic GUI entry unavailable: {error}");
+                        })
+                        .ok()
+                } else {
+                    None
+                };
+                let mut command_environment: Vec<(String, String)> = if cwd_directory.is_some() {
+                    validation_command_environment()
+                        .into_iter()
+                        .map(|(key, value)| (key.into(), value.into()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if let Some(integration) = shell_vim {
+                    command_environment.extend(integration.env());
+                } else if command_argv.is_none()
+                    && cwd_directory.is_none()
+                    && !AUTO_VIM_GUI.load(Ordering::Relaxed)
+                {
+                    // A nested terminal may inherit its parent's shim and
+                    // Bash function. Its own disabled setting still wins.
+                    command_environment.push(("JTERM_VIM9_AUTO_GUI".into(), "0".into()));
+                }
+                let extra_environment: Vec<_> = command_environment
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str()))
+                    .collect();
+                let env_cstrings =
+                    jterm_core::child_env::envp(&child_environment(), &extra_environment)
+                        .map_err(|error| anyhow!("Invalid child environment: {error}"))?;
                 let mut envp: Vec<*const libc::c_char> =
                     env_cstrings.iter().map(|c| c.as_ptr()).collect();
                 envp.push(std::ptr::null());

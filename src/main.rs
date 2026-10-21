@@ -101,6 +101,7 @@ const WINDOW_ICON_PNG: &[u8] = include_bytes!("../data/io.github.beamiter.ember-
 /// A nonzero shell exit inside this window after spawn means the shell never
 /// became interactive: no human could have typed `exit` that fast.
 const SHELL_STARTUP_GRACE: Duration = Duration::from_millis(1500);
+static VIM9_SHELL_EXIT_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 #[cfg(test)]
 static NEXT_KITTY_PASTE_IMAGE_ID: AtomicU32 = AtomicU32::new(1);
 #[cfg(test)]
@@ -801,7 +802,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let cfg = std::sync::Arc::new(cfg);
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Ember",
         options,
         Box::new(move |cc| {
@@ -828,7 +829,14 @@ fn main() -> Result<(), eframe::Error> {
             .map(|app| Box::new(app) as Box<dyn eframe::App>)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
         }),
-    )
+    );
+    if result.is_ok() {
+        let code = VIM9_SHELL_EXIT_STATUS.load(Ordering::Relaxed);
+        if code >= 0 {
+            std::process::exit(code);
+        }
+    }
+    result
 }
 
 // TerminalApp struct definition moved to app::state module
@@ -2466,7 +2474,12 @@ impl TerminalApp {
         repaint_ctx: egui::Context,
         wgpu_render_state: Option<egui_wgpu::RenderState>,
     ) -> std::result::Result<Self, String> {
-        let startup_editor = vim9_ide::startup_target()?
+        crate::pty::set_auto_vim_gui(cfg.vim9.auto_gui);
+        let startup_request = vim9_ide::startup_target()?;
+        let shell_entry = startup_request
+            .as_ref()
+            .is_some_and(|request| request.is_shell_command());
+        let startup_editor = startup_request
             .map(jterm_core::vim9::Vim9Session::start)
             .transpose()
             .map_err(|e| format!("Vim9 IDE could not start: {e}"))?;
@@ -2612,6 +2625,7 @@ impl TerminalApp {
             first_session_id.clone(),
         );
         let mut vim9_editors = std::collections::HashMap::new();
+        let vim9_shell_entry_session = shell_entry.then(|| first_session_id.clone());
         if let Some(editor) = startup_editor {
             session.purpose = crate::session::SessionPurpose::EphemeralCommand;
             session.metadata.name = "Vim9 IDE".to_string();
@@ -2715,6 +2729,7 @@ impl TerminalApp {
             vim9_editors,
             vim9_window_close_pending: false,
             vim9_pending_tab_closes: Vec::new(),
+            vim9_shell_entry_session,
             renderer,
             clipboard,
             clipboard_request_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2852,6 +2867,7 @@ impl TerminalApp {
     }
 
     fn apply_runtime_config(&mut self, ctx: &egui::Context) {
+        crate::pty::set_auto_vim_gui(self.config.vim9.auto_gui);
         self.osc52_read_allowed
             .store(self.config.osc52_clipboard_read, Ordering::Release);
         if !self.config.command_cards_enabled() {
@@ -5947,6 +5963,9 @@ impl eframe::App for TerminalApp {
             if let Some(editor) = self.vim9_editors.remove(&session_id) {
                 editor.session.revoke();
             }
+            if self.finish_shell_vim_exit(&session_id, exit_code, ctx) {
+                return;
+            }
             let terminal_role = self.task_manager.terminal_role_for_session(&session_id);
             let task_terminal = self.handle_task_terminal_exit(&session_id, exit_code);
             let Some(session_idx) = self.session_manager.index_of(&session_id) else {
@@ -6092,6 +6111,9 @@ impl eframe::App for TerminalApp {
             }
         }
 
+        if !ui_input_blocked && !terminal_input_blocked {
+            self.handle_vim9_scroll(ctx);
+        }
         self.prepare_organism(ctx);
         let active_session_idx = self.session_manager.active_index();
         let active_pane_renderer_idx = (self.layout().panes().len() > 1).then(|| {
@@ -7969,6 +7991,9 @@ impl eframe::App for TerminalApp {
         drop(session);
 
         if shell_exit_observed {
+            if self.finish_shell_vim_exit(&active_session_id, shell_exit_code, ctx) {
+                return;
+            }
             self.handle_task_terminal_exit(&active_session_id, shell_exit_code);
             if retain_exited_task_terminal {
                 self.session_manager

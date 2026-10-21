@@ -1331,6 +1331,9 @@ pub struct TerminalRenderer {
     /// compatibility surface outside this frame's buffer rectangle.
     pub native_vim9_frame: Option<std::sync::Arc<jterm_core::vim9::Vim9RenderFrame>>,
     pub native_vim9_font_size: Option<f32>,
+    pub(crate) native_vim9_identity: Option<uuid::Uuid>,
+    pub(crate) native_vim9_smooth_scroll: bool,
+    native_vim9_scroll: crate::vim9_buffer::ScrollPresentation,
     /// Same-frame native active-card free space; never terminal or PTY allocation.
     pub companion_surface: Option<(String, ProjectionCacheKey, egui::Rect)>,
     pub companion_enabled: bool,
@@ -1507,6 +1510,9 @@ impl TerminalRenderer {
             last_content_rect: None,
             native_vim9_frame: None,
             native_vim9_font_size: None,
+            native_vim9_identity: None,
+            native_vim9_smooth_scroll: true,
+            native_vim9_scroll: Default::default(),
             companion_surface: None,
             companion_enabled: false,
             companion_status_surface: None,
@@ -4240,6 +4246,30 @@ impl TerminalRenderer {
                     && terminal.selection.is_none()
             })
             .cloned();
+        let native_time = ui.ctx().input(|input| input.time);
+        let direct_input = ui.ctx().input(|input| {
+            input.pointer.any_pressed()
+                || input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key { pressed: true, .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Ime(_)
+                    )
+                })
+        });
+        self.native_vim9_scroll.update(
+            self.native_vim9_identity,
+            native_buffer.as_ref(),
+            line_height,
+            native_time,
+            self.native_vim9_smooth_scroll,
+            direct_input,
+        );
+        if self.native_vim9_scroll.active(native_time) {
+            ui.ctx().request_repaint();
+        }
 
         // eprintln!("[UI] Rect: {:?}", rect);
 
@@ -4327,7 +4357,13 @@ impl TerminalRenderer {
         let ime_rect = native_buffer
             .as_ref()
             .and_then(|frame| {
-                crate::vim9_buffer::cursor_rect(frame, content_rect, char_width, line_height)
+                crate::vim9_buffer::cursor_rect(
+                    frame,
+                    content_rect,
+                    char_width,
+                    line_height,
+                    self.native_vim9_scroll.offset(frame.window, native_time),
+                )
             })
             .unwrap_or_else(|| {
                 cursor_rect(
@@ -5103,6 +5139,8 @@ impl TerminalRenderer {
                 self.font_size,
                 focus_enabled,
                 cursor_visible,
+                &self.native_vim9_scroll,
+                native_time,
             );
         }
 

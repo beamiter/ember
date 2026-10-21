@@ -44,6 +44,30 @@ advances instead of substituting an unrelated proportional face.
 
 ## Start
 
+In an Ember local shell, type the normal Vim command:
+
+```sh
+vim src/main.rs
+vim +42 'file with spaces.rs'
+vim -p first.rs second.rs
+```
+
+The shell-expanded arguments, working directory and existing Vim configuration
+are preserved. A focused native editor window opens and the invoking shell waits
+until it closes, then returns the editor's exit status. The shell's command line
+is not parsed or rewritten by the GUI. This also means shell quoting, globs and
+Vim startup options retain their normal meaning.
+
+Automatic entry is installed only in new local interactive shell environments.
+It does not edit your shell files. Explicit command/Agent sessions, remote SSH
+commands and noninteractive Vim invocations retain their normal execution.
+Aliases or shell profiles that replace `vim`/`PATH` can deliberately bypass the
+launcher. Use `JTERM_VIM9_AUTO_GUI=0 vim file` or the absolute Vim executable for
+a one-off terminal session; `[vim9] auto_gui = false` disables injection for
+new shell sessions. `nvim` remains separate.
+
+Explicit editor launches remain available:
+
 ```sh
 ember --ide /path/to/project
 ember --ide /path/to/project/src/main.rs
@@ -58,7 +82,9 @@ editor at the active terminal's local working directory. The command palette
 also has **Vim9 IDE: Open Project**; custom keybindings can target `ide:open`.
 
 Vim 9 requires `+vim9script`, `+channel`, `+job`, `+timers` and `+quickfix`.
-Use `JTERM_VIM9_BIN` to select an executable. The bridge is embedded in the
+For explicit editor launches, use `JTERM_VIM9_BIN` to select an executable.
+Shell-launched Vim uses the executable resolved from the shell's `PATH`.
+The bridge is embedded in the
 shared core and prepared automatically. Your existing Vim configuration loads
 normally. Vim startup errors remain visible in its terminal grid.
 
@@ -73,7 +99,9 @@ Existing configuration files automatically get the following settings:
 
 ```toml
 [vim9]
+auto_gui = true
 native_buffer = true
+smooth_scroll = true
 toolbar = false
 buffer_tabs = false
 status_bar = false
@@ -96,6 +124,27 @@ commands open a temporary tool row; Escape from its controls or **Close tools**
 hides it again. Search/build results appear only after the action is requested,
 and their **Hide** button returns the space to the buffer. Errors remain visible
 on demand even when the metadata/status panel is disabled.
+
+## Native scrolling and text detail
+
+Wheel input is coalesced once per frame and targets the Vim split under the
+pointer. One wheel notch moves three lines. Trackpad pixel distances are divided
+by the actual line height, preserving fractional movement independently in each
+split. Ctrl+wheel retains editor font zoom. Input mixed with keyboard activity
+keeps its ordinary terminal route so semantic requests cannot overtake text.
+
+After Vim acknowledges a viewport change, Ember eases that split's native text
+over 100 ms using elapsed time, independent of monitor refresh rate. Previous
+edge rows remain clipped beneath the new content during the transition, so a
+scroll does not reveal a blank band. The cursor and IME anchor use the same
+translation. Keyboard input, mouse presses, edits, zoom, layout changes,
+unsupported views and changing editors settle the surface immediately. Large
+jumps remain immediate. Set `[vim9] smooth_scroll = false` for no animation;
+precision wheel accumulation remains available.
+
+Undercurls use a continuous antialiased wave with physical-pixel sampling and
+shared phase across adjoining syntax runs. Decoration thickness follows display
+scale without changing Vim's logical hit-testing geometry.
 
 ## Controls
 
