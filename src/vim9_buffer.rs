@@ -150,6 +150,16 @@ impl DirectInput {
         self.scrolls.values().any(Vim9PixelScroll::is_animating)
     }
 
+    /// Poll an outstanding viewport acknowledgement on the display clock,
+    /// including while source margins temporarily block further movement.
+    pub fn needs_frame(&self) -> bool {
+        self.animating()
+            || self
+                .scrolls
+                .values()
+                .any(|scroll| scroll.request_id().is_some())
+    }
+
     pub fn needs_wake(&self, session: &Vim9Session) -> bool {
         self.scrolls
             .values()
@@ -1687,6 +1697,177 @@ mod tests {
             egui::Shape::Rect(shape) if shape.fill == rgb(0xddeeff) && shape.rect.min == ime.min)),
             "the candidate anchor and painted caret must agree exactly"
         );
+    }
+
+    #[test]
+    fn successive_pixel_events_move_native_text_caret_and_ime_without_line_steps() {
+        let frame_at = |top| {
+            let mut frame = direct_frame(top);
+            let frame_mut = Arc::make_mut(&mut frame);
+            frame_mut.mode = "n".into();
+            frame_mut.cursor.row = (12 - top) as usize;
+            frame_mut.cursor.line = 12;
+            frame_mut.windows[0].cursor = frame_mut.cursor.clone();
+            let run = frame_mut
+                .runs
+                .iter_mut()
+                .find(|run| run.line == 12)
+                .unwrap();
+            run.style.foreground = Some(0x0abcde);
+            frame
+        };
+        let frame = frame_at(10);
+        let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(220.0, 120.0));
+        let geometry = metrics(content, 10.0, 20.0);
+        let mut direct = direct_fixture(&frame, geometry, 0.0);
+        let sample = |frame: &Arc<Vim9RenderFrame>, direct: &DirectInput| {
+            let ime = direct_cursor_rect(frame, content, 10.0, 20.0, direct).unwrap();
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                paint(
+                    &ui.ctx().layer_painter(egui::LayerId::background()),
+                    frame,
+                    content,
+                    10.0,
+                    20.0,
+                    14.0,
+                    true,
+                    true,
+                    &ScrollPresentation::default(),
+                    0.0,
+                    Some(direct),
+                );
+            });
+            output.textures_delta.clear();
+            let glyph_y = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(shape)
+                        if shape
+                            .galley
+                            .job
+                            .sections
+                            .iter()
+                            .any(|section| section.format.color == rgb(0x0abcde)) =>
+                    {
+                        Some(shape.pos.y)
+                    }
+                    _ => None,
+                })
+                .expect("the tracked source line must be painted");
+            assert!(output.shapes.iter().any(|clipped| matches!(&clipped.shape,
+                egui::Shape::Rect(shape) if shape.fill == rgb(0xddeeff).gamma_multiply(0.22) && shape.rect.min == ime.min)),
+                "the painted caret and native IME anchor must share fractional pixels");
+            (glyph_y, ime.top())
+        };
+        let start = sample(&frame, &direct);
+        let mut pixels = 0.0;
+        let mut submitted = false;
+        for delta in [1.0, 0.25].into_iter().cycle().take(34) {
+            let event = egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -delta),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            };
+            let lines = wheel_lines(&event, geometry.line_height, frame.rows).unwrap();
+            direct.scrolls.get_mut(&1).unwrap().push(lines);
+            pixels += delta;
+            let position = sample(&frame, &direct);
+            assert!(
+                (position.0 - (start.0 - pixels)).abs() < 0.001,
+                "glyphs quantized after {pixels}px"
+            );
+            assert!(
+                (position.1 - (start.1 - pixels)).abs() < 0.001,
+                "caret quantized after {pixels}px"
+            );
+            assert_eq!(direct.offset(&frame, 2, geometry), 0.0);
+            if !submitted && direct.scrolls[&1].command().is_some() {
+                direct.scrolls.get_mut(&1).unwrap().submitted(71);
+                submitted = true;
+            }
+        }
+        assert!(submitted);
+        let before_ack = sample(&frame, &direct);
+        let mut acknowledged = frame_at(11);
+        Arc::make_mut(&mut acknowledged).windows[0].scroll_ack = 71;
+        direct.reconcile_with(&acknowledged, geometry, |_| false);
+        let after_ack = sample(&acknowledged, &direct);
+        assert!((after_ack.0 - before_ack.0).abs() < 0.001);
+        assert!((after_ack.1 - before_ack.1).abs() < 0.001);
+        assert_eq!(direct.scrolls[&1].request_id(), None);
+        assert!(
+            !direct.animating(),
+            "direct pixels inside coverage must not acquire a second momentum curve"
+        );
+    }
+
+    #[test]
+    fn saturated_pixel_ack_keeps_source_stationary_and_requests_frame_catchup() {
+        let old = direct_frame(10);
+        let geometry = Vim9RenderMetrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        };
+        let mut direct = direct_fixture(&old, geometry, 1.25);
+        direct.scrolls.get_mut(&1).unwrap().submitted(72);
+        direct.scrolls.get_mut(&1).unwrap().push(2.0);
+        let before = direct.offset(&old, 1, geometry);
+        assert_eq!(before, -40.0);
+        let mut acknowledged = (*direct_frame(11)).clone();
+        acknowledged.windows[0].scroll_ack = 72;
+        direct.reconcile_with(&acknowledged, geometry, |_| false);
+        let after = direct.offset(&acknowledged, 1, geometry);
+        assert_eq!(
+            after, -20.0,
+            "ack must rebase only already displayed pixels"
+        );
+        assert_eq!(
+            40.0 + before,
+            20.0 + after,
+            "the same source line must stay at the same screen y"
+        );
+        assert!(
+            direct.animating(),
+            "new margin coverage must wake the host frame loop for bounded catchup"
+        );
+    }
+
+    #[test]
+    fn pending_precision_ack_uses_frame_clock_and_stops_when_settled_or_cancelled() {
+        let frame = direct_frame(10);
+        let geometry = Vim9RenderMetrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        };
+        let mut direct = direct_fixture(&frame, geometry, 2.0);
+        direct.scrolls.get_mut(&1).unwrap().submitted(74);
+        assert!(
+            !direct.animating(),
+            "all available rows are already presented"
+        );
+        assert!(
+            direct.needs_frame(),
+            "pending ack must be sampled at display refresh, not a 16ms poll"
+        );
+        let mut acknowledged = (*direct_frame(12)).clone();
+        acknowledged.windows[0].scroll_ack = 74;
+        direct.reconcile_with(&acknowledged, geometry, |_| false);
+        assert!(
+            !direct.needs_frame(),
+            "an idle fractional view must not run a high-frequency loop"
+        );
+        let mut cancelled = direct_fixture(&frame, geometry, 2.0);
+        cancelled.scrolls.get_mut(&1).unwrap().submitted(75);
+        assert!(cancelled.needs_frame());
+        cancelled.cancel();
+        assert!(!cancelled.needs_frame());
     }
 
     #[test]

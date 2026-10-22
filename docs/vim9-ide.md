@@ -150,6 +150,14 @@ of starting a second animation. Vim's file boundaries retire excess movement.
 The renderer reads the frame and command completion set atomically, including
 when an acknowledgement arrives between input handling and painting.
 
+Small trackpad deltas move content by pixels, including fractional pixels in
+layout, without waiting for a whole line. When input reaches the prefetched
+row limit, an acknowledgement preserves the position already shown and the
+remaining movement catches up on display frames. Pending acknowledgements also
+use the display frame clock, so high-refresh displays are not limited by the
+16 ms background snapshot poll. This frame loop stops after the request and
+remaining motion settle or are cancelled; it adds no second touchpad momentum.
+
 The text, clipped edge rows, selection highlights, caret and IME candidate
 anchor use the same viewport translation. A pointer hit uses the frame,
 geometry and offsets actually submitted for display, even if a newer frame has
@@ -263,6 +271,15 @@ The filename itself is preserved, including spaces. **Refresh files** picks
 up files added since the previous scan. Cancelled dialogs, navigation keys and
 confirmation Enter remain owned by the native UI instead of being sent to
 the Vim PTY. File ranking runs only when the query or file set changes.
+
+Quick Open also accepts `main.rs:42` or `src/main.rs:42:8` to open the
+selected fuzzy match at a line and optional Vim byte column. Use `:42` or
+`:42:8` to jump in the current buffer, even while indexing is unavailable.
+The picker shows the destination before confirmation; invalid or zero
+coordinates keep it open with an explanation. An exact indexed filename
+containing colons takes precedence over location syntax, so `notes:42` can
+still open that literal file. Enter and clicking a result use the same validated
+location. Vim's jump list and unsaved-buffer checks continue to apply.
 
 The keyboard actions above are also listed as **Vim9 IDE: …** in the command
 palette and are available for custom bindings: `ide:quick_open`, `ide:goto`,

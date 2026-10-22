@@ -4,8 +4,9 @@
 use crate::app::state::TerminalApp;
 use eframe::egui;
 use jterm_core::vim9::{
-    Vim9Command, Vim9EntryRequest, Vim9ProjectFile, Vim9ProjectIndex, Vim9SearchCase,
-    Vim9SearchOptions, Vim9Session, Vim9Snapshot, Vim9UiConfig,
+    parse_vim9_location as parse_location, Vim9Command, Vim9EntryRequest, Vim9ProjectFile,
+    Vim9ProjectIndex, Vim9ProjectSnapshot, Vim9QuickOpenQuery, Vim9SearchCase, Vim9SearchOptions,
+    Vim9Session, Vim9Snapshot, Vim9UiConfig,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,6 +99,39 @@ impl EditorDialog {
         }
     }
 
+    fn refresh_quick_matches(
+        &mut self,
+        project: &Vim9ProjectSnapshot,
+    ) -> Result<Vim9QuickOpenQuery, &'static str> {
+        let parsed = project.quick_open_query(&self.query);
+        let changed_files = self
+            .ranked_files
+            .as_ref()
+            .is_none_or(|files| !Arc::ptr_eq(files, &project.files));
+        if changed_files || self.ranked_query != self.query {
+            self.matches = match &parsed {
+                Ok(query) if !query.current_buffer => {
+                    project.matches(&query.file_query, QUICK_OPEN_LIMIT)
+                }
+                _ => Vec::new(),
+            };
+            self.ranked_query.clone_from(&self.query);
+            self.ranked_files = Some(Arc::clone(&project.files));
+            self.selected = 0;
+            self.reveal_selection = true;
+            self.error = None;
+        }
+        parsed
+    }
+
+    fn quick_open_command(
+        &mut self,
+        project: &Vim9ProjectSnapshot,
+    ) -> Result<Vim9Command, &'static str> {
+        let query = self.refresh_quick_matches(project)?;
+        query.command(self.matches.get(self.selected))
+    }
+
     fn move_selection(&mut self, delta: isize) {
         if delta != 0 && !self.matches.is_empty() {
             self.selected =
@@ -179,23 +213,6 @@ fn route_dialog_events(
         events.retain(|event| !is_keyboard_event(event));
     }
     cancel
-}
-
-fn parse_location(input: &str) -> Result<(u64, Option<u64>), &'static str> {
-    let mut parts = input.trim().split(':');
-    let parse = |part: &str| {
-        part.trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or("Enter a positive line number, optionally followed by :column")
-    };
-    let line = parse(parts.next().unwrap_or_default())?;
-    let column = parts.next().map(parse).transpose()?;
-    if parts.next().is_some() {
-        return Err("Use line or line:column, for example 42:8");
-    }
-    Ok((line, column))
 }
 
 fn search_options_summary(options: &Vim9SearchOptions) -> String {
@@ -950,7 +967,13 @@ impl Workbench {
         let Some(mut dialog) = self.dialog.take() else {
             return;
         };
-        let project = self.project_index.as_ref().map(Vim9ProjectIndex::snapshot);
+        let project = self
+            .project_index
+            .as_ref()
+            .map(Vim9ProjectIndex::snapshot)
+            .unwrap_or_default();
+        let mut current_buffer = false;
+        let mut quick_valid = false;
         let mut cancel = false;
         let mut refresh = false;
         let response = egui::Modal::new(egui::Id::new(("vim9_dialog", session_id)))
@@ -978,7 +1001,7 @@ impl Workbench {
                         .id_salt(("vim9_dialog_query", session_id))
                         .desired_width(f32::INFINITY)
                         .hint_text(match dialog.kind {
-                            DialogKind::QuickOpen => "Type a filename or path fragment…",
+                            DialogKind::QuickOpen => "File[:line[:column]] or :line[:column]…",
                             DialogKind::Goto => "Line or line:column, for example 42:8",
                         })
                         .char_limit(match dialog.kind {
@@ -996,16 +1019,24 @@ impl Workbench {
                 }
 
                 if dialog.kind == DialogKind::QuickOpen {
-                    if let Some(project) = &project {
-                        let changed_files = dialog.ranked_files.as_ref()
-                            .is_none_or(|files| !Arc::ptr_eq(files, &project.files));
-                        if changed_files || dialog.ranked_query != dialog.query {
-                            dialog.matches = project.matches(&dialog.query, QUICK_OPEN_LIMIT);
-                            dialog.ranked_query.clone_from(&dialog.query);
-                            dialog.ranked_files = Some(Arc::clone(&project.files));
-                            dialog.selected = 0;
-                            dialog.reveal_selection = true;
+                    let parsed = dialog.refresh_quick_matches(&project);
+                    current_buffer = parsed.as_ref().is_ok_and(|query| query.current_buffer);
+                    quick_valid = parsed.is_ok();
+                    match &parsed {
+                        Ok(query) => {
+                            if let Some((line, column)) = query.location {
+                                let target = if query.current_buffer { "Current buffer" } else { "Selected file" };
+                                ui.label(format!("{target} · line {line}{}", column.map(|column| format!(" · byte column {column}")).unwrap_or_default()));
+                            }
                         }
+                        Err(error) => { ui.colored_label(ui.visuals().error_fg_color, *error); }
+                    }
+                    if current_buffer || !quick_valid {
+                        dialog.selection_delta = 0;
+                    }
+                    if current_buffer {
+                        ui.weak("Enter jumps in the current buffer · Esc returns to Vim");
+                    } else if quick_valid {
                         let delta = std::mem::take(&mut dialog.selection_delta);
                         dialog.move_selection(delta);
                         ui.horizontal(|ui| {
@@ -1032,7 +1063,7 @@ impl Workbench {
                                     ui.weak(if project.scanning { "Indexing project files…" } else { "No matching files" });
                                 }
                                 for (index, file) in dialog.matches.iter().enumerate() {
-                                    let row = ui.push_id(&file.path, |ui| ui.add_sized(
+                                    let row = ui.push_id((&file.path, &dialog.query), |ui| ui.add_sized(
                                         [ui.available_width(), 24.0],
                                         egui::Button::new(crate::review_text::visible_bounded(&file.relative, 1024))
                                             .selected(index == dialog.selected)
@@ -1056,9 +1087,9 @@ impl Workbench {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    let label = if dialog.kind == DialogKind::QuickOpen { "Open selected" } else { "Go" };
+                    let label = if dialog.kind == DialogKind::Goto || current_buffer { "Go" } else { "Open selected" };
                     if ui.add_enabled(
-                        dialog.kind == DialogKind::Goto || !dialog.matches.is_empty(),
+                        dialog.kind == DialogKind::Goto || (quick_valid && (current_buffer || !dialog.matches.is_empty())),
                         egui::Button::new(label),
                     ).clicked() {
                         dialog.confirm_requested = true;
@@ -1079,16 +1110,7 @@ impl Workbench {
             let command = match dialog.kind {
                 DialogKind::Goto => parse_location(&dialog.query)
                     .map(|(line, column)| Vim9Command::Goto { line, column }),
-                DialogKind::QuickOpen => dialog
-                    .matches
-                    .get(dialog.selected)
-                    .ok_or("Choose a matching project file")
-                    .and_then(|file| file.path.to_str().ok_or("The filename is not valid UTF-8"))
-                    .map(|path| Vim9Command::Open {
-                        path: path.to_owned(),
-                        line: None,
-                        column: None,
-                    }),
+                DialogKind::QuickOpen => dialog.quick_open_command(&project),
             };
             match command {
                 Ok(command) => {
@@ -1096,7 +1118,8 @@ impl Workbench {
                     return;
                 }
                 Err(error) => {
-                    dialog.error = Some(error.to_string());
+                    dialog.error = (dialog.kind != DialogKind::QuickOpen || quick_valid)
+                        .then(|| error.to_string());
                     dialog.needs_focus = true;
                 }
             }
@@ -1434,7 +1457,7 @@ impl TerminalApp {
         if !direct.pointer_captured() && !claimed && frame.mode == "n" {
             direct.flush_scroll(&editor.session);
         }
-        if direct.animating() {
+        if direct.needs_frame() {
             ctx.request_repaint();
         } else if direct.needs_wake(&editor.session) {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -2253,6 +2276,55 @@ mod tests {
         ] {
             assert!(parse_location(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn quick_open_locations_revalidate_query_and_clear_stale_file_targets() {
+        let project = Vim9ProjectSnapshot {
+            files: Arc::new(
+                ["src/main.rs", "src/other.rs", "notes:42"]
+                    .into_iter()
+                    .map(|relative| Vim9ProjectFile {
+                        path: PathBuf::from("/project").join(relative),
+                        relative: relative.to_owned(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let mut picker = EditorDialog::new(DialogKind::QuickOpen);
+        picker.query = "main:42:8".into();
+        assert!(
+            matches!(picker.quick_open_command(&project), Ok(Vim9Command::Open { path, line: Some(42), column: Some(8) }) if path == "/project/src/main.rs")
+        );
+        picker.query = "other:7".into();
+        assert!(
+            matches!(picker.quick_open_command(&project), Ok(Vim9Command::Open { path, line: Some(7), column: None }) if path == "/project/src/other.rs")
+        );
+        picker.query = "other:0".into();
+        assert!(picker.quick_open_command(&project).is_err());
+        assert!(
+            picker.matches.is_empty(),
+            "invalid location retained the previous file"
+        );
+        picker.query = "notes:42".into();
+        assert!(
+            matches!(picker.quick_open_command(&project), Ok(Vim9Command::Open { path, line: None, column: None }) if path == "/project/notes:42")
+        );
+        picker.query = ":19:3".into();
+        let unavailable_index = Vim9ProjectSnapshot {
+            scanning: true,
+            error: Some("index unavailable".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            picker.quick_open_command(&unavailable_index),
+            Ok(Vim9Command::Goto {
+                line: 19,
+                column: Some(3)
+            })
+        ));
+        assert!(picker.matches.is_empty());
     }
 
     #[test]
