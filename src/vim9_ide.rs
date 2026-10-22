@@ -2404,7 +2404,10 @@ mod tests {
     #[test]
     fn native_shortcuts_preserve_vim_control_keys() {
         let shortcut_command = |key, modifiers| super::shortcut_command(key, modifiers, true);
-        assert_eq!(shortcut_command(egui::Key::Enter, egui::Modifiers::NONE), None);
+        assert_eq!(
+            shortcut_command(egui::Key::Enter, egui::Modifiers::NONE),
+            None
+        );
         for key in [
             egui::Key::P,
             egui::Key::G,
@@ -2456,7 +2459,10 @@ mod tests {
             (egui::Modifiers::SHIFT, Command::Vim9PreviousProblem),
         ] {
             assert_eq!(shortcut_command(egui::Key::F8, modifiers, false), None);
-            assert_eq!(shortcut_command(egui::Key::F8, modifiers, true), Some(action));
+            assert_eq!(
+                shortcut_command(egui::Key::F8, modifiers, true),
+                Some(action)
+            );
         }
         for visible in [false, true] {
             assert_eq!(

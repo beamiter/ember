@@ -148,6 +148,11 @@ consumer_tests = r'''
     }
     #[derive(Default)]
     struct Editor { buffer_font_size: Option<f32>, native_input: NativeInputHandle }
+    impl Editor {
+        fn font_size(&self, configured_size: f32) -> f32 {
+            crate::config::Config::clamp_font_size(self.buffer_font_size.unwrap_or(configured_size))
+        }
+    }
     struct TerminalApp {
         config: Config,
         config_panel: ConfigPanel,

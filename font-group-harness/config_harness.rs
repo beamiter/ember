@@ -614,6 +614,11 @@ use crate::config::Config;
     }
     #[derive(Default)]
     struct Editor { buffer_font_size: Option<f32>, native_input: NativeInputHandle }
+    impl Editor {
+        fn font_size(&self, configured_size: f32) -> f32 {
+            crate::config::Config::clamp_font_size(self.buffer_font_size.unwrap_or(configured_size))
+        }
+    }
     struct TerminalApp {
         config: Config,
         config_panel: ConfigPanel,
@@ -676,7 +681,7 @@ use crate::config::Config;
                 continue;
             };
             editor.native_input.lock().cancel();
-            let size = f64::from(editor.buffer_font_size.unwrap_or(self.config.font_size)) + delta;
+            let size = f64::from(editor.font_size(self.config.font_size)) + delta;
             editor.buffer_font_size = Some(config::Config::clamp_font_size(
                 size.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32,
             ));
