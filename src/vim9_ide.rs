@@ -386,6 +386,7 @@ fn form_submitted(response: &egui::Response) -> bool {
 pub(crate) fn shortcut_command(
     key: egui::Key,
     modifiers: egui::Modifiers,
+    diagnostics_visible: bool,
 ) -> Option<crate::keybindings::Command> {
     use crate::keybindings::Command;
     if modifiers.alt
@@ -414,8 +415,10 @@ pub(crate) fn shortcut_command(
         (egui::Key::PageUp, true, true) => Some(Command::Vim9PreviousBuffer),
         (egui::Key::PageDown, true, true) => Some(Command::Vim9NextBuffer),
         (egui::Key::W, true, true) => Some(Command::Vim9CloseBuffer),
-        (egui::Key::F8, false, false) => Some(Command::Vim9NextProblem),
-        (egui::Key::F8, false, true) => Some(Command::Vim9PreviousProblem),
+        // A hidden workbench must leave plugin keys with Vim. In particular,
+        // SimpleTerminal owns F8 / Shift-F8 in the focused buffer profile.
+        (egui::Key::F8, false, false) if diagnostics_visible => Some(Command::Vim9NextProblem),
+        (egui::Key::F8, false, true) if diagnostics_visible => Some(Command::Vim9PreviousProblem),
         _ => None,
     }
 }
@@ -522,6 +525,10 @@ pub(crate) struct Workbench {
 }
 
 impl Workbench {
+    pub(crate) fn diagnostic_shortcuts_visible(&self, config: &Vim9UiConfig) -> bool {
+        config.tool_panel || self.tools_open || self.problems_open
+    }
+
     pub(crate) fn new(session: Vim9Session, config: &Vim9UiConfig) -> Self {
         let snapshot = Arc::new(session.snapshot());
         Self {
@@ -891,6 +898,10 @@ impl Workbench {
                 if !snapshot.encoding.is_empty() {
                     ui.small(&snapshot.encoding);
                 }
+                let context = snapshot.workbench.status_text();
+                if !context.is_empty() {
+                    ui.small(crate::review_text::visible_bounded(&context, 1024));
+                }
                 ui.small(format!("{} Vim window(s)", snapshot.window_count));
                 if snapshot.build.running {
                     ui.small(format!("Building: {}", snapshot.build.command));
@@ -1126,6 +1137,10 @@ impl Workbench {
                         ui.weak(crate::review_text::visible_bounded(
                             &self.session.root().to_string_lossy(), 1024,
                         ));
+                        let context = self.snapshot.workbench.status_text();
+                        if !context.is_empty() {
+                            ui.weak(crate::review_text::visible_bounded(&context, 1024));
+                        }
                     }
                     DialogKind::Goto => {
                         ui.label(format!(
@@ -2388,6 +2403,8 @@ mod tests {
 
     #[test]
     fn native_shortcuts_preserve_vim_control_keys() {
+        let shortcut_command = |key, modifiers| super::shortcut_command(key, modifiers, true);
+        assert_eq!(shortcut_command(egui::Key::Enter, egui::Modifiers::NONE), None);
         for key in [
             egui::Key::P,
             egui::Key::G,
@@ -2430,6 +2447,65 @@ mod tests {
                 assert_eq!(shortcut_command(key, modifiers), None);
             }
         }
+    }
+
+    #[test]
+    fn hidden_diagnostic_panels_preserve_simpleterminal_keys() {
+        for (modifiers, action) in [
+            (egui::Modifiers::NONE, Command::Vim9NextProblem),
+            (egui::Modifiers::SHIFT, Command::Vim9PreviousProblem),
+        ] {
+            assert_eq!(shortcut_command(egui::Key::F8, modifiers, false), None);
+            assert_eq!(shortcut_command(egui::Key::F8, modifiers, true), Some(action));
+        }
+        for visible in [false, true] {
+            assert_eq!(
+                shortcut_command(egui::Key::F7, egui::Modifiers::NONE, visible),
+                None
+            );
+            assert_eq!(
+                shortcut_command(egui::Key::F8, egui::Modifiers::CTRL, visible),
+                None
+            );
+            assert_eq!(
+                shortcut_command(egui::Key::F8, egui::Modifiers::ALT, visible),
+                None
+            );
+            assert_eq!(
+                shortcut_command(egui::Key::S, egui::Modifiers::CTRL, visible),
+                Some(Command::Vim9Save)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vim 9 executable and local bridge sockets"]
+    fn editor_font_inherits_live_configuration_until_explicit_local_zoom() {
+        // Workbench is a binary module. Keep this check out of the buffer
+        // tests that are also compiled through the smaller library target.
+        if !jterm_core::child_env::inherited_environment_is_captured() {
+            jterm_core::child_env::capture_inherited_environment().unwrap();
+        }
+        let root = std::env::temp_dir().join(format!("vim9-font-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let session = Vim9Session::start(Vim9EntryRequest::user_action(root.clone())).unwrap();
+        let mut editor = Workbench::new(session, &Default::default());
+        assert_eq!(editor.buffer_font_size, None);
+        assert_eq!(editor.font_size(12.0), 12.0);
+        assert_eq!(
+            editor.font_size(21.0),
+            21.0,
+            "settings changes reach an editor that has not been zoomed"
+        );
+        editor.buffer_font_size = Some(18.0);
+        assert_eq!(editor.font_size(12.0), 18.0);
+        assert_eq!(
+            editor.font_size(24.0),
+            18.0,
+            "an intentional per-editor zoom survives global settings changes"
+        );
+        drop(editor);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

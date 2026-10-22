@@ -1,5 +1,32 @@
 # Native Vim9 IDE
 
+## Simple plugin workbench
+
+With the updated [beamiter/vimrc](https://github.com/beamiter/vimrc) loaded,
+**Ctrl+Shift+P**, then **`>simple`**, exposes the configuration's Simple plugin
+actions in the native command picker. Choose files, buffers, grep, symbols,
+rename, code actions, Git status/diff/current hunk, Markdown preview, key help,
+or the Simple workbench. Availability follows the plugins and current buffer;
+an unavailable action explains what it needs.
+
+The picker also shows the Simple configuration's cached Git branch/change
+counts, diagnostic counts, remote workspace label and large-file mode when
+available. The same context appears in the optional native status bar. No
+extra panel is enabled, and the native buffer retains all space when the
+picker is closed. Context collection does not start Git, LSP, or remote jobs.
+
+Vim and the Simple plugins continue to own the action's editing behavior and
+popups. Ordinary supported completion menus use the native paint path; other
+plugin popups and preview views can still use the live compatibility display.
+This integration does not turn browser Markdown previews into embedded web
+views. The standard Vim configuration also remains usable outside these
+terminals.
+
+With the tool and diagnostic panels hidden, **F8** and **Shift+F8** reach Vim's
+SimpleTerminal toggle/new mappings. Enabling the native diagnostic panel gives
+those keys to its previous/next diagnostic actions.
+
+
 Ember opens a real Vim9 process with a native egui buffer surface. Optional workbench controls
 are hidden by default so the editing surface owns the available space. Vim
 owns text editing, modes, internal splits, registers, undo, completion, syntax

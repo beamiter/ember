@@ -2651,9 +2651,16 @@ impl TerminalApp {
             // existing terminal binding, and a native text field keeps its
             // own editing keys. Use the same ordered router as other commands
             // so a modal cannot overtake earlier text/IME in this OS batch.
-            let ide_command = (!ui_input_blocked && self.active_vim9_editor().is_some())
-                .then(|| crate::vim9_ide::shortcut_command(press.key, press.modifiers))
-                .flatten();
+            let ide_command = (!ui_input_blocked)
+                .then(|| self.active_vim9_editor())
+                .flatten()
+                .and_then(|editor| {
+                    crate::vim9_ide::shortcut_command(
+                        press.key,
+                        press.modifiers,
+                        editor.diagnostic_shortcuts_visible(&self.config.vim9),
+                    )
+                });
             if let Some(command) = ide_command.or_else(|| press.command.clone()) {
                 if command == keybindings::Command::EditPaste {
                     log::debug!(target: "ember::clipboard_route",

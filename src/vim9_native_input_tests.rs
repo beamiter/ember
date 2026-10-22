@@ -340,10 +340,6 @@ fn render_only_transition_preserves_old_image_ownership_then_passes_clicks_and_w
         0,
         "render-only UI must not send native commands"
     );
-    assert_eq!(
-        crate::vim9_ide::shortcut_command(egui::Key::Enter, egui::Modifiers::NONE),
-        None
-    );
     let line = fixture.session.snapshot().line;
     fixture.master.write_all(b"\r").unwrap();
     wait(|| fixture.session.snapshot().line == line + 1);
@@ -351,26 +347,5 @@ fn render_only_transition_preserves_old_image_ownership_then_passes_clicks_and_w
         fixture.session.snapshot().pending,
         0,
         "Enter uses the original PTY, not a native command"
-    );
-}
-
-#[test]
-#[ignore = "requires real Vim 9, a PTY, and local bridge sockets"]
-fn editor_font_inherits_live_configuration_until_explicit_local_zoom() {
-    let fixture = Fixture::start();
-    let mut editor = crate::vim9_ide::Workbench::new(fixture.session.clone(), &Default::default());
-    assert_eq!(editor.buffer_font_size, None);
-    assert_eq!(editor.font_size(12.0), 12.0);
-    assert_eq!(
-        editor.font_size(21.0),
-        21.0,
-        "settings changes reach an editor that has not been zoomed"
-    );
-    editor.buffer_font_size = Some(18.0);
-    assert_eq!(editor.font_size(12.0), 18.0);
-    assert_eq!(
-        editor.font_size(24.0),
-        18.0,
-        "an intentional per-editor zoom survives global settings changes"
     );
 }
