@@ -8,8 +8,8 @@ use egui::{self, Color32, FontId, Rect, Stroke};
 use jterm_core::vim9::{
     Vim9BufferPosition, Vim9Command, Vim9CursorBlink, Vim9InputSnapshot, Vim9PixelRect,
     Vim9PixelScroll, Vim9PointerPhase, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect,
-    Vim9RenderStyle, Vim9RenderWindow, Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
-    Vim9ViewportAnchor,
+    Vim9RenderRun, Vim9RenderStyle, Vim9RenderWindow, Vim9ScrollAnimation, Vim9Session,
+    Vim9Viewport, Vim9ViewportAnchor,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -118,7 +118,7 @@ impl DirectInput {
             .presented
             .as_ref()
             .is_some_and(|presented| !same_layout(presented, frame, geometry));
-        if topology_changed || !frame.supported || frame.completion.is_some() {
+        if topology_changed || !frame.supported || frame.has_overlays() {
             self.cancel();
             return;
         }
@@ -218,7 +218,7 @@ impl DirectInput {
         session: &Vim9Session,
         discrete: bool,
     ) -> bool {
-        if frame.completion.is_some() {
+        if frame.has_overlays() {
             self.cancel();
             return false;
         }
@@ -253,6 +253,9 @@ impl DirectInput {
     }
 
     pub fn offset(&self, frame: &Vim9RenderFrame, window: i64, geometry: Vim9RenderMetrics) -> f32 {
+        if frame.has_overlays() {
+            return 0.0;
+        }
         self.scrolls
             .get(&window)
             .map_or(0.0, |scroll| scroll.offset(frame, geometry))
@@ -356,7 +359,7 @@ impl DirectInput {
         let presented = self.presented.as_ref()?;
         if self.presentation_retired
             || !current.supported
-            || current.completion.is_some()
+            || current.has_overlays()
             || !same_layout(presented, current, geometry)
         {
             return None;
@@ -393,7 +396,7 @@ impl DirectInput {
         let presented = self.presented.as_ref()?;
         if self.presentation_retired
             || !current.supported
-            || current.completion.is_some()
+            || current.has_overlays()
             || !same_layout(presented, current, geometry)
         {
             return None;
@@ -418,7 +421,7 @@ impl DirectInput {
         now: f64,
         session: &Vim9Session,
     ) -> bool {
-        if frame.completion.is_some() {
+        if frame.has_overlays() {
             self.cancel();
             return false;
         }
@@ -659,7 +662,7 @@ impl ScrollPresentation {
             || self.identity != identity
             || self.line_height != line_height
             || frame.is_none()
-            || frame.is_some_and(|frame| frame.completion.is_some());
+            || frame.is_some_and(|frame| frame.has_overlays());
         if reset {
             self.windows.clear();
         } else if let (Some(old), Some(new)) = (&self.current, frame) {
@@ -926,7 +929,7 @@ pub(crate) fn paint(
             direct,
         );
         paint_active_window(painter, frame, content, cell_width, line_height, focused);
-        paint_completion(painter, frame, content, cell_width, line_height, font_size);
+        paint_overlays(painter, frame, content, cell_width, line_height, font_size);
         return;
     }
     for view in frame.paint_views() {
@@ -935,7 +938,11 @@ pub(crate) fn paint(
             .iter()
             .find(|window| &window.view == view)
             .map_or((frame.window, 0), |window| (window.window, window.topline));
-        let offset = scroll.offset(window, now);
+        let offset = if frame.has_overlays() {
+            0.0
+        } else {
+            scroll.offset(window, now)
+        };
         if let Some(scroll) = scroll.windows.get(&window).filter(|_| offset != 0.0) {
             if let Some((previous, source_top)) = scroll.sources.front() {
                 if let Some(old_view) = previous.windows.iter().find(|old| old.window == window) {
@@ -971,7 +978,7 @@ pub(crate) fn paint(
         );
     }
     paint_active_window(painter, frame, content, cell_width, line_height, focused);
-    paint_completion(painter, frame, content, cell_width, line_height, font_size);
+    paint_overlays(painter, frame, content, cell_width, line_height, font_size);
 }
 
 /// A stationary focus cue belongs to the Vim window, not to its translated
@@ -1022,6 +1029,39 @@ fn paint_active_window(
     );
 }
 
+/// Vim popup zindex 100 is the completion menu's layer. Popup content owns
+/// screen geometry across split/status cells, independently of source paint.
+fn paint_overlays(
+    painter: &egui::Painter,
+    frame: &Vim9RenderFrame,
+    content: Rect,
+    cell_width: f32,
+    line_height: f32,
+    font_size: f32,
+) {
+    let geometry = metrics(content, cell_width, line_height);
+    let paint_popup = |popup: &jterm_core::vim9::Vim9RenderPopup| {
+        paint_overlay(
+            painter,
+            &frame.default_style,
+            &popup.view,
+            &popup.default_style,
+            &popup.runs,
+            content,
+            geometry,
+            font_size,
+            false,
+        );
+    };
+    for popup in frame.popups.iter().filter(|popup| popup.zindex < 100) {
+        paint_popup(popup);
+    }
+    paint_completion(painter, frame, content, cell_width, line_height, font_size);
+    for popup in frame.popups.iter().filter(|popup| popup.zindex >= 100) {
+        paint_popup(popup);
+    }
+}
+
 /// Completion owns a screen rectangle above every split, including Vim's
 /// status and separator rows. It never inherits a buffer's scrolling offset.
 fn paint_completion(
@@ -1035,8 +1075,32 @@ fn paint_completion(
     let Some(completion) = &frame.completion else {
         return;
     };
-    let geometry = metrics(content, cell_width, line_height);
-    let Some(view) = geometry.rect(&completion.view).map(gui_rect) else {
+    paint_overlay(
+        painter,
+        &frame.default_style,
+        &completion.view,
+        &completion.default_style,
+        &completion.runs,
+        content,
+        metrics(content, cell_width, line_height),
+        font_size,
+        true,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_overlay(
+    painter: &egui::Painter,
+    frame_style: &Vim9RenderStyle,
+    bounds: &Vim9RenderRect,
+    normal: &Vim9RenderStyle,
+    runs: &[Vim9RenderRun],
+    content: Rect,
+    geometry: Vim9RenderMetrics,
+    font_size: f32,
+    outline: bool,
+) {
+    let Some(view) = geometry.rect(bounds).map(gui_rect) else {
         return;
     };
     let clip = view.intersect(content);
@@ -1051,35 +1115,39 @@ fn paint_completion(
         overlay.rect_filled(view.expand(spread), 0.0, Color32::from_black_alpha(alpha));
     }
     let painter = overlay.with_clip_rect(clip);
-    let (foreground, background, _) = colors(&completion.default_style, &frame.default_style);
+    let (foreground, background, _) = colors(normal, frame_style);
     painter.rect_filled(view, 0.0, background);
-    for run in &completion.runs {
+    for run in runs {
         if let Some(rect) = geometry.cell_rect(run.row, run.column, run.cells) {
-            let (_, background, _) = colors(&run.style, &completion.default_style);
+            let (_, background, _) = colors(&run.style, normal);
             painter.rect_filled(gui_rect(rect), 0.0, background);
         }
     }
-    for run in &completion.runs {
+    for run in runs {
         if let Some(rect) = geometry.cell_rect(run.row, run.column, run.cells) {
             paint_run(
                 &painter,
                 run,
-                &completion.default_style,
+                normal,
                 gui_rect(rect),
                 clip,
-                cell_width,
-                line_height,
+                geometry.cell_width,
+                geometry.line_height,
                 font_size,
             );
         }
     }
-    let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
-    painter.rect_stroke(
-        view,
-        0.0,
-        Stroke::new(pixel, foreground.gamma_multiply(0.20)),
-        egui::StrokeKind::Inside,
-    );
+    // Popup borders are already supplied by Vim, with their own GUI colors
+    // and characters. Only the undecorated completion surface adds an outline.
+    if outline {
+        let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
+        painter.rect_stroke(
+            view,
+            0.0,
+            Stroke::new(pixel, foreground.gamma_multiply(0.20)),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 /// The direct fractional transform owns both sampled edge rows and the caret.
@@ -2163,6 +2231,115 @@ mod tests {
                 .iter()
                 .any(|clipped| matches!(&clipped.shape, egui::Shape::Text(_))));
         }
+    }
+
+    #[test]
+    fn vim_popups_cancel_motion_and_keep_zorder_around_completion() {
+        let mut frame = direct_frame(10);
+        let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(220.0, 120.0));
+        let geometry = metrics(content, 10.0, 20.0);
+        let mut direct = direct_fixture(&frame, geometry, 0.3125);
+        assert_ne!(direct.offset(&frame, 1, geometry), 0.0);
+        Arc::make_mut(&mut frame).popups = serde_json::from_value(serde_json::json!([
+            {"id":1003,"zindex":50,
+             "view":{"row":1,"column":8,"rows":2,"columns":10},
+             "default_style":{"background":0x352413},"runs":[]},
+            {"id":1001,"zindex":50,
+             "view":{"row":1,"column":8,"rows":2,"columns":10},
+             "default_style":{"foreground":0xeeddaa,"background":0x294761},
+             "runs":[{"row":1,"column":8,"cells":2,"text":"界",
+                      "style":{"foreground":0x19c3a7,"background":0x8351a7}}]},
+            {"id":1002,"zindex":150,
+             "view":{"row":1,"column":8,"rows":2,"columns":10},
+             "default_style":{"background":0x135724},
+             "runs":[{"row":2,"column":8,"cells":1,"text":"e\u{301}"}]}
+        ]))
+        .unwrap();
+        // Admission and paint must stop the old transform even before the
+        // next reconciliation, and popup glyphs never become source targets.
+        assert_eq!(direct.offset(&frame, 1, geometry), 0.0);
+        assert!(direct
+            .wheel_window_at(&frame, geometry, content.center())
+            .is_none());
+        assert!(direct
+            .presented_anchor(&frame, geometry, content.center())
+            .is_none());
+        direct.reconcile_with(&frame, geometry, |_| false);
+        assert!(!direct.needs_frame());
+        Arc::make_mut(&mut frame).mode = "i".into();
+        Arc::make_mut(&mut frame).completion = Some(
+            serde_json::from_value(serde_json::json!({
+                "view":{"row":1,"column":8,"rows":2,"columns":10},
+                "default_style":{"background":0x246813},"runs":[]
+            }))
+            .unwrap(),
+        );
+        let popup = gui_rect(geometry.rect(&frame.popups[0].view).unwrap());
+        for direct_path in [false, true] {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                paint(
+                    &ui.ctx().layer_painter(egui::LayerId::background()),
+                    &frame,
+                    content,
+                    10.0,
+                    20.0,
+                    14.0,
+                    true,
+                    true,
+                    &ScrollPresentation::default(),
+                    0.0,
+                    direct_path.then_some(&direct),
+                );
+            });
+            output.textures_delta.clear();
+            let surfaces: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(shape)
+                        if shape.rect == popup
+                            && [rgb(0x352413), rgb(0x294761), rgb(0x246813), rgb(0x135724)]
+                                .contains(&shape.fill) =>
+                    {
+                        assert_eq!(clipped.clip_rect, popup);
+                        Some(shape.fill)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                surfaces,
+                vec![rgb(0x352413), rgb(0x294761), rgb(0x246813), rgb(0x135724)],
+                "equal-zindex older popups stay above newer popups, before completion"
+            );
+            assert!(
+                output.shapes.iter().any(|clipped| matches!(&clipped.shape,
+                egui::Shape::Rect(shape) if shape.fill == rgb(0x8351a7)
+                    && shape.rect.width() == 20.0)),
+                "wide popup text retains two Vim cells"
+            );
+            assert!(output.shapes.iter().any(|clipped| matches!(&clipped.shape,
+                egui::Shape::Text(shape) if shape.galley.text() == "界")));
+        }
+        Arc::make_mut(&mut frame).completion = None;
+        Arc::make_mut(&mut frame).popups.clear();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            paint_overlays(
+                &ui.ctx().layer_painter(egui::LayerId::background()),
+                &frame,
+                content,
+                10.0,
+                20.0,
+                14.0,
+            );
+        });
+        output.textures_delta.clear();
+        assert!(
+            output.shapes.is_empty(),
+            "closed popups must not retain native paint"
+        );
     }
 
     #[test]
