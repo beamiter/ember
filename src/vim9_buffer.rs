@@ -2322,6 +2322,130 @@ mod tests {
     }
 
     #[test]
+    fn inline_hints_shift_source_and_ime_then_clear_in_both_paint_paths() {
+        let mut frame = (*direct_frame(10)).clone();
+        frame.windows[0].native_pointer = false;
+        frame.runs.retain(|run| run.row != 0);
+        for (column, text, cells, line, byte_start, byte_end) in [
+            (0, "ab", 2, 10, 0, 2),
+            (2, "参", 2, 0, 0, 0),
+            (4, "e\u{301}", 1, 0, 0, 0),
+            (5, "cd", 2, 10, 2, 4),
+        ] {
+            frame.runs.push(Vim9RenderRun {
+                window: 1,
+                row: 0,
+                column,
+                text: text.into(),
+                cells,
+                line,
+                byte_start,
+                byte_end,
+                style: Vim9RenderStyle {
+                    foreground: Some(if line == 0 { 0x19c3a7 } else { 0xddeeff }),
+                    background: (line == 0).then_some(0x563412),
+                    ..Default::default()
+                },
+            });
+        }
+        frame.cursor.row = 0;
+        frame.cursor.column = 5;
+        frame.cursor.line = 10;
+        frame.cursor.byte_column = 2;
+        frame.windows[0].cursor = frame.cursor.clone();
+        let source_bytes: Vec<_> = frame
+            .runs
+            .iter()
+            .filter(|r| r.line > 0)
+            .map(|r| (r.line, r.byte_start, r.byte_end, r.text.clone()))
+            .collect();
+        assert!(frame.anchor_at_cell(0, 2).is_none());
+        assert_eq!(frame.anchor_at_cell(0, 5).unwrap().byte_start, 2);
+        let labeled = frame;
+        let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(300.0, 140.0));
+        for direct_path in [false, true] {
+            for (cell_width, line_height) in [(8.0, 18.0), (10.5, 23.0)] {
+                let ctx = egui::Context::default();
+                let direct = DirectInput::default();
+                let draw = |frame: &Vim9RenderFrame| {
+                    let mut output = ctx.run_ui(Default::default(), |ui| {
+                        paint(
+                            &ui.ctx().layer_painter(egui::LayerId::background()),
+                            frame,
+                            content,
+                            cell_width,
+                            line_height,
+                            14.0,
+                            true,
+                            true,
+                            &ScrollPresentation::default(),
+                            0.0,
+                            direct_path.then_some(&direct),
+                        );
+                    });
+                    output.textures_delta.clear();
+                    output.shapes
+                };
+                let rendered = draw(&labeled);
+                // ASCII may be one shaped run or fixed-cell glyphs when the
+                // fallback font's natural advance differs from Vim's grid.
+                for (text, column) in [("a", 0), ("参", 2), ("e\u{301}", 4), ("c", 5)] {
+                    assert!(
+                        rendered.iter().any(|clipped| matches!(&clipped.shape,
+                        egui::Shape::Text(shape) if shape.galley.text().starts_with(text)
+                            && shape.pos.x == content.left() + column as f32 * cell_width)),
+                        "missing {text} at its Vim column, direct={direct_path}"
+                    );
+                }
+                let ime = if direct_path {
+                    direct_cursor_rect(&labeled, content, cell_width, line_height, &direct)
+                } else {
+                    cursor_rect(&labeled, content, cell_width, line_height, 0.0)
+                }
+                .unwrap();
+                assert_eq!(ime.left(), content.left() + 5.0 * cell_width);
+                assert!(
+                    rendered.iter().any(|clipped| matches!(&clipped.shape,
+                    egui::Shape::Rect(shape) if shape.rect.min == ime.min
+                        && shape.fill == rgb(0xddeeff))),
+                    "caret and IME must agree"
+                );
+
+                let mut cleared = labeled.clone();
+                cleared.runs.retain(|run| run.line != 0);
+                cleared
+                    .runs
+                    .iter_mut()
+                    .find(|run| run.row == 0 && run.text == "cd")
+                    .unwrap()
+                    .column = 2;
+                cleared.cursor.column = 2;
+                cleared.windows[0].cursor = cleared.cursor.clone();
+                cleared.revision += 1;
+                assert_eq!(cleared.changedtick, labeled.changedtick);
+                assert_eq!(
+                    cleared
+                        .runs
+                        .iter()
+                        .filter(|r| r.line > 0)
+                        .map(|r| (r.line, r.byte_start, r.byte_end, r.text.clone()))
+                        .collect::<Vec<_>>(),
+                    source_bytes
+                );
+                let rendered = draw(&cleared);
+                assert!(!rendered.iter().any(|clipped| match &clipped.shape {
+                    egui::Shape::Text(shape) => ["参", "e\u{301}"].contains(&shape.galley.text()),
+                    egui::Shape::Rect(shape) => shape.fill == rgb(0x563412),
+                    _ => false,
+                }));
+                assert!(rendered.iter().any(|clipped| matches!(&clipped.shape,
+                    egui::Shape::Text(shape) if shape.galley.text().starts_with('c')
+                        && shape.pos.x == content.left() + 2.0 * cell_width)));
+            }
+        }
+    }
+
+    #[test]
     fn vim_popups_cancel_motion_and_keep_zorder_around_completion() {
         let mut frame = direct_frame(10);
         let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(220.0, 120.0));

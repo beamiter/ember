@@ -690,7 +690,7 @@ Each Vim split retains its own options and GUI highlight colors.
 Complex marker fields, default `^I` Tab geometry, active horizontal-edge
 markers and wrapped EOL continuations retain compatibility rendering.
 
-## Native end-of-line annotations
+## Native inline hints and end-of-line annotations
 
 SimpleCC CodeLens (`:SimpleCCCodeLens`) and virtual diagnostics can keep the
 native buffer surface when their end-of-line text properties use the supported
@@ -699,8 +699,24 @@ use the same native text painter as source code, clipped to the owning split.
 Property updates and removal repaint without changing the buffer or requiring
 a source edit.
 
+SimpleCC inline hints (`:SimpleCCInlayHints`) also keep native painting in
+supported `nowrap` Normal, Insert and Replace views. The bridge supplies the
+hint's exact display columns and shifts subsequent source runs without changing
+their UTF-8 byte ranges. Unicode hints, Tab advances, split clipping, GUI colors,
+font zoom and the caret/IME candidate position retain the same Vim geometry.
+Hint removal restores the source layout without requiring a buffer edit.
+
 Annotations carry no source byte range and remain outside saved text and undo.
 Vim owns their lifetime and commands; use `:SimpleCCCodeLensRun` to execute a
-lens supplied by the language server. Inline inlay hints, above/below/right
-alignment and unsupported wrapping or clipping keep the explicit compatibility
-view. No user display option is rewritten to force native rendering.
+lens supplied by the language server. In splits with inline hints, Vim retains
+ordinary mouse hit testing while supported source-bound precision scrolling
+remains available. The other splits retain their own input capabilities.
+Above/below/right alignment, wrapped inline hints, Visual selections with
+virtual text, control/bidirectional labels and unsupported clipping keep the
+explicit compatibility view. No user display option is rewritten to force
+native rendering. `:VimrcWorkbench` reports the authenticated inline capability
+separately from native end-of-line text.
+
+`inline_hints_shift_source_and_ime_then_clear_in_both_paint_paths` checks the
+actual egui painter in both rendering paths, including multiple font geometries,
+source-byte identity, caret/IME placement and removal without a source edit.
