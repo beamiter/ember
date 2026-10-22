@@ -380,6 +380,11 @@ fn form_submitted(response: &egui::Response) -> bool {
     })
 }
 
+fn diagnostic_shortcuts_enabled(visible: bool, mode: &str) -> bool {
+    // Terminal job/normal mode owns F8, including SimpleTerminal's popup.
+    visible && mode != "t" && !mode.starts_with("nt")
+}
+
 /// These chords only apply while the Vim grid owns keyboard input. The
 /// terminal's ordinary palette, SSH picker and pane-close bindings stay intact
 /// in shell tabs; Vim's Ctrl+P, Ctrl+G and Ctrl+W remain untouched.
@@ -526,7 +531,10 @@ pub(crate) struct Workbench {
 
 impl Workbench {
     pub(crate) fn diagnostic_shortcuts_visible(&self, config: &Vim9UiConfig) -> bool {
-        config.tool_panel || self.tools_open || self.problems_open
+        diagnostic_shortcuts_enabled(
+            config.tool_panel || self.tools_open || self.problems_open,
+            &self.snapshot.mode,
+        )
     }
 
     pub(crate) fn new(session: Vim9Session, config: &Vim9UiConfig) -> Self {
@@ -2811,6 +2819,27 @@ mod tests {
             let command: Command = name.parse().unwrap();
             assert!(is_editor_command(&command));
             assert_eq!(command.to_string(), name);
+        }
+    }
+    #[test]
+    fn terminal_modes_keep_diagnostic_function_keys_with_vim() {
+        for visible in [false, true] {
+            for mode in ["t", "nt", "ntT"] {
+                for modifiers in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+                    assert_eq!(
+                        shortcut_command(
+                            egui::Key::F8,
+                            modifiers,
+                            diagnostic_shortcuts_enabled(visible, mode)
+                        ),
+                        None
+                    );
+                }
+            }
+        }
+        for mode in ["n", "i", "v", "no"] {
+            assert!(diagnostic_shortcuts_enabled(true, mode));
+            assert!(!diagnostic_shortcuts_enabled(false, mode));
         }
     }
 }
