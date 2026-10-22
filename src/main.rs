@@ -57,6 +57,7 @@ mod terminal_ime;
 mod theme;
 mod ui;
 mod vim9_buffer;
+mod vim9_buffer_labels;
 mod vim9_ide;
 mod watch_adapter;
 mod windows_compat;
@@ -2640,7 +2641,7 @@ impl TerminalApp {
             session.metadata.name = "Vim9 IDE".to_string();
             vim9_editors.insert(
                 first_session_id,
-                vim9_ide::Workbench::new(editor, cfg.font_size, &cfg.vim9),
+                vim9_ide::Workbench::new(editor, &cfg.vim9),
             );
         }
         let mut session_manager = SessionManager::new(session, repaint_ctx, configured_shell);

@@ -584,3 +584,81 @@ buffer panes retain native RGB under the crossing menu. The real-PTY fixture
 now waits for parsable yank JSON instead of observing a just-created file.
 Artifacts: `/tmp/ember-vim9-completion-20a1c69-v2`. These checks use headless X11
 and software rendering, not a physical-display or Wayland performance test.
+
+## Buffer labels and pointer controls
+
+With `[vim9] buffer_tabs = true`, buffer names use the shortest distinguishing
+path suffix. For example, two `src/main.rs` files appear as
+`client/src/main.rs` and `server/src/main.rs`; full paths remain in tooltips.
+Unnamed or equivalent-path buffers retain distinct buffer IDs when needed.
+Middle-click a buffer entry to close that exact buffer. Vim refuses unsaved
+changes, just as with the existing close button.
+
+Switching buffers reveals the current entry automatically. Refreshing its
+modified marker does not pull the list away from a manually browsed position.
+
+During fractional scrolling, cursor shapes retain their complete source-cell
+geometry and are clipped at the viewport edge. A partially visible row no
+longer compresses or relocates its horizontal caret. Mouse/IME coordinates
+continue to use the visible clip.
+Foreground recoloring and block-cursor inversion reuse the same native
+shaped text; font and DPI changes still invalidate the toolkit's layout cache.
+
+## Native column highlights
+
+`set cursorcolumn` and `set colorcolumn=80,120` remain native in supported
+buffer views. Signed color columns follow Vim's `textwidth`; each split keeps
+its own guides. Syntax, search, Visual selection, tabs, wide characters and
+end-of-line whitespace retain Vim's source and highlight rules. Background
+decorations do not become source text or intercept source-position hits.
+Block-cursor inversion uses the final foreground/background at the cursor
+cell, including syntax over an underlying CursorLine or column background.
+
+## Plugin scratch buffers and per-window palettes
+
+Ordinary `nofile`, `nowrite` and `acwrite` buffers now support native text,
+source-pointer gestures and precision scrolling without changing Vim's buffer
+type, write callbacks or readonly/modifiable options. Terminal and prompt
+buffers retain compatibility rendering.
+
+A local `wincolor` keeps its own resolved Normal palette across text, empty
+rows, gutters and scroll margins. Native focus/caret fallbacks use that split's
+palette; changing the palette retires old scroll imagery. General
+`winhighlight` remapping remains a compatibility case.
+
+## Help and error-list windows
+
+Help, quickfix and location lists now use native text painting for supported
+plain views. QuickFixLine follows the list's current entry even when the text
+cursor moves independently; global and location-list state remains separate.
+These windows keep Vim's own mouse, wheel and keyboard processing, including
+Enter, Ctrl-] and double-click activation. The host does not add pixel-scroll
+animation to a window that explicitly delegates input to Vim. File/scratch
+splits alongside it retain their normal precision scrolling.
+
+Default help concealment and actual wrapped lines still require compatible
+display. User options and readonly/nomodifiable settings are preserved.
+
+A newly opened Vim editor inherits the current configured content font size.
+Later font-setting changes continue to apply until that editor is explicitly
+zoomed; a local zoom then keeps its own size. The same resolved value feeds
+keyboard/wheel zoom and both single-pane and split-pane native painting.
+
+Clicking the Vim body immediately confirms the caret, including a click at
+its current position. This restarts the original `guicursor` blink wait;
+steady cursors and the user's blink timings retain their existing behavior.
+
+## Native visible whitespace
+
+Common `listchars` markers retain native buffer painting. For example:
+
+```vim
+set list listchars=tab:»·,trail:·,nbsp:␣,eol:↲
+```
+
+Explicit two/three-glyph Tab markers, `space`, `lead`, `trail`, `nbsp` and
+`eol` support single-cell symbols. Every marker keeps the original source
+bytes for clicks, selection and saving; a line-end symbol is display-only.
+Each Vim split retains its own options and GUI highlight colors.
+Complex marker fields, default `^I` Tab geometry, active horizontal-edge
+markers and wrapped EOL continuations retain compatibility rendering.

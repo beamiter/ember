@@ -339,6 +339,10 @@ impl DirectInput {
         self.presentation_retired
             || !same_layout(presented, current, geometry)
             || !current.windows.iter().any(|new| same_source(old, new))
+            // A render-only replacement must be drawn before wheel input can
+            // return to PTY screen cells from a previously translated image.
+            || (presented.offsets.get(&old.window).copied().unwrap_or(0.0) != 0.0
+                && current.windows.iter().any(|new| new.window == old.window && render_only(new)))
     }
 
     /// Source hits are frozen with the image submitted to egui. A newer bridge
@@ -570,6 +574,37 @@ fn pointer_command(
     }
 }
 
+/// The protocol places each window's resolved Normal below all decorations.
+/// Legacy frames without explicit full-width backgrounds inherit global Normal.
+fn window_normal<'a>(
+    frame: &'a Vim9RenderFrame,
+    window: &jterm_core::vim9::Vim9RenderWindow,
+) -> &'a Vim9RenderStyle {
+    frame
+        .runs
+        .iter()
+        .find(|run| {
+            run.window == window.window
+                && run.line == 0
+                && run.text.is_empty()
+                && run.byte_start == 0
+                && run.byte_end == 0
+                && run.column == window.view.column
+                && run.cells == window.view.columns
+                && window.view.contains(run.row, run.column)
+        })
+        .map_or(&frame.default_style, |run| &run.style)
+}
+
+/// Protocol 3 source metadata distinguishes intentional render-only windows
+/// from older render frames that still need the legacy scroll presentation.
+fn render_only(window: &Vim9RenderWindow) -> bool {
+    window.line_count > 0
+        && !window.line_lengths.is_empty()
+        && !window.native_pointer
+        && !window.native_scroll
+}
+
 /// Acknowledged Vim frames are the source of truth. While a short scroll
 /// settles, retain its old edge rows so no empty band flashes at the boundary.
 /// State is bound to the editor's identity, never a renderer's reused pane.
@@ -608,8 +643,16 @@ impl ScrollPresentation {
             // animate a delayed acknowledgement of keyboard navigation either.
             self.suspend_until = now + 0.15;
         }
-        self.windows
-            .retain(|_, scroll| scroll.animation.is_active(now));
+        self.windows.retain(|id, scroll| {
+            scroll.animation.is_active(now)
+                && frame.is_none_or(|frame| {
+                    frame
+                        .windows
+                        .iter()
+                        .find(|window| window.window == *id)
+                        .is_none_or(|window| !render_only(window))
+                })
+        });
         let reset = !enabled
             || now < self.suspend_until
             || identity.is_none()
@@ -632,11 +675,16 @@ impl ScrollPresentation {
                             && a.view == b.view
                             && a.leftcol == b.leftcol
                             && a.textoff == b.textoff
+                            && window_normal(old, a) == window_normal(new, b)
                     });
                 if !same_layout {
                     self.windows.clear();
                 } else {
                     for (a, b) in old.windows.iter().zip(&new.windows) {
+                        if render_only(b) {
+                            self.windows.remove(&b.window);
+                            continue;
+                        }
                         let delta = b.topline as f64 - a.topline as f64;
                         if delta == 0.0 {
                             continue;
@@ -953,16 +1001,13 @@ fn paint_active_window(
     if !view.is_positive() {
         return;
     }
-    let (_, background, _) = colors(&frame.default_style, &frame.default_style);
+    let normal = window_normal(frame, window);
+    let (_, background, _) = colors(normal, normal);
     let accent = frame
         .cursor
         .appearance
         .as_ref()
-        .map(|appearance| {
-            rgb(appearance
-                .colors(&frame.default_style, &frame.default_style)
-                .1)
-        })
+        .map(|appearance| rgb(appearance.colors(normal, normal).1))
         .filter(|color| *color != background)
         .unwrap_or_else(|| painter.ctx().global_style().visuals.selection.bg_fill);
     let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
@@ -1071,8 +1116,9 @@ fn paint_direct(
     direct: &DirectInput,
 ) {
     let geometry = metrics(content, cell_width, line_height);
-    let (normal_fg, normal_bg, _) = colors(&frame.default_style, &frame.default_style);
     for window in &frame.windows {
+        let normal = window_normal(frame, window);
+        let (normal_fg, normal_bg, _) = colors(normal, normal);
         let Some(viewport) = Vim9Viewport::new(
             frame,
             window.window,
@@ -1090,14 +1136,14 @@ fn paint_direct(
         // Glyph rectangles retain their full height while only clipping changes.
         painter.rect_filled(view, 0.0, normal_bg);
         for projected in viewport.runs() {
-            let (_, bg, _) = colors(&projected.run.style, &frame.default_style);
+            let (_, bg, _) = colors(&projected.run.style, normal);
             painter.rect_filled(gui_rect(projected.rect), 0.0, bg);
         }
         for projected in viewport.runs() {
             paint_run(
                 &painter,
                 projected.run,
-                &frame.default_style,
+                normal,
                 gui_rect(projected.rect),
                 view,
                 cell_width,
@@ -1106,10 +1152,20 @@ fn paint_direct(
             );
         }
         if window.window == frame.window && (!focused || cursor_on) {
-            if let Some(cursor) = viewport.cursor_rect().map(gui_rect) {
+            // Visibility is clipped, but caret geometry must retain the full
+            // cell. Rebuilding a bar from a partial cell moves it at the edge.
+            if let Some(cursor) = viewport.cursor_rect().and_then(|_| {
+                geometry.cursor_rect(&window.cursor).map(|rect| {
+                    gui_rect(rect).translate(egui::vec2(
+                        0.0,
+                        direct.offset(frame, window.window, geometry),
+                    ))
+                })
+            }) {
                 if !paint_native_cursor(
                     &painter,
                     frame,
+                    normal,
                     cursor,
                     geometry,
                     font_size,
@@ -1127,6 +1183,7 @@ fn paint_direct(
 fn paint_native_cursor<'a>(
     painter: &egui::Painter,
     frame: &Vim9RenderFrame,
+    normal: &Vim9RenderStyle,
     cell: Rect,
     geometry: Vim9RenderMetrics,
     font_size: f32,
@@ -1137,11 +1194,14 @@ fn paint_native_cursor<'a>(
         return false;
     };
     let runs: Vec<_> = runs.filter(|(_, rect)| rect.intersects(cell)).collect();
+    // Background-only row/column runs precede the final glyph/selection ink.
+    // Resolve cursor inversion from the last painted style at its source cell.
     let under = runs
         .iter()
+        .rev()
         .find(|(_, rect)| rect.contains(cell.center()))
-        .map_or(&frame.default_style, |(run, _)| &run.style);
-    let (fg, bg) = appearance.colors(under, &frame.default_style);
+        .map_or(normal, |(run, _)| &run.style);
+    let (fg, bg) = appearance.colors(under, normal);
     if !focused {
         painter.rect_stroke(
             cell.shrink(0.5),
@@ -1163,15 +1223,11 @@ fn paint_native_cursor<'a>(
     ));
     painter.rect_filled(caret, 0.0, rgb(bg));
     for (run, rect) in runs {
-        let mut ink = run.clone();
-        ink.style.foreground = Some(fg);
-        ink.style.background = Some(bg);
-        ink.style.special = Some(fg);
-        ink.style.reverse = false;
-        paint_run(
+        // Reuse the buffer's shaped text; cursor inversion changes ink only.
+        paint_run_ink(
             painter,
-            &ink,
-            &frame.default_style,
+            run,
+            (rgb(fg), rgb(fg)),
             rect,
             caret,
             geometry.cell_width,
@@ -1241,13 +1297,18 @@ fn paint_view(
     }
     let painter = painter.with_clip_rect(view);
     geometry.origin_y += offset_y;
-    let (normal_fg, normal_bg, _) = colors(&frame.default_style, &frame.default_style);
+    let normal = frame
+        .windows
+        .iter()
+        .find(|window| &window.view == logical_view)
+        .map_or(&frame.default_style, |window| window_normal(frame, window));
+    let (normal_fg, normal_bg, _) = colors(normal, normal);
     painter.rect_filled(view.translate(egui::vec2(0.0, offset_y)), 0.0, normal_bg);
     // Backgrounds precede every glyph so a later style run cannot erase the
     // preceding italic glyph's natural overhang.
     for run in &frame.runs {
         if logical_view.contains(run.row, run.column) && run.cells > 0 {
-            let (_, bg, _) = colors(&run.style, &frame.default_style);
+            let (_, bg, _) = colors(&run.style, normal);
             if let Some(rect) = geometry.cell_rect(run.row, run.column, run.cells) {
                 painter.rect_filled(gui_rect(rect), 0.0, bg);
             }
@@ -1266,7 +1327,7 @@ fn paint_view(
         paint_run(
             &painter,
             run,
-            &frame.default_style,
+            normal,
             run_rect,
             view,
             cell_width,
@@ -1285,6 +1346,7 @@ fn paint_view(
         if paint_native_cursor(
             &painter,
             frame,
+            normal,
             cursor,
             geometry,
             font_size,
@@ -1317,6 +1379,29 @@ fn paint_run(
     font_size: f32,
 ) {
     let (fg, _, special) = colors(&run.style, normal);
+    paint_run_ink(
+        painter,
+        run,
+        (fg, special),
+        run_rect,
+        view,
+        cell_width,
+        line_height,
+        font_size,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_run_ink(
+    painter: &egui::Painter,
+    run: &jterm_core::vim9::Vim9RenderRun,
+    (fg, special): (Color32, Color32),
+    run_rect: Rect,
+    view: Rect,
+    cell_width: f32,
+    line_height: f32,
+    font_size: f32,
+) {
     let clip = run_rect
         .expand2(egui::vec2(font_size * 0.25, 0.0))
         .intersect(view);
@@ -1328,7 +1413,10 @@ fn paint_run(
     };
     let format = egui::TextFormat {
         font_id: font,
-        color: fg,
+        // Egui already caches galleys and invalidates them for font/DPI
+        // changes. Keep paint-only ink out of that cache key so cursor
+        // inversion and syntax color changes reuse the exact same shaping.
+        color: Color32::PLACEHOLDER,
         italics: run.style.italic,
         ..Default::default()
     };
@@ -1411,6 +1499,324 @@ fn ascii_columns_match(galley: &egui::Galley, cells: usize, cell_width: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ink_changes_reuse_the_same_shaped_galley_across_frames() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(200.0, 20.0));
+        let mut run = jterm_core::vim9::Vim9RenderRun {
+            text: "缓存字形".into(),
+            cells: 8,
+            ..Default::default()
+        };
+        let draw = |run: &jterm_core::vim9::Vim9RenderRun, ink, font_size| {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                let painter = ui.ctx().layer_painter(egui::LayerId::background());
+                if let Some(ink) = ink {
+                    paint_run_ink(&painter, run, (ink, ink), rect, rect, 10.0, 20.0, font_size);
+                } else {
+                    paint_run(
+                        &painter,
+                        run,
+                        &Vim9RenderStyle::default(),
+                        rect,
+                        rect,
+                        10.0,
+                        20.0,
+                        font_size,
+                    );
+                }
+            });
+            output.textures_delta.clear();
+            output
+                .shapes
+                .into_iter()
+                .find_map(|shape| match shape.shape {
+                    egui::Shape::Text(text) => Some(text),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        run.style.foreground = Some(0x123456);
+        let original = draw(&run, None, 14.0);
+        run.style.foreground = Some(0xabcdef);
+        let recolored = draw(&run, None, 14.0);
+        let cursor = draw(&run, Some(rgb(0xfedcba)), 14.0);
+        assert!(Arc::ptr_eq(&original.galley, &recolored.galley));
+        assert!(Arc::ptr_eq(&original.galley, &cursor.galley));
+        assert_eq!(original.fallback_color, rgb(0x123456));
+        assert_eq!(recolored.fallback_color, rgb(0xabcdef));
+        assert_eq!(cursor.fallback_color, rgb(0xfedcba));
+        let resized = draw(&run, None, 18.0);
+        assert!(!Arc::ptr_eq(&cursor.galley, &resized.galley));
+    }
+
+    #[test]
+    fn partial_top_cell_keeps_full_horizontal_caret_thickness_and_text_baseline() {
+        let mut frame = (*direct_frame(10)).clone();
+        frame.cursor.row = 0;
+        frame.cursor.appearance = Some(jterm_core::vim9::Vim9CursorAppearance {
+            shape: jterm_core::vim9::Vim9CursorShape::Horizontal,
+            percentage: 25,
+            style: Vim9RenderStyle {
+                foreground: Some(0xfaceab),
+                background: Some(0x112233),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        frame.windows[0].cursor = frame.cursor.clone();
+        let frame = Arc::new(frame);
+        let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(220.0, 120.0));
+        let geometry = metrics(content, 10.0, 20.0);
+        let direct = direct_fixture(&frame, geometry, 0.3125);
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            paint_direct(
+                &ui.ctx().layer_painter(egui::LayerId::background()),
+                &frame,
+                content,
+                10.0,
+                20.0,
+                14.0,
+                true,
+                true,
+                &direct,
+            );
+        });
+        output.textures_delta.clear();
+        let caret = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == rgb(0x112233) => Some(rect.rect),
+                _ => None,
+            })
+            .expect("horizontal caret must paint");
+        assert_eq!(
+            caret.height(),
+            5.0,
+            "25% of the full 20px cell, not its clipped 13.75px"
+        );
+        assert_eq!(caret.bottom(), content.top() + 13.75);
+        let text: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        let cursor_ink = text
+            .iter()
+            .find(|text| text.fallback_color == rgb(0xfaceab))
+            .expect("cursor inversion must repaint its underlying glyph");
+        assert!(
+            text.iter().any(|text| text.fallback_color == rgb(0xddeeff)
+                && text.pos == cursor_ink.pos
+                && Arc::ptr_eq(&text.galley, &cursor_ink.galley)),
+            "cursor ink must reuse both the baseline and shaped glyph of the source text"
+        );
+    }
+
+    #[test]
+    fn cursor_inverts_topmost_glyph_style_above_background_runs() {
+        let mut frame = (*direct_frame(10)).clone();
+        frame.cursor.appearance = Some(Default::default());
+        frame.runs[1].style.foreground = Some(0xaabbcc);
+        frame.runs[1].style.background = Some(0x223344);
+        let mut background = frame.runs[1].clone();
+        background.text.clear();
+        background.line = 0;
+        background.byte_start = 0;
+        background.byte_end = 0;
+        background.style.foreground = Some(0x556677);
+        background.style.background = Some(0x112233);
+        frame.runs.insert(0, background);
+        frame.windows[0].cursor = frame.cursor.clone();
+        let ctx = egui::Context::default();
+        let content = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(220.0, 120.0));
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            paint_direct(
+                &ui.ctx().layer_painter(egui::LayerId::background()),
+                &frame,
+                content,
+                10.0,
+                20.0,
+                14.0,
+                true,
+                true,
+                &DirectInput::default(),
+            );
+        });
+        output.textures_delta.clear();
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if rect.rect == Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(10.0, 20.0))
+                && rect.fill == rgb(0xaabbcc))),
+            "the default reversed cursor must use the topmost glyph foreground, not the row background's foreground");
+        assert!(
+            output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.fallback_color == rgb(0x223344))),
+            "cursor ink must use the same glyph's background"
+        );
+    }
+
+    #[test]
+    fn window_backgrounds_own_scrolled_clear_cursor_and_focus_colors() {
+        let mut frame = (*direct_frame(10)).clone();
+        frame.cursor.appearance = Some(Default::default());
+        frame.windows[0].cursor = frame.cursor.clone();
+        let palette = [(0xaabbcc, 0x102030), (0xddaabb, 0x304050)];
+        for (window, (fg, bg)) in frame.windows.iter().zip(palette) {
+            frame.runs.insert(
+                0,
+                jterm_core::vim9::Vim9RenderRun {
+                    window: window.window,
+                    row: window.view.row,
+                    column: window.view.column,
+                    cells: window.view.columns,
+                    text: String::new(),
+                    style: Vim9RenderStyle {
+                        foreground: Some(fg),
+                        background: Some(bg),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        let frame = Arc::new(frame);
+        let content = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(220.0, 120.0));
+        let geometry = metrics(content, 10.0, 20.0);
+        let direct = direct_fixture(&frame, geometry, 0.3125);
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.ctx().layer_painter(egui::LayerId::background());
+            paint_direct(
+                &painter, &frame, content, 10.0, 20.0, 14.0, true, true, &direct,
+            );
+            paint_active_window(&painter, &frame, content, 10.0, 20.0, true);
+        });
+        output.textures_delta.clear();
+        for (window, (_, bg)) in frame.windows.iter().zip(palette) {
+            let view = gui_rect(geometry.rect(&window.view).unwrap());
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.rect == view && rect.fill == rgb(bg))),
+                "the stationary clear must use each split's Normal even while its first row scrolls");
+        }
+        assert!(
+            output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if rect.stroke.color == rgb(0xaabbcc).gamma_multiply(0.6))),
+            "focus outline must resolve the active split's Normal"
+        );
+        assert!(
+            output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.fallback_color == rgb(0x102030))),
+            "cursor inversion of a glyph with unspecified style inherits the same split Normal"
+        );
+    }
+
+    #[test]
+    fn source_row_highlight_is_not_a_window_normal_marker() {
+        let mut frame = (*direct_frame(10)).clone();
+        let window = &frame.windows[0];
+        frame.runs.insert(
+            0,
+            jterm_core::vim9::Vim9RenderRun {
+                window: window.window,
+                row: window.view.row,
+                column: window.view.column,
+                cells: window.view.columns,
+                line: window.topline,
+                style: Vim9RenderStyle {
+                    background: Some(0xaa2266),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            window_normal(&frame, &frame.windows[0]),
+            &frame.default_style,
+            "a QuickFixLine full-width source-row background must not become pane Normal"
+        );
+        let content = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(220.0, 120.0));
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            paint_direct(
+                &ui.ctx().layer_painter(egui::LayerId::background()),
+                &frame,
+                content,
+                10.0,
+                20.0,
+                14.0,
+                true,
+                false,
+                &DirectInput::default(),
+            );
+        });
+        output.textures_delta.clear();
+        let view = gui_rect(
+            metrics(content, 10.0, 20.0)
+                .rect(&frame.windows[0].view)
+                .unwrap(),
+        );
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if rect.rect == view && rect.fill == rgb(0x101820))));
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if rect.rect == view && rect.fill == rgb(0xaa2266))));
+    }
+
+    #[test]
+    fn changing_window_normal_retires_old_scroll_edge_frames() {
+        let recolor = |revision, top, background| {
+            let mut frame = (*scroll_frame(revision, top)).clone();
+            let view = &frame.windows[0].view;
+            frame.runs.insert(
+                0,
+                jterm_core::vim9::Vim9RenderRun {
+                    window: 1,
+                    row: view.row,
+                    column: view.column,
+                    cells: view.columns,
+                    style: Vim9RenderStyle {
+                        background: Some(background),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            Arc::new(frame)
+        };
+        let identity = Some(uuid::Uuid::new_v4());
+        let mut scroll = ScrollPresentation::default();
+        scroll.update(
+            identity,
+            Some(&recolor(1, 1, 0x102030)),
+            20.0,
+            1.0,
+            true,
+            false,
+        );
+        scroll.update(
+            identity,
+            Some(&recolor(2, 4, 0x102030)),
+            20.0,
+            1.02,
+            true,
+            false,
+        );
+        assert!(scroll.active(1.02));
+        scroll.update(
+            identity,
+            Some(&recolor(3, 5, 0x304050)),
+            20.0,
+            1.03,
+            true,
+            false,
+        );
+        assert!(!scroll.active(1.03));
+    }
 
     fn direct_frame(top: u64) -> Arc<Vim9RenderFrame> {
         use jterm_core::vim9::{
@@ -1533,6 +1939,44 @@ mod tests {
         direct.scrolls.insert(1, scroll);
         direct.remember_presentation(Arc::clone(frame), geometry, &egui::Context::default());
         direct
+    }
+
+    #[test]
+    fn render_only_split_releases_wheel_admission_without_disabling_its_peer() {
+        let frame = direct_frame(10);
+        let geometry = metrics(
+            Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(220.0, 120.0)),
+            10.0,
+            20.0,
+        );
+        let mut input = direct_fixture(&frame, geometry, 0.3125);
+        let mut next = (*frame).clone();
+        next.windows[0].native_pointer = false;
+        next.windows[0].native_scroll = false;
+        input.reconcile_with(&next, geometry, |_| false);
+        assert!(
+            input.presented_fraction_at(egui::pos2(15.0, 15.0)),
+            "old image retains input ownership before repaint"
+        );
+        assert!(
+            input.stale_presentation_at(&next, geometry, egui::pos2(15.0, 15.0)),
+            "old fractional wheel input must not fall through to PTY before replacement paint"
+        );
+        input.remember_presentation(Arc::new(next.clone()), geometry, &egui::Context::default());
+        assert!(!input.presented_fraction_at(egui::pos2(15.0, 15.0)));
+        assert!(!input.stale_presentation_at(&next, geometry, egui::pos2(15.0, 15.0)));
+        assert_eq!(
+            input.wheel_window_at(&next, geometry, egui::pos2(15.0, 15.0)),
+            None
+        );
+        assert_eq!(
+            input.wheel_window_at(&next, geometry, egui::pos2(125.0, 15.0)),
+            Some(2)
+        );
+        assert!(input
+            .presented_anchor(&next, geometry, egui::pos2(15.0, 15.0))
+            .is_none());
+        assert!(!input.needs_frame());
     }
 
     #[test]
@@ -1794,12 +2238,9 @@ mod tests {
                     .collect::<String>(),
                 "menu"
             );
-            assert!(text.iter().all(|shape| shape
-                .galley
-                .job
-                .sections
+            assert!(text
                 .iter()
-                .all(|section| section.format.color == rgb(0x19c3a7))));
+                .all(|shape| shape.fallback_color == rgb(0x19c3a7)));
         }
     }
 
@@ -1839,7 +2280,7 @@ mod tests {
         );
         assert!(
             output.shapes.iter().any(|clipped| matches!(&clipped.shape,
-            egui::Shape::Text(shape) if shape.galley.job.sections.iter().any(|section| section.format.color == rgb(0x19c3a7))
+            egui::Shape::Text(shape) if shape.fallback_color == rgb(0x19c3a7)
                 && clipped.clip_rect.bottom() == view.bottom())),
             "fractional input must show real margin glyphs before a whole-line command"
         );
@@ -1894,14 +2335,7 @@ mod tests {
                 .shapes
                 .iter()
                 .find_map(|clipped| match &clipped.shape {
-                    egui::Shape::Text(shape)
-                        if shape
-                            .galley
-                            .job
-                            .sections
-                            .iter()
-                            .any(|section| section.format.color == rgb(0x0abcde)) =>
-                    {
+                    egui::Shape::Text(shape) if shape.fallback_color == rgb(0x0abcde) => {
                         Some(shape.pos.y)
                     }
                     _ => None,
@@ -2274,6 +2708,76 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn render_only_windows_skip_legacy_animation_without_disabling_other_splits() {
+        let frame = |revision, top, modern| {
+            let mut frame = (*scroll_frame(revision, top)).clone();
+            frame.windows[1].topline = top;
+            if modern {
+                frame.windows[0].line_count = 100;
+                frame.windows[0].line_lengths = vec![0; frame.windows[0].view.rows];
+            }
+            Arc::new(frame)
+        };
+        let identity = Some(uuid::Uuid::new_v4());
+        let mut scroll = ScrollPresentation::default();
+        scroll.update(identity, Some(&frame(1, 1, false)), 20.0, 1.0, true, false);
+        scroll.update(identity, Some(&frame(2, 3, false)), 20.0, 1.02, true, false);
+        assert!(
+            scroll.offset(1, 1.02) > 0.0,
+            "protocol 1/2 retains legacy presentation"
+        );
+        assert!(scroll.offset(2, 1.02) > 0.0);
+        scroll.update(identity, Some(&frame(3, 4, true)), 20.0, 1.03, true, false);
+        assert_eq!(
+            scroll.offset(1, 1.03),
+            0.0,
+            "render-only input must match the stationary PTY"
+        );
+        assert!(
+            scroll.offset(2, 1.03) > 0.0,
+            "a peer split keeps its legacy animation"
+        );
+    }
+
+    #[test]
+    fn same_cell_pointer_input_restarts_native_cursor_wait() {
+        let mut frame = (*direct_frame(10)).clone();
+        frame.cursor.appearance = Some(jterm_core::vim9::Vim9CursorAppearance {
+            blinkwait: 100,
+            blinkoff: 50,
+            blinkon: 50,
+            ..Default::default()
+        });
+        let frame = Arc::new(frame);
+        let identity = Some(uuid::Uuid::new_v4());
+        let mut presentation = ScrollPresentation::default();
+        presentation.update(identity, Some(&frame), 20.0, 1.0, true, false);
+        let now = std::time::Instant::now();
+        assert!(
+            presentation
+                .cursor_blink
+                .borrow_mut()
+                .sample(&frame, true, now)
+                .0
+        );
+        let off = now + std::time::Duration::from_millis(101);
+        assert!(
+            !presentation
+                .cursor_blink
+                .borrow_mut()
+                .sample(&frame, true, off)
+                .0
+        );
+        presentation.update(identity, Some(&frame), 20.0, 1.1, true, true);
+        let (visible, wait) = presentation
+            .cursor_blink
+            .borrow_mut()
+            .sample(&frame, true, off);
+        assert!(visible);
+        assert_eq!(wait, Some(std::time::Duration::from_millis(100)));
     }
 
     #[test]

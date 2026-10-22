@@ -3047,7 +3047,7 @@ impl TerminalApp {
                 continue;
             };
             editor.native_input.lock().cancel();
-            let size = f64::from(editor.buffer_font_size.unwrap_or(self.config.font_size)) + delta;
+            let size = f64::from(editor.font_size(self.config.font_size)) + delta;
             editor.buffer_font_size = Some(config::Config::clamp_font_size(
                 size.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32,
             ));

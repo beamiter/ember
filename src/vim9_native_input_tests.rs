@@ -295,3 +295,82 @@ fn real_vim_precision_scroll_with_virtualedit_and_insert_mode_ignores_notch_anim
         assert_eq!(input.offset(&acknowledged, window, geometry), -6.25);
     }
 }
+
+#[test]
+#[ignore = "requires real Vim 9, a PTY, and local bridge sockets"]
+fn render_only_transition_preserves_old_image_ownership_then_passes_clicks_and_wheel() {
+    let mut fixture = Fixture::start();
+    let old = fixture.session.render_snapshot().unwrap();
+    let geometry = Vim9RenderMetrics {
+        origin_x: 0.0,
+        origin_y: 0.0,
+        cell_width: 8.0,
+        line_height: 20.0,
+    };
+    let point = egui::pos2(12.0, 10.0);
+    let ctx = egui::Context::default();
+    let mut input = DirectInput::default();
+    assert!(input.wheel(&old, old.window, geometry, 0.3125, &fixture.session));
+    input.remember_presentation(old.clone(), geometry, &ctx);
+    wait(|| fixture.session.snapshot().pending == 0);
+    let mut current = (*fixture.session.render_snapshot().unwrap()).clone();
+    for window in &mut current.windows {
+        window.native_pointer = false;
+        window.native_scroll = false;
+    }
+    assert!(current.windows.iter().all(render_only));
+    input.reconcile_with(&current, geometry, |_| false);
+    assert!(
+        input.press(&current, geometry, point, 1.0, &fixture.session),
+        "the old moving image must consume a new press"
+    );
+    assert!(input.discarding_pointer());
+    input.finish_cancelled_pointer(false);
+    input.remember_presentation(Arc::new(current.clone()), geometry, &ctx);
+    for now in [2.0, 2.1] {
+        assert!(
+            !input.press(&current, geometry, point, now, &fixture.session),
+            "steady clicks/double clicks stay in PTY"
+        );
+    }
+    assert_eq!(input.wheel_window_at(&current, geometry, point), None);
+    assert_eq!(input.offset(&current, current.window, geometry), 0.0);
+    assert_eq!(
+        fixture.session.snapshot().pending,
+        0,
+        "render-only UI must not send native commands"
+    );
+    assert_eq!(
+        crate::vim9_ide::shortcut_command(egui::Key::Enter, egui::Modifiers::NONE),
+        None
+    );
+    let line = fixture.session.snapshot().line;
+    fixture.master.write_all(b"\r").unwrap();
+    wait(|| fixture.session.snapshot().line == line + 1);
+    assert_eq!(
+        fixture.session.snapshot().pending,
+        0,
+        "Enter uses the original PTY, not a native command"
+    );
+}
+
+#[test]
+#[ignore = "requires real Vim 9, a PTY, and local bridge sockets"]
+fn editor_font_inherits_live_configuration_until_explicit_local_zoom() {
+    let fixture = Fixture::start();
+    let mut editor = crate::vim9_ide::Workbench::new(fixture.session.clone(), &Default::default());
+    assert_eq!(editor.buffer_font_size, None);
+    assert_eq!(editor.font_size(12.0), 12.0);
+    assert_eq!(
+        editor.font_size(21.0),
+        21.0,
+        "settings changes reach an editor that has not been zoomed"
+    );
+    editor.buffer_font_size = Some(18.0);
+    assert_eq!(editor.font_size(12.0), 18.0);
+    assert_eq!(
+        editor.font_size(24.0),
+        18.0,
+        "an intentional per-editor zoom survives global settings changes"
+    );
+}

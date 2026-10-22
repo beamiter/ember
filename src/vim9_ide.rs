@@ -499,6 +499,7 @@ pub(crate) struct Workbench {
     pub(crate) buffer_font_size: Option<f32>,
     pub(crate) native_input: Arc<parking_lot::Mutex<crate::vim9_buffer::DirectInput>>,
     render_subscribed: bool,
+    revealed_buffer: Option<i64>,
     render_wake: Option<RenderWake>,
     deferred_action: Option<DeferredAction>,
     snapshot: Arc<Vim9Snapshot>,
@@ -521,13 +522,15 @@ pub(crate) struct Workbench {
 }
 
 impl Workbench {
-    pub(crate) fn new(session: Vim9Session, font_size: f32, config: &Vim9UiConfig) -> Self {
+    pub(crate) fn new(session: Vim9Session, config: &Vim9UiConfig) -> Self {
         let snapshot = Arc::new(session.snapshot());
         Self {
             session,
-            buffer_font_size: Some(crate::config::Config::clamp_font_size(font_size)),
+            // Inherit live content-font settings until this editor is zoomed.
+            buffer_font_size: None,
             native_input: Arc::new(parking_lot::Mutex::new(Default::default())),
             render_subscribed: false,
+            revealed_buffer: None,
             render_wake: None,
             deferred_action: None,
             snapshot,
@@ -548,6 +551,10 @@ impl Workbench {
             chrome_popup_open: false,
             return_focus: false,
         }
+    }
+
+    pub(crate) fn font_size(&self, configured_size: f32) -> f32 {
+        crate::config::Config::clamp_font_size(self.buffer_font_size.unwrap_or(configured_size))
     }
 
     pub(crate) fn send(&mut self, command: Vim9Command) {
@@ -811,25 +818,36 @@ impl Workbench {
             }
         }
         if config.buffer_tabs {
+            let labels = crate::vim9_buffer_labels::vim9_buffer_labels(&snapshot.buffers);
+            let current = snapshot
+                .buffers
+                .iter()
+                .find(|buffer| buffer.current)
+                .map(|buffer| buffer.id);
+            let reveal_current = current != self.revealed_buffer;
+            self.revealed_buffer = current;
             egui::ScrollArea::horizontal()
                 .id_salt("vim9_buffers")
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        for buffer in &snapshot.buffers {
+                        for (buffer, name) in snapshot.buffers.iter().zip(&labels) {
                             ui.push_id(("buffer", buffer.id), |ui| {
-                                let name = Path::new(&buffer.name)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .filter(|n| !n.is_empty())
-                                    .unwrap_or("[No Name]");
                                 let label =
                                     format!("{}{}", name, if buffer.modified { " •" } else { "" });
-                                if ui
-                                    .selectable_label(buffer.current, label)
-                                    .on_hover_text(&buffer.name)
-                                    .clicked()
-                                {
+                                let tab = ui.selectable_label(buffer.current, label).on_hover_text(
+                                    format!(
+                                        "{}\nMiddle-click to close (keeps unsaved changes)",
+                                        buffer.name
+                                    ),
+                                );
+                                if reveal_current && buffer.current {
+                                    tab.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                if tab.clicked() {
                                     self.send(Vim9Command::Buffer { buffer: buffer.id });
+                                }
+                                if tab.middle_clicked() {
+                                    self.send(Vim9Command::CloseBuffer { buffer: buffer.id });
                                 }
                                 if ui
                                     .small_button("×")
@@ -1754,8 +1772,9 @@ impl TerminalApp {
 
     pub(crate) fn vim9_buffer_font_size(&self) -> f32 {
         self.active_vim9_editor()
-            .and_then(|editor| editor.buffer_font_size)
-            .unwrap_or(self.config.font_size)
+            .map_or(self.config.font_size, |editor| {
+                editor.font_size(self.config.font_size)
+            })
     }
 
     pub(crate) fn set_vim9_buffer_font_size(&mut self, size: f32) -> bool {
@@ -1984,7 +2003,7 @@ impl TerminalApp {
         };
         self.vim9_editors.insert(
             created.session_id,
-            Workbench::new(session, self.config.font_size, &self.config.vim9),
+            Workbench::new(session, &self.config.vim9),
         );
         self.tabs.on_session_inserted(created.session_index);
         self.tabs.insert_tab_after_active(created.session_index);

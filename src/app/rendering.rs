@@ -2512,7 +2512,7 @@ impl TerminalApp {
             .as_ref()
             .and_then(|snapshot| snapshot.frame.clone());
         self.renderer.native_vim9_font_size =
-            native_editor.map(|editor| editor.buffer_font_size.unwrap_or(self.config.font_size));
+            native_editor.map(|editor| editor.font_size(self.config.font_size));
         self.renderer.font_size = self
             .renderer
             .native_vim9_font_size
@@ -2622,8 +2622,8 @@ impl TerminalApp {
                     .native_vim9_input_snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.frame.clone());
-                renderer.native_vim9_font_size = native_editor
-                    .map(|editor| editor.buffer_font_size.unwrap_or(self.config.font_size));
+                renderer.native_vim9_font_size =
+                    native_editor.map(|editor| editor.font_size(self.config.font_size));
                 renderer.font_size = renderer
                     .native_vim9_font_size
                     .unwrap_or(self.config.font_size);
