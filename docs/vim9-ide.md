@@ -139,7 +139,10 @@ on demand even when the metadata/status panel is disabled.
 Wheel input is coalesced once per frame and targets the Vim split under the
 pointer. One wheel notch moves three lines. Trackpad pixel distances are divided
 by the actual line height, preserving fractional movement independently in each
-split. Ctrl+wheel retains editor font zoom. Input mixed with keyboard activity
+split. Fractional X11 line units also follow the device directly. Normal and
+Insert mode scroll independently of native click/drag support, including with
+`virtualedit=block` or custom primary-pointer mappings. Ctrl+wheel retains editor
+font zoom. Input mixed with keyboard activity
 keeps its ordinary terminal route so semantic requests cannot overtake text.
 
 Fractions move the native text immediately, using Vim's prefetched source rows
@@ -183,8 +186,8 @@ or editor changes cancel the local fraction and any queued pointer target.
 A cancelled native press still owns its physical release, so it cannot become
 an unrelated terminal mouse report. Once a replacement frame has been drawn,
 hidden editors and removed panes stop owning new clicks in their old area.
-Set `[vim9] smooth_scroll = false` to keep
-whole-line rendering; precision wheel accumulation remains available. Insert
+Set `[vim9] smooth_scroll = false` to disable discrete wheel easing. Precision
+devices still move the buffer by pixels. Insert
 mode uses a narrow caret, Replace mode an underline, and Normal mode the block
 caret.
 

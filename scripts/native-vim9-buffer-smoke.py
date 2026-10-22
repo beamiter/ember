@@ -56,7 +56,7 @@ def main():
     vimrc.write_text(
         "set nocompatible viminfofile=NONE noswapfile nomore notermguicolors\n"
         "set runtimepath=$VIMRUNTIME packpath= noloadplugins\n"
-        "set nowrap mouse=a laststatus=0 nonumber norelativenumber\n"
+        "set nowrap mouse=a virtualedit=block laststatus=0 nonumber norelativenumber\n"
         "set nospell nolist conceallevel=0\n"
         f"nnoremap <silent> <C-S> <Cmd>call writefile(['raw_ctrl_s'], {quoted(out / 'raw-control-s.txt')}, 'a')<CR>\n"
         "syntax on\n"
@@ -75,7 +75,7 @@ def main():
         "let encoded = get(get(info[0], 'variables', {}), 'previousRender', '')\n"
         "if empty(encoded) | return {} | endif\n"
         "let frame = json_decode(encoded)\n"
-        "return {'cursor': get(frame, 'cursor', {}), 'completion': get(frame, 'completion', v:null), 'views': map(copy(get(frame, 'windows', [])), {_, w -> w.view}), 'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0), 'native_pointer': get(get(get(frame, 'windows', []), 0, {}), 'native_pointer', 0), 'scroll_ack': get(get(get(frame, 'windows', []), 0, {}), 'scroll_ack', 0)}\n"
+        "return {'cursor': get(frame, 'cursor', {}), 'completion': get(frame, 'completion', v:null), 'views': map(copy(get(frame, 'windows', [])), {_, w -> w.view}), 'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0), 'native_pointer': get(get(get(frame, 'windows', []), 0, {}), 'native_pointer', 0), 'native_scroll': get(get(get(frame, 'windows', []), 0, {}), 'native_scroll', 0), 'scroll_ack': get(get(get(frame, 'windows', []), 0, {}), 'scroll_ack', 0)}\n"
         "endfunction\n"
         "function! NativeFixtureState(timer) abort\n"
         f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'completion': complete_info(['selected', 'pum_visible']), 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
@@ -175,8 +175,10 @@ def main():
         # Trace a real wheel notch through window pixels in a disposable Vim
         # buffer. A distinctive source line supplies the visual position oracle.
         command("enew | call setline(1, map(range(1,200), {_, n -> printf('WHEEL_%03d native scroll', n)})) | setlocal nowrap scrolloff=0")
-        command("syntax match NativePlugin /^WHEEL_065.*/ | normal! 50Gzt")
-        wait_for(lambda: state().get("topline") == 50 and state().get("render", {}).get("supported"),
+        command("syntax match NativePlugin /^WHEEL_065.*/ | nnoremap <LeftMouse> <Nop> | normal! 50Gzt")
+        wait_for(lambda: state().get("topline") == 50 and state().get("render", {}).get("supported")
+                 and state().get("render", {}).get("native_scroll")
+                 and not state().get("render", {}).get("native_pointer"),
                  "wheel source viewport", app)
         geometry = dict(line.split("=", 1) for line in xdo("getwindowgeometry", "--shell", window).stdout.splitlines() if "=" in line)
         box = (int(geometry["X"]), int(geometry["Y"]),
@@ -193,22 +195,45 @@ def main():
                 mask = part if mask is None else ImageChops.multiply(mask, part)
             bounds = mask.getbbox()
             return bounds[1] if bounds is not None else None
-        xdo("mousemove", "--window", window, "200", "200")
-        start_y = wait_for(lambda: wheel_y("wheel-before"), "painted wheel source highlight", app)
-        started = time.monotonic()
-        xdo("click", "--delay", "0", "5")
-        trace = []
-        for index in range(8):
-            trace.append([round(time.monotonic() - started, 4), wheel_y("wheel-step-" + str(index))])
-            time.sleep(0.008)
-        wait_for(lambda: state().get("topline") == 53, "one wheel notch moves exactly three Vim rows", app)
-        end_y = wheel_y("wheel-after")
+        def trace_notch(prefix, mode):
+            xdo("mousemove", "--window", window, "200", "200")
+            start_y = wait_for(lambda: wheel_y(prefix + "-before"), "painted wheel source highlight", app)
+            before_ack = state().get("render", {}).get("scroll_ack", 0)
+            started = time.monotonic()
+            xdo("click", "--delay", "0", "5")
+            trace = []
+            for index in range(8):
+                trace.append([round(time.monotonic() - started, 4), wheel_y(prefix + "-step-" + str(index))])
+                time.sleep(0.008)
+            report["wheel_attempt_" + mode] = {"start_y": start_y, "trace": trace,
+                                               "before_ack": before_ack, "after_state": state()}
+            for name, image in wheel_images:
+                image.save(out / (name + ".png"))
+            wait_for(lambda: state().get("topline") == 53 and state().get("mode") == mode,
+                     "one wheel notch moves exactly three Vim rows in " + mode + " mode", app)
+            end_y = wheel_y(prefix + "-after")
+            assert end_y < start_y, (start_y, trace, end_y)
+            row_height = (start_y - end_y) / 3.0
+            fractional = [y for _, y in trace if y is not None and end_y < y < start_y
+                          and abs((start_y - y) / row_height - round((start_y - y) / row_height)) > 0.08]
+            assert fractional, ("wheel moved only by complete Vim rows", mode, start_y, trace, end_y, row_height)
+            return {"source_topline": [50, 53], "start_y": start_y,
+                    "end_y": end_y, "row_height": row_height,
+                    "fractional_positions": fractional, "trace": trace,
+                    "virtualedit": "block", "native_pointer": False, "mode": mode,
+                    "ack": [before_ack, state().get("render", {}).get("scroll_ack", 0)]}
+        report["wheel_notch"] = trace_notch("wheel", "n")
+        command("normal! 50Gzt")
+        xdo("key", "i")
+        wait_for(lambda: state().get("topline") == 50 and state().get("mode") == "i"
+                 and state().get("render", {}).get("native_scroll"),
+                 "Insert wheel source viewport", app)
+        wait_for(lambda: wheel_y("wheel-insert-ready") == report["wheel_notch"]["start_y"],
+                 "Insert wheel source is actually painted at the restored viewport", app)
+        report["wheel_insert"] = trace_notch("wheel-insert", "i")
         for name, image in wheel_images:
             image.save(out / (name + ".png"))
-        assert end_y < start_y, (start_y, trace, end_y)
-        assert any(end_y < y < start_y for _, y in trace), ("wheel skipped its intermediate GUI pixels", start_y, trace, end_y)
-        report["wheel_notch"] = {"source_topline": [50, 53], "start_y": start_y,
-                                  "end_y": end_y, "trace": trace}
+        command("nunmap <LeftMouse>")
         command("bwipeout!")
         wait_for(lambda: state().get("text") == original.splitlines()[0] and state().get("modified") == 0,
                  "return from disposable wheel buffer", app)

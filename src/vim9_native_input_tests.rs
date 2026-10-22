@@ -175,6 +175,11 @@ fn real_vim_fractional_click_drag_yank_and_cancel_use_the_presented_source() {
     let selected = fixture.session.render_snapshot().unwrap();
     assert_eq!(selected.mode, "v");
     assert_eq!((selected.cursor.line, selected.cursor.byte_column), (3, 4));
+    assert_eq!(
+        input.offset(&selected, window, geometry),
+        -6.25,
+        "a source-pointer selection must retain the fractional image throughout Visual mode"
+    );
     let yank_file = fixture.root.join("yank.json");
     fixture
         .master
@@ -222,4 +227,71 @@ fn real_vim_fractional_click_drag_yank_and_cancel_use_the_presented_source() {
         0,
         "a cancelled drag cannot submit a delayed release target"
     );
+}
+
+#[test]
+#[ignore = "requires real Vim 9, a PTY, and local bridge sockets"]
+fn real_vim_precision_scroll_with_virtualedit_and_insert_mode_ignores_notch_animation_preference() {
+    let mut fixture = Fixture::start();
+    fixture
+        .master
+        .write_all(b":set virtualedit=block | nnoremap <LeftMouse> <LeftMouse>\r")
+        .unwrap();
+    wait(|| {
+        fixture.session.render_snapshot().is_some_and(|frame| {
+            frame.supported
+                && frame.mode == "n"
+                && frame
+                    .windows
+                    .iter()
+                    .all(|window| window.native_scroll && !window.native_pointer)
+        }) && fixture.session.snapshot().pending == 0
+    });
+    let geometry = Vim9RenderMetrics {
+        origin_x: 0.0,
+        origin_y: 0.0,
+        cell_width: 8.0,
+        line_height: 20.0,
+    };
+    for mode in ["n", "i"] {
+        if mode == "i" {
+            fixture.master.write_all(b"i").unwrap();
+            wait(|| {
+                fixture
+                    .session
+                    .render_snapshot()
+                    .is_some_and(|frame| frame.supported && frame.mode == "i")
+            });
+        }
+        let frame = fixture.session.render_snapshot().unwrap();
+        let window = frame.window;
+        assert!(frame.windows.iter().all(|window| window.native_scroll));
+        assert!(frame.windows.iter().all(|window| !window.native_pointer));
+        let mut input = DirectInput::default();
+        input.set_smooth(false);
+        assert!(input.wheel(&frame, window, geometry, 0.3125, &fixture.session));
+        assert_eq!(input.offset(&frame, window, geometry), -6.25);
+        assert_eq!(fixture.session.snapshot().pending, 0);
+        input.remember_presentation(Arc::clone(&frame), geometry, &egui::Context::default());
+        assert_eq!(
+            input.wheel_window_at(&frame, geometry, egui::pos2(25.0, 17.0)),
+            Some(window)
+        );
+        assert!(input
+            .presented_anchor(&frame, geometry, egui::pos2(25.0, 17.0))
+            .is_none());
+        assert!(input.wheel(&frame, window, geometry, 1.0, &fixture.session));
+        wait(|| {
+            let snapshot = fixture.session.input_snapshot();
+            input.reconcile(&snapshot, geometry);
+            fixture.session.snapshot().pending == 0 && !input.needs_frame()
+        });
+        let acknowledged = fixture.session.render_snapshot().unwrap();
+        assert_eq!(acknowledged.mode, mode);
+        assert_eq!(
+            acknowledged.windows[0].topline,
+            frame.windows[0].topline + 1
+        );
+        assert_eq!(input.offset(&acknowledged, window, geometry), -6.25);
+    }
 }

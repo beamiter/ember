@@ -1380,7 +1380,7 @@ impl TerminalApp {
             direct.cancel();
             return claimed;
         }
-        if !down && !pressed && frame.mode == "n" {
+        if !down && !pressed && matches!(frame.mode.as_str(), "n" | "i") {
             if let Some(point) = point.filter(|point| content.contains(*point)) {
                 let window = direct
                     .wheel_window_at(frame, geometry, point)
@@ -1392,21 +1392,8 @@ impl TerminalApp {
                     .frame_events
                     .iter()
                     .filter_map(|event| {
-                        crate::vim9_buffer::wheel_lines(event, geometry.line_height, rows).map(
-                            |delta| {
-                                (
-                                    delta,
-                                    matches!(
-                                        event,
-                                        egui::Event::MouseWheel {
-                                            unit: egui::MouseWheelUnit::Line
-                                                | egui::MouseWheelUnit::Page,
-                                            ..
-                                        }
-                                    ),
-                                )
-                            },
-                        )
+                        crate::vim9_buffer::wheel_lines(event, geometry.line_height, rows)
+                            .map(|delta| (delta, crate::vim9_buffer::wheel_is_discrete(event)))
                     })
                     .fold(
                         (0usize, 0.0f64, true),
@@ -1454,7 +1441,7 @@ impl TerminalApp {
             }
         }
         // Pointer-owned fractions stay fixed until the real selection settles.
-        if !direct.pointer_captured() && !claimed && frame.mode == "n" {
+        if !direct.pointer_captured() && !claimed && matches!(frame.mode.as_str(), "n" | "i") {
             direct.flush_scroll(&editor.session);
         }
         if direct.needs_frame() {

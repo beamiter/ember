@@ -23,7 +23,7 @@ mod native_input_tests;
 #[derive(Default)]
 pub struct DirectInput {
     scrolls: HashMap<i64, Vim9PixelScroll>,
-    suppress_fraction: bool,
+    instant_wheel: bool,
     pointer: Option<NativePointer>,
     discarded_pointer: bool,
     next_gesture: u64,
@@ -52,9 +52,9 @@ struct NativePointer {
 
 impl DirectInput {
     pub fn set_smooth(&mut self, enabled: bool) {
-        if self.suppress_fraction == enabled {
+        if self.instant_wheel == enabled {
             self.cancel();
-            self.suppress_fraction = !enabled;
+            self.instant_wheel = !enabled;
         }
     }
 
@@ -235,7 +235,7 @@ impl DirectInput {
             .scrolls
             .get_mut(&window)
             .expect("bound window inserted above");
-        if discrete && !self.suppress_fraction {
+        if discrete && !self.instant_wheel {
             scroll.push_wheel(delta);
         } else {
             scroll.push(delta);
@@ -253,9 +253,6 @@ impl DirectInput {
     }
 
     pub fn offset(&self, frame: &Vim9RenderFrame, window: i64, geometry: Vim9RenderMetrics) -> f32 {
-        if self.suppress_fraction {
-            return 0.0;
-        }
         self.scrolls
             .get(&window)
             .map_or(0.0, |scroll| scroll.offset(frame, geometry))
@@ -401,8 +398,8 @@ impl DirectInput {
             let same_source = current
                 .windows
                 .iter()
-                .any(|new| new.native_pointer && same_source(old, new));
-            (old.native_pointer
+                .any(|new| new.native_scroll && same_source(old, new));
+            (old.native_scroll
                 && same_source
                 && geometry.rect(&old.view)?.contains(point.x, point.y))
             .then_some(old.window)
@@ -760,6 +757,24 @@ pub(crate) fn wheel_lines(event: &egui::Event, line_height: f32, rows: usize) ->
                 egui::MouseWheelUnit::Page => rows.max(1) as f64,
             },
     )
+}
+
+/// X11 precision valuators use fractional line units, even for a touchpad.
+/// Preserve those distances directly instead of adding a wheel-notch curve.
+#[allow(dead_code)]
+pub(crate) fn wheel_is_discrete(event: &egui::Event) -> bool {
+    match event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta,
+            ..
+        } => delta.y.fract() == 0.0,
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Page,
+            ..
+        } => true,
+        _ => false,
+    }
 }
 
 /// The native caret and the OS IME candidate window share the same fractional
@@ -1369,6 +1384,7 @@ mod tests {
             changedtick: 3,
             view: view.clone(),
             native_pointer: true,
+            native_scroll: true,
             topline: top,
             botline: top + 3,
             line_count: 100,
@@ -1416,6 +1432,7 @@ mod tests {
             line_count: 20,
             line_lengths: vec![4; 4],
             native_pointer: true,
+            native_scroll: true,
             ..Default::default()
         };
         Arc::new(Vim9RenderFrame {
@@ -1909,8 +1926,20 @@ mod tests {
         changed.windows[0].native_pointer = false;
         assert!(
             !direct.stale_presentation_at(&changed, geometry, egui::pos2(15.0, 15.0)),
-            "unchanged sources with mouse mappings keep their legacy wheel route"
+            "click mappings do not invalidate an unchanged scroll source"
         );
+        assert_eq!(
+            direct.wheel_window_at(&changed, geometry, egui::pos2(15.0, 15.0)),
+            Some(1),
+            "scroll capability is independent of source-pointer capability"
+        );
+        assert!(direct
+            .presented_anchor(&changed, geometry, egui::pos2(15.0, 15.0))
+            .is_none());
+        changed.windows[0].native_scroll = false;
+        assert!(direct
+            .wheel_window_at(&changed, geometry, egui::pos2(15.0, 15.0))
+            .is_none());
         assert!(direct
             .presented_anchor(
                 &newer,
@@ -2071,7 +2100,7 @@ mod tests {
     }
 
     #[test]
-    fn disabling_smooth_motion_retires_the_fraction_and_presented_source() {
+    fn disabling_notch_easing_retires_old_motion_and_keeps_precision_pixels() {
         let frame = direct_frame(10);
         let geometry = Vim9RenderMetrics {
             origin_x: 0.0,
@@ -2085,6 +2114,14 @@ mod tests {
         assert!(direct.presentation_retired);
         assert!(direct.presented.is_some());
         assert!(direct.scrolls.is_empty());
+        let mut scroll = Vim9PixelScroll::new(&frame.windows[0], geometry).unwrap();
+        scroll.push(0.3125);
+        direct.scrolls.insert(1, scroll);
+        assert_eq!(
+            direct.offset(&frame, 1, geometry),
+            -6.25,
+            "the animation preference must not quantize precision device pixels"
+        );
     }
 
     fn scroll_frame(revision: u64, top: u64) -> Arc<Vim9RenderFrame> {
@@ -2259,6 +2296,23 @@ mod tests {
         )
         .is_none());
         assert!(wheel_lines(&pixel, f32::NAN, 30).is_none());
+        assert!(!wheel_is_discrete(&pixel));
+        let fractional_line = event(egui::MouseWheelUnit::Line, -0.125, egui::Modifiers::NONE);
+        assert_eq!(wheel_lines(&fractional_line, 20.0, 30), Some(0.375));
+        assert!(
+            !wheel_is_discrete(&fractional_line),
+            "X11 touchpad distances must not be eased as wheel notches"
+        );
+        assert!(wheel_is_discrete(&event(
+            egui::MouseWheelUnit::Line,
+            -1.0,
+            egui::Modifiers::NONE
+        )));
+        assert!(wheel_is_discrete(&event(
+            egui::MouseWheelUnit::Page,
+            -1.0,
+            egui::Modifiers::NONE
+        )));
     }
 
     #[test]
