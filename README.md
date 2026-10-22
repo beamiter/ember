@@ -29,10 +29,19 @@ keyboard save/search/build actions, and an explicit **Save + Build** command.
 Project indexing runs in the background, while modal input stays isolated
 from the real Vim editing process.
 
+In Quick Open, type `>` to find editor commands such as Save, Split, Go to
+Definition, Hover or Cancel Search. Unavailable commands explain why; Enter
+rechecks the current Vim state. Remove `>` to find files, or use `:42` and
+`file.rs:42:8` for locations. A literal filename beginning with `>` can be
+opened as `./>filename`.
+
 **Back / Forward** (`Alt+Left` / `Alt+Right`) follows Vim's real jump list.
 Project search adds explicit case, regex, whole-word and file-glob options,
 cancellation, and a quickfix source/title indicator. Search settings stay in
 the native UI and take effect only when the user runs a search.
+Problems use severity labels, project-relative locations and full-message
+tooltips. A subtle inner boundary identifies the active Vim split without
+moving its text or covering Vim's separator/status rows.
 
 ## Highlights
 

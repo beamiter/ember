@@ -172,6 +172,36 @@ def main():
             wait_for(lambda: state().get("render", {}).get("supported")
                      and color_count("plugin-" + kind + "-removed", plugin_rgb) == 0,
                      "removed plugin " + kind + " paint", app)
+        # The fixture has no language service: Enter on >format must retain
+        # the modal. Replacing its query and immediately confirming a real
+        # split proves both unavailable ownership and latest-query dispatch.
+        xdo("key", "ctrl+shift+p")
+        xdo("type", "--clearmodifiers", "--delay", "0", ">format")
+        xdo("key", "Return")
+        time.sleep(0.15)
+        capture("palette-unavailable-format")
+        xdo("key", "ctrl+a")
+        xdo("type", "--clearmodifiers", "--delay", "0", ">vertical split")
+        xdo("key", "Return")
+        wait_for(lambda: state().get("windows") == 2, "typed command palette vertical split", app)
+        capture("palette-split-focus")
+        assert state().get("modified") == 0
+        assert source.read_text(encoding="utf-8") == original
+        report["command_palette_unavailable_and_same_batch_filter"] = "passed"
+        command("only")
+        wait_for(lambda: state().get("windows") == 1, "return from command palette split", app)
+        xdo("key", "ctrl+shift+p")
+        xdo("type", "--clearmodifiers", "--delay", "0", ">save")
+        xdo("key", "Escape")
+        xdo("key", "g", "g", "0", "i")
+        xdo("type", "--clearmodifiers", "--delay", "0", "palette-focus:")
+        xdo("key", "Escape")
+        wait_for(lambda: state().get("text") == "palette-focus:" + original.splitlines()[0],
+                 "palette Escape returns keyboard ownership to Vim", app)
+        command("undo")
+        wait_for(lambda: state().get("text") == original.splitlines()[0] and state().get("modified") == 0,
+                 "palette focus probe undo", app)
+        report["command_palette_escape_focus"] = "passed"
         # Trace a real wheel notch through window pixels in a disposable Vim
         # buffer. A distinctive source line supplies the visual position oracle.
         command("enew | call setline(1, map(range(1,200), {_, n -> printf('WHEEL_%03d native scroll', n)})) | setlocal nowrap scrolloff=0")

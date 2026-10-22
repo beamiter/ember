@@ -284,6 +284,23 @@ containing colons takes precedence over location syntax, so `notes:42` can
 still open that literal file. Enter and clicking a result use the same validated
 location. Vim's jump list and unsaved-buffer checks continue to apply.
 
+Type `>` in Quick Open to search the editor command list. `>save`, `>split`,
+`>definition` and `>hover` select existing typed Vim actions; no Ex or shell
+text is executed. Commands show their shortcuts and explain unavailable
+states, including missing language support or an already finished build or
+search. Up/Down selects a command and Enter runs it after checking the current
+Vim state again. An unavailable action keeps the picker open with an explanation.
+Remove `>` to return to files; `:line` and `path:line:column` retain their
+existing behavior. Use `./>filename` for a literal filename beginning with `>`.
+
+In multi-window Vim layouts, the active buffer view has a subtle inner boundary
+that dims when the editor loses focus. It remains fixed while the buffer scrolls
+and stays inside the view, leaving Vim's separator/status rows unchanged.
+Problem rows show Error/Warning/Info labels and project-relative locations;
+hover shows the full location and message. A completed search with no results
+has its own hint only while it owns the current quickfix list and no merged
+diagnostics are present.
+
 The keyboard actions above are also listed as **Vim9 IDE: …** in the command
 palette and are available for custom bindings: `ide:quick_open`, `ide:goto`,
 `ide:save`, `ide:save_all`, `ide:search`, `ide:build`, `ide:previous_buffer`,

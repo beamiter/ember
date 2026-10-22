@@ -877,6 +877,7 @@ pub(crate) fn paint(
             cursor_on,
             direct,
         );
+        paint_active_window(painter, frame, content, cell_width, line_height, focused);
         paint_completion(painter, frame, content, cell_width, line_height, font_size);
         return;
     }
@@ -921,7 +922,59 @@ pub(crate) fn paint(
             true,
         );
     }
+    paint_active_window(painter, frame, content, cell_width, line_height, focused);
     paint_completion(painter, frame, content, cell_width, line_height, font_size);
+}
+
+/// A stationary focus cue belongs to the Vim window, not to its translated
+/// text. Its inner stroke never reaches Vim's separator or status cells.
+fn paint_active_window(
+    painter: &egui::Painter,
+    frame: &Vim9RenderFrame,
+    content: Rect,
+    cell_width: f32,
+    line_height: f32,
+    focused: bool,
+) {
+    if frame.windows.len() < 2 {
+        return;
+    }
+    let Some(window) = frame
+        .windows
+        .iter()
+        .find(|window| window.window == frame.window)
+    else {
+        return;
+    };
+    let Some(view) = metrics(content, cell_width, line_height).rect(&window.view) else {
+        return;
+    };
+    let view = gui_rect(view).intersect(content);
+    if !view.is_positive() {
+        return;
+    }
+    let (_, background, _) = colors(&frame.default_style, &frame.default_style);
+    let accent = frame
+        .cursor
+        .appearance
+        .as_ref()
+        .map(|appearance| {
+            rgb(appearance
+                .colors(&frame.default_style, &frame.default_style)
+                .1)
+        })
+        .filter(|color| *color != background)
+        .unwrap_or_else(|| painter.ctx().global_style().visuals.selection.bg_fill);
+    let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
+    painter.with_clip_rect(view).rect_stroke(
+        view,
+        0.0,
+        Stroke::new(
+            pixel,
+            accent.gamma_multiply(if focused { 0.6 } else { 0.25 }),
+        ),
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// Completion owns a screen rectangle above every split, including Vim's
@@ -1480,6 +1533,87 @@ mod tests {
         direct.scrolls.insert(1, scroll);
         direct.remember_presentation(Arc::clone(frame), geometry, &egui::Context::default());
         direct
+    }
+
+    #[test]
+    fn active_split_outline_tracks_vim_window_and_stays_inside_at_high_dpi() {
+        let mut frame = direct_frame(10);
+        Arc::make_mut(&mut frame).cursor.appearance = Some(Default::default());
+        let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(220.0, 120.0));
+        let geometry = metrics(content, 10.0, 20.0);
+        let direct = direct_fixture(&frame, geometry, 0.3125);
+        let draw = |frame: &Arc<Vim9RenderFrame>, focused: bool, scale: f32| {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                paint(
+                    ui.painter(),
+                    frame,
+                    content,
+                    10.0,
+                    20.0,
+                    14.0,
+                    focused,
+                    true,
+                    &ScrollPresentation::default(),
+                    0.0,
+                    Some(&direct),
+                );
+            });
+            output.textures_delta.clear();
+            output.shapes
+        };
+        for active in [1, 2] {
+            Arc::make_mut(&mut frame).window = active;
+            let view = gui_rect(
+                geometry
+                    .rect(&frame.windows[(active - 1) as usize].view)
+                    .unwrap(),
+            );
+            for scale in [1.0, 2.0] {
+                let mut colors = Vec::new();
+                for focused in [true, false] {
+                    let output = draw(&frame, focused, scale);
+                    let outlines =
+                        output
+                            .iter()
+                            .filter_map(|clipped| match &clipped.shape {
+                                egui::Shape::Rect(shape)
+                                    if shape.rect == view && shape.stroke.width > 0.0 =>
+                                {
+                                    assert_eq!(clipped.clip_rect, view);
+                                    assert_eq!(shape.stroke.width, 1.0 / scale);
+                                    assert_eq!(shape.stroke.color,
+                                rgb(frame.default_style.foreground.unwrap())
+                                    .gamma_multiply(if focused { 0.6 } else { 0.25 }),
+                                "a reverse caret uses the resolved foreground as its accent");
+                                    Some(shape.stroke.color)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                    assert_eq!(
+                        outlines.len(),
+                        1,
+                        "only the active Vim split gets its boundary"
+                    );
+                    colors.push(outlines[0]);
+                }
+                assert_ne!(colors[0], colors[1], "unfocused editor boundaries must dim");
+            }
+        }
+        assert_eq!(
+            direct.offset(&frame, 1, geometry),
+            -6.25,
+            "focus cues must not change the shared pixel transform"
+        );
+        Arc::make_mut(&mut frame).windows.truncate(1);
+        Arc::make_mut(&mut frame).window = 1;
+        let view = gui_rect(geometry.rect(&frame.windows[0].view).unwrap());
+        assert!(!draw(&frame, true, 1.0)
+            .iter()
+            .any(|clipped| matches!(&clipped.shape,
+            egui::Shape::Rect(shape) if shape.rect == view && shape.stroke.width > 0.0)));
     }
 
     #[test]

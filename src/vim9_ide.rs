@@ -4,9 +4,9 @@
 use crate::app::state::TerminalApp;
 use eframe::egui;
 use jterm_core::vim9::{
-    parse_vim9_location as parse_location, Vim9Command, Vim9EntryRequest, Vim9ProjectFile,
-    Vim9ProjectIndex, Vim9ProjectSnapshot, Vim9QuickOpenQuery, Vim9SearchCase, Vim9SearchOptions,
-    Vim9Session, Vim9Snapshot, Vim9UiConfig,
+    parse_vim9_location as parse_location, vim9_palette_matches, vim9_palette_query, Vim9Command,
+    Vim9EntryRequest, Vim9PaletteCommand, Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot,
+    Vim9QuickOpenQuery, Vim9SearchCase, Vim9SearchOptions, Vim9Session, Vim9Snapshot, Vim9UiConfig,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,6 +72,8 @@ struct EditorDialog {
     ranked_query: String,
     ranked_files: Option<Arc<Vec<Vim9ProjectFile>>>,
     matches: Vec<Vim9ProjectFile>,
+    command_matches: Vec<Vim9PaletteCommand>,
+    activated_command: Option<(String, Vim9PaletteCommand)>,
     selected: usize,
     needs_focus: bool,
     reveal_selection: bool,
@@ -89,6 +91,8 @@ impl EditorDialog {
             ranked_query: String::new(),
             ranked_files: None,
             matches: Vec::new(),
+            command_matches: Vec::new(),
+            activated_command: None,
             selected: 0,
             needs_focus: true,
             reveal_selection: true,
@@ -103,6 +107,7 @@ impl EditorDialog {
         &mut self,
         project: &Vim9ProjectSnapshot,
     ) -> Result<Vim9QuickOpenQuery, &'static str> {
+        self.command_matches.clear();
         let parsed = project.quick_open_query(&self.query);
         let changed_files = self
             .ranked_files
@@ -132,10 +137,64 @@ impl EditorDialog {
         query.command(self.matches.get(self.selected))
     }
 
+    fn refresh_command_matches(&mut self) {
+        let Some(query) = vim9_palette_query(&self.query) else {
+            return;
+        };
+        if self.ranked_query != self.query || self.ranked_files.is_some() {
+            self.command_matches = vim9_palette_matches(query, QUICK_OPEN_LIMIT);
+            self.matches.clear();
+            self.ranked_files = None;
+            self.ranked_query.clone_from(&self.query);
+            self.selected = 0;
+            self.reveal_selection = true;
+            self.error = None;
+        }
+    }
+
+    fn quick_action_command(
+        &mut self,
+        project: &Vim9ProjectSnapshot,
+        snapshot: &Vim9Snapshot,
+    ) -> Result<Vim9Command, &'static str> {
+        let activated = self.activated_command.take();
+        if activated
+            .as_ref()
+            .is_some_and(|(query, _)| query != &self.query)
+        {
+            return Err("The command query changed. Choose a command again.");
+        }
+        if vim9_palette_query(&self.query).is_some() {
+            self.refresh_command_matches();
+            let command = if let Some((_, command)) = activated {
+                if !self.command_matches.contains(&command) {
+                    return Err("The command list changed. Choose a command again.");
+                }
+                command
+            } else {
+                *self
+                    .command_matches
+                    .get(self.selected)
+                    .ok_or("Choose a matching editor command.")?
+            };
+            // Availability can change after paint, including when a running
+            // search/build finishes. The current snapshot owns activation.
+            command.command(snapshot)
+        } else if activated.is_some() {
+            Err("The command query changed. Choose a command again.")
+        } else {
+            self.quick_open_command(project)
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
-        if delta != 0 && !self.matches.is_empty() {
-            self.selected =
-                (self.selected as isize + delta).rem_euclid(self.matches.len() as isize) as usize;
+        let count = if vim9_palette_query(&self.query).is_some() {
+            self.command_matches.len()
+        } else {
+            self.matches.len()
+        };
+        if delta != 0 && count > 0 {
+            self.selected = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
             self.reveal_selection = true;
         }
     }
@@ -233,6 +292,48 @@ fn search_options_summary(options: &Vim9SearchOptions) -> String {
         summary.push_str(&crate::review_text::visible_bounded(&options.glob, 256));
     }
     summary
+}
+
+fn diagnostic_kind_label(kind: &str) -> &'static str {
+    match kind.to_ascii_uppercase().as_str() {
+        "E" | "ERROR" => "Error",
+        "W" | "WARNING" => "Warning",
+        "I" | "INFO" | "INFORMATION" => "Info",
+        "H" | "HINT" => "Hint",
+        _ => "Diagnostic",
+    }
+}
+
+fn diagnostic_location(root: &Path, filename: &str, line: u64, column: u64) -> String {
+    let path = Path::new(filename);
+    let relative = root
+        .is_absolute()
+        .then(|| path.strip_prefix(root).ok())
+        .flatten()
+        .filter(|relative| {
+            !relative.as_os_str().is_empty()
+                && !relative
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+        });
+    let path = relative.unwrap_or(path).to_string_lossy();
+    format!(
+        "{}:{line}:{column}",
+        crate::review_text::visible_bounded(&path, 1024)
+    )
+}
+
+fn search_owns_empty_results(snapshot: &Vim9Snapshot) -> bool {
+    snapshot.quickfix.source == "search"
+        && snapshot.quickfix.count == 0
+        && snapshot.diagnostics.is_empty()
+        && !snapshot.search.query.is_empty()
+        && !snapshot.search.running
+        && !snapshot.search.cancelled
+        && snapshot.search.exit_code == 1
+        && snapshot.search.errors.is_empty()
+        && snapshot.quickfix.title == format!("Search: {}", snapshot.search.query)
+        && snapshot.search.count == 0
 }
 
 fn focused_chrome_widget(ctx: &egui::Context, rects: &[egui::Rect]) -> Option<egui::Id> {
@@ -944,10 +1045,27 @@ impl Workbench {
                 }
                 ui.separator();
             }
-            if snapshot.diagnostics.is_empty() { ui.weak("No quickfix entries. Run a build or project search to populate this panel."); }
+            if search_owns_empty_results(&snapshot) {
+                ui.weak("No matches for this project search. Change the query or Search options and run Find again.");
+            } else if snapshot.diagnostics.is_empty() {
+                ui.weak("No quickfix entries. Run a build or project search to populate this panel.");
+            }
             for diagnostic in &snapshot.diagnostics {
-                let label = format!("{}  {}:{}:{}  {}", diagnostic.kind, diagnostic.filename, diagnostic.line, diagnostic.column, diagnostic.text);
-                if ui.selectable_label(false, label).clicked() && !diagnostic.filename.is_empty() {
+                let kind = diagnostic_kind_label(&diagnostic.kind);
+                let color = match kind {
+                    "Error" => ui.visuals().error_fg_color,
+                    "Warning" => ui.visuals().warn_fg_color,
+                    "Info" | "Hint" => ui.visuals().hyperlink_color,
+                    _ => ui.visuals().text_color(),
+                };
+                let location = diagnostic_location(self.session.root(), &diagnostic.filename, diagnostic.line, diagnostic.column);
+                let text = crate::review_text::visible_bounded(&diagnostic.text, 512);
+                let full_location = diagnostic_location(Path::new(""), &diagnostic.filename, diagnostic.line, diagnostic.column);
+                let tooltip = format!("{kind} · {full_location}\n{}", crate::review_text::visible_bounded(&diagnostic.text, 4096));
+                let row = ui.add_sized([ui.available_width(), 24.0],
+                    egui::Button::new(egui::RichText::new(format!("{kind}  {location}  {text}")).color(color))
+                        .frame(false).truncate()).on_hover_text(tooltip);
+                if row.clicked() && !diagnostic.filename.is_empty() {
                     self.send(Vim9Command::Open { path: diagnostic.filename.clone(), line: Some(diagnostic.line.max(1)), column: Some(diagnostic.column.max(1)) });
                 }
             }
@@ -973,6 +1091,8 @@ impl Workbench {
             .map(Vim9ProjectIndex::snapshot)
             .unwrap_or_default();
         let mut current_buffer = false;
+        let mut command_mode = false;
+        let mut command_available = false;
         let mut quick_valid = false;
         let mut cancel = false;
         let mut refresh = false;
@@ -1001,7 +1121,7 @@ impl Workbench {
                         .id_salt(("vim9_dialog_query", session_id))
                         .desired_width(f32::INFINITY)
                         .hint_text(match dialog.kind {
-                            DialogKind::QuickOpen => "File[:line[:column]] or :line[:column]…",
+                            DialogKind::QuickOpen => "File[:line[:column]], :line, or >command…",
                             DialogKind::Goto => "Line or line:column, for example 42:8",
                         })
                         .char_limit(match dialog.kind {
@@ -1018,7 +1138,55 @@ impl Workbench {
                     dialog.error = None;
                 }
 
-                if dialog.kind == DialogKind::QuickOpen {
+                command_mode = dialog.kind == DialogKind::QuickOpen
+                    && vim9_palette_query(&dialog.query).is_some();
+                if command_mode {
+                    quick_valid = true;
+                    dialog.refresh_command_matches();
+                    let delta = std::mem::take(&mut dialog.selection_delta);
+                    dialog.move_selection(delta);
+                    let snapshot = self.session.snapshot();
+                    command_available = dialog.command_matches.get(dialog.selected)
+                        .is_some_and(|command| command.unavailable_reason(&snapshot).is_none());
+                    ui.small(format!("Editor commands · {} matches", dialog.command_matches.len()));
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt(("vim9_command_results", session_id))
+                        .max_height((ctx.viewport_rect().height() * 0.45).min(360.0))
+                        .show(ui, |ui| {
+                            if dialog.command_matches.is_empty() {
+                                ui.weak("No matching editor commands. Try >save, >split, or >definition.");
+                            }
+                            for (index, command) in dialog.command_matches.clone().into_iter().enumerate() {
+                                let reason = command.unavailable_reason(&snapshot);
+                                let label = if command.shortcut().is_empty() {
+                                    command.title().to_owned()
+                                } else {
+                                    format!("{}    {}", command.title(), command.shortcut())
+                                };
+                                let row = ui.push_id((command.title(), &dialog.query), |ui| {
+                                    ui.add_enabled(reason.is_none(), egui::Button::new(label)
+                                        .selected(index == dialog.selected)
+                                        .truncate()
+                                        .min_size(egui::vec2(ui.available_width(), 24.0)))
+                                        .on_disabled_hover_text(reason.unwrap_or_default())
+                                }).inner;
+                                if index == dialog.selected && dialog.reveal_selection {
+                                    row.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                if let Some(reason) = reason {
+                                    ui.weak(reason);
+                                }
+                                if row.clicked() {
+                                    dialog.selected = index;
+                                    dialog.activated_command = Some((dialog.query.clone(), command));
+                                    dialog.confirm_requested = true;
+                                }
+                            }
+                        });
+                    dialog.reveal_selection = false;
+                    ui.weak("↑ ↓ select · Enter runs · Esc returns to Vim · remove > to find files");
+                } else if dialog.kind == DialogKind::QuickOpen {
                     let parsed = dialog.refresh_quick_matches(&project);
                     current_buffer = parsed.as_ref().is_ok_and(|query| query.current_buffer);
                     quick_valid = parsed.is_ok();
@@ -1079,7 +1247,7 @@ impl Workbench {
                                 }
                             });
                         dialog.reveal_selection = false;
-                        ui.weak("↑ ↓ select · Enter opens · Esc returns to Vim");
+                        ui.weak("↑ ↓ select · Enter opens · Esc returns to Vim · > for editor commands");
                     }
                 }
                 if let Some(error) = &dialog.error {
@@ -1087,11 +1255,18 @@ impl Workbench {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    let label = if dialog.kind == DialogKind::Goto || current_buffer { "Go" } else { "Open selected" };
-                    if ui.add_enabled(
-                        dialog.kind == DialogKind::Goto || (quick_valid && (current_buffer || !dialog.matches.is_empty())),
-                        egui::Button::new(label),
-                    ).clicked() {
+                    let label = if command_mode { "Run selected" } else if dialog.kind == DialogKind::Goto || current_buffer { "Go" } else { "Open selected" };
+                    let command_id = dialog.command_matches.get(dialog.selected).map(|command| command.title()).unwrap_or("file");
+                    let enabled = if command_mode { command_available } else {
+                        dialog.kind == DialogKind::Goto || (quick_valid && (current_buffer || !dialog.matches.is_empty()))
+                    };
+                    if ui.push_id(("confirm", &dialog.query, command_id), |ui|
+                        ui.add_enabled(enabled, egui::Button::new(label))
+                    ).inner.clicked() {
+                        if command_mode {
+                            dialog.activated_command = dialog.command_matches.get(dialog.selected)
+                                .map(|command| (dialog.query.clone(), *command));
+                        }
                         dialog.confirm_requested = true;
                     }
                     cancel = ui.button("Cancel").clicked();
@@ -1110,12 +1285,20 @@ impl Workbench {
             let command = match dialog.kind {
                 DialogKind::Goto => parse_location(&dialog.query)
                     .map(|(line, column)| Vim9Command::Goto { line, column }),
-                DialogKind::QuickOpen => dialog.quick_open_command(&project),
+                DialogKind::QuickOpen => {
+                    dialog.quick_action_command(&project, &self.session.snapshot())
+                }
             };
             match command {
                 Ok(command) => {
-                    self.send(command);
-                    return;
+                    if self.send_tracked(command).is_some() {
+                        return;
+                    }
+                    self.return_focus = false;
+                    dialog.error = Some(self.error.clone().unwrap_or_else(|| {
+                        "The Vim action could not be queued. Try again when Vim is ready.".into()
+                    }));
+                    dialog.needs_focus = true;
                 }
                 Err(error) => {
                     dialog.error = (dialog.kind != DialogKind::QuickOpen || quick_valid)
@@ -2333,6 +2516,177 @@ mod tests {
         picker.reveal_selection = false;
         picker.move_selection(0);
         assert!(!picker.reveal_selection);
+    }
+
+    fn palette_snapshot() -> Vim9Snapshot {
+        Vim9Snapshot {
+            connected: true,
+            mode: "n".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn diagnostic_labels_and_locations_keep_full_external_path_context() {
+        for (kind, label) in [
+            ("E", "Error"),
+            ("w", "Warning"),
+            ("INFO", "Info"),
+            ("", "Diagnostic"),
+        ] {
+            assert_eq!(diagnostic_kind_label(kind), label);
+        }
+        let root = Path::new("/project");
+        assert_eq!(
+            diagnostic_location(root, "/project/src/main.rs", 4, 2),
+            "src/main.rs:4:2"
+        );
+        assert_eq!(
+            diagnostic_location(root, "/project-other/main.rs", 4, 2),
+            "/project-other/main.rs:4:2"
+        );
+        assert_eq!(
+            diagnostic_location(root, "/project/src/../../other.rs", 4, 2),
+            "/project/src/../../other.rs:4:2"
+        );
+        assert_eq!(
+            diagnostic_location(Path::new(""), "/project/src/main.rs", 4, 2),
+            "/project/src/main.rs:4:2"
+        );
+    }
+
+    #[test]
+    fn search_empty_message_requires_current_search_quickfix_and_no_merged_diagnostics() {
+        let mut snapshot = palette_snapshot();
+        snapshot.quickfix.source = "search".into();
+        snapshot.search.query = "needle".into();
+        snapshot.quickfix.title = "Search: needle".into();
+        snapshot.search.exit_code = 1;
+        assert!(search_owns_empty_results(&snapshot));
+        snapshot.quickfix.source = "build".into();
+        assert!(!search_owns_empty_results(&snapshot));
+        snapshot.quickfix.source = "search".into();
+        snapshot.diagnostics.push(Default::default());
+        assert!(!search_owns_empty_results(&snapshot));
+        snapshot.diagnostics.clear();
+        snapshot.search.running = true;
+        assert!(!search_owns_empty_results(&snapshot));
+        snapshot.search.running = false;
+        snapshot.search.cancelled = true;
+        assert!(!search_owns_empty_results(&snapshot));
+        snapshot.search.cancelled = false;
+        snapshot.search.exit_code = 2;
+        assert!(!search_owns_empty_results(&snapshot));
+        snapshot.search.exit_code = 1;
+        snapshot.search.errors.push("search failed".into());
+        assert!(!search_owns_empty_results(&snapshot));
+        snapshot.search.errors.clear();
+        snapshot.quickfix.title = "Search: previous query".into();
+        assert!(!search_owns_empty_results(&snapshot));
+    }
+
+    #[test]
+    fn command_mode_works_without_an_index_and_preserves_file_and_location_modes() {
+        let project = Vim9ProjectSnapshot {
+            scanning: true,
+            error: Some("index unavailable".into()),
+            files: Arc::new(vec![Vim9ProjectFile {
+                path: PathBuf::from("/project/>save"),
+                relative: ">save".into(),
+            }]),
+            ..Default::default()
+        };
+        let mut picker = EditorDialog::new(DialogKind::QuickOpen);
+        picker.query = ">save".into();
+        assert!(matches!(
+            picker.quick_action_command(&project, &palette_snapshot()),
+            Ok(Vim9Command::Save)
+        ));
+        assert!(picker.matches.is_empty());
+        picker.query = "./>save".into();
+        assert!(matches!(
+            picker.quick_action_command(&project, &palette_snapshot()),
+            Ok(Vim9Command::Open { path, .. }) if path == "/project/>save"
+        ));
+        assert!(picker.command_matches.is_empty());
+        picker.query = ":42:8".into();
+        assert!(matches!(
+            picker.quick_action_command(&project, &palette_snapshot()),
+            Ok(Vim9Command::Goto {
+                line: 42,
+                column: Some(8)
+            })
+        ));
+        picker.query = ">no-such-editor-command-987654321".into();
+        assert!(picker
+            .quick_action_command(&project, &palette_snapshot())
+            .is_err());
+        assert!(picker.matches.is_empty());
+        assert!(picker.command_matches.is_empty());
+    }
+
+    #[test]
+    fn command_activation_rechecks_query_stable_identity_and_current_availability() {
+        let project = Vim9ProjectSnapshot::default();
+        let mut picker = EditorDialog::new(DialogKind::QuickOpen);
+        picker.query = ">".into();
+        picker.refresh_command_matches();
+        picker.activated_command = Some((picker.query.clone(), Vim9PaletteCommand::Save));
+        picker.command_matches.reverse();
+        assert!(matches!(
+            picker.quick_action_command(&project, &palette_snapshot()),
+            Ok(Vim9Command::Save)
+        ));
+        picker.activated_command = Some((picker.query.clone(), Vim9PaletteCommand::Save));
+        picker.query = ">split".into();
+        assert!(picker
+            .quick_action_command(&project, &palette_snapshot())
+            .unwrap_err()
+            .contains("query changed"));
+        picker.query = ">cancel search".into();
+        picker.refresh_command_matches();
+        let mut snapshot = palette_snapshot();
+        snapshot.search.running = true;
+        assert!(Vim9PaletteCommand::CancelSearch
+            .unavailable_reason(&snapshot)
+            .is_none());
+        picker.activated_command = Some((picker.query.clone(), Vim9PaletteCommand::CancelSearch));
+        snapshot.search.running = false;
+        assert_eq!(
+            picker
+                .quick_action_command(&project, &snapshot)
+                .unwrap_err(),
+            "No project search is running"
+        );
+        assert!(picker
+            .command_matches
+            .contains(&Vim9PaletteCommand::CancelSearch));
+    }
+
+    #[test]
+    fn command_confirmation_uses_same_batch_edits_and_owns_the_suffix() {
+        let mut picker = EditorDialog::new(DialogKind::QuickOpen);
+        let mut events = vec![
+            egui::Event::Text(">save".into()),
+            key(egui::Key::Enter),
+            egui::Event::Text("must-not-reach-vim".into()),
+        ];
+        assert!(!route_dialog_events(&mut picker, true, &mut events));
+        assert!(picker.confirm_requested);
+        assert_eq!(events, vec![egui::Event::Text(">save".into())]);
+        picker.query = ">save".into();
+        assert!(matches!(
+            picker.quick_action_command(&Vim9ProjectSnapshot::default(), &palette_snapshot()),
+            Ok(Vim9Command::Save)
+        ));
+        picker.query = ">".into();
+        picker.refresh_command_matches();
+        let count = picker.command_matches.len();
+        assert!(count > 1);
+        picker.move_selection(-1);
+        assert_eq!(picker.selected, count - 1);
+        picker.move_selection(1);
+        assert_eq!(picker.selected, 0);
     }
 
     #[test]
