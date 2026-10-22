@@ -1768,9 +1768,11 @@ mod tests {
         output.textures_delta.clear();
         for (window, (_, bg)) in frame.windows.iter().zip(palette) {
             let view = gui_rect(geometry.rect(&window.view).unwrap());
-            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            assert!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
                 egui::Shape::Rect(rect) if rect.rect == view && rect.fill == rgb(bg))),
-                "the stationary clear must use each split's Normal even while its first row scrolls");
+                "the stationary clear must use each split's Normal even while its first row scrolls"
+            );
         }
         assert!(
             output.shapes.iter().any(|shape| matches!(&shape.shape,
@@ -2086,24 +2088,25 @@ mod tests {
                 let mut colors = Vec::new();
                 for focused in [true, false] {
                     let output = draw(&frame, focused, scale);
-                    let outlines =
-                        output
-                            .iter()
-                            .filter_map(|clipped| match &clipped.shape {
-                                egui::Shape::Rect(shape)
-                                    if shape.rect == view && shape.stroke.width > 0.0 =>
-                                {
-                                    assert_eq!(clipped.clip_rect, view);
-                                    assert_eq!(shape.stroke.width, 1.0 / scale);
-                                    assert_eq!(shape.stroke.color,
-                                rgb(frame.default_style.foreground.unwrap())
-                                    .gamma_multiply(if focused { 0.6 } else { 0.25 }),
-                                "a reverse caret uses the resolved foreground as its accent");
-                                    Some(shape.stroke.color)
-                                }
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>();
+                    let outlines = output
+                        .iter()
+                        .filter_map(|clipped| match &clipped.shape {
+                            egui::Shape::Rect(shape)
+                                if shape.rect == view && shape.stroke.width > 0.0 =>
+                            {
+                                assert_eq!(clipped.clip_rect, view);
+                                assert_eq!(shape.stroke.width, 1.0 / scale);
+                                assert_eq!(
+                                    shape.stroke.color,
+                                    rgb(frame.default_style.foreground.unwrap())
+                                        .gamma_multiply(if focused { 0.6 } else { 0.25 }),
+                                    "a reverse caret uses the resolved foreground as its accent"
+                                );
+                                Some(shape.stroke.color)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
                     assert_eq!(
                         outlines.len(),
                         1,
@@ -2230,6 +2233,91 @@ mod tests {
             assert!(output.shapes[popup_index..border_index]
                 .iter()
                 .any(|clipped| matches!(&clipped.shape, egui::Shape::Text(_))));
+        }
+    }
+
+    #[test]
+    fn virtual_text_repaints_without_a_source_edit_in_both_paint_paths() {
+        let mut frame = (*direct_frame(10)).clone();
+        frame.cursor.visible = false;
+        frame.windows[0].cursor.visible = false;
+        let source = frame.runs.clone();
+        let content = Rect::from_min_size(egui::pos2(7.25, 12.5), egui::vec2(220.0, 120.0));
+        for (column, text, cells) in [(5, "参", 2), (7, "e\u{301}", 1)] {
+            frame.runs.push(jterm_core::vim9::Vim9RenderRun {
+                window: 1,
+                column,
+                text: text.into(),
+                cells,
+                style: Vim9RenderStyle {
+                    foreground: Some(0x19c3a7),
+                    background: Some(0x563412),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        let labeled = frame.clone();
+        for direct_path in [false, true] {
+            frame = labeled.clone();
+            let ctx = egui::Context::default();
+            let direct = DirectInput::default();
+            let draw = |frame: &Vim9RenderFrame| {
+                let mut output = ctx.run_ui(Default::default(), |ui| {
+                    paint(
+                        &ui.ctx().layer_painter(egui::LayerId::background()),
+                        frame,
+                        content,
+                        10.0,
+                        20.0,
+                        14.0,
+                        true,
+                        false,
+                        &ScrollPresentation::default(),
+                        0.0,
+                        direct_path.then_some(&direct),
+                    );
+                });
+                output.textures_delta.clear();
+                output.shapes
+            };
+            let rendered = draw(&frame);
+            let label = rendered
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(shape) if shape.galley.text() == "参" => {
+                        assert_eq!(shape.fallback_color, rgb(0x19c3a7));
+                        assert_eq!(shape.pos.x, content.left() + 50.0);
+                        assert!(clipped.clip_rect.right() <= content.left() + 100.0);
+                        Some(shape.galley.clone())
+                    }
+                    _ => None,
+                })
+                .expect("source-free virtual label must reach the native text painter");
+            assert!(rendered.iter().any(|clipped| matches!(&clipped.shape,
+                egui::Shape::Text(shape) if shape.galley.text() == "e\u{301}")));
+            assert!(rendered.iter().any(|clipped| matches!(&clipped.shape,
+                egui::Shape::Rect(shape) if shape.fill == rgb(0x563412)
+                    && shape.rect.width() == 20.0)));
+            assert!(frame.anchor_at_cell(0, 5).is_none());
+
+            frame.runs[source.len()].style.foreground = Some(0x0abcde);
+            frame.revision += 1;
+            let recolored = draw(&frame);
+            assert!(recolored.iter().any(|clipped| matches!(&clipped.shape,
+                egui::Shape::Text(shape) if shape.galley.text() == "参"
+                    && shape.fallback_color == rgb(0x0abcde)
+                    && Arc::ptr_eq(&shape.galley, &label))));
+            frame.runs.truncate(source.len());
+            frame.revision += 1;
+            assert_eq!(frame.changedtick, labeled.changedtick);
+            assert_eq!(frame.runs, source);
+            let cleared = draw(&frame);
+            assert!(!cleared.iter().any(|clipped| match &clipped.shape {
+                egui::Shape::Text(shape) => ["参", "e\u{301}"].contains(&shape.galley.text()),
+                egui::Shape::Rect(shape) => shape.fill == rgb(0x563412),
+                _ => false,
+            }));
         }
     }
 
