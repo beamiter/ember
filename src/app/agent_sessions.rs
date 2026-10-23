@@ -202,7 +202,10 @@ impl TerminalApp {
             }
             self.agent_sessions.opened.remove(&key);
         }
-        let launch = match session.resume_launch() {
+        let launch = match session
+            .resume_launch()
+            .and_then(|launch| launch.resolve_for_spawn())
+        {
             Ok(launch) => launch,
             Err(error) => {
                 self.agent_sessions.error = Some(error);
