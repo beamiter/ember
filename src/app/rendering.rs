@@ -3103,6 +3103,7 @@ impl TerminalApp {
     #[allow(deprecated)]
     pub fn render_floating_panels(&mut self, ctx: &egui::Context) {
         self.render_block_review(ctx);
+        self.render_agent_sessions(ctx);
         const LIVE_SEARCH_REFRESH_INTERVAL: std::time::Duration =
             std::time::Duration::from_millis(300);
         if self.search_state.is_open && self.search_state.projection_message.is_some() {

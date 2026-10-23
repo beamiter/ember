@@ -1696,3 +1696,28 @@ left unchanged. `--dry-run` does not write binaries, configs, or backups.
 An already-running terminal keeps its current process; restart it to use the new
 binary and configuration. If an older copy comes first in PATH, the installer
 prints the conflicting path.
+
+## Agent session manager
+
+Press **Ctrl+Shift+Alt+G** or choose **Agent Sessions** from the command palette
+to find existing Codex and Claude CLI conversations across all projects. Search
+by title, project, branch, session ID or latest context; narrow the list by
+provider and recorded state. **Observed live only** independently filters to
+exact local process matches from the latest refresh. The overview shows session,
+waiting and live-process counts.
+Select a row with the mouse or arrow keys, inspect its directory and command,
+then press **Enter** or **Resume in New Tab**. Ember starts the provider CLI
+with the exact session ID and original working directory in a new focused tab.
+No shell interpolation or manually copied resume command is required.
+If the conversation already has a live tab in this window, confirming switches
+to that tab instead of launching a duplicate CLI.
+
+Discovery runs off the UI thread, refreshes every ten seconds while open, and
+can be refreshed with **F5**. **Escape** closes the manager. Empty sources,
+partial discovery and unavailable resume directories are explained in the
+manager. State labels describe the last recorded provider event; they do not
+assert that a process is still running. Separate **LIVE / PID** badges require
+an exact session-ID match to an actual local CLI process. No API key or model
+call is needed.
+The configurable action is `agent:sessions`. The existing Agent and Tasks
+surfaces remain available.

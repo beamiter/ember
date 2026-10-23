@@ -183,6 +183,12 @@ impl CommandPalette {
     /// 构建所有可用命令列表
     fn build_commands() -> Vec<CommandInfo> {
         let mut commands = vec![
+            CommandInfo::new(
+                "Agent Sessions",
+                CommandCategory::Session,
+                "Find Codex and Claude conversations, inspect activity and resume in a new tab",
+                crate::keybindings::Command::AgentSessions,
+            ),
             // === 会话管理 ===
             CommandInfo::new(
                 "New Tab",

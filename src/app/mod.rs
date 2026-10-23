@@ -8,6 +8,7 @@ pub mod rendering;
 pub mod state;
 pub mod tabs;
 pub mod tasks;
+pub(crate) mod agent_sessions;
 pub mod window;
 
 #[cfg(test)]

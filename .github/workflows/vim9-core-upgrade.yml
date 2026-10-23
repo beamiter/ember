@@ -31,7 +31,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Check Git-repin automation applicability
+        id: core_mode
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import tomllib
+          from pathlib import Path
+          manifest = tomllib.loads(Path('Cargo.toml').read_text())
+          core = manifest.get('dependencies', {}).get('jterm_core', {})
+          applicable = isinstance(core, dict) and core.get('git') == 'https://github.com/beamiter/jterm_core.git'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'applicable={str(applicable).lower()}\n')
+          if not applicable:
+              message = 'Shared core uses bundled snapshot; Git-repin automation not applicable. Regenerate snapshot after core changes.'
+              print(message)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write(message + '\n')
+          PYTHON
       - name: Check whether the exact core revision is already pinned
+        if: steps.core_mode.outputs.applicable == 'true'
         id: pin
         env:
           REQUESTED_REVISION: ${{ inputs.core_revision }}

@@ -167,6 +167,7 @@ pub enum Command {
     /// 同一个手势在 ember 打开会执行命令的 Agent，在别处打开只读聊天库，
     /// 这是家族契约里最不该错的方向，所以 ember 让回家族键位。
     AgentToggle,
+    AgentSessions,
     /// 持久化 AI 聊天库面板（anvil `ToggleAiPanel` 的 ember 对应物；会话级，
     /// 不绑定特定 pane，回复只读展示，绝不触碰 PTY）。默认
     /// `ctrl+shift+alt+a`——anvil/forge/frost 的 AI 面板键位，命令 id 用
@@ -287,6 +288,7 @@ impl std::fmt::Display for Command {
             Command::DebugToggle => write!(f, "debug:toggle"),
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
             Command::AgentToggle => write!(f, "agent:toggle"),
+            Command::AgentSessions => write!(f, "agent:sessions"),
             Command::AiChatToggle => write!(f, "ai_chat:toggle"),
             Command::JshInstall => write!(f, "jsh:install"),
             Command::RemotePicker => write!(f, "remote:picker"),
@@ -395,6 +397,7 @@ impl std::str::FromStr for Command {
             "debug:toggle" => Ok(Command::DebugToggle),
             "sidebar:toggle" => Ok(Command::SidebarToggle),
             "agent:toggle" => Ok(Command::AgentToggle),
+            "agent:sessions" => Ok(Command::AgentSessions),
             "ai_chat:toggle" => Ok(Command::AiChatToggle),
             "jsh:install" => Ok(Command::JshInstall),
             "remote:picker" => Ok(Command::RemotePicker),
@@ -518,6 +521,11 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+backslash".to_string(), "sidebar:toggle".to_string());
+
+        bindings.bindings.insert(
+            "ctrl+shift+alt+g".to_string(),
+            "agent:sessions".to_string(),
+        );
 
         // AI 面板。两个键位都跟随 anvil/forge/frost：Ctrl+Alt+G 打开会执行
         // 命令的 Agent，Ctrl+Shift+Alt+A 打开只读的 AI 聊天库。存储用
@@ -1221,6 +1229,7 @@ mod tests {
             // 另一个会把命令送进 PTY。
             ("ctrl+shift+alt+a", Command::AiChatToggle),
             ("ctrl+alt+g", Command::AgentToggle),
+            ("ctrl+shift+alt+g", Command::AgentSessions),
             ("ctrl+shift+a", Command::BlockSelectAll),
             ("ctrl+shift+i", Command::BlockReinputSelectedCommands),
             ("ctrl+shift+b", Command::BlockToggleBookmark),

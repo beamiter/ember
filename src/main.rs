@@ -2821,6 +2821,7 @@ impl TerminalApp {
             active_session_epoch: 1,
             command_sidebar: Default::default(),
             task_sidebar: Default::default(),
+            agent_sessions: Default::default(),
             block_review: None,
             reading_history: Default::default(),
             block_selection: None,
@@ -6004,6 +6005,9 @@ impl eframe::App for TerminalApp {
             if self.finish_shell_vim_exit(&session_id, exit_code, ctx) {
                 return;
             }
+            if self.handle_agent_session_terminal_exit(&session_id) {
+                continue;
+            }
             let terminal_role = self.task_manager.terminal_role_for_session(&session_id);
             let task_terminal = self.handle_task_terminal_exit(&session_id, exit_code);
             let Some(session_idx) = self.session_manager.index_of(&session_id) else {
@@ -6063,28 +6067,40 @@ impl eframe::App for TerminalApp {
         // 命令面板与帮助面板也通过 Command 派发，确保按键会被消费且
         // 帮助文案始终反映当前绑定。
 
-        let (palette_requested_close, palette_owned_input) = self.handle_command_palette_input(ctx);
+        let agent_sessions_owned_input = self.handle_agent_sessions_input(ctx);
+        let (palette_requested_close, palette_owned_input) = if agent_sessions_owned_input {
+            (false, false)
+        } else {
+            self.handle_command_palette_input(ctx)
+        };
         if palette_requested_close {
             return;
         }
 
         // Block-search picker keys (Enter/Escape/arrows), routed like the
         // palette's so the overlay owns the whole frame's keyboard input.
-        let block_search_owned_input = !palette_owned_input && self.handle_block_search_input();
+        let block_search_owned_input = !agent_sessions_owned_input
+            && !palette_owned_input
+            && self.handle_block_search_input();
         // 历史命令选择器同理：浮层打开期间拥有整帧键盘输入。
-        let history_picker_owned_input =
-            !palette_owned_input && !block_search_owned_input && self.handle_history_picker_input();
+        let history_picker_owned_input = !agent_sessions_owned_input
+            && !palette_owned_input
+            && !block_search_owned_input
+            && self.handle_history_picker_input();
         // 工作流选择器与参数对话框同理。
-        let workflow_picker_owned_input = !palette_owned_input
+        let workflow_picker_owned_input = !agent_sessions_owned_input
+            && !palette_owned_input
             && !block_search_owned_input
             && !history_picker_owned_input
             && self.handle_workflow_picker_input();
-        let vim9_dialog_owned_input = !palette_owned_input
+        let vim9_dialog_owned_input = !agent_sessions_owned_input
+            && !palette_owned_input
             && !block_search_owned_input
             && !history_picker_owned_input
             && !workflow_picker_owned_input
             && self.handle_vim9_dialog_input(ctx);
-        let overlay_owned_input = palette_owned_input
+        let overlay_owned_input = agent_sessions_owned_input
+            || palette_owned_input
             || block_search_owned_input
             || history_picker_owned_input
             || workflow_picker_owned_input

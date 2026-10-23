@@ -21,6 +21,12 @@ jobs:
           path: control
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "control/scripts/materialize-shared-core.sh" ]]; then
+            bash "control/scripts/materialize-shared-core.sh"
+          fi
       - name: Verify and expose reviewed plan
         id: plan
         run: |
@@ -47,16 +53,34 @@ jobs:
           ref: ${{ steps.plan.outputs.baseline_sha }}
           path: baseline
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "baseline/scripts/materialize-shared-core.sh" ]]; then
+            bash "baseline/scripts/materialize-shared-core.sh"
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ steps.plan.outputs.candidate_sha }}
           path: candidate
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "candidate/scripts/materialize-shared-core.sh" ]]; then
+            bash "candidate/scripts/materialize-shared-core.sh"
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ steps.plan.outputs.driver_control_sha }}
           path: driver-control
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "driver-control/scripts/materialize-shared-core.sh" ]]; then
+            bash "driver-control/scripts/materialize-shared-core.sh"
+          fi
       - name: Install official build and desktop packages
         run: |
           sudo apt-get update

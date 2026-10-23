@@ -32,11 +32,23 @@ jobs:
           path: control
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "control/scripts/materialize-shared-core.sh" ]]; then
+            bash "control/scripts/materialize-shared-core.sh"
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.candidate_sha || '60e70c4a24d52e41d173c4baf26bf06bf3bd1569' }}
           path: candidate
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "candidate/scripts/materialize-shared-core.sh" ]]; then
+            bash "candidate/scripts/materialize-shared-core.sh"
+          fi
       - name: Install official build and desktop packages
         run: |
           sudo apt-get update

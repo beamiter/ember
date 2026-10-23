@@ -1229,6 +1229,7 @@ impl TerminalApp {
 
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
         self.block_review.is_some()
+            || self.agent_sessions.is_open
             || self.vim9_dialog_is_open()
             || (egui::Popup::is_any_open(ctx)
                 && self
@@ -1736,6 +1737,7 @@ impl TerminalApp {
                     );
                 }
             }
+            keybindings::Command::AgentSessions => self.toggle_agent_sessions(),
             keybindings::Command::AgentToggle => {
                 let session_id = self
                     .session_manager
@@ -2551,6 +2553,7 @@ impl TerminalApp {
                 self.config_panel.is_open
             }
             keybindings::Command::CommandPaletteToggle => self.command_palette.is_open,
+            keybindings::Command::AgentSessions => self.agent_sessions.is_open,
             keybindings::Command::BlockSearchToggle => self.block_search.is_open,
             keybindings::Command::HistoryPickerToggle => self.history_picker.is_some(),
             keybindings::Command::WorkflowPickerToggle => {

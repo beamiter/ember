@@ -244,6 +244,7 @@ pub struct TerminalApp {
 
     // Experimental provider-neutral task dashboard
     pub task_sidebar: crate::app::tasks::TaskSidebarState,
+    pub(crate) agent_sessions: super::agent_sessions::AgentSessionsState,
 
     /// Block mode 当前选中的命令块范围。范围持有 session、固定 anchor、
     /// active edge 与 terminal-order ids；record 被淘汰或 session 关闭时一律
