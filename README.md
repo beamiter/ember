@@ -1705,6 +1705,15 @@ by title, project, branch, session ID or latest context; narrow the list by
 provider and recorded state. **Observed live only** independently filters to
 exact local process matches from the latest refresh. The overview shows session,
 waiting and live-process counts.
+**This folder + subfolders** scopes the list to the local directory captured
+when the manager opened; it stays fixed during inspection and refresh.
+**Best match** ranks session IDs and titles ahead of incidental message text;
+**Recent** and **Live first** provide alternate orderings. Editing a query or
+filter selects its first result, while automatic refresh preserves your selected
+conversation and reading position. **Clear filters** returns to the full list.
+Search normalization is shared with the other terminals and unchanged discovery
+snapshots reuse the existing index and projection.
+
 Select a row with the mouse or arrow keys, inspect its directory and command,
 then press **Enter** or **Resume in New Tab**. Ember starts the provider CLI
 with the exact session ID and original working directory in a new focused tab.
@@ -1713,7 +1722,8 @@ If the conversation already has a live tab in this window, confirming switches
 to that tab instead of launching a duplicate CLI.
 
 Discovery runs off the UI thread, refreshes every ten seconds while open, and
-can be refreshed with **F5**. **Escape** closes the manager. Empty sources,
+can be refreshed with **F5**. **Ctrl+L** focuses search; **Page Up / Page Down**
+and **Home / End** navigate long lists. **Escape** closes the manager. Empty sources,
 partial discovery and unavailable resume directories are explained in the
 manager. State labels describe the last recorded provider event; they do not
 assert that a process is still running. Separate **LIVE / PID** badges require
