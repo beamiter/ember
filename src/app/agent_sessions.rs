@@ -1049,10 +1049,9 @@ impl TerminalApp {
         if state
             .library_refresh
             .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+            && state.library.refresh()
         {
-            if state.library.refresh() {
-                state.library_refresh = Some(Instant::now());
-            }
+            state.library_refresh = Some(Instant::now());
         }
         if let Some(catalog) = state.scanner.poll() {
             state.replace_catalog(catalog);
