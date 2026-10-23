@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "gui"]
 [dependencies]
 libc = "0.2"
 # Pin the shared shell GUI entry and precise scrolling contract.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "e984062b2c3202aedd8675c077004ce6a492d827" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "d604e698dcb1ffa803857403b70a82429ec95f1a" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -51,7 +51,7 @@ mundy = { version = "=0.2.3", default-features = false, features = ["async-io", 
 harfrust = "0.13.3"
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "e984062b2c3202aedd8675c077004ce6a492d827", features = ["session-parity-tests"] }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "d604e698dcb1ffa803857403b70a82429ec95f1a", features = ["session-parity-tests"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]

@@ -1051,6 +1051,7 @@ fn paint_overlays(
             geometry,
             font_size,
             false,
+            popup.is_documentation_card(),
         );
     };
     for popup in frame.popups.iter().filter(|popup| popup.zindex < 100) {
@@ -1085,6 +1086,7 @@ fn paint_completion(
         metrics(content, cell_width, line_height),
         font_size,
         true,
+        false,
     );
 }
 
@@ -1099,6 +1101,7 @@ fn paint_overlay(
     geometry: Vim9RenderMetrics,
     font_size: f32,
     outline: bool,
+    card: bool,
 ) {
     let Some(view) = geometry.rect(bounds).map(gui_rect) else {
         return;
@@ -1112,15 +1115,23 @@ fn paint_overlay(
     // interior while the editor clip contains the four-point outer falloff.
     let overlay = painter.with_clip_rect(content);
     for (spread, alpha) in [(4.0, 4), (3.0, 5), (2.0, 7), (1.0, 10)] {
-        overlay.rect_filled(view.expand(spread), 0.0, Color32::from_black_alpha(alpha));
+        overlay.rect_filled(
+            view.expand(spread),
+            if card { 6.0 + spread } else { 0.0 },
+            Color32::from_black_alpha(alpha),
+        );
     }
     let painter = overlay.with_clip_rect(clip);
     let (foreground, background, _) = colors(normal, frame_style);
-    painter.rect_filled(view, 0.0, background);
+    // Tagged providers reserve at least one padding cell on every edge.
+    // Keep that space transparent to the shell so row fills cannot square it.
+    painter.rect_filled(view, if card { 6.0 } else { 0.0 }, background);
     for run in runs {
         if let Some(rect) = geometry.cell_rect(run.row, run.column, run.cells) {
-            let (_, background, _) = colors(&run.style, normal);
-            painter.rect_filled(gui_rect(rect), 0.0, background);
+            let (_, run_background, _) = colors(&run.style, normal);
+            if !card || run_background != background {
+                painter.rect_filled(gui_rect(rect), 0.0, run_background);
+            }
         }
     }
     for run in runs {
@@ -1137,13 +1148,13 @@ fn paint_overlay(
             );
         }
     }
-    // Popup borders are already supplied by Vim, with their own GUI colors
-    // and characters. Only the undecorated completion surface adds an outline.
-    if outline {
+    // Generic popup borders retain Vim's GUI glyphs and colors. Tagged
+    // documentation cards and completion use a native outline at the same view.
+    if outline || card {
         let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
         painter.rect_stroke(
             view,
-            0.0,
+            if card { 6.0 } else { 0.0 },
             Stroke::new(pixel, foreground.gamma_multiply(0.20)),
             egui::StrokeKind::Inside,
         );
@@ -2443,6 +2454,62 @@ mod tests {
                         && shape.pos.x == content.left() + 2.0 * cell_width)));
             }
         }
+    }
+
+    #[test]
+    fn documentation_card_preserves_grid_and_only_changes_shell() {
+        let context = egui::Context::default();
+        let content = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(220.0, 120.0));
+        let geometry = metrics(content, 10.0, 20.0);
+        let bounds = Vim9RenderRect {
+            row: 1,
+            column: 2,
+            rows: 3,
+            columns: 8,
+        };
+        let normal = Vim9RenderStyle {
+            foreground: Some(0xddeeff),
+            background: Some(0x123456),
+            ..Default::default()
+        };
+        let runs: Vec<jterm_core::vim9::Vim9RenderRun> =
+            serde_json::from_value(serde_json::json!([
+                {"row":1,"column":2,"cells":8,"text":""},
+                {"row":2,"column":3,"cells":3,"text":"文档"}
+            ]))
+            .unwrap();
+        let draw = |card| {
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                let painter = ui.ctx().layer_painter(egui::LayerId::background());
+                paint_overlay(
+                    &painter, &normal, &bounds, &normal, &runs, content, geometry, 14.0, false,
+                    card,
+                );
+            });
+            output.textures_delta.clear();
+            output.shapes
+        };
+        let plain = draw(false);
+        let card = draw(true);
+        let text_positions = |shapes: &[egui::epaint::ClippedShape]| {
+            shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some((text.pos, text.galley.text().to_owned())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text_positions(&plain), text_positions(&card));
+        let view = gui_rect(geometry.rect(&bounds).unwrap());
+        assert!(card.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == view && rect.fill == rgb(0x123456) && rect.corner_radius.nw == 6)));
+        assert!(!plain.iter().any(
+            |shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.corner_radius.nw != 0)
+        ));
+        assert_eq!(card.iter().filter(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.fill == rgb(0x123456))).count(), 1, "padding and default row fills must not square the card corners");
+        assert!(card
+            .iter()
+            .all(|shape| content.contains_rect(shape.clip_rect)));
     }
 
     #[test]
