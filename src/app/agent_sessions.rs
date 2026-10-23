@@ -407,6 +407,46 @@ fn session_resume_button(
     .inner
 }
 
+// Shared metadata can reverse an action while a pointer is held. Key both the
+// conversation and the displayed state so that release cannot invoke its inverse.
+fn session_pin_button(
+    ui: &mut egui::Ui,
+    key: &SessionKey,
+    pinned: bool,
+    enabled: bool,
+) -> egui::Response {
+    ui.push_id(("pin_agent_session", key, pinned), |ui| {
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(if pinned {
+                "★ Pinned · Unpin"
+            } else {
+                "☆ Pin session"
+            }),
+        )
+    })
+    .inner
+}
+
+fn session_archive_button(
+    ui: &mut egui::Ui,
+    key: &SessionKey,
+    archived: bool,
+    enabled: bool,
+) -> egui::Response {
+    ui.push_id(("archive_agent_session", key, archived), |ui| {
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(if archived {
+                "Restore to active"
+            } else {
+                "Archive locally"
+            }),
+        )
+    })
+    .inner
+}
+
 fn session_row_button(
     ui: &mut egui::Ui,
     selected: bool,
@@ -609,7 +649,7 @@ fn show_session_manager(
                         ui.heading(crate::review_text::visible_bounded(state.library_snapshot.display_title(session.provider, &session.id, &session.title), 240));
                         ui.label(format!("{} · {} · {}", session.provider.label(), session.status.label(), age_label(session.updated_at_ms)));
                         let pinned = state.library_snapshot.is_pinned(session.provider, &session.id);
-                        if ui.push_id(("pin_agent_session", session.provider, &session.id), |ui| ui.add_enabled(state.library.is_loaded() && !state.library.is_busy(), egui::Button::new(if pinned { "★ Pinned · Unpin" } else { "☆ Pin session" }))).inner.clicked() {
+                        if session_pin_button(ui, &session_key(&session), pinned, state.library.is_loaded() && !state.library.is_busy()).clicked() {
                             pin_change = Some((session.provider, session.id.clone(), !pinned));
                         }
                         if let Some(resumed) = state.library_snapshot.last_resumed(session.provider, &session.id) {
@@ -675,7 +715,7 @@ fn show_session_manager(
                                     ui.small(format!("Original title: {}", crate::review_text::visible_bounded(&session.title, 240)));
                                 }
                                 let archived = state.library_snapshot.is_archived(session.provider, &session.id);
-                                if ui.add_enabled(can_save, egui::Button::new(if archived { "Restore to active" } else { "Archive locally" }))
+                                if session_archive_button(ui, &key, archived, can_save)
                                     .on_hover_text("Moves this conversation between Active and Archived in the shared library. It does not delete history or stop a running agent.")
                                     .clicked() { archive_change = Some((key.clone(), !archived)); }
                             });
@@ -1771,5 +1811,85 @@ mod tests {
             "a catalog/library refresh must not transfer a pressed Resume control to another session");
         assert!(!frame(&replacement, pointer(true)).clicked());
         assert!(frame(&replacement, pointer(false)).clicked());
+    }
+
+    #[test]
+    fn organization_pointer_release_cannot_invert_a_peer_metadata_update() {
+        use jterm_core::agent_sessions::SessionOrganization;
+        for archive in [false, true] {
+            for initial in [false, true] {
+                let ctx = egui::Context::default();
+                let key = (SessionProvider::Codex, LIBRARY_A.to_string());
+                let snapshot = |value| {
+                    library(&[(key.0, &key.1, !archive && value, None)])
+                        .with_organization(
+                            key.0,
+                            &key.1,
+                            SessionOrganization {
+                                archived: archive && value,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap()
+                };
+                let mut state = state_with(vec![session(key.0, &key.1, "Shared conversation")]);
+                state.archive = SessionArchiveFilter::All;
+                state.replace_library(snapshot(initial));
+                let frame = |state: &AgentSessionsState, events| {
+                    let current = if archive {
+                        state.library_snapshot.is_archived(key.0, &key.1)
+                    } else {
+                        state.library_snapshot.is_pinned(key.0, &key.1)
+                    };
+                    let mut response = None;
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(600.0, 300.0),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            response = Some(if archive {
+                                session_archive_button(ui, &key, current, true)
+                            } else {
+                                session_pin_button(ui, &key, current, true)
+                            });
+                        },
+                    );
+                    output.textures_delta.clear();
+                    let response = response.unwrap();
+                    let mutation = response.clicked().then_some(!current);
+                    (response, mutation)
+                };
+                let original = frame(&state, vec![]).0;
+                let position = original.rect.left_center() + egui::vec2(8.0, 0.0);
+                let pointer = |pressed| {
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                };
+                assert!(frame(&state, pointer(true)).1.is_none());
+                state.replace_library(snapshot(!initial));
+                assert_eq!(state.selected.as_ref(), Some(&key));
+                let (updated, mutation) = frame(&state, pointer(false));
+                assert!(updated.rect.contains(position));
+                assert_ne!(original.id, updated.id);
+                assert!(
+                    mutation.is_none(),
+                    "release must not undo a peer metadata update"
+                );
+                assert!(frame(&state, pointer(true)).1.is_none());
+                assert_eq!(frame(&state, pointer(false)).1, Some(initial));
+            }
+        }
     }
 }
