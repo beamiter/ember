@@ -274,6 +274,35 @@ fn route_dialog_events(
     cancel
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchFeedbackState {
+    Running,
+    Cancelled,
+    Failed,
+    Completed,
+}
+
+fn search_feedback_state(search: &jterm_core::vim9::Vim9Search) -> SearchFeedbackState {
+    if search.running {
+        SearchFeedbackState::Running
+    } else if search.cancelled {
+        SearchFeedbackState::Cancelled
+    } else if !search.errors.is_empty() || !(0..=1).contains(&search.exit_code) {
+        SearchFeedbackState::Failed
+    } else {
+        SearchFeedbackState::Completed
+    }
+}
+
+// Successful ripgrep exits publish collected results even when the reader reports errors.
+fn search_failure_detail(exit_code: i32) -> &'static str {
+    if (0..=1).contains(&exit_code) {
+        "reported errors; results may be incomplete"
+    } else {
+        "failed; previous quickfix kept"
+    }
+}
+
 fn search_options_summary(options: &Vim9SearchOptions) -> String {
     let mut summary = format!(
         "{} · {}",
@@ -1063,16 +1092,17 @@ impl Workbench {
                 ui.separator();
             }
             if !snapshot.search.query.is_empty() {
+                let search_state = search_feedback_state(&snapshot.search);
                 ui.strong(format!("Project search · {}", snapshot.search.query));
                 ui.weak(search_options_summary(&snapshot.search.options));
-                if snapshot.search.running {
+                if search_state == SearchFeedbackState::Running {
                     ui.label(format!("Searching… {} matches so far. Previous quickfix entries remain until search completes.", snapshot.search.count));
-                } else if snapshot.search.cancelled {
+                } else if search_state == SearchFeedbackState::Cancelled {
                     ui.label(format!("Search cancelled · {} matches found before cancellation", snapshot.search.count));
-                } else if (0..=1).contains(&snapshot.search.exit_code) {
+                } else if search_state == SearchFeedbackState::Completed {
                     ui.label(format!("Search completed · {} matches", snapshot.search.count));
                 } else {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("Search failed (exit {}). Previous quickfix entries were retained.", snapshot.search.exit_code));
+                    ui.colored_label(ui.visuals().error_fg_color, format!("Search {} (exit {}).", search_failure_detail(snapshot.search.exit_code), snapshot.search.exit_code));
                 }
                 if snapshot.search.truncated > 0 {
                     ui.label(format!("Search result limit reached: {} matches omitted. Narrow your query to see other matches.", snapshot.search.truncated));
@@ -2662,6 +2692,52 @@ mod tests {
             diagnostic_location(Path::new(""), "/project/src/main.rs", 4, 2),
             "/project/src/main.rs:4:2"
         );
+    }
+
+    #[test]
+    fn search_errors_with_successful_exit_do_not_claim_previous_results_were_kept() {
+        for exit_code in [0, 1] {
+            assert_eq!(
+                search_failure_detail(exit_code),
+                "reported errors; results may be incomplete"
+            );
+        }
+        for exit_code in [-1, 2] {
+            assert_eq!(
+                search_failure_detail(exit_code),
+                "failed; previous quickfix kept"
+            );
+        }
+    }
+
+    #[test]
+    fn search_feedback_prioritizes_running_cancelled_and_reported_errors() {
+        let mut search = jterm_core::vim9::Vim9Search::default();
+        for exit_code in [0, 1] {
+            search.exit_code = exit_code;
+            assert_eq!(
+                search_feedback_state(&search),
+                SearchFeedbackState::Completed
+            );
+            search
+                .errors
+                .push("ripgrep output could not be read".into());
+            assert_eq!(search_feedback_state(&search), SearchFeedbackState::Failed);
+            search.cancelled = true;
+            assert_eq!(
+                search_feedback_state(&search),
+                SearchFeedbackState::Cancelled
+            );
+            search.running = true;
+            assert_eq!(search_feedback_state(&search), SearchFeedbackState::Running);
+            search.running = false;
+            search.cancelled = false;
+            search.errors.clear();
+        }
+        for exit_code in [-1, 2] {
+            search.exit_code = exit_code;
+            assert_eq!(search_feedback_state(&search), SearchFeedbackState::Failed);
+        }
     }
 
     #[test]
