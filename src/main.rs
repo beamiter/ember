@@ -1585,6 +1585,32 @@ fn app_mouse_frame_route(
 
 const LINK_ACTIVATION_DRAG_THRESHOLD: f32 = 4.0;
 
+fn link_activation_press(input: &egui::InputState) -> Option<(bool, bool, egui::Pos2)> {
+    input.events.iter().find_map(|event| {
+        let egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers,
+        } = event
+        else {
+            return None;
+        };
+        Some((
+            // On Linux/Windows, `command` aliases Ctrl. Use the press event:
+            // Ctrl may already be released and the pointer moved this frame.
+            modifiers.matches_exact(egui::Modifiers::CTRL) && !modifiers.mac_cmd,
+            input
+                .pointer
+                .button_double_clicked(egui::PointerButton::Primary)
+                || input
+                    .pointer
+                    .button_triple_clicked(egui::PointerButton::Primary),
+            *pos,
+        ))
+    })
+}
+
 fn link_activation_dragged(origin: egui::Pos2, current: egui::Pos2) -> bool {
     current.distance(origin) > LINK_ACTIVATION_DRAG_THRESHOLD
 }
@@ -7150,66 +7176,47 @@ impl eframe::App for TerminalApp {
         // capture. Host link activation owns this press on any real grid cell
         // except a finished command header, so a mouse-reporting foreground
         // application must never receive the same press as the host opener.
-        let link_press = ctx.input(|input| {
-            input
-                .pointer
-                .button_pressed(egui::PointerButton::Primary)
-                .then_some((
-                    input.modifiers.ctrl
-                        && !input.modifiers.shift
-                        && !input.modifiers.alt
-                        && !input.modifiers.command,
-                    input
-                        .pointer
-                        .button_double_clicked(egui::PointerButton::Primary)
-                        || input
-                            .pointer
-                            .button_triple_clicked(egui::PointerButton::Primary),
-                    input.pointer.interact_pos().or(input.pointer.hover_pos()),
-                ))
-        });
+        let link_press = ctx.input(link_activation_press);
         let mut link_press_override = false;
-        if let Some((ctrl_only, multiple_click, press_pos)) = link_press {
+        if let Some((ctrl_only, multiple_click, origin)) = link_press {
             self.pending_link_activation = None;
             if !terminal_pointer_input_blocked && ctrl_only && !multiple_click {
-                if let Some(origin) = press_pos {
-                    let renderer = active_pane_renderer_idx
-                        .and_then(|index| self.pane_renderers.get(index))
-                        .unwrap_or(&self.renderer);
-                    let terminal = session.terminal.lock();
-                    if renderer.pointer_link_eligible_projected(
-                        &terminal,
-                        &mouse_projection_viewport,
+                let renderer = active_pane_renderer_idx
+                    .and_then(|index| self.pane_renderers.get(index))
+                    .unwrap_or(&self.renderer);
+                let terminal = session.terminal.lock();
+                if renderer.pointer_link_eligible_projected(
+                    &terminal,
+                    &mouse_projection_viewport,
+                    origin,
+                ) {
+                    let links = self
+                        .link_detector
+                        .detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
+                            mouse_projection_viewport.cells(),
+                            mouse_projection_viewport.row_wrapped(),
+                            |id| terminal.hyperlink_uri(id).map(str::to_owned),
+                        );
+                    let content_rect = renderer
+                        .last_content_rect
+                        .unwrap_or_else(|| ctx.viewport_rect());
+                    if let Some(link) = link_at_pointer(
+                        &links,
                         origin,
+                        content_rect,
+                        renderer.char_width,
+                        renderer.line_height,
+                        &mouse_projection_viewport,
                     ) {
-                        let links = self
-                            .link_detector
-                            .detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
-                                mouse_projection_viewport.cells(),
-                                mouse_projection_viewport.row_wrapped(),
-                                |id| terminal.hyperlink_uri(id).map(str::to_owned),
-                            );
-                        let content_rect = renderer
-                            .last_content_rect
-                            .unwrap_or_else(|| ctx.viewport_rect());
-                        if let Some(link) = link_at_pointer(
-                            &links,
-                            origin,
-                            content_rect,
-                            renderer.char_width,
-                            renderer.line_height,
-                            &mouse_projection_viewport,
-                        ) {
-                            self.pending_link_activation =
-                                Some(crate::app::state::PendingLinkActivation {
-                                    session_id: active_session_id.clone(),
-                                    link,
-                                    origin,
-                                    cancelled: false,
-                                    released_at: None,
-                                });
-                            link_press_override = true;
-                        }
+                        self.pending_link_activation =
+                            Some(crate::app::state::PendingLinkActivation {
+                                session_id: active_session_id.clone(),
+                                link,
+                                origin,
+                                cancelled: false,
+                                released_at: None,
+                            });
+                        link_press_override = true;
                     }
                 }
             }
@@ -8203,12 +8210,12 @@ mod tests {
         clipboard_5522_response_for_mime_with_limit, desktop_notification_channel,
         encode_submitted_command, ensure_direct_paste_route_available,
         flush_pending_mouse_controls, fontconfig_match_family_file, kitty_graphics_payload,
-        link_activation_dragged, link_activation_ready, link_activation_release_allowed,
-        link_at_pointer, maybe_notify_long_command, middle_paste_event_eligible,
-        mouse_capture_accepts_new_press, mouse_cell_for_current_dimensions,
-        mouse_lossy_reports_allowed, mouse_press_reports_to_app, mouse_protocol_input_is_blocked,
-        mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalized_paste_body,
-        osc52_clipboard_response_with_limit, parse_bold_match, paste_policy,
+        link_activation_dragged, link_activation_press, link_activation_ready,
+        link_activation_release_allowed, link_at_pointer, maybe_notify_long_command,
+        middle_paste_event_eligible, mouse_capture_accepts_new_press,
+        mouse_cell_for_current_dimensions, mouse_lossy_reports_allowed, mouse_press_reports_to_app,
+        mouse_protocol_input_is_blocked, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
+        normalized_paste_body, osc52_clipboard_response_with_limit, parse_bold_match, paste_policy,
         paste_requires_confirmation, pointer_is_block_decoration, primary_copy_route,
         queue_mouse_control, reported_capture_button, roll_notification_rate_window,
         should_notify_long_command, should_send_alternate_scroll, show_desktop_notification,
@@ -10117,6 +10124,81 @@ mod tests {
                 modifiers,
             }]
         );
+    }
+
+    #[test]
+    fn ctrl_link_press_accepts_native_ctrl_and_rejects_other_chords() {
+        let native_ctrl = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        let origin = egui::pos2(10.0, 10.0);
+        for (modifiers, expected) in [
+            (native_ctrl, true),
+            (egui::Modifiers::CTRL, true),
+            (native_ctrl | egui::Modifiers::SHIFT, false),
+            (native_ctrl | egui::Modifiers::ALT, false),
+            (native_ctrl | egui::Modifiers::MAC_CMD, false),
+            (egui::Modifiers::COMMAND | egui::Modifiers::MAC_CMD, false),
+            (egui::Modifiers::NONE, false),
+        ] {
+            let ctx = egui::Context::default();
+            let mut press = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::ModifiersChanged(modifiers),
+                        egui::Event::PointerButton {
+                            pos: origin,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| press = ui.input(link_activation_press),
+            );
+            output.textures_delta.clear();
+            assert_eq!(press, Some((expected, false, origin)), "{modifiers:?}");
+        }
+    }
+
+    #[test]
+    fn ctrl_link_press_keeps_event_modifiers_and_position_within_one_frame() {
+        let ctx = egui::Context::default();
+        let origin = egui::pos2(10.0, 10.0);
+        let moved = origin + egui::vec2(1.0, 1.0);
+        let mut press = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::ModifiersChanged(egui::Modifiers::CTRL | egui::Modifiers::COMMAND),
+                    egui::Event::PointerButton {
+                        pos: origin,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                    },
+                    egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+                    egui::Event::PointerMoved(moved),
+                    egui::Event::PointerButton {
+                        pos: moved,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                ui.input(|input| {
+                    assert!(!input.modifiers.ctrl);
+                    assert!(!input.pointer.any_down());
+                    assert!(input.pointer.button_released(egui::PointerButton::Primary));
+                    press = link_activation_press(input);
+                });
+            },
+        );
+        output.textures_delta.clear();
+        assert_eq!(press, Some((true, false, origin)));
     }
 
     #[test]
