@@ -1699,6 +1699,15 @@ prints the conflicting path.
 
 ## Agent session manager
 
+The **Agent command center** adds shared local aliases, tags and reversible
+archiving, project summaries, structured search and a link to the worktree Tasks
+dashboard. **Organize this conversation → Save details** persists names and tags
+across all four terminals; **Reset** preserves control over unsaved drafts.
+Search supports `provider:codex tag:review`, `project:core`, `is:pinned`, quoted
+phrases and exclusions such as `-tag:blocked`. The Tasks dashboard adds provider
+and project filters, five sort modes and stable **Next needs you** navigation.
+See the [Agent management guide](docs/agent-management.md).
+
 Press **Ctrl+Shift+Alt+G** or choose **Agent Sessions** from the command palette
 to find existing Codex and Claude CLI conversations across all projects. Search
 by title, project, branch, session ID or latest context; narrow the list by
@@ -1710,7 +1719,8 @@ when the manager opened; it stays fixed during inspection and refresh.
 **Best match** ranks session IDs and titles ahead of incidental message text;
 **Recent** and **Live first** provide alternate orderings. Editing a query or
 filter selects its first result, while automatic refresh preserves your selected
-conversation and reading position. **Clear filters** returns to the full list.
+conversation and reading position. **Clear filters** returns to Active library
+conversations across all projects; the archive selector also offers Archived and All.
 Search normalization is shared with the other terminals and unchanged discovery
 snapshots reuse the existing index and projection.
 

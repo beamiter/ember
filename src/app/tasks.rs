@@ -141,6 +141,10 @@ pub struct TaskSidebarState {
     pub pending_action: Option<TaskSidebarAction>,
     dashboard_query: String,
     dashboard_view: jterm_core::agent_task::DashboardView,
+    dashboard_provider: Option<AgentProvider>,
+    dashboard_project: Option<PathBuf>,
+    dashboard_sort: jterm_core::agent_task::DashboardSort,
+    scroll_to_selected: bool,
     pending_creation: Option<PendingTaskCreation>,
     follow_up_drafts: HashMap<TaskId, String>,
     recovery_loaded: bool,
@@ -214,6 +218,7 @@ struct TaskRowSnapshot {
     status: TaskStatus,
     runtime_kind: TaskRuntimeKind,
     branch: String,
+    project: String,
     has_agent_terminal: bool,
     has_validation_terminal: bool,
     has_active_agent_stream: bool,
@@ -1131,6 +1136,12 @@ impl TerminalApp {
 
     pub(crate) fn render_sidebar_tasks(&mut self, ui: &mut egui::Ui) {
         self.render_task_recovery(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Agent tasks");
+            if ui.button("Conversation library").clicked() {
+                self.toggle_agent_sessions();
+            }
+        });
         let rows: Vec<_> = self
             .task_manager
             .tasks()
@@ -1143,6 +1154,7 @@ impl TerminalApp {
                 status: task.status,
                 runtime_kind: task.runtime_kind,
                 branch: visible_bounded(&task.branch, MAX_TASK_BRANCH_DISPLAY_BYTES),
+                project: visible_bounded(&task.repo_root.to_string_lossy(), 320),
                 has_agent_terminal: task
                     .terminal_session_id
                     .as_deref()
@@ -1179,6 +1191,67 @@ impl TerminalApp {
             .collect();
         let has_tasks = !rows.is_empty();
         let open_result = dashboard_search(ui, &mut self.task_sidebar.dashboard_query);
+        let mut projects: Vec<_> = self
+            .task_manager
+            .tasks()
+            .iter()
+            .filter(|task| task.status != TaskStatus::Archived)
+            .map(|task| task.repo_root.clone())
+            .collect();
+        projects.sort();
+        projects.dedup();
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("task_dashboard_provider")
+                .selected_text(
+                    self.task_sidebar
+                        .dashboard_provider
+                        .map_or("All providers", AgentProvider::display_name),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.task_sidebar.dashboard_provider,
+                        None,
+                        "All providers",
+                    );
+                    for provider in AgentProvider::ALL {
+                        ui.selectable_value(
+                            &mut self.task_sidebar.dashboard_provider,
+                            Some(provider),
+                            provider.display_name(),
+                        );
+                    }
+                });
+            egui::ComboBox::from_id_salt("task_dashboard_project")
+                .selected_text(self.task_sidebar.dashboard_project.as_ref().map_or_else(
+                    || "All projects".to_string(),
+                    |path| visible_bounded(&path.to_string_lossy(), 120),
+                ))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.task_sidebar.dashboard_project,
+                        None,
+                        "All projects",
+                    );
+                    for project in &projects {
+                        ui.selectable_value(
+                            &mut self.task_sidebar.dashboard_project,
+                            Some(project.clone()),
+                            visible_bounded(&project.to_string_lossy(), 320),
+                        );
+                    }
+                });
+            egui::ComboBox::from_id_salt("task_dashboard_sort")
+                .selected_text(self.task_sidebar.dashboard_sort.label())
+                .show_ui(ui, |ui| {
+                    for sort in jterm_core::agent_task::DashboardSort::ALL {
+                        ui.selectable_value(
+                            &mut self.task_sidebar.dashboard_sort,
+                            sort,
+                            sort.label(),
+                        );
+                    }
+                });
+        });
         let activity: HashMap<_, _> = rows
             .iter()
             .map(|row| {
@@ -1202,6 +1275,8 @@ impl TerminalApp {
                 |id| activity.get(&id).copied().unwrap_or_default(),
                 jterm_core::agent_task::DashboardFilter {
                     text: &self.task_sidebar.dashboard_query,
+                    provider: self.task_sidebar.dashboard_provider,
+                    repo_root: self.task_sidebar.dashboard_project.as_deref(),
                     view,
                     ..Default::default()
                 },
@@ -1229,9 +1304,11 @@ impl TerminalApp {
         if self.task_sidebar.dashboard_view != previous_view {
             dashboard = project_dashboard(self.task_sidebar.dashboard_view);
         }
+        dashboard.sort_rows(self.task_sidebar.dashboard_sort);
         if open_result {
             if let Some(row) = dashboard.rows.first() {
                 self.task_sidebar.selected = Some(row.id);
+                self.task_sidebar.scroll_to_selected = true;
             }
         }
         ui.label(
@@ -1251,6 +1328,8 @@ impl TerminalApp {
         let mut clear_filters = false;
         if !self.task_sidebar.dashboard_query.is_empty()
             || self.task_sidebar.dashboard_view != jterm_core::agent_task::DashboardView::All
+            || self.task_sidebar.dashboard_provider.is_some()
+            || self.task_sidebar.dashboard_project.is_some()
         {
             clear_filters |= ui.button("Clear filters").clicked();
         }
@@ -1261,8 +1340,37 @@ impl TerminalApp {
         if clear_filters {
             self.task_sidebar.dashboard_query.clear();
             self.task_sidebar.dashboard_view = jterm_core::agent_task::DashboardView::All;
+            self.task_sidebar.dashboard_provider = None;
+            self.task_sidebar.dashboard_project = None;
+            self.task_sidebar.scroll_to_selected = true;
             ui.ctx().request_repaint();
         }
+        ui.horizontal_wrapped(|ui| {
+            let previous = dashboard.step_selection(self.task_sidebar.selected, false);
+            let next = dashboard.step_selection(self.task_sidebar.selected, true);
+            if ui
+                .add_enabled(previous.is_some(), egui::Button::new("Previous"))
+                .clicked()
+            {
+                self.task_sidebar.selected = previous;
+                self.task_sidebar.scroll_to_selected = true;
+            }
+            if ui
+                .add_enabled(next.is_some(), egui::Button::new("Next"))
+                .clicked()
+            {
+                self.task_sidebar.selected = next;
+                self.task_sidebar.scroll_to_selected = true;
+            }
+            let attention = dashboard.next_attention(self.task_sidebar.selected);
+            if ui
+                .add_enabled(attention.is_some(), egui::Button::new("Next needs you"))
+                .clicked()
+            {
+                self.task_sidebar.selected = attention;
+                self.task_sidebar.scroll_to_selected = true;
+            }
+        });
         let rows = rows_in_dashboard_order(rows, &dashboard);
         if has_tasks && rows.is_empty() {
             ui.label("No tasks match these filters.");
@@ -1337,6 +1445,10 @@ impl TerminalApp {
                         })
                         .response
                         .interact(egui::Sense::click());
+                    if selected && self.task_sidebar.scroll_to_selected {
+                        response.scroll_to_me(Some(egui::Align::Min));
+                        self.task_sidebar.scroll_to_selected = false;
+                    }
                     if response.clicked() {
                         self.task_sidebar.selected = Some(row.id);
                     }
@@ -1363,9 +1475,9 @@ impl TerminalApp {
                     ui.horizontal(|ui| {
                         ui.add_space(18.0);
                         ui.add(
-                            egui::Label::new(egui::RichText::new(&row.branch).small().weak())
+                            egui::Label::new(egui::RichText::new(format!("{} · {}", row.project, row.branch)).small().weak())
                                 .truncate(),
-                        );
+                        ).on_hover_text(format!("{}\n{}", row.project, row.branch));
                     });
 
                     if let Some(reason) = task_reason(row.status, row.validation_status, row.status_detail.as_deref(), row.validation_detail.as_deref()) {
@@ -2561,6 +2673,7 @@ mod tests {
                     status: task.status,
                     runtime_kind: task.runtime_kind,
                     branch: task.branch.clone(),
+                    project: task.repo_root.to_string_lossy().into_owned(),
                     has_agent_terminal: false,
                     has_validation_terminal: false,
                     has_active_agent_stream: false,

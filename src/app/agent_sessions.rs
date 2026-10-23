@@ -3,9 +3,10 @@
 use super::state::TerminalApp;
 use eframe::egui;
 use jterm_core::agent_sessions::{
-    AgentSession, SessionCatalog, SessionLaunch, SessionLibraryFilter, SessionLibrarySnapshot,
-    SessionLibraryStore, SessionPreflight, SessionPreflightState, SessionProvider, SessionQuery,
-    SessionScanner, SessionSearchIndex, SessionSort, SessionStatus,
+    AgentSession, SessionArchiveFilter, SessionCatalog, SessionLaunch, SessionLibraryFilter,
+    SessionLibrarySnapshot, SessionLibraryStore, SessionPreflight, SessionPreflightState,
+    SessionProjectSummary, SessionProvider, SessionQuery, SessionScanner, SessionSearchIndex,
+    SessionSort, SessionStatus,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ struct FilterKey {
     live_only: bool,
     pinned_only: bool,
     recent_only: bool,
+    archive: SessionArchiveFilter,
     project: Option<PathBuf>,
     sort: SessionSort,
 }
@@ -30,6 +32,37 @@ struct FilterKey {
 struct ScrollAnchor {
     key: SessionKey,
     within_row: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionDetailsDraft {
+    alias: String,
+    tags: String,
+    original_alias: String,
+    original_tags: String,
+}
+
+impl SessionDetailsDraft {
+    fn saved(library: &SessionLibrarySnapshot, key: &SessionKey) -> Self {
+        let alias = library.alias(key.0, &key.1).unwrap_or_default().to_string();
+        let tags = library.tags(key.0, &key.1).join(", ");
+        Self {
+            alias: alias.clone(),
+            tags: tags.clone(),
+            original_alias: alias,
+            original_tags: tags,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.alias != self.original_alias || self.tags != self.original_tags
+    }
+
+    fn sync_saved(&mut self, saved: &Self) {
+        if !self.is_dirty() {
+            *self = saved.clone();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -51,9 +84,14 @@ pub(crate) struct AgentSessionsState {
     live_only: bool,
     pinned_only: bool,
     recent_only: bool,
+    archive: SessionArchiveFilter,
     sort: SessionSort,
     scope_cwd: Option<PathBuf>,
     project_only: bool,
+    project_filter: Option<PathBuf>,
+    projects: Vec<SessionProjectSummary>,
+    details_drafts: HashMap<SessionKey, SessionDetailsDraft>,
+    pending_details: Option<SessionKey>,
     selected: Option<SessionKey>,
     focus_search: bool,
     search_widget: Option<egui::Id>,
@@ -76,8 +114,13 @@ impl AgentSessionsState {
             live_only: self.live_only,
             pinned_only: self.pinned_only,
             recent_only: self.recent_only,
+            archive: self.archive,
             sort: self.sort,
-            project: self.project_only.then(|| self.scope_cwd.clone()).flatten(),
+            project: if self.project_only {
+                self.scope_cwd.clone()
+            } else {
+                self.project_filter.clone()
+            },
         }
     }
 
@@ -104,6 +147,7 @@ impl AgentSessionsState {
                 pinned_only: key.pinned_only,
                 recent_only: key.recent_only,
                 pinned_first: true,
+                archive: key.archive,
             },
         );
         *self.cached_visible.borrow_mut() = Some((key, rows.clone()));
@@ -115,6 +159,7 @@ impl AgentSessionsState {
             return false;
         }
         self.index = SessionSearchIndex::new(&catalog);
+        self.projects = self.index.projects(&self.library_snapshot);
         self.catalog = catalog;
         self.cached_visible.get_mut().take();
         self.restore_anchor = self.scroll_anchor.is_some();
@@ -127,6 +172,7 @@ impl AgentSessionsState {
             return false;
         }
         self.library_snapshot = snapshot;
+        self.projects = self.index.projects(&self.library_snapshot);
         self.cached_visible.get_mut().take();
         self.restore_anchor = self.scroll_anchor.is_some();
         self.reconcile_selection();
@@ -136,6 +182,13 @@ impl AgentSessionsState {
     fn poll_library(&mut self) {
         if self.library.poll() {
             self.replace_library(self.library.snapshot().clone());
+        }
+        if !self.library.is_busy() {
+            if let Some(key) = self.pending_details.take() {
+                if self.library.error().is_none() {
+                    self.details_drafts.remove(&key);
+                }
+            }
         }
     }
 
@@ -202,7 +255,9 @@ impl AgentSessionsState {
         self.live_only = false;
         self.pinned_only = false;
         self.recent_only = false;
+        self.archive = SessionArchiveFilter::Active;
         self.project_only = false;
+        self.project_filter = None;
         self.sort = SessionSort::Relevance;
         self.filters_changed();
         self.focus_search = true;
@@ -321,6 +376,348 @@ fn age_label(updated_at_ms: u64) -> String {
         60..=3599 => format!("{}m ago", seconds / 60),
         3600..=86399 => format!("{}h ago", seconds / 3600),
         _ => format!("{}d ago", seconds / 86400),
+    }
+}
+
+struct SessionManagerActions {
+    open: bool,
+    resume: bool,
+    pin_change: Option<(SessionProvider, String, bool)>,
+    details_change: Option<(SessionKey, String, String)>,
+    archive_change: Option<(SessionKey, bool)>,
+    open_tasks: bool,
+}
+
+fn session_resume_button(
+    ui: &mut egui::Ui,
+    selected: Option<&SessionKey>,
+    enabled: bool,
+    switch_to_tab: bool,
+) -> egui::Response {
+    ui.push_id(("resume_agent_session", selected), |ui| {
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(if switch_to_tab {
+                "Switch to Open Tab  ↵"
+            } else {
+                "Resume in New Tab  ↵"
+            }),
+        )
+    })
+    .inner
+}
+
+fn session_row_button(
+    ui: &mut egui::Ui,
+    selected: bool,
+    status: &str,
+    title: &str,
+    context: &str,
+) -> egui::Response {
+    let response = ui.add_sized(
+        [ui.available_width(), 70.0],
+        egui::Button::selectable(selected, ""),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            selected,
+            format!("{title}. {status}. {context}"),
+        )
+    });
+    let content = response.rect.shrink2(egui::vec2(10.0, 6.0));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .id(response.id.with("text"))
+            .max_rect(content)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| {
+            ui.set_clip_rect(content.intersect(ui.clip_rect()));
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.add(egui::Label::new(egui::RichText::new(status).small().weak()).truncate());
+            ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate());
+            ui.add(egui::Label::new(egui::RichText::new(context).small().weak()).truncate());
+        },
+    );
+    response
+}
+
+// Render pure navigation/editor state and stage exact-identity actions. The
+// caller remains responsible for disk mutations, preflight and process launch.
+fn show_session_manager(
+    ctx: &egui::Context,
+    state: &mut AgentSessionsState,
+    task_dashboard_enabled: bool,
+) -> SessionManagerActions {
+    let mut open = true;
+    let mut resume = false;
+    let mut pin_change = None;
+    let mut details_change = None;
+    let mut archive_change = None;
+    let mut open_tasks = false;
+    egui::Window::new("Agent Sessions")
+        .id(egui::Id::new("agent_sessions_manager"))
+        .open(&mut open)
+        .default_size(egui::vec2(1040.0, 700.0))
+        .min_size(egui::vec2(640.0, 420.0))
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Agent command center").size(20.0).strong());
+                if ui.add_enabled(task_dashboard_enabled, egui::Button::new("Task dashboard"))
+                    .on_disabled_hover_text("Enable the Tasks sidebar in Settings to manage worktree tasks")
+                    .clicked() { open_tasks = true; }
+            });
+            ui.label("Organize conversations, browse projects and return to active work");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let total = state.catalog.sessions.len();
+                let codex = state.catalog.sessions.iter().filter(|s| s.provider == SessionProvider::Codex).count();
+                let waiting = state.catalog.sessions.iter().filter(|s| s.status == SessionStatus::Waiting).count();
+                let live = state.catalog.live_processes.len();
+                ui.label(egui::RichText::new(format!("{total} sessions   ·   {codex} Codex   ·   {} Claude   ·   {waiting} waiting   ·   {live} live processes   ·   {} pinned", total - codex, state.library_snapshot.pinned_count())).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!state.scanner.is_scanning(), egui::Button::new("Refresh  F5")).clicked() { state.refresh(); state.preflight.refresh(); state.library.refresh(); }
+                    if state.scanner.is_scanning() { ui.spinner(); }
+                });
+            });
+            let previous_filters = state.filter_key();
+            ui.horizontal(|ui| {
+                let response = ui.add(egui::TextEdit::singleline(&mut state.query).hint_text("Search · tag:review provider:codex project:core -term \"exact phrase\"").desired_width(f32::INFINITY).char_limit(1024));
+                state.search_widget = Some(response.id);
+                if state.focus_search { response.request_focus(); state.focus_search = false; }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Provider");
+                for (label, value) in [("All", None), ("Codex", Some(SessionProvider::Codex)), ("Claude", Some(SessionProvider::Claude))] {
+                    ui.selectable_value(&mut state.provider, value, label);
+                }
+                ui.separator();
+                egui::ComboBox::from_id_salt("agent_session_status_filter")
+                    .selected_text(state.status.map(|s| s.label()).unwrap_or("All states"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut state.status, None, "All states");
+                        for status in [SessionStatus::Working, SessionStatus::Waiting, SessionStatus::Idle, SessionStatus::Unknown, SessionStatus::Archived] {
+                            ui.selectable_value(&mut state.status, Some(status), status.label());
+                        }
+                    });
+                ui.checkbox(&mut state.live_only, "Observed live only").on_hover_text("Show only sessions with an exact local CLI process match at the latest refresh. Independent of the last recorded state.");
+                ui.add_enabled(state.library.is_loaded(), egui::Checkbox::new(&mut state.pinned_only, "Pinned only"));
+                ui.add_enabled(state.library.is_loaded(), egui::Checkbox::new(&mut state.recent_only, "Previously resumed"));
+                egui::ComboBox::from_id_salt("agent_session_archive_filter")
+                    .selected_text(state.archive.label())
+                    .show_ui(ui, |ui| {
+                        for archive in SessionArchiveFilter::ALL {
+                            ui.selectable_value(&mut state.archive, archive, archive.label());
+                        }
+                    });
+                if ui.small_button("Clear filters").clicked() { state.clear_filters(); }
+            });
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("agent_session_project_filter")
+                    .selected_text(state.project_filter.as_ref().filter(|_| !state.project_only)
+                        .map_or_else(|| "All projects".to_string(), |root| crate::review_text::visible_bounded(&root.to_string_lossy(), 100)))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_value(&mut state.project_filter, None, "All projects").clicked() { state.project_only = false; }
+                        for project in &state.projects {
+                            let label = format!("{} · {} active · {} archived · {} live · {} waiting", crate::review_text::visible_bounded(&project.root.to_string_lossy(), 240), project.total, project.archived, project.live, project.waiting);
+                            if ui.selectable_value(&mut state.project_filter, Some(project.root.clone()), label).clicked() { state.project_only = false; }
+                        }
+                    });
+                let scope_available = state.scope_cwd.is_some();
+                ui.add_enabled(scope_available, egui::Checkbox::new(&mut state.project_only, "This folder + subfolders"))
+                    .on_hover_text("Captured from the active local terminal when this manager opened. The scope stays fixed while you inspect sessions.");
+                if let Some(cwd) = &state.scope_cwd {
+                    ui.add(egui::Label::new(crate::review_text::visible_bounded(&cwd.to_string_lossy(), 140)).truncate()).on_hover_text(cwd.to_string_lossy());
+                } else { ui.weak("Opening folder unavailable"); }
+                ui.separator();
+                ui.label("Sort");
+                egui::ComboBox::from_id_salt("agent_session_sort")
+                    .selected_text(state.sort.label()).width(110.0)
+                    .show_ui(ui, |ui| {
+                        for sort in SessionSort::ALL {
+                            ui.selectable_value(&mut state.sort, sort, sort.label());
+                        }
+                    });
+            });
+            if state.filter_key() != previous_filters { state.filters_changed(); }
+            state.reconcile_selection();
+            let visible = state.visible();
+            ui.separator();
+            ui.small(format!("{} matching sessions · {}{}", visible.len(), state.sort.label(), if state.query.trim().is_empty() && state.sort == SessionSort::Relevance { " · newest first" } else { "" }));
+            if let Some(error) = SessionSearchIndex::query_error(&state.query) {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+            if let Some(error) = &state.error { ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024)); }
+            if !state.library.is_loaded() { ui.small("Loading shared favorites and resume history…"); }
+            else if state.library.is_busy() { ui.small("Syncing favorites and resume history…"); }
+            if let Some(error) = state.library.error().or(state.library_notice.as_deref()) {
+                ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024));
+            }
+            if !state.catalog.warnings.is_empty() {
+                egui::CollapsingHeader::new(format!("{} discovery notices", state.catalog.warnings.len())).show(ui, |ui| {
+                    for warning in &state.catalog.warnings { ui.small(crate::review_text::visible_bounded(warning, 1024)); }
+                });
+            }
+            let height = (ui.available_height() - 72.0).max(160.0);
+            ui.columns(2, |columns| {
+                const ROW_HEIGHT: f32 = 70.0;
+                let stride = ROW_HEIGHT + columns[0].spacing().item_spacing.y;
+                state.page_rows = (height / stride).floor().max(1.0) as usize;
+                let mut list = egui::ScrollArea::vertical().id_salt("agent_sessions_list").max_height(height).auto_shrink([false, false]);
+                if state.restore_anchor {
+                    if let Some(offset) = state.anchor_offset(&visible, stride) {
+                        list = list.vertical_scroll_offset(offset);
+                    } else { state.scroll_selection = true; }
+                    state.restore_anchor = false;
+                }
+                if state.scroll_selection {
+                    if let Some(row) = visible.iter().position(|i| state.selected.as_ref().is_some_and(|key| *key == session_key(&state.catalog.sessions[*i]))) {
+                        let old_offset = state.scroll_anchor.as_ref().and_then(|_| state.anchor_offset(&visible, stride)).unwrap_or(0.0);
+                        let top = row as f32 * stride;
+                        let offset = if top < old_offset { top } else if top + stride > old_offset + height { (top + stride - height).max(0.0) } else { old_offset };
+                        list = list.vertical_scroll_offset(offset);
+                    } else { list = list.vertical_scroll_offset(0.0); }
+                    state.scroll_selection = false;
+                }
+                let list_output = list.show_rows(&mut columns[0], ROW_HEIGHT, visible.len().max(1), |ui, range| {
+                    if visible.is_empty() {
+                        ui.label(if state.scanner.is_scanning() { "Looking for local conversations…" } else if state.catalog.sessions.is_empty() { "No Codex or Claude sessions found. Start a conversation in either CLI, then refresh." } else { "No sessions match. Try another query or clear the filters." });
+                        return;
+                    }
+                    for row in range {
+                        let session = &state.catalog.sessions[visible[row]];
+                        let selected = state.selected.as_ref().is_some_and(|(p, id)| *p == session.provider && *id == session.id);
+                        let live_pids = state.catalog.live_pids(session);
+                        let live_badge = if live_pids.is_empty() { String::new() } else { format!("  ·  LIVE {}", live_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")) };
+                        let pinned = state.library_snapshot.is_pinned(session.provider, &session.id);
+                        let title = format!("{}{}{}", if pinned { "★ " } else { "" }, if state.library_snapshot.is_archived(session.provider, &session.id) { "[Archived] " } else { "" }, crate::review_text::visible_bounded(state.library_snapshot.display_title(session.provider, &session.id, &session.title), 160));
+                        let tags = state.library_snapshot.tags(session.provider, &session.id);
+                        let project = crate::review_text::visible_bounded(&session.cwd.to_string_lossy(), 120);
+                        let context = if tags.is_empty() { project } else { format!("{}  ·  {}", project, tags.join(" · ")) };
+                        let status = format!("{}  ·  {}  ·  {}{}", session.provider.label(), session.status.label(), age_label(session.updated_at_ms), live_badge);
+                        let response = ui.push_id((session.provider.label(), &session.id), |ui| session_row_button(ui, selected, &status, &title, &context)).inner;
+                        if response.has_focus() { state.row_focus_widget = Some(response.id); }
+                        if response.clicked() { state.selected = Some((session.provider, session.id.clone())); }
+                    }
+                });
+                state.remember_anchor(&visible, list_output.state.offset.y, stride);
+                egui::ScrollArea::vertical().id_salt("agent_session_detail").max_height(height).show(&mut columns[1], |ui| {
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    if let Some(session) = state.selected_session().cloned() {
+                        ui.heading(crate::review_text::visible_bounded(state.library_snapshot.display_title(session.provider, &session.id, &session.title), 240));
+                        ui.label(format!("{} · {} · {}", session.provider.label(), session.status.label(), age_label(session.updated_at_ms)));
+                        let pinned = state.library_snapshot.is_pinned(session.provider, &session.id);
+                        if ui.push_id(("pin_agent_session", session.provider, &session.id), |ui| ui.add_enabled(state.library.is_loaded() && !state.library.is_busy(), egui::Button::new(if pinned { "★ Pinned · Unpin" } else { "☆ Pin session" }))).inner.clicked() {
+                            pin_change = Some((session.provider, session.id.clone(), !pinned));
+                        }
+                        if let Some(resumed) = state.library_snapshot.last_resumed(session.provider, &session.id) {
+                            ui.small(format!("Last resumed {} · shared across your terminals", age_label(resumed)));
+                        }
+                        if state.opened.contains_key(&session_key(&session)) {
+                            ui.colored_label(egui::Color32::LIGHT_GREEN, "Ready to switch to the open tab");
+                        } else if state.preflight.ready_launch(&session).is_some() {
+                            ui.colored_label(egui::Color32::LIGHT_GREEN, "Ready · project and CLI checked");
+                        } else {
+                            match state.preflight.state() {
+                                SessionPreflightState::Unavailable(error) => { ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024)); }
+                                _ => { ui.horizontal(|ui| { ui.spinner(); ui.label("Checking project and CLI…"); }); }
+                            }
+                        }
+                        if state.pending_resume.is_some() { ui.small("Confirming a fresh readiness check…"); }
+                        let live_pids = state.catalog.live_pids(&session);
+                        if !live_pids.is_empty() {
+                            ui.colored_label(egui::Color32::LIGHT_GREEN, format!("Live CLI process · PID {}", live_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
+                            ui.small("Exact session-ID process match; recorded state remains separate.");
+                        }
+                        if state.opened.contains_key(&(session.provider, session.id.clone())) {
+                            ui.label("Open in this window · confirming switches to its tab");
+                        }
+                        ui.add_space(8.0);
+                        let key = session_key(&session);
+                        let saved = SessionDetailsDraft::saved(&state.library_snapshot, &key);
+                        let can_edit = state.library.is_loaded() && state.pending_details.as_ref() != Some(&key);
+                        let can_save = state.library.is_loaded() && !state.library.is_busy();
+                        let draft = state.details_drafts.entry(key.clone()).or_insert_with(|| saved.clone());
+                        draft.sync_saved(&saved);
+                        egui::CollapsingHeader::new("Organize this conversation")
+                            .id_salt(("session_details", session.provider.label(), &session.id))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.small("Local alias");
+                                ui.add_enabled(can_edit, egui::TextEdit::singleline(&mut draft.alias)
+                                    .id_salt(("session_alias", session.provider.label(), &session.id))
+                                    .hint_text("A recognizable name for this work")
+                                    .char_limit(160).desired_width(f32::INFINITY));
+                                ui.small("Tags · comma separated");
+                                ui.add_enabled(can_edit, egui::TextEdit::singleline(&mut draft.tags)
+                                    .id_salt(("session_tags", session.provider.label(), &session.id))
+                                    .hint_text("review, release, research")
+                                    .char_limit(420).desired_width(f32::INFINITY));
+                                let changed = draft.alias != saved.alias || draft.tags != saved.tags;
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.add_enabled(can_save && changed, egui::Button::new("Save details")).clicked() {
+                                        details_change = Some((key.clone(), draft.alias.clone(), draft.tags.clone()));
+                                    }
+                                    if ui.add_enabled(can_edit && changed, egui::Button::new("Reset")).clicked() {
+                                        *draft = saved.clone();
+                                    }
+                                    if state.pending_details.as_ref() == Some(&key) { ui.small("Saving details…"); }
+                                    else if !state.library.is_loaded() { ui.small("Loading organization…"); }
+                                    else if changed { ui.small("Unsaved changes"); }
+                                });
+                                if draft.is_dirty() && (draft.original_alias != saved.alias || draft.original_tags != saved.tags) {
+                                    ui.colored_label(egui::Color32::YELLOW, "Saved details changed in another terminal. Reset to use those details, or save your edits.");
+                                }
+                                ui.small("Alias and tags are shared across your four terminals. The provider's conversation stays intact.");
+                                if state.library_snapshot.alias(session.provider, &session.id).is_some() {
+                                    ui.small(format!("Original title: {}", crate::review_text::visible_bounded(&session.title, 240)));
+                                }
+                                let archived = state.library_snapshot.is_archived(session.provider, &session.id);
+                                if ui.add_enabled(can_save, egui::Button::new(if archived { "Restore to active" } else { "Archive locally" }))
+                                    .on_hover_text("Moves this conversation between Active and Archived in the shared library. It does not delete history or stop a running agent.")
+                                    .clicked() { archive_change = Some((key.clone(), !archived)); }
+                            });
+                        if !draft.is_dirty() {
+                            state.details_drafts.remove(&key);
+                        }
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Project").strong());
+                        ui.label(crate::review_text::visible_bounded(&session.cwd.to_string_lossy(), 1024));
+                        if let Some(branch) = &session.branch { ui.label(format!("Branch: {}", crate::review_text::visible_bounded(branch, 160))); }
+                        ui.label(format!("Session: {}", crate::review_text::visible_bounded(&session.id, 160)));
+                        ui.separator();
+                        ui.label(egui::RichText::new("Latest context").strong());
+                        ui.label(if session.preview.is_empty() { "No message preview available".to_string() } else { crate::review_text::visible_bounded(&session.preview, 8192) });
+                        ui.add_space(10.0);
+                        if let Some(launch) = state.preflight.ready_launch(&session) {
+                            ui.label(egui::RichText::new("Resume command").strong());
+                            ui.monospace(crate::review_text::visible_bounded(&launch.display_command(), 1024));
+                            if ui.button("Copy command").clicked() { ui.ctx().copy_text(launch.display_command()); }
+                        }
+                    } else { ui.label("Select a conversation to inspect its project and latest context."); }
+                    });
+                });
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.small("↑ ↓ / PgUp PgDn / Home End select · Ctrl+L search · Enter resume · Esc close");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_resume = state.pending_resume.is_none() && (state.selected.as_ref().is_some_and(|key| state.opened.contains_key(key)) || state.selected_session().is_some_and(|s| state.preflight.ready_launch(s).is_some()));
+                    let switch_to_tab = state.selected.as_ref().is_some_and(|key| state.opened.contains_key(key));
+                    if session_resume_button(ui, state.selected.as_ref(), can_resume, switch_to_tab).clicked() { resume = true; }
+                });
+            });
+            ui.small("States are last recorded events. LIVE badges show exact session-ID process matches; they do not imply busy.");
+        });
+    SessionManagerActions {
+        open,
+        resume,
+        pin_change,
+        details_change,
+        archive_change,
+        open_tasks,
     }
 }
 
@@ -537,7 +934,14 @@ impl TerminalApp {
         let title = format!(
             "{} · {}",
             session.provider.label(),
-            crate::review_text::visible_bounded(&session.title, 96)
+            crate::review_text::visible_bounded(
+                self.agent_sessions.library_snapshot.display_title(
+                    session.provider,
+                    &session.id,
+                    &session.title
+                ),
+                96
+            )
         );
         match self.session_manager.new_command_session_in_cwd(
             title,
@@ -599,6 +1003,7 @@ impl TerminalApp {
                     == crate::session::SessionPurpose::EphemeralCommand
             })
         });
+        let task_dashboard_enabled = self.config.experimental_task_sidebar;
         let state = &mut self.agent_sessions;
         state.poll_library();
         if state
@@ -626,187 +1031,14 @@ impl TerminalApp {
                 1000
             },
         ));
-        let mut open = true;
-        let mut resume = false;
-        let mut pin_change = None;
-        egui::Window::new("Agent Sessions")
-            .id(egui::Id::new("agent_sessions_manager"))
-            .open(&mut open)
-            .default_size(egui::vec2(1040.0, 700.0))
-            .min_size(egui::vec2(640.0, 420.0))
-            .collapsible(false)
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Pick up where you left off").size(20.0).strong());
-                ui.label("Codex + Claude · all projects · local conversation history");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let total = state.catalog.sessions.len();
-                    let codex = state.catalog.sessions.iter().filter(|s| s.provider == SessionProvider::Codex).count();
-                    let waiting = state.catalog.sessions.iter().filter(|s| s.status == SessionStatus::Waiting).count();
-                    let live = state.catalog.live_processes.len();
-                    ui.label(egui::RichText::new(format!("{total} sessions   ·   {codex} Codex   ·   {} Claude   ·   {waiting} waiting   ·   {live} live processes   ·   {} pinned", total - codex, state.library_snapshot.pinned_count())).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(!state.scanner.is_scanning(), egui::Button::new("Refresh  F5")).clicked() { state.refresh(); state.preflight.refresh(); state.library.refresh(); }
-                        if state.scanner.is_scanning() { ui.spinner(); }
-                    });
-                });
-                let previous_filters = state.filter_key();
-                ui.horizontal(|ui| {
-                    let response = ui.add(egui::TextEdit::singleline(&mut state.query).hint_text("Search title, project, branch, session ID or preview…").desired_width(f32::INFINITY).char_limit(1024));
-                    state.search_widget = Some(response.id);
-                    if state.focus_search { response.request_focus(); state.focus_search = false; }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Provider");
-                    for (label, value) in [("All", None), ("Codex", Some(SessionProvider::Codex)), ("Claude", Some(SessionProvider::Claude))] {
-                        ui.selectable_value(&mut state.provider, value, label);
-                    }
-                    ui.separator();
-                    egui::ComboBox::from_id_salt("agent_session_status_filter")
-                        .selected_text(state.status.map(|s| s.label()).unwrap_or("All states"))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut state.status, None, "All states");
-                            for status in [SessionStatus::Working, SessionStatus::Waiting, SessionStatus::Idle, SessionStatus::Unknown, SessionStatus::Archived] {
-                                ui.selectable_value(&mut state.status, Some(status), status.label());
-                            }
-                        });
-                    ui.checkbox(&mut state.live_only, "Observed live only").on_hover_text("Show only sessions with an exact local CLI process match at the latest refresh. Independent of the last recorded state.");
-                    ui.add_enabled(state.library.is_loaded(), egui::Checkbox::new(&mut state.pinned_only, "Pinned only"));
-                    ui.add_enabled(state.library.is_loaded(), egui::Checkbox::new(&mut state.recent_only, "Previously resumed"));
-                    if ui.small_button("Clear filters").clicked() { state.clear_filters(); }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let scope_available = state.scope_cwd.is_some();
-                    ui.add_enabled(scope_available, egui::Checkbox::new(&mut state.project_only, "This folder + subfolders"))
-                        .on_hover_text("Captured from the active local terminal when this manager opened. The scope stays fixed while you inspect sessions.");
-                    if let Some(cwd) = &state.scope_cwd {
-                        ui.add(egui::Label::new(crate::review_text::visible_bounded(&cwd.to_string_lossy(), 140)).truncate()).on_hover_text(cwd.to_string_lossy());
-                    } else { ui.weak("Opening folder unavailable"); }
-                    ui.separator();
-                    ui.label("Sort");
-                    egui::ComboBox::from_id_salt("agent_session_sort")
-                        .selected_text(state.sort.label()).width(110.0)
-                        .show_ui(ui, |ui| {
-                            for sort in SessionSort::ALL {
-                                ui.selectable_value(&mut state.sort, sort, sort.label());
-                            }
-                        });
-                });
-                if state.filter_key() != previous_filters { state.filters_changed(); }
-                state.reconcile_selection();
-                let visible = state.visible();
-                ui.separator();
-                ui.small(format!("{} matching sessions · {}{}", visible.len(), state.sort.label(), if state.query.trim().is_empty() && state.sort == SessionSort::Relevance { " · newest first" } else { "" }));
-                if let Some(error) = &state.error { ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024)); }
-                if !state.library.is_loaded() { ui.small("Loading shared favorites and resume history…"); }
-                else if state.library.is_busy() { ui.small("Syncing favorites and resume history…"); }
-                if let Some(error) = state.library.error().or(state.library_notice.as_deref()) {
-                    ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024));
-                }
-                if !state.catalog.warnings.is_empty() {
-                    egui::CollapsingHeader::new(format!("{} discovery notices", state.catalog.warnings.len())).show(ui, |ui| {
-                        for warning in &state.catalog.warnings { ui.small(crate::review_text::visible_bounded(warning, 1024)); }
-                    });
-                }
-                let height = (ui.available_height() - 72.0).max(160.0);
-                ui.columns(2, |columns| {
-                    const ROW_HEIGHT: f32 = 70.0;
-                    let stride = ROW_HEIGHT + columns[0].spacing().item_spacing.y;
-                    state.page_rows = (height / stride).floor().max(1.0) as usize;
-                    let mut list = egui::ScrollArea::vertical().id_salt("agent_sessions_list").max_height(height).auto_shrink([false, false]);
-                    if state.restore_anchor {
-                        if let Some(offset) = state.anchor_offset(&visible, stride) {
-                            list = list.vertical_scroll_offset(offset);
-                        } else { state.scroll_selection = true; }
-                        state.restore_anchor = false;
-                    }
-                    if state.scroll_selection {
-                        if let Some(row) = visible.iter().position(|i| state.selected.as_ref().is_some_and(|key| *key == session_key(&state.catalog.sessions[*i]))) {
-                            let old_offset = state.scroll_anchor.as_ref().and_then(|_| state.anchor_offset(&visible, stride)).unwrap_or(0.0);
-                            let top = row as f32 * stride;
-                            let offset = if top < old_offset { top } else if top + stride > old_offset + height { (top + stride - height).max(0.0) } else { old_offset };
-                            list = list.vertical_scroll_offset(offset);
-                        } else { list = list.vertical_scroll_offset(0.0); }
-                        state.scroll_selection = false;
-                    }
-                    let list_output = list.show_rows(&mut columns[0], ROW_HEIGHT, visible.len().max(1), |ui, range| {
-                        if visible.is_empty() {
-                            ui.label(if state.scanner.is_scanning() { "Looking for local conversations…" } else if state.catalog.sessions.is_empty() { "No Codex or Claude sessions found. Start a conversation in either CLI, then refresh." } else { "No sessions match. Try another query or clear the filters." });
-                            return;
-                        }
-                        for row in range {
-                            let session = &state.catalog.sessions[visible[row]];
-                            let selected = state.selected.as_ref().is_some_and(|(p, id)| *p == session.provider && *id == session.id);
-                            let live_pids = state.catalog.live_pids(session);
-                            let live_badge = if live_pids.is_empty() { String::new() } else { format!("  ·  LIVE {}", live_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")) };
-                            let pinned = state.library_snapshot.is_pinned(session.provider, &session.id);
-                            let title = format!("{}{}", if pinned { "★ " } else { "" }, crate::review_text::visible_bounded(&session.title, 160));
-                            let text = format!("{}  ·  {}  ·  {}{}\n{}\n{}", session.provider.label(), session.status.label(), age_label(session.updated_at_ms), live_badge, title, crate::review_text::visible_bounded(&session.cwd.to_string_lossy(), 160));
-                            let response = ui.push_id((session.provider.label(), &session.id), |ui| ui.add_sized([ui.available_width(), ROW_HEIGHT], egui::Button::selectable(selected, text).wrap())).inner;
-                            if response.has_focus() { state.row_focus_widget = Some(response.id); }
-                            if response.clicked() { state.selected = Some((session.provider, session.id.clone())); }
-                        }
-                    });
-                    state.remember_anchor(&visible, list_output.state.offset.y, stride);
-                    egui::ScrollArea::vertical().id_salt("agent_session_detail").max_height(height).show(&mut columns[1], |ui| {
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        if let Some(session) = state.selected_session() {
-                            ui.heading(crate::review_text::visible_bounded(&session.title, 240));
-                            ui.label(format!("{} · {} · {}", session.provider.label(), session.status.label(), age_label(session.updated_at_ms)));
-                            let pinned = state.library_snapshot.is_pinned(session.provider, &session.id);
-                            if ui.add_enabled(state.library.is_loaded() && !state.library.is_busy(), egui::Button::new(if pinned { "★ Pinned · Unpin" } else { "☆ Pin session" })).clicked() {
-                                pin_change = Some((session.provider, session.id.clone(), !pinned));
-                            }
-                            if let Some(resumed) = state.library_snapshot.last_resumed(session.provider, &session.id) {
-                                ui.small(format!("Last resumed {} · shared across your terminals", age_label(resumed)));
-                            }
-                            if state.opened.contains_key(&session_key(session)) {
-                                ui.colored_label(egui::Color32::LIGHT_GREEN, "Ready to switch to the open tab");
-                            } else if state.preflight.ready_launch(session).is_some() {
-                                ui.colored_label(egui::Color32::LIGHT_GREEN, "Ready · project and CLI checked");
-                            } else {
-                                match state.preflight.state() {
-                                    SessionPreflightState::Unavailable(error) => { ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024)); }
-                                    _ => { ui.horizontal(|ui| { ui.spinner(); ui.label("Checking project and CLI…"); }); }
-                                }
-                            }
-                            if state.pending_resume.is_some() { ui.small("Confirming a fresh readiness check…"); }
-                            let live_pids = state.catalog.live_pids(session);
-                            if !live_pids.is_empty() {
-                                ui.colored_label(egui::Color32::LIGHT_GREEN, format!("Live CLI process · PID {}", live_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
-                                ui.small("Exact session-ID process match; recorded state remains separate.");
-                            }
-                            if state.opened.contains_key(&(session.provider, session.id.clone())) {
-                                ui.label("Open in this window · confirming switches to its tab");
-                            }
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new("Project").strong());
-                            ui.label(crate::review_text::visible_bounded(&session.cwd.to_string_lossy(), 1024));
-                            if let Some(branch) = &session.branch { ui.label(format!("Branch: {}", crate::review_text::visible_bounded(branch, 160))); }
-                            ui.label(format!("Session: {}", crate::review_text::visible_bounded(&session.id, 160)));
-                            ui.separator();
-                            ui.label(egui::RichText::new("Latest context").strong());
-                            ui.label(if session.preview.is_empty() { "No message preview available".to_string() } else { crate::review_text::visible_bounded(&session.preview, 8192) });
-                            ui.add_space(10.0);
-                            if let Some(launch) = state.preflight.ready_launch(session) {
-                                ui.label(egui::RichText::new("Resume command").strong());
-                                ui.monospace(crate::review_text::visible_bounded(&launch.display_command(), 1024));
-                                if ui.button("Copy command").clicked() { ui.ctx().copy_text(launch.display_command()); }
-                            }
-                        } else { ui.label("Select a conversation to inspect its project and latest context."); }
-                        });
-                    });
-                });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.small("↑ ↓ / PgUp PgDn / Home End select · Ctrl+L search · Enter resume · Esc close");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can_resume = state.pending_resume.is_none() && (state.selected.as_ref().is_some_and(|key| state.opened.contains_key(key)) || state.selected_session().is_some_and(|s| state.preflight.ready_launch(s).is_some()));
-                        if ui.add_enabled(can_resume, egui::Button::new(if state.selected.as_ref().is_some_and(|key| state.opened.contains_key(key)) { "Switch to Open Tab  ↵" } else { "Resume in New Tab  ↵" })).clicked() { resume = true; }
-                    });
-                });
-                ui.small("States are last recorded events. LIVE badges show exact session-ID process matches; they do not imply busy.");
-            });
+        let SessionManagerActions {
+            open,
+            mut resume,
+            pin_change,
+            details_change,
+            archive_change,
+            open_tasks,
+        } = show_session_manager(ctx, state, task_dashboard_enabled);
         if !open {
             self.agent_sessions.is_open = false;
             self.agent_sessions.cancel_resume();
@@ -818,6 +1050,39 @@ impl TerminalApp {
                 .library
                 .set_pinned(provider, &id, pinned)
                 .err();
+        }
+        if let Some((key, alias, tags)) = details_change {
+            self.agent_sessions.pending_resume = None;
+            match self
+                .agent_sessions
+                .library
+                .set_details(key.0, &key.1, &alias, &tags)
+            {
+                Ok(()) => {
+                    self.agent_sessions.library_notice = None;
+                    self.agent_sessions.pending_details = Some(key);
+                }
+                Err(error) => self.agent_sessions.library_notice = Some(error),
+            }
+        }
+        if let Some((key, archived)) = archive_change {
+            self.agent_sessions.pending_resume = None;
+            resume = false;
+            self.agent_sessions.library_notice = self
+                .agent_sessions
+                .library
+                .set_archived(key.0, &key.1, archived)
+                .err();
+        }
+        if open_tasks {
+            self.agent_sessions.is_open = false;
+            self.agent_sessions.cancel_resume();
+            self.sidebar.note_files_user_intent();
+            self.sidebar.visible = true;
+            self.sidebar.view = crate::sidebar::SidebarView::Tasks;
+            self.config.sidebar_view = crate::sidebar::SidebarView::Tasks;
+            self.schedule_config_save();
+            return;
         }
         if resume {
             self.resume_selected_agent_session(ctx);
@@ -1172,6 +1437,28 @@ mod tests {
                 .last_resumed(SessionProvider::Codex, LIBRARY_A)
                 .is_some()
         });
+        let key = (SessionProvider::Codex, LIBRARY_A.to_string());
+        let mut draft = SessionDetailsDraft::saved(&state.library_snapshot, &key);
+        draft.alias = "Release review".into();
+        draft.tags = "review, release".into();
+        state.details_drafts.insert(key.clone(), draft);
+        state
+            .library
+            .set_details(key.0, &key.1, "Release review", "review, release")
+            .unwrap();
+        state.pending_details = Some(key.clone());
+        wait(&mut state, |s| {
+            s.library_snapshot.alias(key.0, &key.1) == Some("Release review")
+                && s.pending_details.is_none()
+        });
+        assert!(
+            !state.details_drafts.contains_key(&key),
+            "only a completed save clears its own draft"
+        );
+        state.library.set_archived(key.0, &key.1, true).unwrap();
+        wait(&mut state, |s| {
+            s.library_snapshot.is_archived(key.0, &key.1)
+        });
         state.library = SessionLibraryStore::with_path(path.clone());
         wait(&mut state, |s| s.library.is_loaded());
         assert!(state
@@ -1181,6 +1468,22 @@ mod tests {
             .library_snapshot
             .last_resumed(SessionProvider::Codex, LIBRARY_A)
             .is_some());
+        assert_eq!(
+            state.library_snapshot.alias(key.0, &key.1),
+            Some("Release review")
+        );
+        assert_eq!(
+            state.library_snapshot.tags(key.0, &key.1),
+            &["release", "review"]
+        );
+        assert!(state.library_snapshot.is_archived(key.0, &key.1));
+        assert!(state.visible().is_empty());
+        state.library.set_archived(key.0, &key.1, false).unwrap();
+        wait(&mut state, |s| {
+            !s.library_snapshot.is_archived(key.0, &key.1)
+        });
+        assert_eq!(state.visible(), vec![0]);
+        assert!(state.opened.is_empty());
         state
             .library
             .set_pinned(SessionProvider::Codex, LIBRARY_A, false)
@@ -1239,6 +1542,8 @@ mod tests {
         state.live_only = true;
         state.pinned_only = true;
         state.recent_only = true;
+        state.archive = SessionArchiveFilter::Archived;
+        state.project_filter = Some(PathBuf::from("/missing-project"));
         state.sort = SessionSort::LiveFirst;
         state.error = Some("stale launch error".into());
         state.filters_changed();
@@ -1250,7 +1555,221 @@ mod tests {
         assert!(!state.project_only);
         assert!(!state.pinned_only);
         assert!(!state.recent_only);
+        assert_eq!(state.archive, SessionArchiveFilter::Active);
+        assert!(state.project_filter.is_none());
         assert!(state.error.is_none());
         assert!(state.focus_search);
+    }
+
+    #[test]
+    fn organization_search_archive_and_project_filters_preserve_draft_identity() {
+        use jterm_core::agent_sessions::SessionOrganization;
+        let mut a = session(SessionProvider::Codex, LIBRARY_A, "original title");
+        a.cwd = "/work/core/sub".into();
+        let mut b = session(SessionProvider::Claude, LIBRARY_B, "another conversation");
+        b.cwd = "/work/core-other".into();
+        let mut state = state_with(vec![a, b]);
+        let snapshot = SessionLibrarySnapshot::default()
+            .with_organization(
+                SessionProvider::Codex,
+                LIBRARY_A,
+                SessionOrganization {
+                    alias: Some("Release review".into()),
+                    tags: vec!["review".into()],
+                    archived: false,
+                },
+            )
+            .unwrap()
+            .with_organization(
+                SessionProvider::Claude,
+                LIBRARY_B,
+                SessionOrganization {
+                    archived: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        state.replace_library(snapshot);
+        state.query = "tag:review provider:codex".into();
+        state.project_filter = Some("/work/core".into());
+        state.filters_changed();
+        assert_eq!(state.visible(), vec![0]);
+        let key = (SessionProvider::Codex, LIBRARY_A.to_string());
+        let mut draft = SessionDetailsDraft::saved(&state.library_snapshot, &key);
+        draft.alias = "Unsaved release plan".into();
+        state.details_drafts.insert(key.clone(), draft);
+        state.query.clear();
+        state.project_filter = None;
+        state.archive = SessionArchiveFilter::Archived;
+        state.filters_changed();
+        assert_eq!(state.visible(), vec![1]);
+        assert_eq!(state.selected_session().unwrap().id, LIBRARY_B);
+        assert_eq!(state.details_drafts[&key].alias, "Unsaved release plan");
+        state.archive = SessionArchiveFilter::All;
+        state.query = "\"Release review\"".into();
+        state.filters_changed();
+        assert_eq!(state.visible(), vec![0]);
+        assert!(state.pending_resume.is_none());
+        assert!(
+            state.opened.is_empty(),
+            "organizing never launches an agent"
+        );
+        assert_eq!(state.catalog.sessions[0].title, "original title");
+    }
+
+    #[test]
+    fn organizer_refresh_updates_clean_drafts_and_preserves_unsaved_edits() {
+        use jterm_core::agent_sessions::SessionOrganization;
+        let key = (SessionProvider::Codex, LIBRARY_A.to_string());
+        let empty = SessionLibrarySnapshot::default();
+        let saved = empty
+            .clone()
+            .with_organization(
+                key.0,
+                &key.1,
+                SessionOrganization {
+                    alias: Some("Saved elsewhere".into()),
+                    tags: vec!["release".into()],
+                    archived: false,
+                },
+            )
+            .unwrap();
+        let next = SessionDetailsDraft::saved(&saved, &key);
+        let mut clean = SessionDetailsDraft::saved(&empty, &key);
+        clean.sync_saved(&next);
+        assert_eq!(clean.alias, "Saved elsewhere");
+        assert!(!clean.is_dirty());
+        let mut dirty = SessionDetailsDraft::saved(&empty, &key);
+        dirty.alias = "My unsaved draft".into();
+        dirty.sync_saved(&next);
+        assert_eq!(dirty.alias, "My unsaved draft");
+        assert!(dirty.is_dirty());
+        assert_ne!(dirty.original_alias, next.alias);
+        let editor_id = egui::Id::new(("session_alias", "Codex", LIBRARY_A));
+        assert!(
+            !session_key_route(Some(editor_id), Some(egui::Id::new("search")), None),
+            "Enter in the details editor must never resume a conversation"
+        );
+    }
+
+    #[test]
+    fn organizer_window_layout_is_navigation_only_at_wide_and_narrow_sizes() {
+        use jterm_core::agent_sessions::SessionOrganization;
+        let destination = std::env::var_os("EMBER_AGENT_UI_SNAPSHOT_DIR").map(PathBuf::from);
+        if let Some(path) = &destination {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for (name, width, height) in [
+            ("agent-manager-wide", 1280, 900),
+            ("agent-manager-narrow", 800, 650),
+        ] {
+            let ctx = egui::Context::default();
+            crate::apply_theme_visuals(&ctx, &crate::theme::Theme::default());
+            let mut state = state_with(vec![
+                session(
+                    SessionProvider::Codex,
+                    LIBRARY_A,
+                    "Review the shared terminal agent manager",
+                ),
+                session(
+                    SessionProvider::Claude,
+                    LIBRARY_B,
+                    "Explore the terminal workspace",
+                ),
+            ]);
+            state.scope_cwd = Some("/tmp/project".into());
+            state.replace_library(
+                SessionLibrarySnapshot::default()
+                    .with_organization(
+                        SessionProvider::Codex,
+                        LIBRARY_A,
+                        SessionOrganization {
+                            alias: Some("Release review — four terminal Agent management".into()),
+                            tags: vec!["release".into(), "review".into(), "terminal".into()],
+                            archived: false,
+                        },
+                    )
+                    .unwrap(),
+            );
+            state.selected = Some((SessionProvider::Codex, LIBRARY_A.into()));
+            let mut capture = super::super::visual_test_support::OffscreenCapture::default();
+            for pass in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        time: Some(pass as f64 * 0.25),
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width as f32, height as f32),
+                        )),
+                        ..Default::default()
+                    },
+                    |_ui| {
+                        let action = show_session_manager(&ctx, &mut state, true);
+                        assert!(action.open);
+                        assert!(!action.resume && !action.open_tasks);
+                        assert!(
+                            action.details_change.is_none()
+                                && action.archive_change.is_none()
+                                && action.pin_change.is_none()
+                        );
+                    },
+                );
+                if let Some(path) = &destination {
+                    capture.save(
+                        &ctx,
+                        &mut output,
+                        [width, height],
+                        &path.join(format!("{name}.png")),
+                    );
+                } else {
+                    output.textures_delta.clear();
+                }
+            }
+            assert!(state.opened.is_empty());
+            assert!(state.pending_resume.is_none());
+            assert_eq!(state.selected_session().unwrap().id, LIBRARY_A);
+        }
+    }
+
+    #[test]
+    fn resume_pointer_release_cannot_retarget_a_refreshed_selection() {
+        let ctx = egui::Context::default();
+        let first = (SessionProvider::Codex, LIBRARY_A.to_string());
+        let replacement = (SessionProvider::Claude, LIBRARY_B.to_string());
+        let frame = |selected: &SessionKey, events| {
+            let mut response = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 300.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    response = Some(session_resume_button(ui, Some(selected), true, false));
+                },
+            );
+            output.textures_delta.clear();
+            response.unwrap()
+        };
+        let position = frame(&first, vec![]).rect.center();
+        let pointer = |pressed| {
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        assert!(!frame(&first, pointer(true)).clicked());
+        assert!(!frame(&replacement, pointer(false)).clicked(),
+            "a catalog/library refresh must not transfer a pressed Resume control to another session");
+        assert!(!frame(&replacement, pointer(true)).clicked());
+        assert!(frame(&replacement, pointer(false)).clicked());
     }
 }

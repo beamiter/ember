@@ -6079,9 +6079,8 @@ impl eframe::App for TerminalApp {
 
         // Block-search picker keys (Enter/Escape/arrows), routed like the
         // palette's so the overlay owns the whole frame's keyboard input.
-        let block_search_owned_input = !agent_sessions_owned_input
-            && !palette_owned_input
-            && self.handle_block_search_input();
+        let block_search_owned_input =
+            !agent_sessions_owned_input && !palette_owned_input && self.handle_block_search_input();
         // 历史命令选择器同理：浮层打开期间拥有整帧键盘输入。
         let history_picker_owned_input = !agent_sessions_owned_input
             && !palette_owned_input

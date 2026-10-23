@@ -522,10 +522,9 @@ impl KeyBindings {
             .bindings
             .insert("ctrl+backslash".to_string(), "sidebar:toggle".to_string());
 
-        bindings.bindings.insert(
-            "ctrl+shift+alt+g".to_string(),
-            "agent:sessions".to_string(),
-        );
+        bindings
+            .bindings
+            .insert("ctrl+shift+alt+g".to_string(), "agent:sessions".to_string());
 
         // AI 面板。两个键位都跟随 anvil/forge/frost：Ctrl+Alt+G 打开会执行
         // 命令的 Agent，Ctrl+Shift+Alt+A 打开只读的 AI 聊天库。存储用
