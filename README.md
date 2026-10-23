@@ -1714,6 +1714,20 @@ conversation and reading position. **Clear filters** returns to the full list.
 Search normalization is shared with the other terminals and unchanged discovery
 snapshots reuse the existing index and projection.
 
+Pin a conversation with **☆ Pin session** in its details; a star marks pinned
+rows. Pins and successful resume history persist across all four terminals and
+app restarts. **Pinned only**, **Previously resumed**, and **Recently resumed**
+sorting help you return to ongoing work. Pins lead the empty **Best match** list;
+search text and explicit sorting retain their usual ordering. Saving and syncing
+run in a worker, and an error is shown if a durable update fails. Merely viewing,
+pinning, or failing to launch a session does not create a resume-history entry.
+
+Selecting a conversation checks its directory and installed CLI asynchronously.
+The detail panel shows checking, ready, or a precise missing-directory/CLI
+message. Confirming performs a fresh check before the new tab opens; changing
+the selection or closing the manager cancels a pending confirmation. An already
+open tab can still be switched to when the CLI installation is unavailable.
+
 Select a row with the mouse or arrow keys, inspect its directory and command,
 then press **Enter** or **Resume in New Tab**. Ember starts the provider CLI
 with the exact session ID and original working directory in a new focused tab.

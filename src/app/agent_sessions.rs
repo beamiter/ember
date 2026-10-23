@@ -3,8 +3,9 @@
 use super::state::TerminalApp;
 use eframe::egui;
 use jterm_core::agent_sessions::{
-    AgentSession, SessionCatalog, SessionProvider, SessionQuery, SessionScanner,
-    SessionSearchIndex, SessionSort, SessionStatus,
+    AgentSession, SessionCatalog, SessionLaunch, SessionLibraryFilter, SessionLibrarySnapshot,
+    SessionLibraryStore, SessionPreflight, SessionPreflightState, SessionProvider, SessionQuery,
+    SessionScanner, SessionSearchIndex, SessionSort, SessionStatus,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,6 +20,8 @@ struct FilterKey {
     provider: Option<SessionProvider>,
     status: Option<SessionStatus>,
     live_only: bool,
+    pinned_only: bool,
+    recent_only: bool,
     project: Option<PathBuf>,
     sort: SessionSort,
 }
@@ -33,6 +36,12 @@ struct ScrollAnchor {
 pub(crate) struct AgentSessionsState {
     pub(crate) is_open: bool,
     scanner: SessionScanner,
+    library: SessionLibraryStore,
+    library_snapshot: SessionLibrarySnapshot,
+    library_refresh: Option<Instant>,
+    library_notice: Option<String>,
+    preflight: SessionPreflight,
+    pending_resume: Option<AgentSession>,
     catalog: SessionCatalog,
     index: SessionSearchIndex,
     cached_visible: RefCell<Option<(FilterKey, Vec<usize>)>>,
@@ -40,6 +49,8 @@ pub(crate) struct AgentSessionsState {
     provider: Option<SessionProvider>,
     status: Option<SessionStatus>,
     live_only: bool,
+    pinned_only: bool,
+    recent_only: bool,
     sort: SessionSort,
     scope_cwd: Option<PathBuf>,
     project_only: bool,
@@ -63,6 +74,8 @@ impl AgentSessionsState {
             provider: self.provider,
             status: self.status,
             live_only: self.live_only,
+            pinned_only: self.pinned_only,
+            recent_only: self.recent_only,
             sort: self.sort,
             project: self.project_only.then(|| self.scope_cwd.clone()).flatten(),
         }
@@ -84,7 +97,15 @@ impl AgentSessionsState {
             sort: key.sort,
         };
         // Catalog replacement installs one normalized index for every query.
-        let rows = self.index.query(&query);
+        let rows = self.index.query_with_library(
+            &query,
+            &self.library_snapshot,
+            SessionLibraryFilter {
+                pinned_only: key.pinned_only,
+                recent_only: key.recent_only,
+                pinned_first: true,
+            },
+        );
         *self.cached_visible.borrow_mut() = Some((key, rows.clone()));
         rows
     }
@@ -99,6 +120,49 @@ impl AgentSessionsState {
         self.restore_anchor = self.scroll_anchor.is_some();
         self.reconcile_selection();
         true
+    }
+
+    fn replace_library(&mut self, snapshot: SessionLibrarySnapshot) -> bool {
+        if self.library_snapshot == snapshot {
+            return false;
+        }
+        self.library_snapshot = snapshot;
+        self.cached_visible.get_mut().take();
+        self.restore_anchor = self.scroll_anchor.is_some();
+        self.reconcile_selection();
+        true
+    }
+
+    fn poll_library(&mut self) {
+        if self.library.poll() {
+            self.replace_library(self.library.snapshot().clone());
+        }
+    }
+
+    fn sync_preflight(&mut self) {
+        let selected = self
+            .selected_session()
+            .filter(|session| !self.opened.contains_key(&session_key(session)))
+            .cloned();
+        if self.preflight.select(selected.as_ref()) {
+            self.pending_resume = None;
+        }
+        self.preflight.poll();
+    }
+
+    fn cancel_resume(&mut self) {
+        self.pending_resume = None;
+        self.preflight.select(None);
+    }
+
+    fn note_resumed(&mut self, session: &AgentSession) {
+        self.library_notice = self
+            .library
+            .record_resumed(session.provider, &session.id)
+            .err()
+            .map(|error| {
+                format!("Resumed successfully, but recent activity could not be saved: {error}")
+            });
     }
 
     fn selected_session(&self) -> Option<&AgentSession> {
@@ -136,6 +200,8 @@ impl AgentSessionsState {
         self.provider = None;
         self.status = None;
         self.live_only = false;
+        self.pinned_only = false;
+        self.recent_only = false;
         self.project_only = false;
         self.sort = SessionSort::Relevance;
         self.filters_changed();
@@ -195,6 +261,14 @@ impl AgentSessionsState {
             self.last_refresh = Some(Instant::now());
         }
     }
+}
+
+fn same_launch_target(left: &AgentSession, right: &AgentSession) -> bool {
+    left.provider == right.provider
+        && left.id == right.id
+        && left.cwd == right.cwd
+        && left.source == right.source
+        && left.archived == right.archived
 }
 
 fn matches_key(session: &AgentSession, key: &SessionKey) -> bool {
@@ -260,6 +334,9 @@ impl TerminalApp {
             .map(PathBuf::from);
         let state = &mut self.agent_sessions;
         state.is_open = !state.is_open;
+        if !state.is_open {
+            state.cancel_resume();
+        }
         if state.is_open {
             let previous = state.filter_key();
             state.scope_cwd = cwd;
@@ -271,6 +348,8 @@ impl TerminalApp {
             }
             state.focus_search = true;
             state.error = None;
+            state.library.refresh();
+            state.library_refresh = Some(Instant::now());
             state.refresh();
         }
     }
@@ -278,6 +357,30 @@ impl TerminalApp {
     /// Own the complete key batch, including the frame that closes or resumes.
     /// PTY pumping and app persistence continue in the main event loop.
     pub(crate) fn handle_agent_sessions_input(&mut self, ctx: &egui::Context) -> bool {
+        let previous_selection = self.agent_sessions.selected.clone();
+        let previous_library_error = self.agent_sessions.library.error().map(str::to_owned);
+        self.agent_sessions.poll_library();
+        if !self.agent_sessions.is_open {
+            if let Some(error) = self
+                .agent_sessions
+                .library
+                .error()
+                .map(str::to_owned)
+                .filter(|error| Some(error) != previous_library_error.as_ref())
+            {
+                self.set_status_for(
+                    format!("Session library could not sync: {error}"),
+                    Duration::from_secs(6),
+                );
+            }
+        }
+        let metadata_changed_selection = previous_selection != self.agent_sessions.selected;
+        if metadata_changed_selection {
+            self.agent_sessions.pending_resume = None;
+        }
+        if !self.agent_sessions.is_open && self.agent_sessions.preflight.is_busy() {
+            self.agent_sessions.preflight.poll();
+        }
         if !self.agent_sessions.is_open {
             return false;
         }
@@ -288,6 +391,9 @@ impl TerminalApp {
         }
         self.agent_sessions.reconcile_selection();
         let query_is_changing = query_edit_pending(&self.frame_events);
+        if query_is_changing {
+            self.agent_sessions.pending_resume = None;
+        }
         let session_confirmation = session_key_route(
             ctx.memory(|memory| memory.focused()),
             self.agent_sessions.search_widget,
@@ -307,12 +413,22 @@ impl TerminalApp {
             match key {
                 egui::Key::Escape => {
                     self.agent_sessions.is_open = false;
+                    self.agent_sessions.cancel_resume();
                     self.return_focus_to_terminal(ctx);
                     break;
                 }
-                egui::Key::Enter if !repeat && !query_is_changing && session_confirmation => {
+                egui::Key::Enter
+                    if !repeat
+                        && !query_is_changing
+                        && !metadata_changed_selection
+                        && session_confirmation =>
+                {
                     self.resume_selected_agent_session(ctx);
-                    break;
+                    // A fresh check is asynchronous: later cancellation or
+                    // navigation in this same key batch must still take effect.
+                    if !self.agent_sessions.is_open {
+                        break;
+                    }
                 }
                 egui::Key::L if modifiers.command && !modifiers.alt => {
                     self.agent_sessions.focus_search = true;
@@ -333,7 +449,11 @@ impl TerminalApp {
                         input.consume_key(modifiers, key);
                     });
                 }
-                egui::Key::F5 if !repeat => self.agent_sessions.refresh(),
+                egui::Key::F5 if !repeat => {
+                    self.agent_sessions.refresh();
+                    self.agent_sessions.preflight.refresh();
+                    self.agent_sessions.library.refresh();
+                }
                 _ => {}
             }
         }
@@ -350,8 +470,9 @@ impl TerminalApp {
                 self.session_manager.sessions()[*index].purpose
                     == crate::session::SessionPurpose::EphemeralCommand
             });
-            if let Some(index) = existing {
-                self.activate_session(index);
+            if existing.is_some_and(|index| self.activate_session(index)) {
+                self.agent_sessions.note_resumed(&session);
+                self.agent_sessions.cancel_resume();
                 self.claim_enter_for_prompt_recall();
                 self.agent_sessions.is_open = false;
                 self.return_focus_to_terminal(ctx);
@@ -363,16 +484,54 @@ impl TerminalApp {
             }
             self.agent_sessions.opened.remove(&key);
         }
-        let launch = match session
-            .resume_launch()
-            .and_then(|launch| launch.resolve_for_spawn())
-        {
-            Ok(launch) => launch,
-            Err(error) => {
-                self.agent_sessions.error = Some(error);
-                return;
-            }
+        self.agent_sessions.preflight.select(Some(&session));
+        self.agent_sessions.preflight.refresh();
+        self.agent_sessions.pending_resume = Some(session);
+        self.agent_sessions.error = None;
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+
+    fn finish_pending_agent_resume(&mut self, ctx: &egui::Context) {
+        if !self.agent_sessions.is_open {
+            self.agent_sessions.pending_resume = None;
+            return;
+        }
+        self.agent_sessions.sync_preflight();
+        let Some(pending) = self.agent_sessions.pending_resume.clone() else {
+            return;
         };
+        if !self.agent_sessions.is_open
+            || !self
+                .agent_sessions
+                .selected_session()
+                .is_some_and(|session| same_launch_target(session, &pending))
+        {
+            self.agent_sessions.pending_resume = None;
+            return;
+        }
+        if let Some(launch) = self
+            .agent_sessions
+            .preflight
+            .ready_launch(&pending)
+            .cloned()
+        {
+            self.agent_sessions.pending_resume = None;
+            self.spawn_ready_agent_session(pending, launch, ctx);
+        } else if let SessionPreflightState::Unavailable(error) =
+            self.agent_sessions.preflight.state()
+        {
+            self.agent_sessions.error = Some(error.clone());
+            self.agent_sessions.pending_resume = None;
+        }
+    }
+
+    fn spawn_ready_agent_session(
+        &mut self,
+        session: AgentSession,
+        launch: SessionLaunch,
+        ctx: &egui::Context,
+    ) {
+        let key = session_key(&session);
         let argv = std::iter::once(launch.program).chain(launch.args).collect();
         let (cols, rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
         let title = format!(
@@ -389,6 +548,7 @@ impl TerminalApp {
             self.config.scrollback_lines,
         ) {
             Ok(created) => {
+                self.agent_sessions.note_resumed(&session);
                 self.agent_sessions
                     .opened
                     .insert(key, created.session_id.clone());
@@ -398,6 +558,7 @@ impl TerminalApp {
                 self.schedule_session_save();
                 self.claim_enter_for_prompt_recall();
                 self.agent_sessions.is_open = false;
+                self.agent_sessions.cancel_resume();
                 self.agent_sessions.error = None;
                 self.return_focus_to_terminal(ctx);
                 self.set_status(format!(
@@ -439,6 +600,15 @@ impl TerminalApp {
             })
         });
         let state = &mut self.agent_sessions;
+        state.poll_library();
+        if state
+            .library_refresh
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+        {
+            if state.library.refresh() {
+                state.library_refresh = Some(Instant::now());
+            }
+        }
         if let Some(catalog) = state.scanner.poll() {
             state.replace_catalog(catalog);
         }
@@ -448,13 +618,17 @@ impl TerminalApp {
         {
             state.refresh();
         }
-        ctx.request_repaint_after(Duration::from_millis(if state.scanner.is_scanning() {
-            100
-        } else {
-            1000
-        }));
+        state.sync_preflight();
+        ctx.request_repaint_after(Duration::from_millis(
+            if state.scanner.is_scanning() || state.library.is_busy() || state.preflight.is_busy() {
+                100
+            } else {
+                1000
+            },
+        ));
         let mut open = true;
         let mut resume = false;
+        let mut pin_change = None;
         egui::Window::new("Agent Sessions")
             .id(egui::Id::new("agent_sessions_manager"))
             .open(&mut open)
@@ -470,9 +644,9 @@ impl TerminalApp {
                     let codex = state.catalog.sessions.iter().filter(|s| s.provider == SessionProvider::Codex).count();
                     let waiting = state.catalog.sessions.iter().filter(|s| s.status == SessionStatus::Waiting).count();
                     let live = state.catalog.live_processes.len();
-                    ui.label(egui::RichText::new(format!("{total} sessions   ·   {codex} Codex   ·   {} Claude   ·   {waiting} waiting   ·   {live} live processes", total - codex)).strong());
+                    ui.label(egui::RichText::new(format!("{total} sessions   ·   {codex} Codex   ·   {} Claude   ·   {waiting} waiting   ·   {live} live processes   ·   {} pinned", total - codex, state.library_snapshot.pinned_count())).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(!state.scanner.is_scanning(), egui::Button::new("Refresh  F5")).clicked() { state.refresh(); }
+                        if ui.add_enabled(!state.scanner.is_scanning(), egui::Button::new("Refresh  F5")).clicked() { state.refresh(); state.preflight.refresh(); state.library.refresh(); }
                         if state.scanner.is_scanning() { ui.spinner(); }
                     });
                 });
@@ -497,6 +671,8 @@ impl TerminalApp {
                             }
                         });
                     ui.checkbox(&mut state.live_only, "Observed live only").on_hover_text("Show only sessions with an exact local CLI process match at the latest refresh. Independent of the last recorded state.");
+                    ui.add_enabled(state.library.is_loaded(), egui::Checkbox::new(&mut state.pinned_only, "Pinned only"));
+                    ui.add_enabled(state.library.is_loaded(), egui::Checkbox::new(&mut state.recent_only, "Previously resumed"));
                     if ui.small_button("Clear filters").clicked() { state.clear_filters(); }
                 });
                 ui.horizontal_wrapped(|ui| {
@@ -511,7 +687,7 @@ impl TerminalApp {
                     egui::ComboBox::from_id_salt("agent_session_sort")
                         .selected_text(state.sort.label()).width(110.0)
                         .show_ui(ui, |ui| {
-                            for sort in [SessionSort::Relevance, SessionSort::Recent, SessionSort::LiveFirst] {
+                            for sort in SessionSort::ALL {
                                 ui.selectable_value(&mut state.sort, sort, sort.label());
                             }
                         });
@@ -522,6 +698,11 @@ impl TerminalApp {
                 ui.separator();
                 ui.small(format!("{} matching sessions · {}{}", visible.len(), state.sort.label(), if state.query.trim().is_empty() && state.sort == SessionSort::Relevance { " · newest first" } else { "" }));
                 if let Some(error) = &state.error { ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024)); }
+                if !state.library.is_loaded() { ui.small("Loading shared favorites and resume history…"); }
+                else if state.library.is_busy() { ui.small("Syncing favorites and resume history…"); }
+                if let Some(error) = state.library.error().or(state.library_notice.as_deref()) {
+                    ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024));
+                }
                 if !state.catalog.warnings.is_empty() {
                     egui::CollapsingHeader::new(format!("{} discovery notices", state.catalog.warnings.len())).show(ui, |ui| {
                         for warning in &state.catalog.warnings { ui.small(crate::review_text::visible_bounded(warning, 1024)); }
@@ -558,7 +739,8 @@ impl TerminalApp {
                             let selected = state.selected.as_ref().is_some_and(|(p, id)| *p == session.provider && *id == session.id);
                             let live_pids = state.catalog.live_pids(session);
                             let live_badge = if live_pids.is_empty() { String::new() } else { format!("  ·  LIVE {}", live_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")) };
-                            let title = crate::review_text::visible_bounded(&session.title, 160);
+                            let pinned = state.library_snapshot.is_pinned(session.provider, &session.id);
+                            let title = format!("{}{}", if pinned { "★ " } else { "" }, crate::review_text::visible_bounded(&session.title, 160));
                             let text = format!("{}  ·  {}  ·  {}{}\n{}\n{}", session.provider.label(), session.status.label(), age_label(session.updated_at_ms), live_badge, title, crate::review_text::visible_bounded(&session.cwd.to_string_lossy(), 160));
                             let response = ui.push_id((session.provider.label(), &session.id), |ui| ui.add_sized([ui.available_width(), ROW_HEIGHT], egui::Button::selectable(selected, text).wrap())).inner;
                             if response.has_focus() { state.row_focus_widget = Some(response.id); }
@@ -571,6 +753,24 @@ impl TerminalApp {
                         if let Some(session) = state.selected_session() {
                             ui.heading(crate::review_text::visible_bounded(&session.title, 240));
                             ui.label(format!("{} · {} · {}", session.provider.label(), session.status.label(), age_label(session.updated_at_ms)));
+                            let pinned = state.library_snapshot.is_pinned(session.provider, &session.id);
+                            if ui.add_enabled(state.library.is_loaded() && !state.library.is_busy(), egui::Button::new(if pinned { "★ Pinned · Unpin" } else { "☆ Pin session" })).clicked() {
+                                pin_change = Some((session.provider, session.id.clone(), !pinned));
+                            }
+                            if let Some(resumed) = state.library_snapshot.last_resumed(session.provider, &session.id) {
+                                ui.small(format!("Last resumed {} · shared across your terminals", age_label(resumed)));
+                            }
+                            if state.opened.contains_key(&session_key(session)) {
+                                ui.colored_label(egui::Color32::LIGHT_GREEN, "Ready to switch to the open tab");
+                            } else if state.preflight.ready_launch(session).is_some() {
+                                ui.colored_label(egui::Color32::LIGHT_GREEN, "Ready · project and CLI checked");
+                            } else {
+                                match state.preflight.state() {
+                                    SessionPreflightState::Unavailable(error) => { ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024)); }
+                                    _ => { ui.horizontal(|ui| { ui.spinner(); ui.label("Checking project and CLI…"); }); }
+                                }
+                            }
+                            if state.pending_resume.is_some() { ui.small("Confirming a fresh readiness check…"); }
                             let live_pids = state.catalog.live_pids(session);
                             if !live_pids.is_empty() {
                                 ui.colored_label(egui::Color32::LIGHT_GREEN, format!("Live CLI process · PID {}", live_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
@@ -588,13 +788,10 @@ impl TerminalApp {
                             ui.label(egui::RichText::new("Latest context").strong());
                             ui.label(if session.preview.is_empty() { "No message preview available".to_string() } else { crate::review_text::visible_bounded(&session.preview, 8192) });
                             ui.add_space(10.0);
-                            match session.resume_launch() {
-                                Ok(launch) => {
-                                    ui.label(egui::RichText::new("Resume command").strong());
-                                    ui.monospace(launch.display_command());
-                                    if ui.button("Copy command").clicked() { ui.ctx().copy_text(launch.display_command()); }
-                                }
-                                Err(error) => { ui.colored_label(egui::Color32::LIGHT_RED, error); }
+                            if let Some(launch) = state.preflight.ready_launch(session) {
+                                ui.label(egui::RichText::new("Resume command").strong());
+                                ui.monospace(crate::review_text::visible_bounded(&launch.display_command(), 1024));
+                                if ui.button("Copy command").clicked() { ui.ctx().copy_text(launch.display_command()); }
                             }
                         } else { ui.label("Select a conversation to inspect its project and latest context."); }
                         });
@@ -604,7 +801,7 @@ impl TerminalApp {
                 ui.horizontal(|ui| {
                     ui.small("↑ ↓ / PgUp PgDn / Home End select · Ctrl+L search · Enter resume · Esc close");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can_resume = state.selected.as_ref().is_some_and(|key| state.opened.contains_key(key)) || state.selected_session().is_some_and(|s| s.resume_launch().is_ok());
+                        let can_resume = state.pending_resume.is_none() && (state.selected.as_ref().is_some_and(|key| state.opened.contains_key(key)) || state.selected_session().is_some_and(|s| state.preflight.ready_launch(s).is_some()));
                         if ui.add_enabled(can_resume, egui::Button::new(if state.selected.as_ref().is_some_and(|key| state.opened.contains_key(key)) { "Switch to Open Tab  ↵" } else { "Resume in New Tab  ↵" })).clicked() { resume = true; }
                     });
                 });
@@ -612,11 +809,20 @@ impl TerminalApp {
             });
         if !open {
             self.agent_sessions.is_open = false;
+            self.agent_sessions.cancel_resume();
             self.return_focus_to_terminal(ctx);
+        }
+        if let Some((provider, id, pinned)) = pin_change {
+            self.agent_sessions.library_notice = self
+                .agent_sessions
+                .library
+                .set_pinned(provider, &id, pinned)
+                .err();
         }
         if resume {
             self.resume_selected_agent_session(ctx);
         }
+        self.finish_pending_agent_resume(ctx);
     }
 }
 
@@ -826,6 +1032,199 @@ mod tests {
         assert!(state.restore_anchor);
     }
 
+    const LIBRARY_A: &str = "11111111-1111-4111-8111-111111111111";
+    const LIBRARY_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn library(entries: &[(SessionProvider, &str, bool, Option<u64>)]) -> SessionLibrarySnapshot {
+        SessionLibrarySnapshot::from_entries(
+            entries
+                .iter()
+                .map(|(provider, id, pinned, resumed)| {
+                    jterm_core::agent_sessions::SessionLibraryEntry {
+                        provider: *provider,
+                        id: (*id).into(),
+                        pinned: *pinned,
+                        last_resumed_ms: *resumed,
+                    }
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn durable_metadata_reprojects_filters_without_losing_visible_selection_or_anchor() {
+        let mut state = state_with(vec![
+            session(SessionProvider::Codex, LIBRARY_A, "first"),
+            session(SessionProvider::Claude, LIBRARY_B, "second"),
+        ]);
+        state.replace_library(library(&[
+            (SessionProvider::Codex, LIBRARY_A, true, None),
+            (SessionProvider::Claude, LIBRARY_B, true, None),
+        ]));
+        state.pinned_only = true;
+        state.filters_changed();
+        state.selected = Some((SessionProvider::Claude, LIBRARY_B.into()));
+        state.remember_anchor(&state.visible(), 74.0, 74.0);
+        state.replace_library(library(&[
+            (SessionProvider::Codex, LIBRARY_A, false, None),
+            (SessionProvider::Claude, LIBRARY_B, true, None),
+        ]));
+        assert_eq!(state.visible(), vec![1]);
+        assert_eq!(state.selected_session().unwrap().id, LIBRARY_B);
+        assert_eq!(state.anchor_offset(&state.visible(), 74.0), Some(0.0));
+        state.replace_library(library(&[(
+            SessionProvider::Claude,
+            LIBRARY_B,
+            false,
+            None,
+        )]));
+        assert!(state.visible().is_empty());
+        assert!(state.selected_session().is_none());
+        assert!(
+            state.opened.is_empty(),
+            "metadata changes never create or resume a terminal"
+        );
+    }
+
+    #[test]
+    fn resumed_history_filter_and_sort_follow_only_recorded_successes() {
+        let mut state = state_with(vec![
+            session(SessionProvider::Codex, LIBRARY_A, "first"),
+            session(SessionProvider::Claude, LIBRARY_B, "second"),
+        ]);
+        state.recent_only = true;
+        state.filters_changed();
+        assert!(
+            state.visible().is_empty(),
+            "viewing a session does not manufacture a resume"
+        );
+        state.replace_library(library(&[
+            (SessionProvider::Codex, LIBRARY_A, false, Some(100)),
+            (SessionProvider::Claude, LIBRARY_B, false, Some(200)),
+        ]));
+        state.sort = SessionSort::RecentlyResumed;
+        state.filters_changed();
+        assert_eq!(state.selected_session().unwrap().id, LIBRARY_B);
+        state.replace_library(library(&[
+            (SessionProvider::Codex, LIBRARY_A, false, Some(300)),
+            (SessionProvider::Claude, LIBRARY_B, false, Some(200)),
+        ]));
+        assert_eq!(state.visible(), vec![0, 1]);
+        assert_eq!(
+            state.selected_session().unwrap().id,
+            LIBRARY_B,
+            "background metadata reorder preserves the inspected conversation"
+        );
+    }
+
+    #[test]
+    fn pin_unpin_and_resume_history_survive_a_fresh_async_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir().join(format!(
+            "ember-session-library-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("library.json");
+        let mut state = state_with(vec![session(SessionProvider::Codex, LIBRARY_A, "first")]);
+        state.library = SessionLibraryStore::with_path(path.clone());
+        fn wait(state: &mut AgentSessionsState, ready: impl Fn(&AgentSessionsState) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                state.poll_library();
+                if ready(state) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "store did not settle: {:?}",
+                    state.library.error()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        wait(&mut state, |s| s.library.is_loaded());
+        state
+            .library
+            .set_pinned(SessionProvider::Codex, LIBRARY_A, true)
+            .unwrap();
+        wait(&mut state, |s| {
+            s.library_snapshot
+                .is_pinned(SessionProvider::Codex, LIBRARY_A)
+        });
+        assert!(
+            state
+                .library_snapshot
+                .last_resumed(SessionProvider::Codex, LIBRARY_A)
+                .is_none(),
+            "pinning never marks a successful resume"
+        );
+        let selected = state.selected_session().unwrap().clone();
+        state.note_resumed(&selected);
+        wait(&mut state, |s| {
+            s.library_snapshot
+                .last_resumed(SessionProvider::Codex, LIBRARY_A)
+                .is_some()
+        });
+        state.library = SessionLibraryStore::with_path(path.clone());
+        wait(&mut state, |s| s.library.is_loaded());
+        assert!(state
+            .library_snapshot
+            .is_pinned(SessionProvider::Codex, LIBRARY_A));
+        assert!(state
+            .library_snapshot
+            .last_resumed(SessionProvider::Codex, LIBRARY_A)
+            .is_some());
+        state
+            .library
+            .set_pinned(SessionProvider::Codex, LIBRARY_A, false)
+            .unwrap();
+        wait(&mut state, |s| {
+            !s.library_snapshot
+                .is_pinned(SessionProvider::Codex, LIBRARY_A)
+        });
+        assert!(state
+            .library_snapshot
+            .last_resumed(SessionProvider::Codex, LIBRARY_A)
+            .is_some());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pending_confirmation_is_cancelled_by_selection_target_changes_and_close() {
+        let mut a = session(SessionProvider::Codex, LIBRARY_A, "first");
+        a.cwd = PathBuf::from("/nonexistent-ember-preflight-fixture-a");
+        let mut b = session(SessionProvider::Claude, LIBRARY_B, "second");
+        b.cwd = PathBuf::from("/nonexistent-ember-preflight-fixture-b");
+        let mut state = state_with(vec![a.clone(), b]);
+        state.sync_preflight();
+        state.preflight.refresh();
+        state.pending_resume = Some(a.clone());
+        state.selected = Some((SessionProvider::Claude, LIBRARY_B.into()));
+        state.sync_preflight();
+        assert!(state.pending_resume.is_none());
+        state.selected = Some(session_key(&a));
+        state.sync_preflight();
+        state.pending_resume = Some(a);
+        state.cancel_resume();
+        assert!(state.pending_resume.is_none());
+        assert!(matches!(
+            state.preflight.state(),
+            SessionPreflightState::Idle
+        ));
+        assert!(state.opened.is_empty());
+        assert!(
+            state.library_snapshot.is_empty(),
+            "readiness and cancellation never record a successful resume"
+        );
+    }
+
     #[test]
     fn clearing_filters_restores_all_sessions_and_clears_stale_error() {
         let mut state = state_with(vec![
@@ -838,6 +1237,8 @@ mod tests {
         state.scope_cwd = Some(PathBuf::from("/elsewhere"));
         state.project_only = true;
         state.live_only = true;
+        state.pinned_only = true;
+        state.recent_only = true;
         state.sort = SessionSort::LiveFirst;
         state.error = Some("stale launch error".into());
         state.filters_changed();
@@ -847,6 +1248,8 @@ mod tests {
         assert!(state.selected_session().is_some());
         assert_eq!(state.sort, SessionSort::Relevance);
         assert!(!state.project_only);
+        assert!(!state.pinned_only);
+        assert!(!state.recent_only);
         assert!(state.error.is_none());
         assert!(state.focus_search);
     }
