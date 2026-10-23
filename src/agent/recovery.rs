@@ -132,6 +132,17 @@ pub fn register(
     record: &Record,
     task: NewTask,
 ) -> Result<TaskId, String> {
+    register_with_brief(manager, record, task, None)
+}
+
+/// The authored brief is passed directly into the live manager and never added
+/// to the on-disk recovery record. Restart recovery still requires fresh input.
+pub fn register_with_brief(
+    manager: &mut TaskManager,
+    record: &Record,
+    task: NewTask,
+    brief: Option<super::TaskBrief>,
+) -> Result<TaskId, String> {
     if task.repo_root != record.repository
         || task.worktree_path != record.path
         || task.branch != record.branch
@@ -155,7 +166,10 @@ pub fn register(
         }
         return Err("This worktree is already attached to a different task identity.".into());
     }
-    manager.create(task).map_err(|_| "Task registration rejected its metadata. The worktree is preserved; Retry uses a generic title without saved command context.".into())
+    match brief {
+        Some(brief) => manager.create_with_brief(task, brief),
+        None => manager.create(task),
+    }.map_err(|_| "Task registration rejected its metadata. The worktree is preserved; Retry uses a generic title without a saved goal or command context.".into())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -508,6 +522,48 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[test]
+    fn authored_registration_retains_the_live_goal_without_journaling_it() {
+        let fixture = Fixture::new();
+        let mut journal = Journal::open(&fixture.root).unwrap();
+        let record = fixture.prepared(&mut journal);
+        let mut new_task = record.new_task().unwrap();
+        new_task.title = "User-authored goal".into();
+        let goal = "Private goal retained only in the live task manager";
+        let brief = super::super::TaskBrief::new(goal, None).unwrap();
+        let mut manager = TaskManager::new();
+        let id = register_with_brief(&mut manager, &record, new_task, Some(brief.clone())).unwrap();
+        assert_eq!(manager.get(id).unwrap().brief.as_ref(), Some(&brief));
+        assert!(manager.get(id).unwrap().requires_manual_review());
+        assert_eq!(
+            manager.get(id).unwrap().status,
+            super::super::TaskStatus::Created
+        );
+        // A retry while the journal marker is pending must preserve the live
+        // brief and runtime identity, even when retry has no saved context.
+        assert_eq!(
+            register(&mut manager, &record, record.new_task().unwrap()).unwrap(),
+            id
+        );
+        assert_eq!(manager.get(id).unwrap().brief.as_ref(), Some(&brief));
+        assert_eq!(manager.tasks().len(), 1);
+        // A process restart before the marker commit has only this prepared
+        // record. Its fresh task deliberately has no authored instructions.
+        let recovered = record.new_task().unwrap();
+        let mut restarted = TaskManager::new();
+        let recovered_id = register(&mut restarted, &record, recovered).unwrap();
+        assert!(restarted.get(recovered_id).unwrap().brief.is_none());
+        assert!(!restarted
+            .get(recovered_id)
+            .unwrap()
+            .requires_manual_review());
+        journal.registered(record.id, id).unwrap();
+        let json = fs::read_to_string(&journal.path).unwrap();
+        assert!(!json.contains(goal));
+        assert!(!json.contains("brief") && !json.contains("User-authored goal"));
+        assert_eq!(manager.get(id).unwrap().brief.as_ref(), Some(&brief));
     }
 
     #[test]

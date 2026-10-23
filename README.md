@@ -90,6 +90,14 @@ moving its text or covering Vim's separator/status rows.
   for the current search.
 - Failed and waiting tasks show a reason preview in the list, with bounded full
   details available on hover.
+- The Tasks sidebar can create project tasks from a goal, provider and optional
+  validation command. Creation prepares an isolated worktree; starting the Agent
+  remains a separate action. A task inspector explains next steps and review
+  prerequisites, with explicit human acceptance for goals without validation.
+- The [Agent command center](docs/agent-management.md) supports independent
+  conversation checkboxes and atomic batches of pin, archive, restore and tag
+  changes. Hidden selections stay counted, and failed saves preserve selection
+  and editor input.
 - [Workflows](#workflows): saved command templates with named parameters, in
   TOML or YAML, opened with `Ctrl+Shift+M`. The rendered command is *inserted*
   at the prompt and never run for you. Discovery, both parsers, validation and

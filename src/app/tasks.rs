@@ -36,8 +36,9 @@ pub(crate) fn task_reason(
 use crate::agent::{
     AgentProvider, AgentSessionOutcome, ApprovalDecision, ApprovalId, CodexAppServerApprovalKind,
     CodexAppServerPhase, CodexAppServerTurnHistory, CodexAppServerViewSnapshot, NativePromptPolicy,
-    TaskId, TaskRuntimeKind, TaskStatus, TaskValidationStatus, CODEX_APP_SERVER_LIVE_TURN_MAX,
-    NATIVE_AGENT_FOLLOW_UP_MAX_BYTES, PTY_TASK_BRIEF_RELATIVE,
+    TaskBrief, TaskId, TaskInspector, TaskRuntimeKind, TaskStatus, TaskValidationRecipe,
+    TaskValidationStatus, CODEX_APP_SERVER_LIVE_TURN_MAX, NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
+    PTY_TASK_BRIEF_RELATIVE,
 };
 use crate::app::state::TerminalApp;
 use crate::review_text::{sanitize_prompt_payload, visible_bounded, VisualSpoofDisposition};
@@ -83,6 +84,7 @@ pub enum TaskSidebarAction {
     FocusValidation(TaskId),
     RunValidation(TaskId),
     Complete(TaskId),
+    AcceptReviewed(TaskId),
     ReviewDiff(TaskId),
     Archive(TaskId),
 }
@@ -146,6 +148,7 @@ pub struct TaskSidebarState {
     dashboard_sort: jterm_core::agent_task::DashboardSort,
     scroll_to_selected: bool,
     pending_creation: Option<PendingTaskCreation>,
+    composer: TaskComposer,
     follow_up_drafts: HashMap<TaskId, String>,
     recovery_loaded: bool,
     recovery_records: Vec<crate::agent::recovery::Record>,
@@ -159,14 +162,185 @@ struct PendingTaskCreation {
     receiver: Receiver<Result<PreparedTask, String>>,
     worker: Option<JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
+    authored: bool,
 }
 
 struct PreparedTask {
-    context: crate::agent::SemanticCommandContext,
+    context: Option<crate::agent::SemanticCommandContext>,
+    brief: Option<TaskBrief>,
+    autostart: bool,
     title: String,
     provider: AgentProvider,
     record: crate::agent::recovery::Record,
     journal: crate::agent::recovery::Journal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TaskComposer {
+    open: bool,
+    project: String,
+    title: String,
+    goal: String,
+    provider: AgentProvider,
+    with_validation: bool,
+    validation_command: String,
+    validation_shell: String,
+    error: Option<String>,
+}
+
+impl Default for TaskComposer {
+    fn default() -> Self {
+        Self {
+            open: false,
+            project: String::new(),
+            title: String::new(),
+            goal: String::new(),
+            provider: AgentProvider::Codex,
+            with_validation: false,
+            validation_command: String::new(),
+            validation_shell: "/bin/sh".into(),
+            error: None,
+        }
+    }
+}
+
+struct TaskCreationRequest {
+    cwd: PathBuf,
+    title: String,
+    provider: AgentProvider,
+    context: Option<crate::agent::SemanticCommandContext>,
+    brief: Option<TaskBrief>,
+    autostart: bool,
+}
+
+impl TaskComposer {
+    fn request(&self) -> Result<TaskCreationRequest, String> {
+        let title = self.title.trim();
+        if title.is_empty() || title.len() > 256 || title.chars().any(char::is_control) {
+            return Err(
+                "Give the task a title of 1–256 UTF-8 bytes, without control characters.".into(),
+            );
+        }
+        let project = self.project.trim();
+        if project.len() > 4096
+            || project.chars().any(char::is_control)
+            || !std::path::Path::new(project).is_absolute()
+        {
+            return Err("Choose an absolute local project directory.".into());
+        }
+        let validation = self
+            .with_validation
+            .then(|| {
+                TaskValidationRecipe::new(
+                    self.validation_command.clone(),
+                    self.validation_shell.clone(),
+                )
+            })
+            .transpose()?;
+        let brief = TaskBrief::new(self.goal.clone(), validation)?;
+        Ok(TaskCreationRequest {
+            cwd: project.into(),
+            title: title.into(),
+            provider: self.provider,
+            context: None,
+            brief: Some(brief),
+            autostart: false,
+        })
+    }
+}
+
+fn task_composer_create_button(
+    ui: &mut egui::Ui,
+    draft: &TaskComposer,
+    enabled: bool,
+) -> egui::Response {
+    // A held click authorizes the exact visible draft, never a replacement.
+    ui.push_id(
+        (
+            "create_agent_task",
+            &draft.project,
+            &draft.title,
+            &draft.goal,
+            draft.provider.display_name(),
+            draft.with_validation,
+            &draft.validation_command,
+            &draft.validation_shell,
+        ),
+        |ui| ui.add_enabled(enabled, egui::Button::new("Create isolated task")),
+    )
+    .inner
+}
+
+fn show_task_composer(
+    ctx: &egui::Context,
+    draft: &mut TaskComposer,
+    projects: &[PathBuf],
+    busy: bool,
+) -> Option<TaskCreationRequest> {
+    if !draft.open {
+        return None;
+    }
+    let mut open = true;
+    let mut request = None;
+    egui::Window::new("New Agent task")
+        .id(egui::Id::new("agent_task_composer"))
+        .open(&mut open).collapsible(false).resizable(true)
+        .default_size(egui::vec2(540.0, 600.0)).min_width(360.0).min_height(320.0).vscroll(true)
+        .show(ctx, |ui| {
+            ui.label("Describe work for an isolated Git worktree. Start the Agent separately when you are ready.");
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.label("Project directory");
+                ui.add(egui::TextEdit::singleline(&mut draft.project).id(egui::Id::new("task_composer_project")).desired_width(f32::INFINITY).char_limit(4096).hint_text("/absolute/path/to/project"));
+                if !projects.is_empty() {
+                    egui::ComboBox::from_id_salt("new_task_project")
+                        .selected_text("Choose an existing project…")
+                        .show_ui(ui, |ui| {
+                            for project in projects {
+                                let path = project.to_string_lossy();
+                                if ui.selectable_label(draft.project == path, visible_bounded(&path, 240)).clicked() {
+                                    draft.project = path.into_owned();
+                                }
+                            }
+                        });
+                }
+                ui.label("Task title");
+                ui.add(egui::TextEdit::singleline(&mut draft.title).id(egui::Id::new("task_composer_title")).desired_width(f32::INFINITY).char_limit(256).hint_text("Improve the project’s…"));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Agent");
+                    for provider in AgentProvider::ALL {
+                        ui.selectable_value(&mut draft.provider, provider, provider.display_name());
+                    }
+                });
+                ui.label("Goal and acceptance criteria");
+                ui.add(egui::TextEdit::multiline(&mut draft.goal).id(egui::Id::new("task_composer_goal")).desired_width(f32::INFINITY).desired_rows(7).char_limit(16 * 1024).hint_text("What should change? What should a successful result do?"));
+                ui.small(format!("{} / 16,384 UTF-8 bytes", draft.goal.len()));
+                ui.checkbox(&mut draft.with_validation, "Require a validation command before completion");
+                if draft.with_validation {
+                    ui.label("Validation command · one line, run at the isolated worktree root");
+                    ui.add(egui::TextEdit::singleline(&mut draft.validation_command).desired_width(f32::INFINITY).char_limit(16 * 1024).hint_text("cargo test"));
+                    ui.label("Validation shell · absolute executable path");
+                    ui.add(egui::TextEdit::singleline(&mut draft.validation_shell).desired_width(f32::INFINITY).char_limit(4096).hint_text("/bin/sh"));
+                    ui.small("Validation runs only when you choose Run validation.");
+                } else {
+                    ui.small("Without a validation command, completion requires your explicit acceptance after reviewing the diff.");
+                }
+            });
+            ui.small("After a restart, recovery preserves the worktree but does not restore the goal. Enter it again before starting a new goal task.");
+            if let Some(error) = &draft.error {
+                ui.colored_label(egui::Color32::LIGHT_RED, visible_bounded(error, 1024));
+            }
+            if busy {
+                ui.horizontal(|ui| { ui.spinner(); ui.label("Preparing the isolated task…"); });
+            }
+            if task_composer_create_button(ui, draft, !busy).clicked() {
+                match draft.request() {
+                    Ok(value) => { draft.error = None; request = Some(value); }
+                    Err(error) => draft.error = Some(error),
+                }
+            }
+        });
+    draft.open = open;
+    request
 }
 
 enum RecoveryResult {
@@ -239,6 +413,129 @@ impl TaskRowSnapshot {
             || self.has_active_agent_stream
             || self.native_preparing
     }
+}
+
+fn task_next_step(
+    row: &TaskRowSnapshot,
+    manual_review: bool,
+    has_input: bool,
+    registration_pending: bool,
+) -> &'static str {
+    if registration_pending {
+        "Registration is awaiting its durable recovery marker. Start remains blocked until confirmation succeeds."
+    } else if row.native_preparing {
+        "Checking the provider and isolated workspace. You can cancel preparation before it starts."
+    } else if row.validation_status == TaskValidationStatus::Running {
+        "Validation is running. Open Validation output to follow the result; acceptance remains blocked."
+    } else {
+        match row.status {
+            TaskStatus::Created if !has_input => "Recovery preserved this worktree without its goal or command evidence. Inspect it with Review diff; create a new goal task to resume guided work.",
+            TaskStatus::Created => "Review the goal and project, then explicitly choose Start. Creating a task does not start its Agent.",
+            TaskStatus::WaitingForApproval => "Review the pending approval and its exact requested operation before choosing Allow or Deny.",
+            TaskStatus::WaitingForHuman => "The Agent needs your input. Inspect its latest activity or open its terminal.",
+            TaskStatus::ReadyForReview if row.has_active_agent_stream => "Review the latest result and send feedback if needed. Finish the Agent session before validation or acceptance.",
+            TaskStatus::ReadyForReview if manual_review => "Review the diff and acceptance criteria. No validation command was configured; choose Accept reviewed work when satisfied.",
+            TaskStatus::ReadyForReview if row.validation_status == TaskValidationStatus::Passed => "Validation passed. Review the diff, then choose Mark complete to accept the work.",
+            TaskStatus::ReadyForReview if row.validation_status.needs_attention() => "Inspect the validation result and diff. Resolve the issue and run validation again before completion.",
+            TaskStatus::ReadyForReview => "Review the diff and run validation. Completion requires a passing validation result.",
+            TaskStatus::Completed => "Work was accepted. You can inspect the diff or hide its task card while retaining the worktree.",
+            TaskStatus::Failed | TaskStatus::Cancelled => "Inspect the latest failure or cancellation and the preserved worktree. Available recovery controls appear below.",
+            TaskStatus::Starting | TaskStatus::Working => "The Agent is working. Inspect its activity, open its terminal, or stop it when necessary.",
+            TaskStatus::Archived => "This task is hidden; its worktree is preserved.",
+        }
+    }
+}
+
+fn render_task_inspector(
+    ui: &mut egui::Ui,
+    id: TaskId,
+    inspector: &TaskInspector,
+    next_step: &str,
+) {
+    ui.group(|ui| {
+        ui.strong("Next step");
+        ui.label(next_step);
+        if let Some(goal) = &inspector.goal {
+            egui::CollapsingHeader::new("Goal and acceptance criteria")
+                .id_salt(("task_goal", id))
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("task_goal_text", id))
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            ui.label(goal);
+                        });
+                });
+        }
+        egui::CollapsingHeader::new("Task inspector")
+            .id_salt(("task_inspector", id))
+            .show(ui, |ui| {
+                for field in &inspector.fields {
+                    ui.strong(field.label);
+                    ui.add(egui::Label::new(&field.value).wrap());
+                }
+            });
+    });
+}
+
+fn task_accept_button(
+    ui: &mut egui::Ui,
+    row: &TaskRowSnapshot,
+    manual_review: bool,
+    enabled: bool,
+) -> egui::Response {
+    ui.push_id(
+        (
+            "accept_agent_task",
+            row.id,
+            manual_review,
+            row.status as u8,
+            row.validation_status as u8,
+            row.has_active_agent_stream,
+            enabled,
+        ),
+        |ui| {
+            ui.add_enabled(
+                enabled,
+                egui::Button::new(if manual_review {
+                    "Accept reviewed work"
+                } else {
+                    "Mark complete"
+                }),
+            )
+        },
+    )
+    .inner
+}
+
+fn task_action_scope<R>(
+    ui: &mut egui::Ui,
+    row: &TaskRowSnapshot,
+    manual_review: bool,
+    registration_pending: bool,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    ui.push_id(
+        (
+            "task_action_strip",
+            row.id,
+            row.status as u8,
+            row.runtime_kind as u8,
+            row.validation_status as u8,
+            [
+                row.has_agent_terminal,
+                row.has_validation_terminal,
+                row.has_active_agent_stream,
+                row.native_preparing,
+                row.terminal_retry_available,
+                row.native_terminal_fallback_available,
+                manual_review,
+                registration_pending,
+            ],
+        ),
+        contents,
+    )
 }
 
 /// The shared projection owns ordering and filtering. Joining by stable ID
@@ -756,22 +1053,47 @@ fn native_follow_up_can_send(text: &str, completed_turns: usize) -> bool {
 }
 
 impl TerminalApp {
+    fn open_task_composer(&mut self) {
+        let draft = &mut self.task_sidebar.composer;
+        if draft.project.is_empty() {
+            draft.project = self
+                .task_sidebar
+                .dashboard_project
+                .as_ref()
+                .or_else(|| {
+                    self.task_sidebar
+                        .selected
+                        .and_then(|id| self.task_manager.get(id))
+                        .map(|task| &task.repo_root)
+                })
+                .or_else(|| {
+                    (!self.sidebar.location().is_remote()).then_some(&self.sidebar.current_dir)
+                })
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+        }
+        if draft.title.is_empty() && draft.goal.is_empty() {
+            draft.provider = self.task_sidebar.dashboard_provider.unwrap_or_else(|| {
+                AgentProvider::from_config_value(&self.config.preferred_fix_provider)
+                    .unwrap_or(AgentProvider::Codex)
+            });
+            draft.validation_shell = std::env::var("EMBER_SHELL")
+                .ok()
+                .or(self.config.shell.clone())
+                .filter(|path| std::path::Path::new(path).is_absolute())
+                .unwrap_or_else(|| "/bin/sh".into());
+        }
+        draft.open = true;
+    }
+
     pub(crate) fn begin_command_worktree_task(
         &mut self,
         context: crate::agent::SemanticCommandContext,
         provider: AgentProvider,
     ) -> Result<(), String> {
-        if self.task_sidebar.pending_creation.is_some() || self.task_sidebar.recovery_job.is_some()
-        {
-            return Err("another task worktree is still being created".to_string());
-        }
         provider
             .ensure_executable_available()
             .map_err(|error| error.to_string())?;
-        let worktree_root = dirs::data_local_dir()
-            .ok_or_else(|| "cannot locate the per-user data directory".to_string())?
-            .join("ember")
-            .join("agent-tasks");
         let cwd = context
             .cwd
             .as_deref()
@@ -780,6 +1102,36 @@ impl TerminalApp {
             .ok_or_else(|| "source command has no working directory".to_string())?;
         let command = context.command.as_deref().unwrap_or("failed command");
         let title = format!("Fix {}", visible_bounded(command, 112));
+        self.begin_worktree_task(TaskCreationRequest {
+            cwd,
+            title,
+            provider,
+            context: Some(context),
+            brief: None,
+            autostart: true,
+        })
+    }
+
+    fn begin_worktree_task(&mut self, request: TaskCreationRequest) -> Result<(), String> {
+        if self.task_sidebar.pending_creation.is_some() || self.task_sidebar.recovery_job.is_some()
+        {
+            return Err(
+                "Another task worktree is still being created; your draft is preserved.".into(),
+            );
+        }
+        let worktree_root = dirs::data_local_dir()
+            .ok_or_else(|| "Cannot locate the per-user data directory".to_string())?
+            .join("ember")
+            .join("agent-tasks");
+        let TaskCreationRequest {
+            cwd,
+            title,
+            provider,
+            context,
+            brief,
+            autostart,
+        } = request;
+        let authored = brief.is_some();
         let (sender, receiver) = mpsc::sync_channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -810,6 +1162,8 @@ impl TerminalApp {
                         .map_err(|error| crate::agent::recovery::error_message(&error))?;
                     Ok(PreparedTask {
                         context,
+                        brief,
+                        autostart,
                         title,
                         provider,
                         record,
@@ -824,7 +1178,12 @@ impl TerminalApp {
             receiver,
             worker: Some(worker),
             cancel,
+            authored,
         });
+        self.task_sidebar.recovery_error = None;
+        if authored {
+            self.task_sidebar.composer.error = None;
+        }
         self.sidebar.note_files_user_intent();
         self.sidebar.visible = true;
         self.sidebar.view = crate::sidebar::SidebarView::Tasks;
@@ -841,6 +1200,11 @@ impl TerminalApp {
     /// add and activate a task terminal later in the same frame.
     pub(crate) fn poll_task_creation(&mut self, ctx: &egui::Context) {
         self.poll_task_recovery(ctx);
+        let authored = self
+            .task_sidebar
+            .pending_creation
+            .as_ref()
+            .is_some_and(|pending| pending.authored);
         let result = self
             .task_sidebar
             .pending_creation
@@ -854,6 +1218,9 @@ impl TerminalApp {
             Some(Err(TryRecvError::Disconnected)) => {
                 self.task_sidebar.pending_creation = None;
                 self.task_sidebar.recovery_error = Some("Task worktree worker stopped unexpectedly. Inspect its recovery record; no worktree cleanup was attempted.".into());
+                if authored {
+                    self.task_sidebar.composer.error = self.task_sidebar.recovery_error.clone();
+                }
                 self.task_sidebar.recovery_loaded = false;
             }
             Some(Ok(result)) => {
@@ -862,6 +1229,9 @@ impl TerminalApp {
                 self.task_sidebar.pending_creation = None;
                 match result {
                     Err(error) => {
+                        if authored {
+                            self.task_sidebar.composer.error = Some(error.clone());
+                        }
                         self.task_sidebar.recovery_error = Some(error);
                         self.task_sidebar.recovery_loaded = false;
                     }
@@ -873,9 +1243,15 @@ impl TerminalApp {
                             worktree_path: prepared.record.path.clone(),
                             branch: prepared.record.branch.clone(),
                             base_commit: prepared.record.base_commit.clone().unwrap_or_default(),
-                            source_context: Some(prepared.context),
+                            source_context: prepared.context,
                         };
-                        self.register_prepared_task(prepared.journal, prepared.record, task, true);
+                        self.register_prepared_task(
+                            prepared.journal,
+                            prepared.record,
+                            task,
+                            prepared.brief,
+                            prepared.autostart,
+                        );
                     }
                 }
             }
@@ -909,12 +1285,31 @@ impl TerminalApp {
         mut journal: crate::agent::recovery::Journal,
         record: crate::agent::recovery::Record,
         task: crate::agent::NewTask,
+        brief: Option<TaskBrief>,
         autostart: bool,
     ) {
         self.task_sidebar.recovery_records = journal.records().to_vec();
-        match crate::agent::recovery::register(&mut self.task_manager, &record, task) {
+        let authored = brief.is_some();
+        match crate::agent::recovery::register_with_brief(
+            &mut self.task_manager,
+            &record,
+            task,
+            brief,
+        ) {
             Ok(id) => {
                 self.task_sidebar.selected = Some(id);
+                self.task_sidebar.scroll_to_selected = true;
+                if authored {
+                    self.task_sidebar.dashboard_query.clear();
+                    self.task_sidebar.dashboard_view = jterm_core::agent_task::DashboardView::All;
+                    self.task_sidebar.dashboard_provider = None;
+                    self.task_sidebar.dashboard_project = None;
+                    self.task_sidebar.composer.open = false;
+                    self.task_sidebar.composer.title.clear();
+                    self.task_sidebar.composer.goal.clear();
+                    self.task_sidebar.composer.validation_command.clear();
+                    self.task_sidebar.composer.error = None;
+                }
                 self.task_sidebar.unconfirmed_registrations.insert(id);
                 self.start_recovery_job(move || {
                     // Core registration is in memory; this marker is a separate commit.
@@ -932,6 +1327,9 @@ impl TerminalApp {
             }
             Err(error) => {
                 self.task_sidebar.recovery_records = journal.records().to_vec();
+                if authored {
+                    self.task_sidebar.composer.error = Some(error.clone());
+                }
                 self.task_sidebar.recovery_error = Some(error);
             }
         }
@@ -1011,7 +1409,9 @@ impl TerminalApp {
                     Ok(RecoveryResult::Retry(prepared)) => {
                         let (journal, record) = *prepared;
                         match record.new_task() {
-                            Ok(task) => self.register_prepared_task(journal, record, task, false),
+                            Ok(task) => {
+                                self.register_prepared_task(journal, record, task, None, false)
+                            }
                             Err(error) => self.task_sidebar.recovery_error = Some(error),
                         }
                     }
@@ -1019,7 +1419,11 @@ impl TerminalApp {
                         self.task_sidebar.recovery_records = records;
                         self.task_sidebar.unconfirmed_registrations.remove(&id);
                         self.task_sidebar.recovery_error = None;
-                        self.set_status("Task registered. Recovered tasks require an explicit Start; command context was not saved.");
+                        self.set_status(if self.task_manager.get(id).is_some_and(|task| task.brief.is_some()) {
+                            "Task created. Review its goal and choose Start when you are ready."
+                        } else {
+                            "Task registered. Recovered tasks require an explicit Start; command context was not saved."
+                        });
                         if registration_may_autostart(&self.task_manager, id, autostart) {
                             match provider {
                                 AgentProvider::Claude | AgentProvider::Kimi => {
@@ -1138,10 +1542,33 @@ impl TerminalApp {
         self.render_task_recovery(ui);
         ui.horizontal_wrapped(|ui| {
             ui.strong("Agent tasks");
+            if ui.button("New task").clicked() {
+                self.open_task_composer();
+            }
             if ui.button("Conversation library").clicked() {
                 self.toggle_agent_sessions();
             }
         });
+        let mut composer_projects: Vec<_> = self
+            .task_manager
+            .tasks()
+            .iter()
+            .map(|task| task.repo_root.clone())
+            .collect();
+        composer_projects.sort();
+        composer_projects.dedup();
+        let creation_busy = self.task_sidebar.pending_creation.is_some()
+            || self.task_sidebar.recovery_job.is_some();
+        if let Some(request) = show_task_composer(
+            ui.ctx(),
+            &mut self.task_sidebar.composer,
+            &composer_projects,
+            creation_busy,
+        ) {
+            if let Err(error) = self.begin_worktree_task(request) {
+                self.task_sidebar.composer.error = Some(error);
+            }
+        }
         let rows: Vec<_> = self
             .task_manager
             .tasks()
@@ -1390,7 +1817,7 @@ impl TerminalApp {
             ui.label(egui::RichText::new("No Agent tasks yet").strong());
             ui.label(
                 egui::RichText::new(
-                    "Create one from a failed command block: Fix with Codex, Claude, OpenCode, or Kimi. Each task gets its own Git worktree and Agent terminal.",
+                    "Choose New task to describe a goal for any local Git project, or use Fix on a failed command block. Each task gets its own isolated worktree.",
                 )
                 .small()
                 .color(ui.visuals().weak_text_color()),
@@ -1489,6 +1916,16 @@ impl TerminalApp {
                     }
 
                     if selected {
+                        ui.push_id(("selected_task_card", row.id), |ui| {
+                        let task = self.task_manager.get(row.id);
+                        let authored_task = task.is_some_and(|task| task.brief.is_some());
+                        let manual_review = task.is_some_and(|task| task.requires_manual_review());
+                        let has_input = task.is_some_and(|task| task.brief.is_some() || task.source_context.is_some());
+                        let has_validation = task.is_some_and(|task| task.validation_command().is_some());
+                        let registration_pending = self.task_sidebar.unconfirmed_registrations.contains(&row.id);
+                        if let Some(task) = task {
+                            render_task_inspector(ui, row.id, &TaskInspector::from_task(task), task_next_step(row, manual_review, has_input, registration_pending));
+                        }
                         if let Some(notice) = native_start_notice(row.provider) {
                             ui.label(egui::RichText::new(notice).small().color(egui::Color32::YELLOW));
                         }
@@ -1506,6 +1943,7 @@ impl TerminalApp {
                             && native_view
                                 .as_ref()
                                 .is_some_and(|view| view.phase == CodexAppServerPhase::Ready);
+                        task_action_scope(ui, row, manual_review, registration_pending, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             if row.status == TaskStatus::Created
                                 && row.runtime_kind == TaskRuntimeKind::Unassigned
@@ -1529,19 +1967,24 @@ impl TerminalApp {
                                     };
                                     if ui
                                         .add_enabled(
-                                            native_ai_enabled,
+                                            native_ai_enabled && has_input && !registration_pending,
                                             egui::Button::new(&start_label),
                                         )
-                                        .on_disabled_hover_text(
-                                            "Enable AI features and cloud command-context sharing in Settings → AI first",
-                                        )
+                                        .on_disabled_hover_text(if registration_pending {
+                                            "Wait for durable registration confirmation before starting the Agent"
+                                        } else if !has_input {
+                                            "Recovery did not save the task goal or command evidence. Create a new goal task before native Start"
+                                        } else {
+                                            "Enable AI features and cloud command-context sharing in Settings → AI first"
+                                        })
                                         .on_hover_text(native_hover)
                                         .clicked()
                                     {
                                         pending = Some(TaskSidebarAction::StartNative(row.id));
                                     }
                                     if ui
-                                        .button("Terminal fallback")
+                                        .add_enabled(!registration_pending && (!authored_task || native_ai_enabled), egui::Button::new("Terminal fallback"))
+                                        .on_disabled_hover_text(if registration_pending { "Wait for durable registration confirmation" } else { "Enable AI features and command-context sharing so the authored goal can be sent" })
                                         .on_hover_text(
                                             "Open the provider CLI in a PTY without Ember-native events or approval cards; the provider TUI owns its prompts",
                                         )
@@ -1550,7 +1993,8 @@ impl TerminalApp {
                                         pending = Some(TaskSidebarAction::StartTerminal(row.id));
                                     }
                                 } else if ui
-                                    .button(&start_label)
+                                    .add_enabled(!registration_pending && (!authored_task || native_ai_enabled), egui::Button::new(&start_label))
+                                    .on_disabled_hover_text(if registration_pending { "Wait for durable registration confirmation" } else { "Enable AI features and command-context sharing so the authored goal can be sent" })
                                     .on_hover_text(format!(
                                         "Open {} in a PTY inside this isolated worktree. Native structured events are not available for this provider yet; the CLI TUI owns its prompts and approvals.",
                                         row.provider.display_name()
@@ -1646,11 +2090,12 @@ impl TerminalApp {
                             {
                                 pending = Some(TaskSidebarAction::FocusTerminal(row.id));
                             }
-                            if row.status == TaskStatus::ReadyForReview
-                                && ui
+                            if !manual_review && ui
                                     .add_enabled(
-                                        row.validation_status != TaskValidationStatus::Running
-                                            && !row.has_active_agent_stream,
+                                        row.status == TaskStatus::ReadyForReview
+                                            && row.validation_status != TaskValidationStatus::Running
+                                            && !row.has_active_agent_stream
+                                            && has_validation && !registration_pending,
                                         egui::Button::new(
                                             if row.validation_attempt == 0 {
                                                 "Run validation"
@@ -1659,7 +2104,11 @@ impl TerminalApp {
                                             },
                                         ),
                                     )
-                                    .on_disabled_hover_text(if row.has_active_agent_stream {
+                                    .on_disabled_hover_text(if !has_validation {
+                                        "No validation command is available in this recovered task".to_string()
+                                    } else if registration_pending {
+                                        "Wait for durable registration confirmation".to_string()
+                                    } else if row.has_active_agent_stream {
                                         if native_idle {
                                             format!(
                                                 "Finish {} to end the native session and unlock validation",
@@ -1669,8 +2118,10 @@ impl TerminalApp {
                                             "Wait for the native Agent turn to reach review, then finish the session"
                                                 .to_string()
                                         }
-                                    } else {
+                                    } else if row.validation_status == TaskValidationStatus::Running {
                                         "Validation is already running".to_string()
+                                    } else {
+                                        "The Agent must reach Ready for review before validation".to_string()
                                     })
                                     .clicked()
                             {
@@ -1689,16 +2140,21 @@ impl TerminalApp {
                             if ui.button("Review diff").clicked() {
                                 pending = Some(TaskSidebarAction::ReviewDiff(row.id));
                             }
-                            if row.status == TaskStatus::ReadyForReview
-                                && row.validation_status == TaskValidationStatus::Passed
-                                && ui
-                                    .button("Mark complete")
-                                    .on_hover_text(
-                                        "Accept the reviewed task after its latest validation passed",
-                                    )
-                                    .clicked()
-                            {
-                                pending = Some(TaskSidebarAction::Complete(row.id));
+                            let can_accept = row.status == TaskStatus::ReadyForReview
+                                && !row.has_active_agent_stream && !registration_pending
+                                && if manual_review { row.validation_status == TaskValidationStatus::NotRun }
+                                   else { row.validation_status == TaskValidationStatus::Passed };
+                            if task_accept_button(ui, row, manual_review, can_accept)
+                                .on_disabled_hover_text(if row.has_active_agent_stream {
+                                    "Finish the Agent session before accepting its work"
+                                } else if manual_review {
+                                    "Accept reviewed work becomes available when the Agent is ready for review"
+                                } else {
+                                    "Completion requires Ready for review and a passing validation result"
+                                })
+                                .on_hover_text(if manual_review { "Accept the diff you reviewed without an automated validation claim" } else { "Accept the reviewed task after its latest validation passed" })
+                                .clicked() {
+                                pending = Some(if manual_review { TaskSidebarAction::AcceptReviewed(row.id) } else { TaskSidebarAction::Complete(row.id) });
                             }
                             if ui
                                 .add_enabled(
@@ -1706,10 +2162,12 @@ impl TerminalApp {
                                     egui::Button::new("Hide task"),
                                 )
                                 .on_hover_text("Hide task metadata; leave its worktree in place")
+                                .on_disabled_hover_text("Stop or finish the Agent and wait for validation to end before hiding this task")
                                 .clicked()
                             {
                                 pending = Some(TaskSidebarAction::Archive(row.id));
                             }
+                        });
                         });
                         if let Some(detail) = &row.status_detail {
                             ui.horizontal(|ui| {
@@ -1877,6 +2335,7 @@ impl TerminalApp {
                                 });
                             }
                         }
+                        });
                     }
                     ui.separator();
                 }
@@ -1989,6 +2448,14 @@ impl TerminalApp {
             TaskSidebarAction::Complete(task_id) => {
                 match self.task_manager.complete_after_validation(task_id) {
                     Ok(()) => self.set_status("Task marked complete after passing validation"),
+                    Err(error) => self.set_status_for(error.to_string(), Duration::from_secs(5)),
+                }
+            }
+            TaskSidebarAction::AcceptReviewed(task_id) => {
+                match self.task_manager.complete_after_manual_review(task_id) {
+                    Ok(()) => self.set_status(
+                        "Task accepted after manual review; no automated validation was claimed",
+                    ),
                     Err(error) => self.set_status_for(error.to_string(), Duration::from_secs(5)),
                 }
             }
@@ -2178,9 +2645,26 @@ impl TerminalApp {
             share_command_context: self.config.ai_enabled && self.config.ai_share_command_context,
             redact_secrets: self.config.ai_redact_secrets,
         };
+        if task_snapshot.brief.is_some() && !policy.share_command_context {
+            self.set_status_for("Enable AI features and command-context sharing in Settings → AI before starting this authored task. Its goal has not been sent.", Duration::from_secs(8));
+            return;
+        }
         let brief_written = match crate::agent::write_pty_task_brief(&task_snapshot, policy) {
-            Ok(path) => path.is_some(),
+            Ok(path) => {
+                if task_snapshot.brief.is_some() && path.is_none() {
+                    self.set_status_for("The task goal could not be prepared. No Agent was started; check AI sharing settings and retry.", Duration::from_secs(8));
+                    return;
+                }
+                path.is_some()
+            }
             Err(error) => {
+                if task_snapshot.brief.is_some() {
+                    self.set_status_for(
+                        format!("Could not prepare the task goal; no Agent was started: {error}"),
+                        Duration::from_secs(8),
+                    );
+                    return;
+                }
                 // Missing/disabled context is expected; IO failures should surface.
                 if !matches!(
                     error,
@@ -2203,9 +2687,12 @@ impl TerminalApp {
         {
             Ok(launch) => {
                 if brief_written {
-                    launch.with_pty_seed_prompt(&format!(
-                        "Read {PTY_TASK_BRIEF_RELATIVE} and fix the failed command described there. Stay inside this worktree."
-                    ))
+                    let instruction = if task_snapshot.brief.is_some() {
+                        "carry out the user-authored goal described there"
+                    } else {
+                        "fix the failed command described there"
+                    };
+                    launch.with_pty_seed_prompt(&format!("Read {PTY_TASK_BRIEF_RELATIVE} and {instruction}. Stay inside this worktree."))
                 } else {
                     launch
                 }
@@ -2478,6 +2965,326 @@ fn task_validation_color(ui: &egui::Ui, status: TaskValidationStatus) -> egui::C
             ui.visuals().warn_fg_color
         }
         TaskValidationStatus::NotRun => ui.visuals().weak_text_color(),
+    }
+}
+
+#[cfg(test)]
+mod management_v2_tests {
+    use super::*;
+
+    fn composer() -> TaskComposer {
+        TaskComposer {
+            open: true,
+            project: "/work/terminal".into(),
+            title: "Improve the Agent workspace".into(),
+            goal: "Add task creation and clear review guidance.\nKeep approval decisions explicit and preserve editor drafts.".into(),
+            with_validation: true,
+            validation_command: "cargo test --lib".into(),
+            ..Default::default()
+        }
+    }
+
+    fn row(id: TaskId) -> TaskRowSnapshot {
+        TaskRowSnapshot {
+            id,
+            title: "Review the new task manager".into(),
+            provider: AgentProvider::Codex,
+            status: TaskStatus::ReadyForReview,
+            runtime_kind: TaskRuntimeKind::Unassigned,
+            branch: "ember/task-review".into(),
+            project: "/work/terminal".into(),
+            has_agent_terminal: false,
+            has_validation_terminal: false,
+            has_active_agent_stream: false,
+            native_preparing: false,
+            terminal_retry_available: false,
+            native_terminal_fallback_available: false,
+            validation_status: TaskValidationStatus::NotRun,
+            validation_attempt: 0,
+            validation_detail: None,
+            needs_attention: true,
+            status_detail: None,
+        }
+    }
+
+    #[test]
+    fn composer_creates_authored_requests_without_starting_any_provider() {
+        let mut draft = composer();
+        for provider in AgentProvider::ALL {
+            draft.provider = provider;
+            let request = draft.request().unwrap();
+            assert!(!request.autostart);
+            assert!(request.context.is_none());
+            assert_eq!(request.provider, provider);
+            assert_eq!(request.cwd, PathBuf::from("/work/terminal"));
+            let brief = request.brief.unwrap();
+            assert_eq!(brief.goal, draft.goal);
+            assert_eq!(brief.validation.unwrap().shell, "/bin/sh");
+        }
+        draft.validation_command = "cargo test\nrm -f marker".into();
+        assert!(draft.request().is_err());
+        draft.with_validation = false;
+        assert!(draft.request().unwrap().brief.unwrap().validation.is_none());
+        draft.project = "relative/path".into();
+        assert!(draft.request().is_err());
+    }
+
+    #[test]
+    fn composer_pointer_release_cannot_submit_a_replaced_project_or_goal() {
+        let original = composer();
+        let mut replacement = original.clone();
+        replacement.project = "/work/other-project".into();
+        replacement.goal = "A different goal".into();
+        let ctx = egui::Context::default();
+        let frame = |draft: &TaskComposer, events| {
+            let mut response = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    response = Some(task_composer_create_button(ui, draft, true));
+                },
+            );
+            output.textures_delta.clear();
+            response.unwrap()
+        };
+        let position = frame(&original, vec![]).rect.center();
+        let pointer = |pressed| {
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        assert!(!frame(&original, pointer(true)).clicked());
+        assert!(!frame(&replacement, pointer(false)).clicked());
+        assert!(!frame(&replacement, pointer(true)).clicked());
+        assert!(frame(&replacement, pointer(false)).clicked());
+    }
+
+    #[test]
+    fn composer_editor_enter_keeps_the_goal_draft_without_creating_a_task() {
+        let ctx = egui::Context::default();
+        let mut draft = composer();
+        for focused in [false, true] {
+            if focused {
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("task_composer_goal")));
+            }
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 900.0),
+                    )),
+                    events: if focused {
+                        vec![egui::Event::Key {
+                            key: egui::Key::Enter,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                },
+                |_ui| {
+                    assert!(show_task_composer(&ctx, &mut draft, &[], false).is_none());
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert!(draft.open);
+        assert!(draft.goal.contains("Keep approval decisions explicit"));
+        assert!(draft.error.is_none());
+    }
+
+    #[test]
+    fn task_action_strip_pointer_state_tracks_identity_and_lifecycle() {
+        let first = row(TaskId::new());
+        let mut changed_state = first.clone();
+        changed_state.status = TaskStatus::Created;
+        for replacement in [row(TaskId::new()), changed_state] {
+            let ctx = egui::Context::default();
+            let frame = |task: &TaskRowSnapshot, events| {
+                let mut response = None;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        response = Some(
+                            task_action_scope(ui, task, true, false, |ui| ui.button("Task action"))
+                                .inner,
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                response.unwrap()
+            };
+            let position = frame(&first, vec![]).rect.center();
+            let pointer = |pressed| {
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            };
+            assert!(!frame(&first, pointer(true)).clicked());
+            assert!(!frame(&replacement, pointer(false)).clicked());
+            assert!(!frame(&replacement, pointer(true)).clicked());
+            assert!(frame(&replacement, pointer(false)).clicked());
+        }
+    }
+
+    #[test]
+    fn manual_accept_pointer_release_cannot_accept_a_different_task() {
+        let ctx = egui::Context::default();
+        let first = row(TaskId::new());
+        let second = row(TaskId::new());
+        let frame = |row: &TaskRowSnapshot, events| {
+            let mut response = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    response = Some(task_accept_button(ui, row, true, true));
+                },
+            );
+            output.textures_delta.clear();
+            response.unwrap()
+        };
+        let position = frame(&first, vec![]).rect.center();
+        let pointer = |pressed| {
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        assert!(!frame(&first, pointer(true)).clicked());
+        assert!(!frame(&second, pointer(false)).clicked());
+        assert!(!frame(&second, pointer(true)).clicked());
+        assert!(frame(&second, pointer(false)).clicked());
+        let mut active = second.clone();
+        active.has_active_agent_stream = true;
+        assert!(task_next_step(&active, true, true, false).contains("Finish"));
+        assert!(task_next_step(&second, true, true, false).contains("No validation command"));
+        assert!(task_next_step(&second, false, true, true).contains("durable recovery marker"));
+    }
+
+    #[test]
+    fn task_composer_and_inspector_render_without_staging_execution() {
+        let destination = std::env::var_os("EMBER_AGENT_UI_SNAPSHOT_DIR").map(PathBuf::from);
+        for (name, width, height) in [
+            ("task-composer-wide", 1180, 820),
+            ("task-composer-narrow", 700, 800),
+        ] {
+            let ctx = egui::Context::default();
+            let mut draft = composer();
+            let mut capture = super::super::visual_test_support::OffscreenCapture::default();
+            for pass in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        time: Some(pass as f64 * 0.25),
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width as f32, height as f32),
+                        )),
+                        ..Default::default()
+                    },
+                    |_ui| {
+                        assert!(show_task_composer(
+                            &ctx,
+                            &mut draft,
+                            &[PathBuf::from("/work/terminal")],
+                            false
+                        )
+                        .is_none());
+                    },
+                );
+                if let Some(path) = &destination {
+                    capture.save(
+                        &ctx,
+                        &mut output,
+                        [width, height],
+                        &path.join(format!("{name}.png")),
+                    );
+                } else {
+                    output.textures_delta.clear();
+                }
+            }
+        }
+        let mut manager = crate::agent::TaskManager::new();
+        let id = manager
+            .create_with_brief(
+                crate::agent::NewTask {
+                    title: "Improve the Agent workspace".into(),
+                    provider: AgentProvider::Codex,
+                    repo_root: "/work/terminal".into(),
+                    worktree_path: "/work/tasks/task-review".into(),
+                    branch: "ember/task-review".into(),
+                    base_commit: "a".repeat(40),
+                    source_context: None,
+                },
+                TaskBrief::new(composer().goal, None).unwrap(),
+            )
+            .unwrap();
+        let mut reviewed = manager.get(id).unwrap().clone();
+        reviewed.status = TaskStatus::ReadyForReview;
+        let inspector = TaskInspector::from_task(&reviewed);
+        let ctx = egui::Context::default();
+        let mut capture = super::super::visual_test_support::OffscreenCapture::default();
+        for pass in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(pass as f64 * 0.25),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(720.0, 640.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    render_task_inspector(
+                        ui,
+                        id,
+                        &inspector,
+                        task_next_step(&row(id), true, true, false),
+                    );
+                    assert!(!task_accept_button(ui, &row(id), true, true).clicked());
+                },
+            );
+            if let Some(path) = &destination {
+                capture.save(
+                    &ctx,
+                    &mut output,
+                    [720, 640],
+                    &path.join("task-inspector.png"),
+                );
+            } else {
+                output.textures_delta.clear();
+            }
+        }
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Created);
     }
 }
 

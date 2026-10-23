@@ -3,13 +3,13 @@
 use super::state::TerminalApp;
 use eframe::egui;
 use jterm_core::agent_sessions::{
-    AgentSession, SessionArchiveFilter, SessionCatalog, SessionLaunch, SessionLibraryFilter,
-    SessionLibrarySnapshot, SessionLibraryStore, SessionPreflight, SessionPreflightState,
-    SessionProjectSummary, SessionProvider, SessionQuery, SessionScanner, SessionSearchIndex,
-    SessionSort, SessionStatus,
+    AgentSession, SessionArchiveFilter, SessionBatchAction, SessionCatalog, SessionLaunch,
+    SessionLibraryFilter, SessionLibrarySnapshot, SessionLibraryStore, SessionPreflight,
+    SessionPreflightState, SessionProjectSummary, SessionProvider, SessionQuery, SessionScanner,
+    SessionSearchIndex, SessionSort, SessionStatus, SESSION_BATCH_LIMIT,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -93,6 +93,10 @@ pub(crate) struct AgentSessionsState {
     details_drafts: HashMap<SessionKey, SessionDetailsDraft>,
     pending_details: Option<SessionKey>,
     selected: Option<SessionKey>,
+    checked: HashSet<SessionKey>,
+    batch_tag: String,
+    batch_notice: Option<String>,
+    pending_batch: Option<usize>,
     focus_search: bool,
     search_widget: Option<egui::Id>,
     row_focus_widget: Option<egui::Id>,
@@ -189,7 +193,39 @@ impl AgentSessionsState {
                     self.details_drafts.remove(&key);
                 }
             }
+            if let Some(count) = self.pending_batch.take() {
+                self.batch_notice = Some(if self.library.error().is_none() {
+                    format!("Updated {count} selected conversations. Your selection is retained.")
+                } else {
+                    "The batch could not be saved. Your selection and tag input are retained; review the error and retry.".into()
+                });
+            }
         }
+    }
+
+    fn checked_keys(&self) -> Vec<SessionKey> {
+        let mut keys: Vec<_> = self.checked.iter().cloned().collect();
+        keys.sort_by(|left, right| {
+            left.0
+                .label()
+                .cmp(right.0.label())
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        keys
+    }
+
+    fn select_visible(&mut self, visible: &[usize]) -> Result<(), String> {
+        let mut selected = self.checked.clone();
+        selected.extend(
+            visible
+                .iter()
+                .map(|index| session_key(&self.catalog.sessions[*index])),
+        );
+        if selected.len() > SESSION_BATCH_LIMIT {
+            return Err(format!("Select up to {SESSION_BATCH_LIMIT} conversations per batch. Narrow the filters or clear the existing selection first."));
+        }
+        self.checked = selected;
+        Ok(())
     }
 
     fn sync_preflight(&mut self) {
@@ -385,7 +421,132 @@ struct SessionManagerActions {
     pin_change: Option<(SessionProvider, String, bool)>,
     details_change: Option<(SessionKey, String, String)>,
     archive_change: Option<(SessionKey, bool)>,
+    batch_change: Option<(Vec<SessionKey>, SessionBatchAction)>,
     open_tasks: bool,
+}
+
+fn session_batch_button(
+    ui: &mut egui::Ui,
+    keys: &[SessionKey],
+    action: &SessionBatchAction,
+    enabled: bool,
+    label: &str,
+) -> egui::Response {
+    let meaning = match action {
+        SessionBatchAction::Pin(true) => ("pin", ""),
+        SessionBatchAction::Pin(false) => ("unpin", ""),
+        SessionBatchAction::Archive(true) => ("archive", ""),
+        SessionBatchAction::Archive(false) => ("restore", ""),
+        SessionBatchAction::AddTag(tag) => ("add_tag", tag.as_str()),
+        SessionBatchAction::RemoveTag(tag) => ("remove_tag", tag.as_str()),
+    };
+    ui.push_id(("session_batch", keys, meaning, enabled), |ui| {
+        ui.add_enabled(enabled, egui::Button::new(label))
+    })
+    .inner
+}
+
+fn show_session_batch_controls(
+    ui: &mut egui::Ui,
+    state: &mut AgentSessionsState,
+    visible: &[usize],
+) -> Option<(Vec<SessionKey>, SessionBatchAction)> {
+    let mut change = None;
+    let visible_keys: Vec<_> = visible
+        .iter()
+        .map(|index| session_key(&state.catalog.sessions[*index]))
+        .collect();
+    let checked_keys = state.checked_keys();
+    ui.horizontal_wrapped(|ui| {
+        let visible_checked = visible
+            .iter()
+            .filter(|index| {
+                state
+                    .checked
+                    .contains(&session_key(&state.catalog.sessions[**index]))
+            })
+            .count();
+        ui.strong(format!(
+            "{} selected · {} hidden by filters or refresh",
+            state.checked.len(),
+            state.checked.len().saturating_sub(visible_checked)
+        ));
+        if ui
+            .push_id(
+                ("select_visible_sessions", &visible_keys, &checked_keys),
+                |ui| ui.add_enabled(!visible.is_empty(), egui::Button::new("Select visible")),
+            )
+            .inner
+            .clicked()
+        {
+            state.library_notice = state.select_visible(visible).err();
+        }
+        if ui
+            .push_id(("clear_checked_sessions", &checked_keys), |ui| {
+                ui.add_enabled(
+                    !state.checked.is_empty(),
+                    egui::Button::new("Clear selection"),
+                )
+            })
+            .inner
+            .clicked()
+        {
+            state.checked.clear();
+            state.batch_notice = None;
+        }
+    });
+    if !state.checked.is_empty() {
+        let keys = state.checked_keys();
+        let enabled = state.library.is_loaded() && !state.library.is_busy();
+        ui.horizontal_wrapped(|ui| {
+            for (label, action) in [
+                ("Pin selected", SessionBatchAction::Pin(true)),
+                ("Unpin selected", SessionBatchAction::Pin(false)),
+                ("Archive selected", SessionBatchAction::Archive(true)),
+                ("Restore selected", SessionBatchAction::Archive(false)),
+            ] {
+                if session_batch_button(ui, &keys, &action, enabled, label).clicked() {
+                    change = Some((keys.clone(), action));
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut state.batch_tag)
+                    .id(egui::Id::new("session_batch_tag"))
+                    .hint_text("One tag for the selected conversations")
+                    .char_limit(32)
+                    .desired_width(260.0),
+            );
+            for (label, action) in [
+                (
+                    "Add tag",
+                    SessionBatchAction::AddTag(state.batch_tag.clone()),
+                ),
+                (
+                    "Remove tag",
+                    SessionBatchAction::RemoveTag(state.batch_tag.clone()),
+                ),
+            ] {
+                if session_batch_button(
+                    ui,
+                    &keys,
+                    &action,
+                    enabled && !state.batch_tag.trim().is_empty(),
+                    label,
+                )
+                .clicked()
+                {
+                    change = Some((keys.clone(), action));
+                }
+            }
+        });
+        ui.small(format!("Actions apply to all {} checked conversations, including hidden selections. Limit: {SESSION_BATCH_LIMIT}.", keys.len()));
+    }
+    if let Some(notice) = &state.batch_notice {
+        ui.small(notice);
+    }
+    change
 }
 
 fn session_resume_button(
@@ -495,6 +656,7 @@ fn show_session_manager(
     let mut pin_change = None;
     let mut details_change = None;
     let mut archive_change = None;
+    let mut batch_change = None;
     let mut open_tasks = false;
     egui::Window::new("Agent Sessions")
         .id(egui::Id::new("agent_sessions_manager"))
@@ -585,6 +747,7 @@ fn show_session_manager(
             state.reconcile_selection();
             let visible = state.visible();
             ui.separator();
+            batch_change = show_session_batch_controls(ui, state, &visible);
             ui.small(format!("{} matching sessions · {}{}", visible.len(), state.sort.label(), if state.query.trim().is_empty() && state.sort == SessionSort::Relevance { " · newest first" } else { "" }));
             if let Some(error) = SessionSearchIndex::query_error(&state.query) {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
@@ -637,7 +800,21 @@ fn show_session_manager(
                         let project = crate::review_text::visible_bounded(&session.cwd.to_string_lossy(), 120);
                         let context = if tags.is_empty() { project } else { format!("{}  ·  {}", project, tags.join(" · ")) };
                         let status = format!("{}  ·  {}  ·  {}{}", session.provider.label(), session.status.label(), age_label(session.updated_at_ms), live_badge);
-                        let response = ui.push_id((session.provider.label(), &session.id), |ui| session_row_button(ui, selected, &status, &title, &context)).inner;
+                        let key = session_key(session);
+                        let mut checked = state.checked.contains(&key);
+                        let response = ui.push_id((session.provider.label(), &session.id), |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(checked || state.checked.len() < SESSION_BATCH_LIMIT,
+                                    egui::Checkbox::without_text(&mut checked))
+                                    .on_hover_text("Include this conversation in batch actions")
+                                    .on_disabled_hover_text(format!("A batch can contain at most {SESSION_BATCH_LIMIT} conversations"))
+                                    .changed() {
+                                    if checked { state.checked.insert(key.clone()); }
+                                    else { state.checked.remove(&key); }
+                                }
+                                session_row_button(ui, selected, &status, &title, &context)
+                            }).inner
+                        }).inner;
                         if response.has_focus() { state.row_focus_widget = Some(response.id); }
                         if response.clicked() { state.selected = Some((session.provider, session.id.clone())); }
                     }
@@ -757,6 +934,7 @@ fn show_session_manager(
         pin_change,
         details_change,
         archive_change,
+        batch_change,
         open_tasks,
     }
 }
@@ -1076,6 +1254,7 @@ impl TerminalApp {
             pin_change,
             details_change,
             archive_change,
+            batch_change,
             open_tasks,
         } = show_session_manager(ctx, state, task_dashboard_enabled);
         if !open {
@@ -1112,6 +1291,19 @@ impl TerminalApp {
                 .library
                 .set_archived(key.0, &key.1, archived)
                 .err();
+        }
+        if let Some((keys, action)) = batch_change {
+            self.agent_sessions.pending_resume = None;
+            resume = false;
+            match self.agent_sessions.library.apply_batch(&keys, action) {
+                Ok(count) => {
+                    self.agent_sessions.library_notice = None;
+                    self.agent_sessions.batch_notice =
+                        Some(format!("Saving changes to {count} selected conversations…"));
+                    self.agent_sessions.pending_batch = Some(count);
+                }
+                Err(error) => self.agent_sessions.library_notice = Some(error),
+            }
         }
         if open_tasks {
             self.agent_sessions.is_open = false;
@@ -1157,6 +1349,26 @@ mod tests {
             ..Default::default()
         });
         state
+    }
+
+    fn load_private_library(state: &mut AgentSessionsState) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("ember-batch-ui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        state.library = SessionLibraryStore::with_path(directory.join("library.json"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.library.is_loaded() {
+            state.poll_library();
+            assert!(
+                Instant::now() < deadline,
+                "library fixture failed to load: {:?}",
+                state.library.error()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        directory
     }
 
     #[test]
@@ -1717,6 +1929,7 @@ mod tests {
                 ),
             ]);
             state.scope_cwd = Some("/tmp/project".into());
+            let library_directory = load_private_library(&mut state);
             state.replace_library(
                 SessionLibrarySnapshot::default()
                     .with_organization(
@@ -1731,6 +1944,11 @@ mod tests {
                     .unwrap(),
             );
             state.selected = Some((SessionProvider::Codex, LIBRARY_A.into()));
+            state.checked.extend([
+                (SessionProvider::Codex, LIBRARY_A.into()),
+                (SessionProvider::Claude, LIBRARY_B.into()),
+            ]);
+            state.batch_tag = "review".into();
             let mut capture = super::super::visual_test_support::OffscreenCapture::default();
             for pass in 0..3 {
                 let mut output = ctx.run_ui(
@@ -1750,6 +1968,7 @@ mod tests {
                             action.details_change.is_none()
                                 && action.archive_change.is_none()
                                 && action.pin_change.is_none()
+                                && action.batch_change.is_none()
                         );
                     },
                 );
@@ -1767,7 +1986,155 @@ mod tests {
             assert!(state.opened.is_empty());
             assert!(state.pending_resume.is_none());
             assert_eq!(state.selected_session().unwrap().id, LIBRARY_A);
+            drop(state);
+            std::fs::remove_dir_all(library_directory).unwrap();
         }
+    }
+
+    #[test]
+    fn batch_selection_survives_filters_and_refuses_partial_select_visible() {
+        let mut state = state_with(vec![
+            session(SessionProvider::Codex, LIBRARY_A, "first"),
+            session(
+                SessionProvider::Claude,
+                LIBRARY_A,
+                "second provider, same id",
+            ),
+        ]);
+        state.select_visible(&state.visible()).unwrap();
+        assert_eq!(state.checked.len(), 2);
+        state.provider = Some(SessionProvider::Claude);
+        state.filters_changed();
+        assert_eq!(state.visible().len(), 1);
+        assert_eq!(
+            state.checked.len(),
+            2,
+            "hidden checked identities remain explicit batch targets"
+        );
+        let original = state.checked_keys();
+        state.replace_catalog(SessionCatalog {
+            sessions: (0..=SESSION_BATCH_LIMIT)
+                .map(|index| {
+                    session(
+                        SessionProvider::Codex,
+                        &format!("00000000-0000-4000-8000-{index:012x}"),
+                        "large catalog",
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        });
+        state.provider = None;
+        state.filters_changed();
+        assert!(state.select_visible(&state.visible()).is_err());
+        assert_eq!(
+            state.checked_keys(),
+            original,
+            "limit failure must not leave a partial selection"
+        );
+    }
+
+    #[test]
+    fn batch_pointer_release_cannot_retarget_selection_action_or_tag() {
+        let first = vec![(SessionProvider::Codex, LIBRARY_A.to_string())];
+        let replacement = vec![(SessionProvider::Claude, LIBRARY_A.to_string())];
+        let original = SessionBatchAction::AddTag("review".into());
+        for (keys, action) in [
+            (replacement, original.clone()),
+            (
+                first.clone(),
+                SessionBatchAction::RemoveTag("review".into()),
+            ),
+            (first.clone(), SessionBatchAction::AddTag("release".into())),
+        ] {
+            let ctx = egui::Context::default();
+            let frame = |keys: &[SessionKey], action: &SessionBatchAction, events| {
+                let mut response = None;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(600.0, 300.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        response = Some(session_batch_button(
+                            ui,
+                            keys,
+                            action,
+                            true,
+                            "Apply to selection",
+                        ));
+                    },
+                );
+                output.textures_delta.clear();
+                response.unwrap()
+            };
+            let position = frame(&first, &original, vec![]).rect.center();
+            let pointer = |pressed| {
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            };
+            assert!(!frame(&first, &original, pointer(true)).clicked());
+            assert!(!frame(&keys, &action, pointer(false)).clicked());
+            assert!(!frame(&keys, &action, pointer(true)).clicked());
+            assert!(frame(&keys, &action, pointer(false)).clicked());
+        }
+    }
+
+    #[test]
+    fn batch_tag_enter_is_an_editor_event_without_resume_or_apply() {
+        let ctx = egui::Context::default();
+        let mut state = state_with(vec![session(SessionProvider::Codex, LIBRARY_A, "selected")]);
+        let library_directory = load_private_library(&mut state);
+        state
+            .checked
+            .insert((SessionProvider::Codex, LIBRARY_A.into()));
+        state.batch_tag = "review".into();
+        let tag_id = egui::Id::new("session_batch_tag");
+        for pressed in [false, true] {
+            ctx.memory_mut(|memory| memory.request_focus(tag_id));
+            assert!(!session_key_route(
+                ctx.memory(|memory| memory.focused()),
+                Some(egui::Id::new("search")),
+                None
+            ));
+            let visible = state.visible();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: if pressed {
+                        vec![egui::Event::Key {
+                            key: egui::Key::Enter,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                },
+                |ui| {
+                    assert!(show_session_batch_controls(ui, &mut state, &visible).is_none());
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert!(state.pending_resume.is_none());
+        assert_eq!(state.checked.len(), 1);
+        assert_eq!(state.batch_tag, "review");
+        drop(state);
+        std::fs::remove_dir_all(library_directory).unwrap();
     }
 
     #[test]
