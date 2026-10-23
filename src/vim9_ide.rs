@@ -66,6 +66,34 @@ enum ToolInput {
     Build,
 }
 
+fn restored_workspace_input(
+    focus: jterm_core::vim9::Vim9WorkbenchFocus,
+    tools: bool,
+) -> Option<ToolInput> {
+    use jterm_core::vim9::Vim9WorkbenchFocus;
+    match focus {
+        Vim9WorkbenchFocus::Search if tools => Some(ToolInput::Search),
+        Vim9WorkbenchFocus::Build if tools => Some(ToolInput::Build),
+        _ => None,
+    }
+}
+
+#[test]
+fn workspace_focus_restore_never_targets_hidden_tools() {
+    use jterm_core::vim9::Vim9WorkbenchFocus::*;
+    assert_eq!(
+        restored_workspace_input(Search, true),
+        Some(ToolInput::Search)
+    );
+    assert_eq!(
+        restored_workspace_input(Build, true),
+        Some(ToolInput::Build)
+    );
+    for focus in [Editor, Search, Build, Files, Output] {
+        assert_eq!(restored_workspace_input(focus, false), None);
+    }
+}
+
 struct EditorDialog {
     kind: DialogKind,
     query: String,
@@ -78,6 +106,8 @@ struct EditorDialog {
     needs_focus: bool,
     reveal_selection: bool,
     selection_delta: isize,
+    page_delta: isize,
+    page_rows: usize,
     query_widget: Option<egui::Id>,
     confirm_requested: bool,
     error: Option<String>,
@@ -97,6 +127,8 @@ impl EditorDialog {
             needs_focus: true,
             reveal_selection: true,
             selection_delta: 0,
+            page_delta: 0,
+            page_rows: 8,
             query_widget: None,
             confirm_requested: false,
             error: None,
@@ -187,6 +219,19 @@ impl EditorDialog {
         }
     }
 
+    fn move_page_selection(&mut self) {
+        let delta = std::mem::take(&mut self.page_delta);
+        let count = if vim9_palette_query(&self.query).is_some() {
+            self.command_matches.len()
+        } else {
+            self.matches.len()
+        };
+        if delta != 0 && count > 0 {
+            self.selected = self.selected.saturating_add_signed(delta).min(count - 1);
+            self.reveal_selection = true;
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
         let count = if vim9_palette_query(&self.query).is_some() {
             self.command_matches.len()
@@ -198,6 +243,15 @@ impl EditorDialog {
             self.reveal_selection = true;
         }
     }
+}
+
+fn visible_result_rows(view_height: f32, content_height: f32, count: usize) -> usize {
+    if count == 0 || content_height <= 0.0 {
+        return 1;
+    }
+    (view_height / (content_height / count as f32))
+        .floor()
+        .clamp(1.0, count as f32) as usize
 }
 
 fn is_keyboard_event(event: &egui::Event) -> bool {
@@ -255,6 +309,17 @@ fn route_dialog_events(
             egui::Key::Enter if query_owns_keyboard && !focus_may_have_moved => {
                 dialog.confirm_requested = true;
                 claimed_suffix = true;
+                false
+            }
+            egui::Key::PageUp | egui::Key::PageDown
+                if query_owns_keyboard
+                    && !focus_may_have_moved
+                    && dialog.kind == DialogKind::QuickOpen =>
+            {
+                let direction = if *key == egui::Key::PageDown { 1 } else { -1 };
+                dialog.page_delta = dialog
+                    .page_delta
+                    .saturating_add(direction * dialog.page_rows as isize);
                 false
             }
             egui::Key::ArrowUp | egui::Key::ArrowDown
@@ -556,6 +621,9 @@ pub(crate) struct Workbench {
     chrome_focus: Option<egui::Id>,
     chrome_popup_open: bool,
     return_focus: bool,
+    workspace_store: jterm_core::vim9::Vim9WorkspaceStateStore,
+    workspace: jterm_core::vim9::Vim9WorkspaceState,
+    workspace_focus_pending: bool,
 }
 
 impl Workbench {
@@ -568,6 +636,10 @@ impl Workbench {
 
     pub(crate) fn new(session: Vim9Session, config: &Vim9UiConfig) -> Self {
         let snapshot = Arc::new(session.snapshot());
+        let mut workspace_store =
+            jterm_core::vim9::Vim9WorkspaceStateStore::new(session.root(), "ember");
+        let workspace =
+            workspace_store.restore(jterm_core::vim9::Vim9WorkspaceState::for_config(config));
         Self {
             session,
             // Inherit live content-font settings until this editor is zoomed.
@@ -580,12 +652,12 @@ impl Workbench {
             snapshot,
             refreshed_at: Instant::now(),
             file_input: String::new(),
-            search_input: String::new(),
-            search_options: Vim9SearchOptions::default(),
+            search_input: workspace.search_query.clone(),
+            search_options: workspace.search_options.clone(),
             build_input: String::new(),
             rename_input: String::new(),
-            tools_open: false,
-            problems_open: config.tool_panel,
+            tools_open: workspace.tools_visible,
+            problems_open: workspace.output_visible,
             error: None,
             project_index: None,
             dialog: None,
@@ -594,6 +666,9 @@ impl Workbench {
             chrome_focus: None,
             chrome_popup_open: false,
             return_focus: false,
+            workspace_store,
+            workspace,
+            workspace_focus_pending: true,
         }
     }
 
@@ -683,6 +758,18 @@ impl Workbench {
                     .is_ok()
             {
                 self.render_subscribed = native_buffer;
+            }
+            if self.workspace_focus_pending
+                && self.snapshot.connected
+                && self.snapshot.buffer > 0
+                && self.snapshot.window > 0
+                && !self.snapshot.mode.is_empty()
+            {
+                self.workspace_focus_pending = false;
+                self.focus_input = restored_workspace_input(self.workspace.focus, self.tools_open);
+                if self.focus_input.is_none() {
+                    self.return_focus = true;
+                }
             }
             self.refreshed_at = Instant::now();
         }
@@ -821,6 +908,9 @@ impl Workbench {
                         if self.focus_input == Some(ToolInput::Build) {
                             build.request_focus();
                             self.focus_input = None;
+                        }
+                        if build.has_focus() {
+                            self.workspace.focus = jterm_core::vim9::Vim9WorkbenchFocus::Build;
                         }
                         let build_enter = form_submitted(&build);
                         if snapshot.build.running {
@@ -995,6 +1085,9 @@ impl Workbench {
             if self.focus_input == Some(ToolInput::Search) {
                 search.request_focus();
                 self.focus_input = None;
+            }
+            if search.has_focus() {
+                self.workspace.focus = jterm_core::vim9::Vim9WorkbenchFocus::Search;
             }
             let enter = form_submitted(&search);
             let options_label = if self.search_options == Vim9SearchOptions::default() {
@@ -1216,12 +1309,13 @@ impl Workbench {
                     dialog.refresh_command_matches();
                     let delta = std::mem::take(&mut dialog.selection_delta);
                     dialog.move_selection(delta);
+                    dialog.move_page_selection();
                     let snapshot = self.session.snapshot();
                     command_available = dialog.command_matches.get(dialog.selected)
                         .is_some_and(|command| command.unavailable_reason(&snapshot).is_none());
                     ui.small(format!("Editor commands · {} matches", dialog.command_matches.len()));
                     ui.separator();
-                    egui::ScrollArea::vertical()
+                    let results = egui::ScrollArea::vertical()
                         .id_salt(("vim9_command_results", session_id))
                         .max_height((ctx.viewport_rect().height() * 0.45).min(360.0))
                         .show(ui, |ui| {
@@ -1255,8 +1349,9 @@ impl Workbench {
                                 }
                             }
                         });
+                    dialog.page_rows = visible_result_rows(results.inner_rect.height(), results.content_size.y, dialog.command_matches.len());
                     dialog.reveal_selection = false;
-                    ui.weak("↑ ↓ select · Enter runs · Esc returns to Vim · remove > to find files");
+                    ui.weak("↑ ↓ / PgUp PgDn select · Enter runs · Esc returns to Vim · remove > to find files");
                 } else if dialog.kind == DialogKind::QuickOpen {
                     let parsed = dialog.refresh_quick_matches(&project);
                     current_buffer = parsed.as_ref().is_ok_and(|query| query.current_buffer);
@@ -1272,12 +1367,14 @@ impl Workbench {
                     }
                     if current_buffer || !quick_valid {
                         dialog.selection_delta = 0;
+                        dialog.page_delta = 0;
                     }
                     if current_buffer {
                         ui.weak("Enter jumps in the current buffer · Esc returns to Vim");
                     } else if quick_valid {
                         let delta = std::mem::take(&mut dialog.selection_delta);
                         dialog.move_selection(delta);
+                        dialog.move_page_selection();
                         ui.horizontal(|ui| {
                             if project.scanning { ui.spinner(); }
                             ui.small(format!(
@@ -1294,7 +1391,7 @@ impl Workbench {
                             ui.weak("Project file limit reached. Open a narrower project or use the path field.");
                         }
                         ui.separator();
-                        egui::ScrollArea::vertical()
+                        let results = egui::ScrollArea::vertical()
                             .id_salt(("vim9_quick_open_results", session_id))
                             .max_height((ctx.viewport_rect().height() * 0.45).min(360.0))
                             .show(ui, |ui| {
@@ -1317,8 +1414,9 @@ impl Workbench {
                                     }
                                 }
                             });
+                        dialog.page_rows = visible_result_rows(results.inner_rect.height(), results.content_size.y, dialog.matches.len());
                         dialog.reveal_selection = false;
-                        ui.weak("↑ ↓ select · Enter opens · Esc returns to Vim · > for editor commands");
+                        ui.weak("↑ ↓ / PgUp PgDn select · Enter opens · Esc returns to Vim · > for editor commands");
                     }
                 }
                 if let Some(error) = &dialog.error {
@@ -1424,6 +1522,7 @@ pub(crate) fn launch_button(ui: &egui::Ui, rect: egui::Rect, font_size: f32) -> 
 
 impl Drop for Workbench {
     fn drop(&mut self) {
+        let _ = self.workspace_store.flush();
         self.session.revoke();
     }
 }
@@ -1991,6 +2090,12 @@ impl TerminalApp {
         } else {
             focused_chrome_widget(ctx, &editor.chrome_rects)
         };
+        if !editor.workspace_focus_pending
+            && editor.chrome_focus.is_none()
+            && !editor.chrome_popup_open
+        {
+            editor.workspace.focus = jterm_core::vim9::Vim9WorkbenchFocus::Editor;
+        }
         if return_focus {
             self.claim_enter_for_prompt_recall();
             self.return_focus_to_terminal(ctx);
@@ -2062,7 +2167,18 @@ impl TerminalApp {
         self.tabs.insert_tab_after_active(created.session_index);
         self.activate_session(created.session_index);
         self.force_resize_session = true;
-        if self.config.vim9.project_panel {
+        let active_id = self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            .clone();
+        let restored = &self.vim9_editors[&active_id].workspace;
+        self.sidebar.visible = restored.files_visible;
+        if let Some(width) = restored.project_width {
+            self.sidebar.width = f32::from(width);
+        }
+        if restored.files_visible {
             self.sidebar.visible = true;
             self.sidebar.view = crate::sidebar::SidebarView::Files;
             if let Some(error) = self.sidebar.set_current_dir(root) {
@@ -2120,7 +2236,9 @@ impl TerminalApp {
         }
         editor.refresh(self.config.vim9.native_buffer);
         editor.chrome_rects.clear();
-        let config = &self.config.vim9;
+        let mut restored_config = self.config.vim9;
+        restored_config.tool_panel = false;
+        let config = &restored_config;
         let chrome_visible = config.toolbar
             || config.buffer_tabs
             || config.status_bar
@@ -2160,13 +2278,30 @@ impl TerminalApp {
         if editor.problems_open {
             let problems = egui::Panel::bottom(egui::Id::new(("vim9_problems_panel", &id)))
                 .resizable(true)
-                .default_size(240.0)
+                .default_size(f32::from(editor.workspace.output_height.unwrap_or(240)))
                 .min_size(70.0)
                 .max_size(300.0)
                 .show(root_ui, |ui| {
                     editor.problems(ui);
                 });
+            editor.workspace.output_height =
+                Some(problems.response.rect.height().clamp(80.0, 1200.0) as u16);
             editor.chrome_rects.push(problems.response.rect);
+        }
+        if !editor.workspace_focus_pending {
+            editor
+                .workspace
+                .search_query
+                .clone_from(&editor.search_input);
+            editor.workspace.search_options = editor.search_options.clone();
+            editor.workspace.files_visible = self.sidebar.visible;
+            editor.workspace.project_width = Some(self.sidebar.width.clamp(120.0, 1200.0) as u16);
+            editor.workspace.tools_visible = editor.tools_open;
+            editor.workspace.output_visible = editor.problems_open;
+            if editor.return_focus {
+                editor.workspace.focus = jterm_core::vim9::Vim9WorkbenchFocus::Editor;
+            }
+            editor.workspace_store.remember(editor.workspace.clone());
         }
     }
 
@@ -2411,6 +2546,52 @@ mod tests {
         assert!(!route_dialog_events(&mut dialog, true, &mut events));
         assert!(dialog.confirm_requested);
         assert_eq!(events, vec![egui::Event::Text("latest-query".into())]);
+    }
+
+    #[test]
+    fn dialog_page_navigation_tracks_viewport_and_preserves_focus_modifiers() {
+        let mut dialog = EditorDialog::new(DialogKind::QuickOpen);
+        dialog.matches = (0..30)
+            .map(|index| Vim9ProjectFile {
+                path: PathBuf::from(format!("file{index}")),
+                relative: format!("file{index}"),
+            })
+            .collect();
+        dialog.page_rows = visible_result_rows(180.0, 30.0 * 30.0, 30);
+        assert_eq!(dialog.page_rows, 6);
+        let mut events = vec![key(egui::Key::PageDown)];
+        assert!(!route_dialog_events(&mut dialog, true, &mut events));
+        assert!(events.is_empty());
+        dialog.move_page_selection();
+        assert_eq!(dialog.selected, 6);
+        dialog.page_delta = 300;
+        dialog.move_page_selection();
+        assert_eq!(dialog.selected, 29);
+        dialog.page_delta = -300;
+        dialog.move_page_selection();
+        assert_eq!(dialog.selected, 0);
+        for focused in [false, true] {
+            let mut modified = key(egui::Key::PageDown);
+            if let egui::Event::Key { modifiers, .. } = &mut modified {
+                modifiers.ctrl = true;
+            }
+            let mut events = vec![modified.clone()];
+            route_dialog_events(&mut dialog, focused, &mut events);
+            assert_eq!(events, vec![modified]);
+        }
+        let mut events = vec![key(egui::Key::PageDown)];
+        route_dialog_events(&mut dialog, false, &mut events);
+        assert_eq!(events.len(), 1);
+        let mut events = vec![key(egui::Key::Tab), key(egui::Key::PageDown)];
+        route_dialog_events(&mut dialog, true, &mut events);
+        assert_eq!(events.len(), 2);
+        assert_eq!(dialog.page_delta, 0);
+        dialog.query = ">".into();
+        dialog.refresh_command_matches();
+        dialog.page_delta = 6;
+        dialog.move_page_selection();
+        assert_eq!(dialog.selected, 6.min(dialog.command_matches.len() - 1));
+        assert_eq!(visible_result_rows(0.0, 0.0, 0), 1);
     }
 
     #[test]
