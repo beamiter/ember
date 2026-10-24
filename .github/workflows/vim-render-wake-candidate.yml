@@ -7,7 +7,8 @@ permissions:
   contents: write
 jobs:
   validate:
-    uses: beamiter/jterm_core/.github/workflows/vim-render-wake-frontends.yml@3dbcec71d33a0dbcf7b1e562c31102e4d2a255df
+    uses: beamiter/jterm_core/.github/workflows/vim-render-wake-frontends.yml@7ffde581f91958ca13613efb0b85024198dd9877
     with:
       base: 6469f3336345e208544db9c92bc914dca31e5b1d
+      core: 88afec4c3846a68e0b94103ad7ca9c2ffcfa4a66
       patch_sha256: bcf6957df838ce742efc2903438d6a860b7c904e797ba1677ded960fe190b809
