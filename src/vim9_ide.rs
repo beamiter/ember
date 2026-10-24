@@ -17,43 +17,38 @@ use std::time::{Duration, Instant};
 
 const QUICK_OPEN_LIMIT: usize = 40;
 
-/// Wake the native surface only when the shared immutable frame changes.
-/// Metadata keeps its existing slower poll; idle buffers do not repaint at 60Hz.
+/// The socket worker publishes validated frames into a latest-value slot.
+/// No fixed repaint poll, and this worker does not keep the editor alive.
 struct RenderWake {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    cancel: jterm_core::vim9::Vim9RenderCancel,
+    _thread: std::thread::JoinHandle<()>,
 }
 
 impl RenderWake {
-    fn start(session: Vim9Session, ctx: egui::Context) -> Self {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
+    fn start(session: &Vim9Session, ctx: egui::Context) -> Option<Self> {
+        let mut updates = session.watch_render().ok()?;
+        let cancel = updates.cancellation();
         let thread = std::thread::Builder::new()
             .name("vim9-gui-repaint".into())
             .spawn(move || {
-                let mut previous = None;
-                while !worker_stop.load(Ordering::Acquire) {
-                    let revision = session.render_snapshot().map(|frame| frame.revision);
-                    if revision != previous {
-                        previous = revision;
-                        ctx.request_repaint();
-                    }
-                    std::thread::park_timeout(Duration::from_millis(16));
+                while updates.recv().is_some() {
+                    ctx.request_repaint();
                 }
             })
-            .ok();
-        Self { stop, thread }
+            .ok()?;
+        Some(Self {
+            cancel,
+            _thread: thread,
+        })
     }
 }
 
 impl Drop for RenderWake {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
-            let _ = thread.join();
-        }
+        // Wake the condition variable directly; never wait for a polling tick.
+        self.cancel.cancel();
+        // The worker owns no app/session and only calls the nonblocking repaint
+        // request. Detach rather than joining an executor on a UI thread.
     }
 }
 
@@ -2270,10 +2265,7 @@ impl TerminalApp {
             return;
         };
         if editor.render_wake.is_none() {
-            editor.render_wake = Some(RenderWake::start(
-                editor.session.clone(),
-                root_ui.ctx().clone(),
-            ));
+            editor.render_wake = RenderWake::start(&editor.session, root_ui.ctx().clone());
         }
         editor.refresh(self.config.vim9.native_buffer);
         editor.chrome_rects.clear();
