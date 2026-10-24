@@ -2,7 +2,7 @@ name: Native Vim dialog candidate
 on:
   push:
     branches: [codex/vim-dialog-focus-20261024]
-    paths: [.github/workflows/vim-dialog-candidate.yml, scripts/stage-vim9-dialog-focus.py, src/vim9_dialog_focus.rs]
+    paths: [.github/workflows/vim-dialog-candidate.yml, scripts/stage-vim9-dialog-focus.py, scripts/stage-release-paste.py, src/vim9_dialog_focus.rs]
 permissions:
   contents: write
 concurrency:
@@ -24,6 +24,7 @@ jobs:
       - name: Prepare exact production changes
         run: |
           python3 scripts/stage-vim9-dialog-focus.py
+          python3 scripts/stage-release-paste.py
           bash scripts/materialize-shared-core.sh
           mkdir -p evidence
           python3 -m py_compile scripts/native-vim9-buffer-smoke.py
@@ -40,6 +41,7 @@ jobs:
         with:
           shared-key: font-groups
           workspaces: font-group-harness -> target
+          cache-on-failure: true
       - name: Prove regression fails without the focus guard
         shell: bash
         run: |
@@ -73,15 +75,10 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: release
+          cache-on-failure: true
       - name: Build optimized production binary
+        id: build
         run: cargo build --workspace --release --all-features --locked
-      - name: Run production IDE regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --release --locked --bin ember vim9_ide:: 2>&1 | tee evidence/ide-tests.txt
-      - name: Strict production lint
-        run: cargo clippy --release --locked --bin ember --all-features -- -D warnings
       - name: Prove keyboard-only modal input twice in real Vim and GUI
         shell: bash
         run: |
@@ -91,6 +88,16 @@ jobs:
           done
           sha256sum target/release/ember > evidence/binary-identity.txt
           rustc -Vv > evidence/rust-version.txt
+      - name: Run production IDE and paste regressions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --locked --bin ember vim9_ide:: 2>&1 | tee evidence/ide-tests.txt
+          cargo test --release --locked --bin ember semantic_paste 2>&1 | tee evidence/paste-tests.txt
+      - name: Strict production lint
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: cargo clippy --release --locked --bin ember --all-features -- -D warnings
       - name: Prepare clean candidate without moving master
         env:
           GH_TOKEN: ${{ github.token }}
@@ -100,8 +107,8 @@ jobs:
           import base64,json,os,subprocess,urllib.request
           from pathlib import Path
           base='387ec628ecab655819be3b571666f070673590a1'
-          files=['src/vim9_ide.rs','src/vim9_dialog_focus.rs','scripts/native-vim9-buffer-smoke.py','.github/workflows/ci.yml']
-          temporary=['scripts/stage-vim9-dialog-focus.py','.github/workflows/vim-dialog-candidate.yml']
+          files=['src/vim9_ide.rs','src/vim9_dialog_focus.rs','src/main.rs','scripts/native-vim9-buffer-smoke.py','.github/workflows/ci.yml']
+          temporary=['scripts/stage-vim9-dialog-focus.py','scripts/stage-release-paste.py','.github/workflows/vim-dialog-candidate.yml']
           changed=set(subprocess.check_output(['git','diff',base,'--name-only'],text=True).splitlines())
           assert changed == set(files + temporary), changed
           assert subprocess.check_output(['git','diff',base,'--','Cargo.toml','Cargo.lock','font-group-harness/lib.rs','font-group-harness/Cargo.lock']) == b''
@@ -120,7 +127,7 @@ jobs:
               mode='100755' if path.startswith('scripts/') else '100644'
               entries.append({'path':path,'mode':mode,'type':'blob','sha':sha})
           tree=request('/git/trees',{'base_tree':tree,'tree':entries})['sha']
-          message='fix(vim): preserve modal focus and provider query caret\n\nRetain focus through hidden sizing passes, apply it before text processing, and position the caret after a selected Simple provider prefix. Keep focused controls and Unicode query edits intact.\n\nAdd six real-egui regression tests and an independent real-Vim/X11 modal gate. Preserve the default full native buffer suite. Validate the locked GUI stack, an intentional before-fix failure, production IDE tests, optimized build, strict production Clippy, and two keyboard-only GUI runs. Shared core and dependency locks are unchanged.'
+          message='fix(vim): preserve modal focus and provider query caret\n\nRetain focus through hidden sizing passes, apply it before text processing, and position the caret after a selected Simple provider prefix. Keep focused controls and Unicode query edits intact. Preserve first-paste detection and debug logging while fixing its release-only lint.\n\nAdd six real-egui regression tests and an independent real-Vim/X11 modal gate. Preserve the default full native buffer suite. Validate the locked GUI stack, an intentional before-fix failure, production IDE and paste tests, optimized build, strict production Clippy, and two keyboard-only GUI runs. Shared core and dependency locks are unchanged.'
           commit=request('/git/commits',{'message':message,'tree':tree,'parents':[base]})['sha']
           Path('evidence/candidate.json').write_text(json.dumps({'base':base,'commit':commit,'files':entries,'master_updated':False},indent=2)+'\n')
           Path('evidence/candidate.patch').write_bytes(subprocess.check_output(['git','diff',base,'--',*files]))
