@@ -1,0 +1,13 @@
+name: Native Vim render wake candidate
+on:
+  push:
+    branches: [codex/vim-render-wake-20261024]
+    paths: [.github/workflows/vim-render-wake-candidate.yml, .ci/vim-render-wake.patch.b64]
+permissions:
+  contents: write
+jobs:
+  validate:
+    uses: beamiter/jterm_core/.github/workflows/vim-render-wake-frontends.yml@3dbcec71d33a0dbcf7b1e562c31102e4d2a255df
+    with:
+      base: 6469f3336345e208544db9c92bc914dca31e5b1d
+      patch_sha256: bcf6957df838ce742efc2903438d6a860b7c904e797ba1677ded960fe190b809
