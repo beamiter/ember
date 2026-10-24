@@ -135,6 +135,21 @@ impl EditorDialog {
         }
     }
 
+    fn select_workbench_section(&mut self, query: &str) {
+        if self.kind != DialogKind::QuickOpen {
+            return;
+        }
+        self.query = query.to_owned();
+        self.activated_command = None;
+        self.confirm_requested = false;
+        self.selected = 0;
+        self.selection_delta = 0;
+        self.page_delta = 0;
+        self.needs_focus = true;
+        self.reveal_selection = true;
+        self.error = None;
+    }
+
     fn refresh_quick_matches(
         &mut self,
         project: &Vim9ProjectSnapshot,
@@ -1280,9 +1295,17 @@ impl Workbench {
                         ));
                     }
                 }
+                let query_id = ui.make_persistent_id(("vim9_dialog_query", session_id));
+                if dialog.needs_focus {
+                    // Apply a category's pending focus before TextEdit reads
+                    // this frame's input. The category controls are below the
+                    // field, so their pointer click cannot steal it back.
+                    ui.memory_mut(|memory| memory.request_focus(query_id));
+                    dialog.needs_focus = false;
+                }
                 let edit = ui.add(
                     egui::TextEdit::singleline(&mut dialog.query)
-                        .id_salt(("vim9_dialog_query", session_id))
+                        .id(query_id)
                         .desired_width(f32::INFINITY)
                         .hint_text(match dialog.kind {
                             DialogKind::QuickOpen => "File[:line[:column]], :line, or >command…",
@@ -1294,12 +1317,30 @@ impl Workbench {
                         }),
                 );
                 dialog.query_widget = Some(edit.id);
-                if dialog.needs_focus {
-                    edit.request_focus();
-                    dialog.needs_focus = false;
-                }
                 if edit.changed() {
                     dialog.error = None;
+                }
+                if dialog.kind == DialogKind::QuickOpen {
+                    let sections = self.snapshot.workbench.sections();
+                    if !sections.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            for section in &sections {
+                                let active = section.matches_query(&dialog.query);
+                                if ui.selectable_label(active, section.title)
+                                    .on_hover_text(crate::review_text::visible_bounded(&section.summary, 1024))
+                                    .clicked()
+                                {
+                                    // Filtering never confirms the previously selected action.
+                                    dialog.select_workbench_section(section.query);
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        });
+                        if let Some(section) = sections.iter().find(|section| section.matches_query(&dialog.query))
+                        {
+                            ui.small(crate::review_text::visible_bounded(&section.summary, 1024));
+                        }
+                    }
                 }
 
                 command_mode = dialog.kind == DialogKind::QuickOpen
@@ -2844,6 +2885,64 @@ mod tests {
             mode: "n".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn workbench_section_clears_pending_activation_and_preserves_source_identity() {
+        let mut picker = EditorDialog::new(DialogKind::QuickOpen);
+        picker.query = ">save".into();
+        picker.activated_command = Some((picker.query.clone(), Vim9PaletteCommand::Save));
+        picker.confirm_requested = true;
+        picker.selection_delta = 1;
+        picker.page_delta = 8;
+        picker.select_workbench_section(">simplegit");
+        assert!(!picker.confirm_requested);
+        assert!(picker.activated_command.is_none());
+        assert!(picker.needs_focus);
+        assert_eq!(
+            (picker.selection_delta, picker.page_delta, picker.selected),
+            (0, 0, 0)
+        );
+        let source = Vim9Snapshot {
+            connected: true,
+            mode: "n".into(),
+            buffer: 3,
+            window: 1001,
+            changedtick: 7,
+            line: 4,
+            column: 8,
+            capabilities: vec!["simple_git_status".into()],
+            ..Default::default()
+        };
+        picker.refresh_command_matches();
+        picker.selected = picker
+            .command_matches
+            .iter()
+            .position(|command| {
+                *command
+                    == Vim9PaletteCommand::Workbench(
+                        jterm_core::vim9::Vim9WorkbenchAction::SimpleGitStatus,
+                    )
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                picker
+                    .quick_action_command(&Vim9ProjectSnapshot::default(), &source)
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({"action":"workbench", "command":"simple_git_status", "buffer":3, "window":1001, "changedtick":7, "line":4, "column":8})
+        );
+        let mut unavailable = source;
+        unavailable.capabilities.clear();
+        assert!(picker
+            .quick_action_command(&Vim9ProjectSnapshot::default(), &unavailable)
+            .is_err());
+        let mut goto = EditorDialog::new(DialogKind::Goto);
+        goto.query = "42".into();
+        goto.select_workbench_section(">simplegit");
+        assert_eq!(goto.query, "42");
     }
 
     #[test]
