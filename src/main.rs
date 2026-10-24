@@ -6239,8 +6239,13 @@ impl eframe::App for TerminalApp {
         let paste_confirmation_was_open = self.pending_paste_confirm.is_some();
         let mut semantic_paste_claims_rest = false;
         let mut rejected_mouse_prefix_allows_pointer = false;
-        let saw_semantic_paste = events_copy.iter().any(|event| {
-            if let egui::Event::Paste(_content) = event {
+        let saw_semantic_paste = events_copy
+            .iter()
+            .find_map(|event| match event {
+                egui::Event::Paste(content) => Some(content),
+                _ => None,
+            })
+            .inspect(|_content| {
                 crate::debug_log!(
                     "[EVENT] detected Paste event: {:?}",
                     if _content.is_empty() {
@@ -6249,11 +6254,8 @@ impl eframe::App for TerminalApp {
                         "has content"
                     }
                 );
-                true
-            } else {
-                false
-            }
-        });
+            })
+            .is_some();
 
         if saw_semantic_paste {
             crate::debug_log!("[PASTE] ===== Semantic Paste triggered =====");

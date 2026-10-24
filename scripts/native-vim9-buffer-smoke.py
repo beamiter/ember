@@ -33,6 +33,8 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--app", choices=("ember", "frost"), required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--scenario", choices=("all", "palette"), default="all",
+                        help="Run the full native suite or the independent modal input gate")
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -202,6 +204,27 @@ def main():
         wait_for(lambda: state().get("text") == original.splitlines()[0] and state().get("modified") == 0,
                  "palette focus probe undo", app)
         report["command_palette_escape_focus"] = "passed"
+        if args.scenario == "palette":
+            # Cold/reopened modal input must not require a pointer click. Both
+            # editor dialogs share the focus helper, but own distinct queries.
+            for line, column in ((2, 3), (3, 1), (1, 1)):
+                xdo("key", "ctrl+shift+g")
+                xdo("type", "--clearmodifiers", "--delay", "0", f"{line}:{column}")
+                xdo("key", "Return")
+                wait_for(lambda: state().get("line") == line and state().get("column") == column,
+                         f"keyboard-only Go to {line}:{column}", app)
+                capture(f"goto-{line}-{column}")
+                assert state().get("modified") == 0
+                assert source.read_text(encoding="utf-8") == original
+            report["goto_reopen_without_click"] = "passed"
+            report["vim_state"] = state()
+            command("qa")
+            app.wait(timeout=10)
+            assert app.returncode == 0
+            report["normal_quit"] = "passed"
+            (out / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+            print(json.dumps(report, indent=2))
+            return
         # Trace a real wheel notch through window pixels in a disposable Vim
         # buffer. A distinctive source line supplies the visual position oracle.
         command("enew | call setline(1, map(range(1,200), {_, n -> printf('WHEEL_%03d native scroll', n)})) | setlocal nowrap scrolloff=0")

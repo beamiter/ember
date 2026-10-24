@@ -1,6 +1,9 @@
 //! Native Vim9 workbench and GUI buffer rendering around a real Vim process.
 //! Editing, undo, registers, plugins and modified-buffer protection belong to Vim.
 
+#[path = "vim9_dialog_focus.rs"]
+mod dialog_focus;
+
 use crate::app::state::TerminalApp;
 use eframe::egui;
 use jterm_core::vim9::{
@@ -1296,13 +1299,9 @@ impl Workbench {
                     }
                 }
                 let query_id = ui.make_persistent_id(("vim9_dialog_query", session_id));
-                if dialog.needs_focus {
-                    // Apply a category's pending focus before TextEdit reads
-                    // this frame's input. The category controls are below the
-                    // field, so their pointer click cannot steal it back.
-                    ui.memory_mut(|memory| memory.request_focus(query_id));
-                    dialog.needs_focus = false;
-                }
+                // Hidden sizing passes cannot own the query. Request focus
+                // before TextEdit reads input, but keep it pending until visible.
+                dialog_focus::request(ui, query_id, &mut dialog.needs_focus);
                 let edit = ui.add(
                     egui::TextEdit::singleline(&mut dialog.query)
                         .id(query_id)
@@ -1332,6 +1331,7 @@ impl Workbench {
                                 {
                                     // Filtering never confirms the previously selected action.
                                     dialog.select_workbench_section(section.query);
+                                    dialog_focus::move_caret_to_end(ui.ctx(), edit.id, &dialog.query);
                                     ui.ctx().request_repaint();
                                 }
                             }

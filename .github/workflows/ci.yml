@@ -322,6 +322,14 @@ jobs:
             --binary "$RUNNER_TEMP/ember-installed/bin/ember" --app ember \
             --output native-smoke-artifacts/vim9-buffer-gui
 
+      - name: Gate native Vim modal focus independently
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          xvfb-run -a -s '-screen 0 1600x1100x24' /usr/bin/python3 scripts/native-vim9-buffer-smoke.py \
+            --binary "$RUNNER_TEMP/ember-installed/bin/ember" --app ember --scenario palette \
+            --output native-smoke-artifacts/vim9-modal-focus
+
       - name: Probe owned Block Search accessibility on isolated X11
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
         timeout-minutes: 3
