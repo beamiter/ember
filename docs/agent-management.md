@@ -143,3 +143,57 @@ Status counts describe matches before the selected status view. A running native
 stream, waiting approval and task lifecycle remain separate facts. Existing
 Start, Stop, Follow-up, Finish, Validation and Review diff controls continue to
 use the authoritative task runtime; browsing and filtering do not change tasks.
+
+### Work through the attention queues
+
+The task dashboard separates work that needs you into **Approvals**, **Needs
+reply**, **Validation issues**, **Ready to review** and **Failed tasks**. Counts
+describe the current search, provider and project scope before the selected
+status view or attention queue. A pending approval or question takes precedence
+over an older validation issue; a running check is not a review-ready result.
+
+Choose a queue to narrow the list without replacing your search text. Choosing
+a status view clears the queue selection; **Clear filters** clears both. A
+selected task stays bound to its identity when it is hidden by either filter.
+**Show selected task** restores the full view, while **Next needs you** navigates
+only the currently visible tasks. These controls never start or accept work.
+
+Task search now supports field constraints in the same dashboard:
+
+| Search | Result |
+| --- | --- |
+| `provider:codex attention:approval,review` | Codex tasks awaiting approval or review |
+| `project:ember -validation:passed` | Matching projects without a recorded passing check |
+| `status:failed,cancelled "release plan"` | Failed or cancelled tasks matching the phrase |
+| `is:running -runtime:fallback` | Current activity excluding terminal-fallback tasks |
+| `branch:release id:1234` | A branch match and a task-ID fragment |
+
+Supported fields are `title`, `provider`, `status`, `runtime`, `validation`,
+`project`, `branch`, `id`, `is` and `attention`. Separate terms combine with AND;
+comma-separated alternatives in enumerated fields combine with OR. Prefix a
+term with `-` to exclude it and use double quotes for phrases. **Search help**
+shows examples in the panel. Queries are limited to 256 UTF-8 bytes. Invalid
+fields or values show an error and no results, retaining the selected task and
+editor drafts until the query is corrected. Enter selects a result without
+starting the Agent. Pasting a query never silently truncates its final terms;
+an editor update larger than 4 KiB is rejected in full with a visible notice.
+
+### Read task state without conflating progress and acceptance
+
+Task cards show the provider and lifecycle, validation attempt/result, runtime
+attachment, project/branch and last recorded update separately. A live native
+session can remain open while its task awaits review. A passing validation is
+shown as a passing check; the completion checkmark appears only after the task
+has actually been accepted. Relative update times use the task's recorded
+timestamp, with unavailable or future timestamps identified explicitly.
+Card height follows the configured text sizes, keeping all six information
+lines visible when the interface font is enlarged.
+
+The selected task's **Next step** and current blocking reason use the shared
+four-terminal guidance. Pending recovery registration takes precedence until
+its durable marker is confirmed. These explanations do not enable an action
+whose runtime prerequisites are unmet. Action controls appear before the
+expandable goal and inspector, keeping long instructions from pushing the
+controls out of immediate reach. Follow-up drafts are cleared only after
+the runtime accepts the exact submitted text; a later edit or another task's
+draft remains available.

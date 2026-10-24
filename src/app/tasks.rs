@@ -5,40 +5,13 @@
 //! egui closure, so a concurrent PTY exit or tab removal cannot redirect an
 //! action to an unrelated index.
 
-/// A display-only reason, selected from authoritative task/validation details.
-pub(crate) fn task_reason(
-    status: jterm_core::agent_task::TaskStatus,
-    validation: jterm_core::agent_task::TaskValidationStatus,
-    status_detail: Option<&str>,
-    validation_detail: Option<&str>,
-) -> Option<String> {
-    use jterm_core::agent_task::{TaskStatus, TaskValidationStatus};
-    let nonempty = |text: &&str| !text.trim().is_empty();
-    let validation_reason = matches!(
-        validation,
-        TaskValidationStatus::Failed | TaskValidationStatus::Inconclusive
-    )
-    .then_some(validation_detail)
-    .flatten()
-    .filter(nonempty);
-    let task_reason = matches!(
-        status,
-        TaskStatus::Failed | TaskStatus::WaitingForHuman | TaskStatus::WaitingForApproval
-    )
-    .then_some(status_detail)
-    .flatten()
-    .filter(nonempty);
-    validation_reason
-        .or(task_reason)
-        .map(|text| jterm_core::review_input::safe_inline_display(text.trim(), 1024))
-}
-
 use crate::agent::{
     AgentProvider, AgentSessionOutcome, ApprovalDecision, ApprovalId, CodexAppServerApprovalKind,
-    CodexAppServerPhase, CodexAppServerTurnHistory, CodexAppServerViewSnapshot, NativePromptPolicy,
-    TaskBrief, TaskId, TaskInspector, TaskRuntimeKind, TaskStatus, TaskValidationRecipe,
-    TaskValidationStatus, CODEX_APP_SERVER_LIVE_TURN_MAX, NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
-    PTY_TASK_BRIEF_RELATIVE,
+    CodexAppServerPhase, CodexAppServerTurnHistory, CodexAppServerViewSnapshot,
+    DashboardAttentionKind, DashboardRow, DashboardSnapshot, DashboardView, NativePromptPolicy,
+    TaskBrief, TaskGuidance, TaskId, TaskInspector, TaskRuntimeKind, TaskStatus,
+    TaskValidationRecipe, TaskValidationStatus, CODEX_APP_SERVER_LIVE_TURN_MAX,
+    NATIVE_AGENT_FOLLOW_UP_MAX_BYTES, PTY_TASK_BRIEF_RELATIVE,
 };
 use crate::app::state::TerminalApp;
 use crate::review_text::{sanitize_prompt_payload, visible_bounded, VisualSpoofDisposition};
@@ -49,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_TASK_TITLE_DISPLAY_BYTES: usize = 160;
 const MAX_TASK_BRANCH_DISPLAY_BYTES: usize = 120;
@@ -146,6 +119,7 @@ pub struct TaskSidebarState {
     dashboard_provider: Option<AgentProvider>,
     dashboard_project: Option<PathBuf>,
     dashboard_sort: jterm_core::agent_task::DashboardSort,
+    dashboard_attention: Option<DashboardAttentionKind>,
     scroll_to_selected: bool,
     pending_creation: Option<PendingTaskCreation>,
     composer: TaskComposer,
@@ -415,46 +389,44 @@ impl TaskRowSnapshot {
     }
 }
 
-fn task_next_step(
+fn task_guidance(
+    task: &crate::agent::AgentTask,
     row: &TaskRowSnapshot,
-    manual_review: bool,
-    has_input: bool,
     registration_pending: bool,
-) -> &'static str {
+) -> TaskGuidance {
+    let mut guidance = TaskGuidance::from_task(
+        task,
+        jterm_core::agent_task::DashboardActivity {
+            has_agent_terminal: row.has_agent_terminal,
+            has_validation_terminal: row.has_validation_terminal,
+            has_active_agent_stream: row.has_active_agent_stream,
+            native_preparing: row.native_preparing,
+        },
+    );
     if registration_pending {
-        "Registration is awaiting its durable recovery marker. Start remains blocked until confirmation succeeds."
-    } else if row.native_preparing {
-        "Checking the provider and isolated workspace. You can cancel preparation before it starts."
-    } else if row.validation_status == TaskValidationStatus::Running {
-        "Validation is running. Open Validation output to follow the result; acceptance remains blocked."
-    } else {
-        match row.status {
-            TaskStatus::Created if !has_input => "Recovery preserved this worktree without its goal or command evidence. Inspect it with Review diff; create a new goal task to resume guided work.",
-            TaskStatus::Created => "Review the goal and project, then explicitly choose Start. Creating a task does not start its Agent.",
-            TaskStatus::WaitingForApproval => "Review the pending approval and its exact requested operation before choosing Allow or Deny.",
-            TaskStatus::WaitingForHuman => "The Agent needs your input. Inspect its latest activity or open its terminal.",
-            TaskStatus::ReadyForReview if row.has_active_agent_stream => "Review the latest result and send feedback if needed. Finish the Agent session before validation or acceptance.",
-            TaskStatus::ReadyForReview if manual_review => "Review the diff and acceptance criteria. No validation command was configured; choose Accept reviewed work when satisfied.",
-            TaskStatus::ReadyForReview if row.validation_status == TaskValidationStatus::Passed => "Validation passed. Review the diff, then choose Mark complete to accept the work.",
-            TaskStatus::ReadyForReview if row.validation_status.needs_attention() => "Inspect the validation result and diff. Resolve the issue and run validation again before completion.",
-            TaskStatus::ReadyForReview => "Review the diff and run validation. Completion requires a passing validation result.",
-            TaskStatus::Completed => "Work was accepted. You can inspect the diff or hide its task card while retaining the worktree.",
-            TaskStatus::Failed | TaskStatus::Cancelled => "Inspect the latest failure or cancellation and the preserved worktree. Available recovery controls appear below.",
-            TaskStatus::Starting | TaskStatus::Working => "The Agent is working. Inspect its activity, open its terminal, or stop it when necessary.",
-            TaskStatus::Archived => "This task is hidden; its worktree is preserved.",
-        }
+        guidance.title = "Confirm task registration";
+        guidance.detail = "Registration is awaiting its durable recovery marker. Start remains blocked until confirmation succeeds.";
     }
+    guidance
 }
 
-fn render_task_inspector(
-    ui: &mut egui::Ui,
-    id: TaskId,
-    inspector: &TaskInspector,
-    next_step: &str,
-) {
+fn render_task_guidance(ui: &mut egui::Ui, guidance: &TaskGuidance) {
     ui.group(|ui| {
-        ui.strong("Next step");
-        ui.label(next_step);
+        ui.strong(format!("Next step · {}", guidance.title));
+        ui.label(guidance.detail);
+        if let Some(reason) = &guidance.reason {
+            egui::ScrollArea::vertical()
+                .id_salt("task_current_blocker")
+                .max_height(112.0)
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(reason).color(ui.visuals().warn_fg_color));
+                });
+        }
+    });
+}
+
+fn render_task_inspector(ui: &mut egui::Ui, id: TaskId, inspector: &TaskInspector) {
+    ui.group(|ui| {
         if let Some(goal) = &inspector.goal {
             egui::CollapsingHeader::new("Goal and acceptance criteria")
                 .id_salt(("task_goal", id))
@@ -550,6 +522,285 @@ fn rows_in_dashboard_order(
         .iter()
         .filter_map(|row| by_id.remove(&row.id))
         .collect()
+}
+
+/// Queue navigation preserves the query and project/provider scope. Neither
+/// selection nor a changing count creates an execution request.
+fn dashboard_filter_chips<T: Copy>(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    choices: &[(T, String, bool)],
+    help: impl Fn(T) -> String,
+) -> Option<T> {
+    let available = ui.available_width().max(1.0);
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let natural_width = choices
+        .iter()
+        .map(|(_, label, _)| {
+            ui.fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
+        })
+        .fold(0.0, f32::max);
+    let width = (natural_width + 16.0).ceil().min(available);
+    let gap = ui.spacing().item_spacing.x;
+    let columns = ((available + gap) / (width + gap)).floor().max(1.0) as usize;
+    let mut chosen = None;
+    ui.push_id(id, |ui| {
+        for (row, chunk) in choices.chunks(columns).enumerate() {
+            ui.horizontal(|ui| {
+                for (column, (value, label, selected)) in chunk.iter().enumerate() {
+                    if ui
+                        .push_id(row * columns + column, |ui| {
+                            ui.add_sized(
+                                [width, ui.spacing().interact_size.y],
+                                egui::Button::selectable(
+                                    *selected,
+                                    egui::RichText::new(label).font(font.clone()),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(help(*value))
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        chosen = Some(*value);
+                    }
+                }
+            });
+        }
+    });
+    chosen
+}
+
+fn render_attention_queues(
+    ui: &mut egui::Ui,
+    search_matches: &DashboardSnapshot,
+    attention: &mut Option<DashboardAttentionKind>,
+    view: &mut DashboardView,
+) {
+    ui.label(
+        egui::RichText::new("Attention queues · within this search")
+            .small()
+            .weak(),
+    );
+    let choices = DashboardAttentionKind::ALL.map(|kind| {
+        let count = search_matches
+            .rows
+            .iter()
+            .filter(|row| row.attention_kind() == Some(kind))
+            .count();
+        (
+            kind,
+            format!("{} {count}", kind.label()),
+            *attention == Some(kind),
+        )
+    });
+    if let Some(kind) = dashboard_filter_chips(ui, "task_attention_queue", &choices, |kind| {
+        format!(
+            "Filter this search and project scope to {}. Search syntax: attention:{}",
+            kind.label().to_lowercase(),
+            kind.query_value()
+        )
+    }) {
+        *attention = Some(kind);
+        *view = DashboardView::All;
+    }
+}
+
+fn filter_attention_queue(
+    dashboard: &mut DashboardSnapshot,
+    attention: Option<DashboardAttentionKind>,
+) {
+    if let Some(kind) = attention {
+        dashboard
+            .rows
+            .retain(|row| row.attention_kind() == Some(kind));
+    }
+}
+
+fn task_runtime_label(row: &TaskRowSnapshot) -> Option<&'static str> {
+    if row.native_preparing {
+        Some("Preparing Agent")
+    } else if row.has_active_agent_stream {
+        Some("Native session open")
+    } else if row.has_agent_terminal {
+        Some("Agent terminal available")
+    } else if row.status.is_running() {
+        Some("No attached terminal or native stream")
+    } else {
+        None
+    }
+}
+
+fn task_validation_label(row: &TaskRowSnapshot) -> String {
+    if row.validation_attempt == 0 {
+        format!("Validation: {}", row.validation_status.label())
+    } else {
+        format!(
+            "Validation #{}: {}",
+            row.validation_attempt,
+            row.validation_status.label(),
+        )
+    }
+}
+
+fn task_update_age(updated_at_ms: u64, now_ms: u64) -> String {
+    if updated_at_ms == 0 {
+        return "Update time unavailable".into();
+    }
+    let Some(elapsed) = now_ms.checked_sub(updated_at_ms) else {
+        return "Update time is ahead of this clock".into();
+    };
+    match elapsed / 1_000 {
+        0..60 => "Updated just now".into(),
+        seconds @ 60..3_600 => format!("Updated {}m ago", seconds / 60),
+        seconds @ 3_600..86_400 => format!("Updated {}h ago", seconds / 3_600),
+        seconds => format!("Updated {}d ago", seconds / 86_400),
+    }
+}
+
+fn task_row_marker(row: &TaskRowSnapshot) -> &'static str {
+    if row.needs_attention {
+        "!"
+    } else if row.is_running() {
+        "●"
+    } else if row.status == TaskStatus::Completed {
+        "✓"
+    } else {
+        "·"
+    }
+}
+
+/// Lifecycle, validation, and an open runtime are separate facts. In
+/// particular, a validation pass must not draw a completed-task checkmark.
+fn task_row_button(
+    ui: &mut egui::Ui,
+    row: &TaskRowSnapshot,
+    shared: &DashboardRow,
+    selected: bool,
+    now_ms: u64,
+) -> egui::Response {
+    ui.push_id(("task_overview", row.id), |ui| {
+        let lifecycle = format!("{} · {}", row.provider.display_name(), row.status.label());
+        let validation = task_validation_label(row);
+        let runtime = task_runtime_label(row);
+        let context = format!("{} · {}", row.project, row.branch);
+        let age = task_update_age(shared.updated_at_ms, now_ms);
+        let attention = shared.attention_kind();
+        let freshness = match attention {
+            Some(kind) => format!("{} · {age}", kind.label()),
+            None => age,
+        };
+        let validation_and_runtime = match runtime {
+            Some(runtime) => format!("{validation} · {runtime}"),
+            None => validation.clone(),
+        };
+        let marker = task_row_marker(row);
+        let accessible = format!(
+            "{}. {lifecycle}. {validation_and_runtime}. {context}. {freshness}",
+            row.title,
+        );
+        let row_spacing = 2.0;
+        // Each laid-out line rounds up independently. Rounding only their
+        // sum can crop the final descender when the user enlarges UI fonts.
+        let card_height = (ui.text_style_height(&egui::TextStyle::Body).ceil()
+            + 5.0 * ui.text_style_height(&egui::TextStyle::Small).ceil()
+            + 5.0 * row_spacing
+            + 14.0)
+            .max(96.0);
+        let response = ui.add_sized(
+            [ui.available_width(), card_height],
+            egui::Button::selectable(selected, ""),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                selected,
+                &accessible,
+            )
+        });
+        let content = response.rect.shrink2(egui::vec2(8.0, 7.0));
+        let detail_color = if selected {
+            ui.visuals().selection.stroke.color
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .id(response.id.with("text"))
+                .max_rect(content)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| {
+                ui.set_clip_rect(content.intersect(ui.clip_rect()));
+                ui.spacing_mut().item_spacing.y = row_spacing;
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{marker} {}", row.title))
+                            .strong()
+                            .color(if selected {
+                                detail_color
+                            } else {
+                                ui.visuals().text_color()
+                            }),
+                    )
+                    .truncate(),
+                );
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&lifecycle).small().color(if selected {
+                        detail_color
+                    } else {
+                        task_status_color(ui, row.status)
+                    }))
+                    .truncate(),
+                );
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&validation).small().color(if selected {
+                        detail_color
+                    } else {
+                        task_validation_color(ui, row.validation_status)
+                    }))
+                    .truncate(),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(runtime.unwrap_or("No attached Agent runtime"))
+                            .small()
+                            .color(detail_color),
+                    )
+                    .truncate(),
+                );
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&context).small().color(detail_color))
+                        .truncate(),
+                );
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&freshness).small().color(detail_color))
+                        .truncate(),
+                );
+            },
+        );
+        response.on_hover_text(accessible)
+    })
+    .inner
+}
+
+fn clear_sent_follow_up(
+    drafts: &mut HashMap<TaskId, String>,
+    task_id: TaskId,
+    accepted_text: &str,
+) {
+    if drafts
+        .get(&task_id)
+        .is_some_and(|draft| draft == accepted_text)
+    {
+        drafts.remove(&task_id);
+    }
 }
 
 fn render_native_codex_view(
@@ -1709,28 +1960,41 @@ impl TerminalApp {
                 },
             )
         };
-        let previous_view = self.task_sidebar.dashboard_view;
-        let mut dashboard = project_dashboard(previous_view);
-        ui.horizontal_wrapped(|ui| {
-            use jterm_core::agent_task::DashboardView;
-            for view in [
-                DashboardView::All,
-                DashboardView::NeedsAttention,
-                DashboardView::Running,
-                DashboardView::NotStarted,
-                DashboardView::Review,
-                DashboardView::Finished,
-            ] {
-                ui.selectable_value(
-                    &mut self.task_sidebar.dashboard_view,
-                    view,
-                    dashboard_filter_label(view, &dashboard.counts),
-                );
-            }
+        let search_matches = project_dashboard(DashboardView::All);
+        let views = [
+            DashboardView::All,
+            DashboardView::NeedsAttention,
+            DashboardView::Running,
+            DashboardView::NotStarted,
+            DashboardView::Review,
+            DashboardView::Finished,
+        ]
+        .map(|view| {
+            (
+                view,
+                dashboard_filter_label(view, &search_matches.counts),
+                self.task_sidebar.dashboard_attention.is_none()
+                    && self.task_sidebar.dashboard_view == view,
+            )
         });
-        if self.task_sidebar.dashboard_view != previous_view {
-            dashboard = project_dashboard(self.task_sidebar.dashboard_view);
+        if let Some(view) = dashboard_filter_chips(ui, "task_status_views", &views, |_| {
+            "Filter tasks within the current search and project scope.".into()
+        }) {
+            self.task_sidebar.dashboard_view = view;
+            self.task_sidebar.dashboard_attention = None;
         }
+        render_attention_queues(
+            ui,
+            &search_matches,
+            &mut self.task_sidebar.dashboard_attention,
+            &mut self.task_sidebar.dashboard_view,
+        );
+        let mut dashboard = DashboardSnapshot::filter_rows(
+            &search_matches.rows,
+            "",
+            self.task_sidebar.dashboard_view,
+        );
+        filter_attention_queue(&mut dashboard, self.task_sidebar.dashboard_attention);
         dashboard.sort_rows(self.task_sidebar.dashboard_sort);
         if open_result {
             if let Some(row) = dashboard.rows.first() {
@@ -1757,6 +2021,7 @@ impl TerminalApp {
             || self.task_sidebar.dashboard_view != jterm_core::agent_task::DashboardView::All
             || self.task_sidebar.dashboard_provider.is_some()
             || self.task_sidebar.dashboard_project.is_some()
+            || self.task_sidebar.dashboard_attention.is_some()
         {
             clear_filters |= ui.button("Clear filters").clicked();
         }
@@ -1769,6 +2034,7 @@ impl TerminalApp {
             self.task_sidebar.dashboard_view = jterm_core::agent_task::DashboardView::All;
             self.task_sidebar.dashboard_provider = None;
             self.task_sidebar.dashboard_project = None;
+            self.task_sidebar.dashboard_attention = None;
             self.task_sidebar.scroll_to_selected = true;
             ui.ctx().request_repaint();
         }
@@ -1799,6 +2065,12 @@ impl TerminalApp {
             }
         });
         let rows = rows_in_dashboard_order(rows, &dashboard);
+        let row_details: HashMap<_, _> = dashboard.rows.iter().map(|row| (row.id, row)).collect();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         if has_tasks && rows.is_empty() {
             ui.label("No tasks match these filters.");
             return;
@@ -1843,35 +2115,8 @@ impl TerminalApp {
             .show(ui, |ui| {
                 for row in &rows {
                     let selected = self.task_sidebar.selected == Some(row.id);
-                    let attention = row.needs_attention;
-                    let marker = if attention {
-                        "!"
-                    } else if row.is_running() {
-                        "●"
-                    } else if row.status == TaskStatus::Completed
-                        || row.validation_status == TaskValidationStatus::Passed
-                    {
-                        "✓"
-                    } else {
-                        "·"
-                    };
-                    let color = if row.native_preparing {
-                        egui::Color32::from_rgb(90, 150, 230)
-                    } else if row.validation_status == TaskValidationStatus::NotRun {
-                        task_status_color(ui, row.status)
-                    } else {
-                        task_validation_color(ui, row.validation_status)
-                    };
-                    let response = ui
-                        .horizontal(|ui| {
-                            ui.colored_label(color, marker);
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(&row.title).strong())
-                                    .truncate(),
-                            );
-                        })
-                        .response
-                        .interact(egui::Sense::click());
+                    let Some(shared) = row_details.get(&row.id) else { continue; };
+                    let response = task_row_button(ui, row, shared, selected, now_ms);
                     if selected && self.task_sidebar.scroll_to_selected {
                         response.scroll_to_me(Some(egui::Align::Min));
                         self.task_sidebar.scroll_to_selected = false;
@@ -1880,37 +2125,12 @@ impl TerminalApp {
                         self.task_sidebar.selected = Some(row.id);
                     }
 
-                    ui.horizontal(|ui| {
-                        ui.add_space(18.0);
-                        let activity = if row.native_preparing {
-                            format!("{} · Preparing…", row.provider.display_name())
-                        } else if row.validation_attempt == 0 {
-                            format!("{} · {}", row.provider.display_name(), row.status.label())
-                        } else {
-                            format!(
-                                "{} · Validation #{} {}",
-                                row.provider.display_name(),
-                                row.validation_attempt,
-                                row.validation_status.label().to_lowercase()
-                            )
-                        };
-                        ui.label(egui::RichText::new(activity).small().color(color));
-                        if row.native_preparing {
-                            ui.spinner();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(18.0);
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(format!("{} · {}", row.project, row.branch)).small().weak())
-                                .truncate(),
-                        ).on_hover_text(format!("{}\n{}", row.project, row.branch));
-                    });
-
-                    if let Some(reason) = task_reason(row.status, row.validation_status, row.status_detail.as_deref(), row.validation_detail.as_deref()) {
+                    if let Some(reason) = self.task_manager.get(row.id)
+                        .and_then(|task| TaskGuidance::from_task(task, shared.activity).reason) {
+                        let preview = jterm_core::review_input::safe_inline_display(&reason, 1024);
                         ui.horizontal(|ui| {
                             ui.add_space(18.0);
-                            ui.add(egui::Label::new(egui::RichText::new(&reason).small().weak()).truncate())
+                            ui.add(egui::Label::new(egui::RichText::new(preview).small().weak()).truncate())
                                 .on_hover_text(&reason);
                         });
                     }
@@ -1924,7 +2144,7 @@ impl TerminalApp {
                         let has_validation = task.is_some_and(|task| task.validation_command().is_some());
                         let registration_pending = self.task_sidebar.unconfirmed_registrations.contains(&row.id);
                         if let Some(task) = task {
-                            render_task_inspector(ui, row.id, &TaskInspector::from_task(task), task_next_step(row, manual_review, has_input, registration_pending));
+                            render_task_guidance(ui, &task_guidance(task, row, registration_pending));
                         }
                         if let Some(notice) = native_start_notice(row.provider) {
                             ui.label(egui::RichText::new(notice).small().color(egui::Color32::YELLOW));
@@ -2169,6 +2389,9 @@ impl TerminalApp {
                             }
                         });
                         });
+                        if let Some(task) = task {
+                            render_task_inspector(ui, row.id, &TaskInspector::from_task(task));
+                        }
                         if let Some(detail) = &row.status_detail {
                             ui.horizontal(|ui| {
                                 ui.add_space(18.0);
@@ -2381,7 +2604,11 @@ impl TerminalApp {
                     .prompt_codex(&self.task_manager, task_id, &text, policy)
                 {
                     Ok(()) => {
-                        self.task_sidebar.follow_up_drafts.remove(&task_id);
+                        clear_sent_follow_up(
+                            &mut self.task_sidebar.follow_up_drafts,
+                            task_id,
+                            &text,
+                        );
                         self.set_status("Follow-up queued on the existing Codex thread…");
                     }
                     Err(error) => {
@@ -2937,15 +3164,56 @@ fn dashboard_filter_label(
 
 /// Use TextEdit's own Enter/focus handling; this is not a terminal shortcut.
 fn dashboard_search(ui: &mut egui::Ui, query: &mut String) -> bool {
+    let previous = query.clone();
+    let rejected_input = egui::Id::new("agent-task-query-rejected-input");
     let search = ui.add(
         egui::TextEdit::singleline(query)
             .id(egui::Id::new("agent-task-search"))
-            .hint_text("Search tasks, providers or repositories · Enter to open")
-            .char_limit(256),
-    );
+            .hint_text("Search tasks · provider:codex attention:review"),
+    ).on_hover_text("Enter selects the first matching task. Search never starts an Agent or confirms an operation.");
+    // Truncating a pasted query can drop its final exclusion and silently
+    // broaden the result set. Preserve input through the core's byte budget;
+    // reject an excessive editor update atomically instead of truncating it.
+    let input_rejected = query.len() > 4096;
+    if input_rejected {
+        *query = previous;
+        ui.data_mut(|data| data.insert_temp(rejected_input, query.clone()));
+        ui.ctx().request_repaint();
+    } else if search.changed() {
+        ui.data_mut(|data| data.remove::<String>(rejected_input));
+    }
+    if ui
+        .data(|data| data.get_temp::<String>(rejected_input))
+        .as_deref()
+        == Some(query.as_str())
+    {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            "Search input exceeds 4 KiB. The previous query was kept in full.",
+        );
+    }
+    if let Some(error) = jterm_core::agent_task::dashboard_query_error(query) {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    }
+    egui::CollapsingHeader::new("Search help")
+        .id_salt("task_dashboard_query_help")
+        .show(ui, |ui| {
+            ui.label("Combine words, quoted phrases and field filters. Prefix a term with - to exclude it. Enumerated fields such as provider or status accept comma-separated alternatives; commas in text fields stay literal.");
+            ui.label("Fields: title, provider, status, runtime, validation, project, branch, id, is, attention.");
+            for example in [
+                "provider:codex attention:approval,review",
+                "project:ember -validation:passed",
+                "status:failed,cancelled \"release plan\"",
+                "is:running",
+            ] {
+                ui.monospace(example);
+            }
+            ui.label("Queries are limited to 256 UTF-8 bytes. An invalid query shows no tasks; your selected task and editor drafts are kept.");
+        });
     // Single-line TextEdit surrenders focus on its native Enter handling.
     // Do not treat an IME commit in the same frame as an open gesture.
-    search.lost_focus()
+    !input_rejected
+        && search.lost_focus()
         && ui.input(|input| {
             input.key_pressed(egui::Key::Enter)
                 && input.modifiers.is_none()
@@ -2965,6 +3233,405 @@ fn task_validation_color(ui: &egui::Ui, status: TaskValidationStatus) -> egui::C
             ui.visuals().warn_fg_color
         }
         TaskValidationStatus::NotRun => ui.visuals().weak_text_color(),
+    }
+}
+
+#[cfg(test)]
+mod management_v3_tests {
+    use super::*;
+
+    fn fixture(
+        status: TaskStatus,
+        validation: TaskValidationStatus,
+    ) -> (crate::agent::AgentTask, TaskRowSnapshot, DashboardRow) {
+        let mut manager = crate::agent::TaskManager::new();
+        let id = manager
+            .create_with_brief(
+                crate::agent::NewTask {
+                    title: "Review the release changes".into(),
+                    provider: AgentProvider::Codex,
+                    repo_root: "/work/ember".into(),
+                    worktree_path: "/work/tasks/release-review".into(),
+                    branch: "task/release-review".into(),
+                    base_commit: "a".repeat(40),
+                    source_context: None,
+                },
+                TaskBrief::new("Improve task review and keep validation explicit", None).unwrap(),
+            )
+            .unwrap();
+        let mut task = manager.get(id).unwrap().clone();
+        task.status = status;
+        task.validation.status = validation;
+        task.validation.attempt = u64::from(validation != TaskValidationStatus::NotRun);
+        task.updated_at_ms = 1_000_000;
+        let shared = DashboardRow::from_task(&task, Default::default());
+        let row = TaskRowSnapshot {
+            id,
+            title: task.title.clone(),
+            provider: task.provider,
+            status,
+            runtime_kind: TaskRuntimeKind::Unassigned,
+            branch: task.branch.clone(),
+            project: task.repo_root.to_string_lossy().into_owned(),
+            has_agent_terminal: false,
+            has_validation_terminal: false,
+            has_active_agent_stream: false,
+            native_preparing: false,
+            terminal_retry_available: false,
+            native_terminal_fallback_available: false,
+            validation_status: validation,
+            validation_attempt: task.validation.attempt,
+            validation_detail: None,
+            needs_attention: task.needs_attention(),
+            status_detail: None,
+        };
+        (task, row, shared)
+    }
+
+    #[test]
+    fn attention_queue_preserves_hidden_selection_and_pre_filter_counts() {
+        let (_, _, approval) =
+            fixture(TaskStatus::WaitingForApproval, TaskValidationStatus::Failed);
+        let (_, _, validation) = fixture(TaskStatus::ReadyForReview, TaskValidationStatus::Failed);
+        let (_, _, review) = fixture(TaskStatus::ReadyForReview, TaskValidationStatus::NotRun);
+        let selected = Some(review.id);
+        let query = "provider:codex project:ember";
+        let mut dashboard = DashboardSnapshot::filter_rows(
+            &[approval, validation.clone(), review],
+            query,
+            DashboardView::All,
+        );
+        filter_attention_queue(&mut dashboard, Some(DashboardAttentionKind::Validation));
+        assert_eq!(dashboard.counts.total, 3);
+        assert_eq!(dashboard.rows.len(), 1);
+        assert_eq!(dashboard.rows[0].id, validation.id);
+        assert_eq!(dashboard.selected_index(selected), None);
+        assert_eq!(dashboard.next_attention(selected), Some(validation.id));
+        let mut invalid = DashboardSnapshot::filter_rows(
+            &dashboard.rows,
+            "provider:not-a-provider",
+            DashboardView::All,
+        );
+        filter_attention_queue(&mut invalid, Some(DashboardAttentionKind::Validation));
+        assert!(invalid.rows.is_empty());
+        assert_eq!(invalid.next_attention(selected), None);
+    }
+
+    #[test]
+    fn validation_pass_does_not_show_task_completion_and_runtime_is_independent() {
+        let (_, mut row, _) = fixture(TaskStatus::ReadyForReview, TaskValidationStatus::Passed);
+        assert_ne!(task_row_marker(&row), "✓");
+        assert_eq!(task_validation_label(&row), "Validation #1: Passed");
+        row.has_active_agent_stream = true;
+        assert_eq!(task_runtime_label(&row), Some("Native session open"));
+        assert_eq!(row.status, TaskStatus::ReadyForReview);
+        row.native_preparing = true;
+        assert_eq!(task_runtime_label(&row), Some("Preparing Agent"));
+        row.native_preparing = false;
+        row.has_active_agent_stream = false;
+        row.status = TaskStatus::Completed;
+        row.needs_attention = false;
+        assert_eq!(task_row_marker(&row), "✓");
+    }
+
+    #[test]
+    fn registration_guidance_precedes_shared_review_without_changing_authority() {
+        let (task, mut row, _) = fixture(TaskStatus::ReadyForReview, TaskValidationStatus::NotRun);
+        row.has_active_agent_stream = true;
+        let guidance = task_guidance(&task, &row, false);
+        assert_eq!(guidance.title, "Review or continue the live session");
+        let pending = task_guidance(&task, &row, true);
+        assert!(pending.detail.contains("durable recovery marker"));
+        assert_eq!(task.status, TaskStatus::ReadyForReview);
+        assert!(row.has_active_agent_stream);
+    }
+
+    #[test]
+    fn follow_up_receipt_preserves_newer_text_and_other_task_drafts() {
+        let task = TaskId::new();
+        let other = TaskId::new();
+        let mut drafts = HashMap::from([
+            (task, "Newer feedback".to_string()),
+            (other, "Other task feedback".to_string()),
+        ]);
+        clear_sent_follow_up(&mut drafts, task, "Previously sent feedback");
+        assert_eq!(drafts[&task], "Newer feedback");
+        clear_sent_follow_up(&mut drafts, task, "Newer feedback");
+        assert!(!drafts.contains_key(&task));
+        assert_eq!(drafts[&other], "Other task feedback");
+    }
+
+    #[test]
+    fn update_age_does_not_invent_recent_activity_from_missing_or_future_time() {
+        assert_eq!(task_update_age(0, 100_000), "Update time unavailable");
+        assert_eq!(
+            task_update_age(110_000, 100_000),
+            "Update time is ahead of this clock"
+        );
+        assert_eq!(task_update_age(100_000, 159_999), "Updated just now");
+        assert_eq!(task_update_age(100_000, 160_000), "Updated 1m ago");
+    }
+
+    #[test]
+    fn task_row_pointer_release_cannot_select_a_replacement_after_filtering() {
+        let ctx = egui::Context::default();
+        let (_, first, first_shared) =
+            fixture(TaskStatus::ReadyForReview, TaskValidationStatus::Passed);
+        let (_, second, second_shared) =
+            fixture(TaskStatus::WaitingForApproval, TaskValidationStatus::NotRun);
+        let frame = |row: &TaskRowSnapshot, shared: &DashboardRow, events| {
+            let mut response = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    response = Some(task_row_button(ui, row, shared, false, 1_060_000));
+                },
+            );
+            output.textures_delta.clear();
+            response.unwrap()
+        };
+        let pos = frame(&first, &first_shared, vec![]).rect.center();
+        let pointer = |pressed| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        assert!(!frame(&first, &first_shared, pointer(true)).clicked());
+        assert!(!frame(&second, &second_shared, pointer(false)).clicked());
+        assert!(!frame(&second, &second_shared, pointer(true)).clicked());
+        assert!(frame(&second, &second_shared, pointer(false)).clicked());
+    }
+
+    #[test]
+    fn long_search_paste_is_never_silently_truncated_or_submitted() {
+        for (initial, pasted, rejected) in [
+            (
+                "",
+                format!("provider:codex project:{} -status:failed", "x".repeat(300)),
+                false,
+            ),
+            (
+                "provider:codex",
+                format!("{} -status:failed", "x".repeat(5000)),
+                true,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut query = initial.to_string();
+            let mut frame = |events| {
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("agent-task-search")));
+                let mut submitted = false;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        submitted = dashboard_search(ui, &mut query);
+                    },
+                );
+                output.textures_delta.clear();
+                submitted
+            };
+            assert!(!frame(vec![]));
+            let mut events = vec![egui::Event::Paste(pasted.clone())];
+            if rejected {
+                events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            assert!(!frame(events));
+            if rejected {
+                assert_eq!(
+                    query, initial,
+                    "oversized edit retains the complete old query"
+                );
+            } else {
+                assert_eq!(
+                    query, pasted,
+                    "the core must see the full trailing exclusion"
+                );
+                assert!(jterm_core::agent_task::dashboard_query_error(&query).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn enlarged_fonts_keep_all_task_card_facts_inside_the_card() {
+        fn text_bounds(shape: &egui::Shape, bounds: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(shape) if !shape.galley.text().trim().is_empty() => {
+                    bounds.push(shape.galley.rect.translate(shape.pos.to_vec2()))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text_bounds(shape, bounds);
+                    }
+                }
+                _ => (),
+            }
+        }
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| {
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(30.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Small, egui::FontId::proportional(24.0));
+        });
+        let (_, mut row, mut shared) =
+            fixture(TaskStatus::ReadyForReview, TaskValidationStatus::Passed);
+        row.has_active_agent_stream = true;
+        shared.activity.has_active_agent_stream = true;
+        let mut capture = super::super::visual_test_support::OffscreenCapture::default();
+        for pass in 0..3 {
+            let mut card = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(pass as f64 * 0.25),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(480.0, 360.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    card = Some(task_row_button(ui, &row, &shared, true, 1_060_000));
+                },
+            );
+            let card = card.unwrap();
+            let mut bounds = Vec::new();
+            for shape in &output.shapes {
+                text_bounds(&shape.shape, &mut bounds);
+            }
+            if let Some(path) = std::env::var_os("EMBER_AGENT_UI_SNAPSHOT_DIR").map(PathBuf::from) {
+                capture.save(
+                    &ctx,
+                    &mut output,
+                    [480, 360],
+                    &path.join("task-card-scaled-fonts.png"),
+                );
+            } else {
+                output.textures_delta.clear();
+            }
+            assert!(
+                card.rect.height() > 120.0,
+                "card grows with the configured fonts"
+            );
+            assert_eq!(bounds.len(), 6);
+            for text in bounds {
+                assert!(
+                    text.bottom() <= card.rect.bottom() - 6.0,
+                    "text {text:?} must not be clipped by the card {card:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_center_queue_and_cards_render_at_narrow_and_wide_sizes() {
+        fn text_shapes(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(shape) => {
+                    text.push_str(shape.galley.text());
+                    text.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text_shapes(shape, text);
+                    }
+                }
+                _ => (),
+            }
+        }
+        let destination = std::env::var_os("EMBER_AGENT_UI_SNAPSHOT_DIR").map(PathBuf::from);
+        for (name, width, height) in [
+            ("task-queues-narrow", 320, 800),
+            ("task-queues-wide", 760, 800),
+        ] {
+            let ctx = egui::Context::default();
+            let (task, mut row, mut shared) =
+                fixture(TaskStatus::ReadyForReview, TaskValidationStatus::Passed);
+            row.has_active_agent_stream = true;
+            shared.activity.has_active_agent_stream = true;
+            let dashboard = DashboardSnapshot::filter_rows(
+                std::slice::from_ref(&shared),
+                "",
+                DashboardView::All,
+            );
+            let mut capture = super::super::visual_test_support::OffscreenCapture::default();
+            for pass in 0..3 {
+                let mut query = "provider:codex".to_string();
+                let mut view = DashboardView::All;
+                let mut attention = None;
+                let mut queue_height = 0.0;
+                let mut queue_right = 0.0;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        time: Some(pass as f64 * 0.25),
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width as f32, height as f32),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui.strong("Agent command center");
+                        assert!(!dashboard_search(ui, &mut query));
+                        let queue_rect = ui
+                            .scope(|ui| {
+                                render_attention_queues(ui, &dashboard, &mut attention, &mut view);
+                            })
+                            .response
+                            .rect;
+                        queue_height = queue_rect.height();
+                        queue_right = queue_rect.right();
+                        assert!(!task_row_button(ui, &row, &shared, true, 1_060_000).clicked());
+                        render_task_guidance(ui, &task_guidance(&task, &row, false));
+                        render_task_inspector(ui, row.id, &TaskInspector::from_task(&task));
+                    },
+                );
+                let mut rendered_text = String::new();
+                for shape in &output.shapes {
+                    text_shapes(&shape.shape, &mut rendered_text);
+                }
+                if let Some(path) = &destination {
+                    capture.save(
+                        &ctx,
+                        &mut output,
+                        [width, height],
+                        &path.join(format!("{name}.png")),
+                    );
+                } else {
+                    output.textures_delta.clear();
+                }
+                assert!(
+                    rendered_text.contains("Ready for review"),
+                    "lifecycle remains visible: {rendered_text}"
+                );
+                assert!(rendered_text.contains("Validation #1: Passed"));
+                assert!(rendered_text.contains("Native session open"));
+                assert_eq!(query, "provider:codex");
+                assert_eq!(view, DashboardView::All);
+                assert_eq!(attention, None);
+                assert!(queue_height <= 100.0, "filter chips must wrap as whole labels at {width}px, got height {queue_height}");
+                assert!(queue_right <= width as f32, "all queue controls must remain reachable inside {width}px, right edge was {queue_right}");
+            }
+        }
     }
 }
 
@@ -3184,11 +3851,6 @@ mod management_v2_tests {
         assert!(!frame(&second, pointer(false)).clicked());
         assert!(!frame(&second, pointer(true)).clicked());
         assert!(frame(&second, pointer(false)).clicked());
-        let mut active = second.clone();
-        active.has_active_agent_stream = true;
-        assert!(task_next_step(&active, true, true, false).contains("Finish"));
-        assert!(task_next_step(&second, true, true, false).contains("No validation command"));
-        assert!(task_next_step(&second, false, true, true).contains("durable recovery marker"));
     }
 
     #[test]
@@ -3264,12 +3926,8 @@ mod management_v2_tests {
                     ..Default::default()
                 },
                 |ui| {
-                    render_task_inspector(
-                        ui,
-                        id,
-                        &inspector,
-                        task_next_step(&row(id), true, true, false),
-                    );
+                    render_task_guidance(ui, &task_guidance(&reviewed, &row(id), false));
+                    render_task_inspector(ui, id, &inspector);
                     assert!(!task_accept_button(ui, &row(id), true, true).clicked());
                 },
             );
@@ -3290,64 +3948,6 @@ mod management_v2_tests {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn task_reason_prefers_validation_and_drops_stale_or_empty_detail() {
-        use jterm_core::agent_task::{TaskStatus as S, TaskValidationStatus as V};
-        assert_eq!(
-            super::task_reason(
-                S::Failed,
-                V::Failed,
-                Some("task failed"),
-                Some("tests failed")
-            )
-            .as_deref(),
-            Some("tests failed")
-        );
-        assert_eq!(
-            super::task_reason(
-                S::Failed,
-                V::Inconclusive,
-                Some("task failed"),
-                Some("no exit status")
-            )
-            .as_deref(),
-            Some("no exit status")
-        );
-        assert_eq!(
-            super::task_reason(S::Failed, V::Failed, Some("task failed"), Some("  ")).as_deref(),
-            Some("task failed")
-        );
-        for status in [S::WaitingForHuman, S::WaitingForApproval] {
-            assert_eq!(
-                super::task_reason(status, V::NotRun, Some("needs a decision"), None).as_deref(),
-                Some("needs a decision")
-            );
-        }
-        assert_eq!(
-            super::task_reason(
-                S::Completed,
-                V::Passed,
-                Some("old failure"),
-                Some("old tests")
-            ),
-            None
-        );
-        assert_eq!(
-            super::task_reason(S::Failed, V::NotRun, Some(" \n\t "), None),
-            None
-        );
-        assert_eq!(super::task_reason(S::Failed, V::NotRun, None, None), None);
-        let unsafe_detail = format!("bad\u{1b}\n\u{202e}{}", "界".repeat(800));
-        let reason = super::task_reason(S::Failed, V::NotRun, Some(&unsafe_detail), None).unwrap();
-        assert!(reason.len() <= 1024);
-        assert!(!reason.chars().any(char::is_control));
-        assert!(!reason.contains('\u{202e}'));
-        assert_eq!(
-            super::task_reason(S::Failed, V::NotRun, Some("updated"), None).as_deref(),
-            Some("updated")
-        );
-    }
-
     #[test]
     fn dashboard_filter_labels_map_activity_and_finished_counts() {
         use jterm_core::agent_task::{DashboardCounts, DashboardView};
