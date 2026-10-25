@@ -3626,19 +3626,19 @@ impl TerminalApp {
                         view_changed = true;
                     }
                     if self.config.experimental_task_sidebar {
-                        let attention = self.task_manager.attention_count();
-                        let label = if attention == 0 {
-                            "Tasks".to_string()
-                        } else {
-                            format!("Tasks {attention}")
+                        // One count across the five attention queues; the
+                        // hover names them, e.g. "2 tasks need you: …".
+                        let (label, summary) =
+                            crate::app::tasks::tasks_tab_label(self.task_manager.attention_counts());
+                        let tab = ui.selectable_label(
+                            self.sidebar.view == sidebar::SidebarView::Tasks,
+                            egui::RichText::new(label).strong(),
+                        );
+                        let tab = match summary {
+                            Some(summary) => tab.on_hover_text(summary),
+                            None => tab,
                         };
-                        if ui
-                            .selectable_label(
-                                self.sidebar.view == sidebar::SidebarView::Tasks,
-                                egui::RichText::new(label).strong(),
-                            )
-                            .clicked()
-                        {
+                        if tab.clicked() {
                             self.sidebar.view = sidebar::SidebarView::Tasks;
                             view_changed = true;
                         }
@@ -4413,7 +4413,7 @@ impl TerminalApp {
             }
         }
         self.execute_pending_command_sidebar_action();
-        self.execute_pending_task_sidebar_action();
+        self.execute_pending_task_sidebar_action(root_ui.ctx());
         if let Some(p) = toggle_path {
             if let Some(error) = self.sidebar.toggle_node(&p) {
                 self.set_status_for(

@@ -1459,6 +1459,21 @@ impl TerminalApp {
         )
         .on_hover_text("Move tab bar to the top");
 
+        // Tasks waiting for the user stay discoverable while the sidebar
+        // that holds the dashboard is hidden.
+        if let Some((label, hover)) = self.chrome_task_attention() {
+            let width = super::tasks::task_attention_chip_width(ui, &label, font_size);
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(pos_btn_rect.right() + 4.0, tab_rect.top() + 5.0),
+                egui::vec2(width, tab_height - 10.0),
+            );
+            if super::tasks::task_attention_chip(ui, rect, &label, &hover, font_size)
+                && !workspace_drag_in_flight
+            {
+                self.open_tasks_view();
+            }
+        }
+
         let vim9_launch_clicked = crate::vim9_ide::launch_button(
             ui,
             egui::Rect::from_min_size(
@@ -1586,7 +1601,13 @@ impl TerminalApp {
         let base_left_margin: f32 = 5.0;
         // 左侧保留侧边栏和标签栏位置开关，右侧预留 Vim9、Blocks 及窗口控件。
         let ctrl_btn_w: f32 = font_size + 16.0;
-        let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0;
+        // A compact "tasks need you" indicator follows the sidebar controls
+        // while the sidebar holding the Tasks dashboard is hidden.
+        let task_attention = self.chrome_task_attention();
+        let task_attention_w = task_attention.as_ref().map_or(0.0, |(label, _)| {
+            super::tasks::task_attention_chip_width(ui, label, font_size) + 4.0
+        });
+        let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0 + task_attention_w;
         let reserved_right: f32 = 170.0; // "+"、Vim9、Blocks、关闭窗口按钮及间距
         let tab_clip_rect = egui::Rect::from_min_max(
             egui::pos2(tab_rect.left() + left_margin, tab_rect.top()),
@@ -1902,6 +1923,21 @@ impl TerminalApp {
                 egui::Sense::hover(),
             )
             .on_hover_text("Move tab bar into the sidebar");
+        }
+        if let Some((label, hover)) = &task_attention {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    tab_rect.left() + base_left_margin + ctrl_btn_w * 2.0,
+                    tab_rect.top() + 5.0,
+                ),
+                egui::vec2(task_attention_w - 4.0, tab_height - 10.0),
+            );
+            if super::tasks::task_attention_chip(ui, rect, label, hover, font_size)
+                && !any_tab_drag_in_flight
+                && !pane_drag_in_flight
+            {
+                self.open_tasks_view();
+            }
         }
 
         // === 交互辅助：用 tab_widths 计算 tab 位置的宏 ===

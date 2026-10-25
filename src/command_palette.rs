@@ -189,6 +189,12 @@ impl CommandPalette {
                 "Find Codex and Claude conversations, inspect activity and resume in a new tab",
                 crate::keybindings::Command::AgentSessions,
             ),
+            CommandInfo::new(
+                "Toggle Agent Tasks Panel",
+                CommandCategory::Window,
+                "Show or hide the agent Tasks dashboard in the sidebar (experimental; enable it in Settings → AI)",
+                crate::keybindings::Command::TaskToggle,
+            ),
             // === 会话管理 ===
             CommandInfo::new(
                 "New Tab",
@@ -1457,6 +1463,8 @@ mod tests {
             Command::DebugToggle,
             Command::SidebarToggle,
             Command::AgentToggle,
+            Command::AgentSessions,
+            Command::TaskToggle,
             Command::AiChatToggle,
             Command::JshInstall,
         ];
@@ -1467,5 +1475,34 @@ mod tests {
         for index in 0..8 {
             assert!(represented(&Command::SessionJump(index)));
         }
+    }
+
+    #[test]
+    fn agent_tasks_toggle_is_discoverable_by_name_and_shortcut_vocabulary() {
+        use crate::keybindings::Command;
+        for query in ["agent tasks", "tasks panel", "toggle tasks"] {
+            let mut palette = CommandPalette::new();
+            palette.set_query(query);
+            assert!(
+                palette
+                    .get_results()
+                    .iter()
+                    .any(|(entry, _)| entry.command == Command::TaskToggle),
+                "{query}"
+            );
+        }
+        let palette = CommandPalette::new();
+        let entry = palette
+            .all_commands()
+            .iter()
+            .find(|entry| entry.command == Command::TaskToggle)
+            .unwrap();
+        assert_eq!(entry.name, "Toggle Agent Tasks Panel");
+        assert!(entry.description.contains("Settings"));
+        assert_eq!(
+            crate::keybindings::KeyBindings::default_bindings()
+                .pretty_bindings_for(&entry.command.to_string()),
+            vec!["Ctrl+Shift+Alt+T".to_string()]
+        );
     }
 }

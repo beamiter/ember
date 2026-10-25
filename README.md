@@ -97,7 +97,13 @@ moving its text or covering Vim's separator/status rows.
 - The [Agent command center](docs/agent-management.md) supports independent
   conversation checkboxes and atomic batches of pin, archive, restore and tag
   changes. Hidden selections stay counted, and failed saves preserve selection
-  and editor input.
+  and editor input. Resuming a conversation that another CLI is observed running
+  asks for an explicit **Resume anyway** first.
+- **Hide task** moves a finished task out of the Tasks dashboard; **Hidden (N)**
+  lists hidden tasks and **Restore** returns one to the state it had when hidden,
+  without starting anything. The **Tasks N** tab (and a compact indicator in the
+  top bar while the sidebar is hidden) counts tasks that need you; hover for the
+  breakdown. **Ctrl+Alt+Shift+T** (`task:toggle`) shows or hides the dashboard.
 - [Workflows](#workflows): saved command templates with named parameters, in
   TOML or YAML, opened with `Ctrl+Shift+M`. The rendered command is *inserted*
   at the prompt and never run for you. Discovery, both parsers, validation and
@@ -819,7 +825,10 @@ shutdown path. Initial redaction covers only the attached command, relative
 cwd, and captured terminal output; Codex may separately send worktree content
 and tool output according to its provider behavior. Task metadata is currently
 runtime-only; **Hide task** only hides that metadata and deliberately leaves the
-active worktree untouched.
+active worktree untouched. It is unavailable while the Agent, its preparation or
+validation is still running. **Hidden (N)** lists hidden tasks; **Restore** returns
+one to the lifecycle state it had when hidden, with its native transcript, and
+never starts, validates or accepts work.
 
 The native path does not load the user's Codex configuration, trust database,
 MCP servers, hooks, plugins, apps, or refresh token. Ember creates a private
@@ -1100,6 +1109,8 @@ Defaults include:
 | Search/filter completed command blocks | `Ctrl+Shift+G` |
 | Toggle Agent panel (per-command approval) | `Ctrl+Alt+G` |
 | Toggle AI chats library (read-only; nothing runs) | `Ctrl+Shift+Alt+A` |
+| Agent Sessions library | `Ctrl+Shift+Alt+G` |
+| Toggle agent Tasks panel (experimental dashboard) | `Ctrl+Alt+Shift+T` |
 | Workflow picker (parameterised command templates) | `Ctrl+Shift+M` |
 | Help | `Ctrl+Shift+/` |
 | Debug overlay | `F12` |
@@ -1713,7 +1724,7 @@ dashboard. **Organize this conversation → Save details** persists names and ta
 across all four terminals; **Reset** preserves control over unsaved drafts.
 Search supports `provider:codex tag:review`, `project:core`, `is:pinned`, quoted
 phrases and exclusions such as `-tag:blocked`. The Tasks dashboard adds provider
-and project filters, five sort modes and stable **Next needs you** navigation.
+and project filters, six sort modes and stable **Next needs you** navigation.
 See the [Agent management guide](docs/agent-management.md).
 
 Press **Ctrl+Shift+Alt+G** or choose **Agent Sessions** from the command palette
@@ -1721,14 +1732,20 @@ to find existing Codex and Claude CLI conversations across all projects. Search
 by title, project, branch, session ID or latest context; narrow the list by
 provider and recorded state. **Observed live only** independently filters to
 exact local process matches from the latest refresh. The overview shows session,
-waiting and live-process counts.
+waiting and live CLI conversation counts (several processes holding one
+conversation count once).
 **This folder + subfolders** scopes the list to the local directory captured
 when the manager opened; it stays fixed during inspection and refresh.
 **Best match** ranks session IDs and titles ahead of incidental message text;
 **Recent** and **Live first** provide alternate orderings. Editing a query or
 filter selects its first result, while automatic refresh preserves your selected
-conversation and reading position. **Clear filters** returns to Active library
+conversation and reading position. A refresh never moves the selection to another
+conversation: if the selected one is archived elsewhere, filtered out or removed,
+the details pane says it is no longer in this view and Resume and organization
+stay paused until you select again. **Clear filters** returns to Active library
 conversations across all projects; the archive selector also offers Archived and All.
+Searches may be up to 4,096 bytes; a longer paste stays visibly over the limit
+with an explanation and no results, instead of silently losing its final terms.
 Search normalization is shared with the other terminals and unchanged discovery
 snapshots reuse the existing index and projection.
 
@@ -1737,8 +1754,11 @@ rows. Pins and successful resume history persist across all four terminals and
 app restarts. **Pinned only**, **Previously resumed**, and **Recently resumed**
 sorting help you return to ongoing work. Pins lead the empty **Best match** list;
 search text and explicit sorting retain their usual ordering. Saving and syncing
-run in a worker, and an error is shown if a durable update fails. Merely viewing,
-pinning, or failing to launch a session does not create a resume-history entry.
+run in a worker, and an error is shown if a durable update fails. Organize controls
+pause only while your own change is saving, not during the periodic reload from
+other terminals. Names and tags are checked as you type against their byte limits.
+Merely viewing, pinning, or failing to launch a session does not create a
+resume-history entry.
 
 Selecting a conversation checks its directory and installed CLI asynchronously.
 The detail panel shows checking, ready, or a precise missing-directory/CLI
@@ -1751,15 +1771,27 @@ then press **Enter** or **Resume in New Tab**. Ember starts the provider CLI
 with the exact session ID and original working directory in a new focused tab.
 No shell interpolation or manually copied resume command is required.
 If the conversation already has a live tab in this window, confirming switches
-to that tab instead of launching a duplicate CLI.
+to that tab instead of launching a duplicate CLI. If the latest scan observed a CLI
+process elsewhere already holding the conversation, the first Resume only shows
+that warning; **Resume anyway** (or Enter again) for that same conversation starts
+a second CLI on the same history, while selecting another row, a refresh that
+removes it, **Cancel** or **Escape** dismisses it. A quick repeat such as a
+double-click is ignored, and a confirmation covers only the attempt it starts.
+The details show the exact resume command, computed by the background readiness
+check and including an `env CODEX_HOME=…` override when needed; **Copy
+command** and **Copy path** confirm with a short “Copied …” note.
 
-Discovery runs off the UI thread, refreshes every ten seconds while open, and
-can be refreshed with **F5**. **Ctrl+L** focuses search; **Page Up / Page Down**
-and **Home / End** navigate long lists. **Escape** closes the manager. Empty sources,
+Discovery runs off the UI thread. While the manager is open it rescans five
+seconds after the previous scan finished and reloads the shared library at the
+same time; opening the manager, **F5** and **Refresh** do both at once.
+**Ctrl+L** focuses search; **Page Up / Page Down** and **Home / End** navigate long
+lists. **Escape** first leaves a focused search or name/tag editor, then dismisses
+a pending live-process warning, and otherwise closes the manager. Empty sources,
 partial discovery and unavailable resume directories are explained in the
 manager. State labels describe the last recorded provider event; they do not
 assert that a process is still running. Separate **LIVE / PID** badges require
 an exact session-ID match to an actual local CLI process. No API key or model
 call is needed.
-The configurable action is `agent:sessions`. The existing Agent and Tasks
-surfaces remain available.
+The configurable action is `agent:sessions`. The Tasks panel's **Conversation
+library** button opens or focuses the manager; it never closes it. The existing
+Agent and Tasks surfaces remain available.

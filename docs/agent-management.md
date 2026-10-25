@@ -4,7 +4,10 @@ Open **Agent Sessions** with **Ctrl+Shift+Alt+G** or the command palette.
 The command center brings local Codex and Claude conversation history into a
 searchable project library. The **Task dashboard** button opens worktree tasks
 when the experimental Tasks sidebar is enabled. The Tasks sidebar has a
-**Conversation library** button for the return trip.
+**Conversation library** button for the return trip; it opens the library or
+brings it forward, and never closes it. **Ctrl+Alt+Shift+T** (`task:toggle`,
+also in the command palette) shows or hides the Tasks dashboard; while the
+dashboard is disabled it explains where to enable it.
 
 ## Organize conversations
 
@@ -21,8 +24,19 @@ terminal changes saved details during editing, the editor preserves your draft
 and offers Reset to load the newer saved values.
 
 Aliases allow up to 160 UTF-8 bytes; use at most 12 tags, each up to 32 UTF-8
-bytes. Tags are normalized and deduplicated on save. A rejected or failed save
-shows an error and keeps the editable draft.
+bytes. The editor shows the alias byte count and applies the shared validation
+while you type: an over-long name, too many or too long tags, or a control
+character is explained inline and **Save details** stays disabled until it is
+fixed. The batch tag field works the same way for **Add tag** and **Remove tag**,
+and also rejects a comma. A paste is never silently shortened to fit. Tags are
+normalized and deduplicated on save. A failed save shows an error and keeps the
+editable draft. The error is reported even if a background reload finishes at
+the same moment, and stays until the next successful reload replaces it; the
+draft stays either way.
+
+Pin, archive, Save and batch controls pause only while your own change is being
+saved (**Saving favorites and organization…**). The periodic read-only reload
+that picks up other terminals' changes never disables them.
 
 **Archive locally** moves a conversation out of the default Active library view.
 Choose the Archived library view to find it, then **Restore to active** to bring
@@ -52,6 +66,10 @@ Enter in the tag editor does not apply a batch or resume a conversation.
 
 ## Find work across projects
 
+The overview counts sessions, waiting conversations and **live CLI
+conversations**: conversations with an exact session-ID match to at least one
+local CLI process, so several processes on one conversation count once.
+
 The project selector lists discovered directories with session, observed-live
 and waiting counts. Choosing a project includes its subdirectories.
 **This folder + subfolders** scopes the library to the terminal folder captured when the
@@ -70,7 +88,9 @@ archive controls. For more precise searches:
 | `is:live` | Exact session-ID match to an observed local CLI process |
 
 Use the Archived or All library view when looking for a locally archived
-conversation. Invalid queries show a message beside the result count.
+conversation. Invalid queries show a message beside the result count and no
+results. Searches are limited to 4,096 UTF-8 bytes; a longer paste stays visibly
+over the limit with that explanation rather than silently losing its final terms.
 **Clear filters** restores Active browsing across all projects.
 
 The session list is virtualized and uses fixed-height, clipped rows so long
@@ -78,6 +98,47 @@ aliases or tags do not shift the scroll geometry. Arrow keys, Page Up/Down and
 Home/End browse results; Ctrl+L focuses search. Enter resumes from search or the
 session list. Editing alias/tags, choosing filters and saving details do not
 resume an agent.
+
+Editing a query or filter selects its first match. A background refresh never
+moves the selection to a different conversation: when the selected conversation
+is archived by another terminal, filtered out or no longer discovered, it stays
+selected but detached. The details pane says it is no longer in this view, and
+Resume and organization stay unavailable until you select a conversation again.
+When your own change moved it (archiving or restoring it, unpinning it under
+**Pinned only**, or a name or tag that no longer matches the search), the notice
+says so and names the view that finds it. Opening the manager replaces a
+selection that is no longer listed with the first match.
+
+While the manager is open, discovery rescans five seconds after the previous scan
+finished and reloads the shared library in the same step. Opening the manager,
+**F5** and **Refresh** rescan and reload immediately.
+
+### Resume safely
+
+A conversation already open in an Ember tab switches to that tab. Otherwise,
+when the latest scan observed a CLI process already running the conversation,
+the first **Resume** (button or Enter) does not launch: it shows which process
+holds the history. Only **Resume anyway**, or Enter again, for exactly that
+conversation starts a second CLI that writes to the same history. Selecting
+another conversation, a refresh that removes it, **Cancel** or **Escape**
+dismisses the warning. A repeat within 600 ms of the warning, such as the second
+click of a double-click, is ignored, so it cannot confirm a warning you have not
+read. **Resume anyway** covers only the attempt it starts: if that readiness
+check fails or the attempt is dropped, the next Resume warns again. If a scan
+reveals such a process while a resume is waiting for its readiness check, the
+launch stops and asks first.
+
+The details pane shows the exact resume command, including an
+`env CODEX_HOME=…` or `CLAUDE_CONFIG_DIR=…` override when the conversation
+belongs to another provider home. The background readiness check computes it,
+so it appears a moment after selecting without any file checks on the UI
+thread; it stays copyable when only the CLI is missing from this desktop.
+**Copy command** copies that command and **Copy path** the project directory;
+each confirms with a short “Copied …” note.
+
+**Escape** first leaves a focused search, alias, tag or batch-tag editor (a
+pending live-process warning stays), then dismisses that warning, and otherwise
+closes the manager.
 
 ## Manage worktree tasks
 
@@ -134,7 +195,8 @@ diff and choose **Accept reviewed work** once the Agent is ready for review.
 This records human acceptance without claiming an automated validation pass.
 
 The dashboard adds exact-project and provider selectors alongside the status
-views. Choose Attention, Recent, Oldest, Title or Project ordering. Cards show
+views. Choose one of six orderings: Needs you first, Recently updated, Oldest
+update, Task name, Project, or Needs you · oldest update. Cards show
 project and branch together, with full text on hover. **Previous**, **Next** and
 **Next needs you** select a task and scroll to its card without starting it.
 The shared core resolves selection by stable task ID after filtering and sorting.
@@ -143,6 +205,36 @@ Status counts describe matches before the selected status view. A running native
 stream, waiting approval and task lifecycle remain separate facts. Existing
 Start, Stop, Follow-up, Finish, Validation and Review diff controls continue to
 use the authoritative task runtime; browsing and filtering do not change tasks.
+Native views show readable phases (for example **Waiting for approval**) and
+approval kinds. An approval wait or an idle review point polls the provider
+slowly, but Approve, Deny, Follow-up, Finish and Stop refresh the view promptly.
+
+### Hide and restore tasks
+
+**Hide task** removes a task from the dashboard and leaves its worktree in
+place. It is disabled, with the reason on hover, while the Agent or its
+preparation is still running or validation is in progress. Once at least one
+task is hidden, **Hidden (N)** switches the list to hidden tasks; choose it again
+to return. Opening the dashboard (from the top-bar indicator, `task:toggle` or
+the Agent Sessions **Task dashboard** button), creating a task and restoring one
+also return to the dashboard, as does restoring the last hidden task. Each
+hidden task offers **Restore** and a read-only **Review diff**.
+Restore returns the task to the lifecycle state it had when it was hidden, with
+its native transcript, approvals and follow-up draft, and reports it (for
+example "Task restored · Ready for review"); it never starts an Agent, reruns
+validation or accepts work. If its registration was still unconfirmed when it
+was hidden, Start stays blocked after Restore until **Retry registration** or
+**Reload** confirms it. If its recovery record was dismissed meanwhile, nothing
+can confirm it any more: the Restore message and the task card say so, and
+dismissing such a record warns first. A task hidden by an older version has no
+recorded state, so it cannot be restored.
+
+### See what needs you
+
+The sidebar's **Tasks N** tab counts tasks in all five attention queues; hover
+for the breakdown, such as "2 tasks need you: 1 approval, 1 reply". Hidden tasks
+never count. While the sidebar is hidden, a compact **Tasks N** indicator in the
+top bar opens the dashboard.
 
 ### Work through the attention queues
 

@@ -3,17 +3,40 @@
 use super::state::TerminalApp;
 use eframe::egui;
 use jterm_core::agent_sessions::{
-    AgentSession, SessionArchiveFilter, SessionBatchAction, SessionCatalog, SessionLaunch,
-    SessionLibraryFilter, SessionLibrarySnapshot, SessionLibraryStore, SessionPreflight,
-    SessionPreflightState, SessionProjectSummary, SessionProvider, SessionQuery, SessionScanner,
-    SessionSearchIndex, SessionSort, SessionStatus, SESSION_BATCH_LIMIT,
+    validate_session_batch_tag, validate_session_details, AgentSession, SessionArchiveFilter,
+    SessionBatchAction, SessionCatalog, SessionLaunch, SessionLibraryFilter,
+    SessionLibrarySnapshot, SessionLibraryStore, SessionPreflight, SessionPreflightState,
+    SessionProjectSummary, SessionProvider, SessionQuery, SessionScanner, SessionSearchIndex,
+    SessionSort, SessionStatus, SESSION_ALIAS_MAX_BYTES, SESSION_BATCH_LIMIT,
+    SESSION_QUERY_MAX_BYTES, SESSION_RESUME_ANYWAY_DELAY, SESSION_TAG_LIMIT, SESSION_TAG_MAX_BYTES,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type SessionKey = (SessionProvider, String);
+
+/// While open, rescan once the previous scan has been idle this long, as the
+/// other three terminals do. The shared library reloads in the same step, so
+/// other terminals' pins, names and archive changes arrive with the catalog
+/// rather than on a second timer.
+const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// Raw tag-editor budget accepted by `validate_session_details`: every tag at
+/// its byte limit plus the ", " separators the editor displays between them.
+const SESSION_TAGS_EDITOR_MAX_BYTES: usize = (SESSION_TAG_MAX_BYTES + 2) * SESSION_TAG_LIMIT;
+/// How long an inline "Copied …" receipt stays beside its button.
+const COPY_RECEIPT: Duration = Duration::from_secs(3);
+
+/// egui bounds an editor in Unicode scalar values, while the shared library
+/// validates UTF-8 bytes. One scalar above the byte budget never truncates
+/// valid input, and a truncated paste stays over budget, so the core explains
+/// the limit instead of a paste silently losing its final terms or tags.
+const fn editor_char_limit(max_bytes: usize) -> usize {
+    max_bytes + 1
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FilterKey {
@@ -26,6 +49,190 @@ struct FilterKey {
     archive: SessionArchiveFilter,
     project: Option<PathBuf>,
     sort: SessionSort,
+}
+
+/// One projection of the catalog for the current filters. Every per-frame
+/// reader shares the rows; the fingerprint binds gestures to exactly the
+/// identities shown, and the query explanation is parsed once per edit.
+struct VisibleRows {
+    key: FilterKey,
+    rows: Rc<[usize]>,
+    fingerprint: u64,
+    query_error: Option<String>,
+}
+
+/// Overview counts, computed once per catalog rather than on every frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CatalogStats {
+    total: usize,
+    codex: usize,
+    waiting: usize,
+    /// Conversations with an exact session-ID match to at least one local CLI
+    /// process. Several processes holding one conversation count once.
+    live_conversations: usize,
+}
+
+impl CatalogStats {
+    fn of(catalog: &SessionCatalog) -> Self {
+        let live: HashSet<(SessionProvider, &str)> = catalog
+            .live_processes
+            .iter()
+            .map(|process| (process.provider, process.id.as_str()))
+            .collect();
+        let mut stats = Self {
+            total: catalog.sessions.len(),
+            ..Self::default()
+        };
+        for session in &catalog.sessions {
+            stats.codex += usize::from(session.provider == SessionProvider::Codex);
+            stats.waiting += usize::from(session.status == SessionStatus::Waiting);
+            stats.live_conversations +=
+                usize::from(live.contains(&(session.provider, session.id.as_str())));
+        }
+        stats
+    }
+}
+
+/// Resume is a two-step action while another CLI is observed holding the
+/// conversation. Both steps are bound to one provider/session identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ResumeGate {
+    #[default]
+    Clear,
+    /// The first Resume showed the live-process warning at this instant. Only
+    /// "Resume anyway" for exactly this identity may continue, and not before
+    /// [`SESSION_RESUME_ANYWAY_DELAY`] has passed.
+    Armed(SessionKey, Instant),
+    /// The user chose "Resume anyway" for exactly this identity. It covers
+    /// only the pending attempt it started.
+    Confirmed(SessionKey),
+}
+
+/// What a pending resume needs next.
+#[derive(Debug)]
+enum ResumeStep {
+    /// Nothing is pending, or its fresh readiness check is still running.
+    Wait,
+    /// The fresh check passed and nothing new blocks the launch.
+    Launch(Box<(AgentSession, SessionLaunch)>),
+    /// A scan observed a live CLI after Resume was chosen; warn first.
+    Rearmed,
+}
+
+/// The user's own organization change to the selected conversation. When it
+/// moves the conversation out of the view, the detached notice says so and
+/// names the view that finds it, instead of blaming a refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnChange {
+    Archived,
+    Restored,
+    Unpinned,
+    Details,
+}
+
+impl OwnChange {
+    fn of_batch(action: &SessionBatchAction) -> Option<Self> {
+        match action {
+            SessionBatchAction::Archive(true) => Some(Self::Archived),
+            SessionBatchAction::Archive(false) => Some(Self::Restored),
+            SessionBatchAction::Pin(false) => Some(Self::Unpinned),
+            SessionBatchAction::Pin(true) => None,
+            SessionBatchAction::AddTag(_) | SessionBatchAction::RemoveTag(_) => Some(Self::Details),
+        }
+    }
+
+    fn explanation(self, title: &str) -> String {
+        match self {
+            Self::Archived => format!(
+                "You archived “{title}”, so it left this view. Choose Archived here or All conversations to find or restore it."
+            ),
+            Self::Restored => format!(
+                "You restored “{title}” to the Active library, so it left this view. Choose Active library or All conversations to find it."
+            ),
+            Self::Unpinned => format!(
+                "You unpinned “{title}”, so it left this view. Turn off Pinned only to find it."
+            ),
+            Self::Details => format!(
+                "Your new name or tags for “{title}” no longer match this search or these filters, so it left this view. Edit the search or choose Clear filters to find it."
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ResumeButtonMode {
+    NewTab,
+    SwitchToTab,
+    ResumeAnyway,
+}
+
+impl ResumeButtonMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NewTab => "Resume in New Tab  ↵",
+            Self::SwitchToTab => "Switch to Open Tab  ↵",
+            Self::ResumeAnyway => "Resume anyway  ↵",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyKind {
+    Command,
+    Path,
+}
+
+impl CopyKind {
+    fn receipt(self) -> &'static str {
+        match self {
+            Self::Command => "Copied the resume command",
+            Self::Path => "Copied the project path",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CopyReceipt {
+    key: SessionKey,
+    kind: CopyKind,
+    at: Instant,
+}
+
+/// Escape is layered: leave a text editor, then dismiss a resume warning,
+/// and only then close the manager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionEscape {
+    LeaveEditor,
+    CancelConfirmation,
+    Close,
+}
+
+fn session_escape_action(editor_focused: bool, confirmation_armed: bool) -> SessionEscape {
+    if editor_focused {
+        SessionEscape::LeaveEditor
+    } else if confirmation_armed {
+        SessionEscape::CancelConfirmation
+    } else {
+        SessionEscape::Close
+    }
+}
+
+/// Whether an Enter just raised a live-process warning (for any identity).
+/// Later Enter presses in the same key batch must not confirm a warning the
+/// user has not yet seen.
+fn enter_raised_warning(before: &ResumeGate, after: &ResumeGate) -> bool {
+    matches!(after, ResumeGate::Armed(..)) && after != before
+}
+
+/// One batch tag, checked live with the rules `apply_batch` enforces. A batch
+/// adds or removes a single tag, so the core rejects a comma rather than
+/// splitting on it. An empty field disables the buttons without an error.
+fn batch_tag_problem(tag: &str) -> Option<String> {
+    if tag.trim().is_empty() {
+        None
+    } else {
+        validate_session_batch_tag(tag).err()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -44,8 +251,9 @@ struct SessionDetailsDraft {
 
 impl SessionDetailsDraft {
     fn saved(library: &SessionLibrarySnapshot, key: &SessionKey) -> Self {
-        let alias = library.alias(key.0, &key.1).unwrap_or_default().to_string();
-        let tags = library.tags(key.0, &key.1).join(", ");
+        let facts = library.facts(key.0, &key.1);
+        let alias = facts.alias.unwrap_or_default().to_string();
+        let tags = facts.tags.join(", ");
         Self {
             alias: alias.clone(),
             tags: tags.clone(),
@@ -71,13 +279,14 @@ pub(crate) struct AgentSessionsState {
     scanner: SessionScanner,
     library: SessionLibraryStore,
     library_snapshot: SessionLibrarySnapshot,
-    library_refresh: Option<Instant>,
     library_notice: Option<String>,
     preflight: SessionPreflight,
     pending_resume: Option<AgentSession>,
+    resume_gate: ResumeGate,
     catalog: SessionCatalog,
+    catalog_stats: CatalogStats,
     index: SessionSearchIndex,
-    cached_visible: RefCell<Option<(FilterKey, Vec<usize>)>>,
+    cached_visible: RefCell<Option<VisibleRows>>,
     query: String,
     provider: Option<SessionProvider>,
     status: Option<SessionStatus>,
@@ -98,18 +307,31 @@ pub(crate) struct AgentSessionsState {
     batch_notice: Option<String>,
     pending_batch: Option<usize>,
     focus_search: bool,
+    bring_to_front: bool,
     search_widget: Option<egui::Id>,
     row_focus_widget: Option<egui::Id>,
+    /// Text editors rendered in the previous frame. Escape leaves them first.
+    text_editors: Vec<egui::Id>,
     scroll_selection: bool,
     scroll_anchor: Option<ScrollAnchor>,
     restore_anchor: bool,
     page_rows: usize,
-    last_refresh: Option<Instant>,
+    copy_receipt: Option<CopyReceipt>,
+    /// The latest organization change the user made to the selection.
+    own_change: Option<(SessionKey, OwnChange)>,
     error: Option<String>,
     opened: HashMap<SessionKey, String>,
 }
 
 impl AgentSessionsState {
+    fn filter_project(&self) -> Option<&Path> {
+        if self.project_only {
+            self.scope_cwd.as_deref()
+        } else {
+            self.project_filter.as_deref()
+        }
+    }
+
     fn filter_key(&self) -> FilterKey {
         FilterKey {
             text: self.query.clone(),
@@ -120,21 +342,36 @@ impl AgentSessionsState {
             recent_only: self.recent_only,
             archive: self.archive,
             sort: self.sort,
-            project: if self.project_only {
-                self.scope_cwd.clone()
-            } else {
-                self.project_filter.clone()
-            },
+            project: self.filter_project().map(Path::to_path_buf),
         }
     }
 
-    fn visible(&self) -> Vec<usize> {
-        let key = self.filter_key();
-        if let Some((cached_key, rows)) = self.cached_visible.borrow().as_ref() {
-            if *cached_key == key {
-                return rows.clone();
+    /// Compare the current filters without copying the query or project.
+    fn filter_matches(&self, key: &FilterKey) -> bool {
+        key.text == self.query
+            && key.provider == self.provider
+            && key.status == self.status
+            && key.live_only == self.live_only
+            && key.pinned_only == self.pinned_only
+            && key.recent_only == self.recent_only
+            && key.archive == self.archive
+            && key.sort == self.sort
+            && key.project.as_deref() == self.filter_project()
+    }
+
+    fn visible(&self) -> Rc<[usize]> {
+        self.visible_rows().0
+    }
+
+    /// Visible catalog indices and their identity fingerprint, recomputed only
+    /// after a filter, catalog or library change.
+    fn visible_rows(&self) -> (Rc<[usize]>, u64) {
+        if let Some(cached) = self.cached_visible.borrow().as_ref() {
+            if self.filter_matches(&cached.key) {
+                return (cached.rows.clone(), cached.fingerprint);
             }
         }
+        let key = self.filter_key();
         let query = SessionQuery {
             text: &key.text,
             provider: key.provider,
@@ -144,18 +381,43 @@ impl AgentSessionsState {
             sort: key.sort,
         };
         // Catalog replacement installs one normalized index for every query.
-        let rows = self.index.query_with_library(
-            &query,
-            &self.library_snapshot,
-            SessionLibraryFilter {
-                pinned_only: key.pinned_only,
-                recent_only: key.recent_only,
-                pinned_first: true,
-                archive: key.archive,
-            },
-        );
-        *self.cached_visible.borrow_mut() = Some((key, rows.clone()));
-        rows
+        let rows: Rc<[usize]> = self
+            .index
+            .query_with_library(
+                &query,
+                &self.library_snapshot,
+                SessionLibraryFilter {
+                    pinned_only: key.pinned_only,
+                    recent_only: key.recent_only,
+                    pinned_first: true,
+                    archive: key.archive,
+                },
+            )
+            .into();
+        let mut hasher = DefaultHasher::new();
+        for index in rows.iter() {
+            let session = &self.catalog.sessions[*index];
+            session.provider.hash(&mut hasher);
+            session.id.hash(&mut hasher);
+        }
+        let fingerprint = hasher.finish();
+        let query_error = SessionSearchIndex::query_error(&key.text);
+        *self.cached_visible.borrow_mut() = Some(VisibleRows {
+            key,
+            rows: rows.clone(),
+            fingerprint,
+            query_error,
+        });
+        (rows, fingerprint)
+    }
+
+    /// The shared parser's explanation for the current search, if invalid.
+    fn query_error(&self) -> Option<String> {
+        self.visible_rows();
+        self.cached_visible
+            .borrow()
+            .as_ref()
+            .and_then(|cached| cached.query_error.clone())
     }
 
     fn replace_catalog(&mut self, catalog: SessionCatalog) -> bool {
@@ -164,6 +426,7 @@ impl AgentSessionsState {
         }
         self.index = SessionSearchIndex::new(&catalog);
         self.projects = self.index.projects(&self.library_snapshot);
+        self.catalog_stats = CatalogStats::of(&catalog);
         self.catalog = catalog;
         self.cached_visible.get_mut().take();
         self.restore_anchor = self.scroll_anchor.is_some();
@@ -187,7 +450,11 @@ impl AgentSessionsState {
         if self.library.poll() {
             self.replace_library(self.library.snapshot().clone());
         }
-        if !self.library.is_busy() {
+        // Only user writes decide these outcomes; the periodic read-only
+        // reload never delays them. A failed write is reported even if a
+        // reload finished at the same moment, until the next successful
+        // reload replaces it.
+        if !self.library.is_saving() {
             if let Some(key) = self.pending_details.take() {
                 if self.library.error().is_none() {
                     self.details_drafts.remove(&key);
@@ -229,19 +496,180 @@ impl AgentSessionsState {
     }
 
     fn sync_preflight(&mut self) {
-        let selected = self
-            .selected_session()
-            .filter(|session| !self.opened.contains_key(&session_key(session)))
-            .cloned();
-        if self.preflight.select(selected.as_ref()) {
-            self.pending_resume = None;
+        let index = self.selected_index(&self.visible());
+        let selected = index
+            .map(|index| &self.catalog.sessions[index])
+            .filter(|session| !self.opened.contains_key(&session_key(session)));
+        if self.preflight.select(selected) {
+            self.end_resume_attempt();
         }
         self.preflight.poll();
+        self.reconcile_resume_gate();
+    }
+
+    /// End the pending resume attempt without launching it. A "Resume anyway"
+    /// covers only the attempt it started, so the next Resume of a
+    /// conversation another CLI holds warns again.
+    fn end_resume_attempt(&mut self) {
+        self.pending_resume = None;
+        if matches!(self.resume_gate, ResumeGate::Confirmed(_)) {
+            self.resume_gate = ResumeGate::Clear;
+        }
     }
 
     fn cancel_resume(&mut self) {
         self.pending_resume = None;
+        self.resume_gate = ResumeGate::Clear;
         self.preflight.select(None);
+    }
+
+    /// Dismiss the live-process warning without resuming.
+    fn cancel_confirmation(&mut self) {
+        if matches!(self.resume_gate, ResumeGate::Armed(..)) {
+            self.resume_gate = ResumeGate::Clear;
+        }
+    }
+
+    fn confirmation_armed(&self) -> bool {
+        matches!(self.resume_gate, ResumeGate::Armed(..))
+    }
+
+    fn confirmation_armed_for(&self, key: &SessionKey) -> bool {
+        matches!(&self.resume_gate, ResumeGate::Armed(armed, _) if armed == key)
+    }
+
+    fn admit_resume(&mut self, session: &AgentSession) -> bool {
+        self.admit_resume_at(session, Instant::now())
+    }
+
+    /// Decide whether a Resume request may start its fresh readiness check.
+    /// Positive live-process evidence turns the first request into a warning;
+    /// only a later, explicit request for exactly that identity proceeds. A
+    /// repeat within [`SESSION_RESUME_ANYWAY_DELAY`] of the warning, such as
+    /// the second click of a double-click, does nothing.
+    fn admit_resume_at(&mut self, session: &AgentSession, now: Instant) -> bool {
+        if self.catalog.resume_conflict(session).is_none() {
+            self.resume_gate = ResumeGate::Clear;
+            return true;
+        }
+        let key = session_key(session);
+        let pending_for_key = self
+            .pending_resume
+            .as_ref()
+            .is_some_and(|pending| matches_key(pending, &key));
+        match &self.resume_gate {
+            ResumeGate::Armed(armed, at) if *armed == key => {
+                if now.saturating_duration_since(*at) < SESSION_RESUME_ANYWAY_DELAY {
+                    return false;
+                }
+                self.resume_gate = ResumeGate::Confirmed(key);
+                true
+            }
+            // Repeating Resume while the confirmed attempt is still pending.
+            ResumeGate::Confirmed(confirmed) if *confirmed == key && pending_for_key => true,
+            _ => {
+                self.resume_gate = ResumeGate::Armed(key, now);
+                self.pending_resume = None;
+                false
+            }
+        }
+    }
+
+    /// A scan can observe a live CLI after Resume was requested. Launch only
+    /// without such evidence or after "Resume anyway" for this identity.
+    fn conflict_blocks_launch(&self, session: &AgentSession) -> bool {
+        self.catalog.resume_conflict(session).is_some()
+            && !matches!(&self.resume_gate, ResumeGate::Confirmed(key) if matches_key(session, key))
+    }
+
+    /// A confirmation belongs to one visible identity. Selecting another
+    /// conversation, a refresh that hides or removes it, an open tab taking
+    /// over, or (for the warning) the observed process ending clears it.
+    fn reconcile_resume_gate(&mut self) {
+        let (key, needs_conflict) = match &self.resume_gate {
+            ResumeGate::Clear => return,
+            ResumeGate::Armed(key, _) => (key, true),
+            ResumeGate::Confirmed(key) => (key, false),
+        };
+        // A confirmation lives only as long as the attempt it started.
+        let attempt_alive = needs_conflict
+            || self
+                .pending_resume
+                .as_ref()
+                .is_some_and(|pending| matches_key(pending, key));
+        let keep = attempt_alive
+            && !self.opened.contains_key(key)
+            && self.selected_session().is_some_and(|session| {
+                matches_key(session, key)
+                    && (!needs_conflict || self.catalog.resume_conflict(session).is_some())
+            });
+        if !keep {
+            self.resume_gate = ResumeGate::Clear;
+        }
+    }
+
+    /// Advance the pending resume after this frame's readiness poll. Every
+    /// way it ends without a launch also ends its "Resume anyway".
+    fn advance_pending_resume(&mut self) -> ResumeStep {
+        if !self.is_open {
+            self.end_resume_attempt();
+            return ResumeStep::Wait;
+        }
+        self.sync_preflight();
+        let Some(pending) = self.pending_resume.clone() else {
+            return ResumeStep::Wait;
+        };
+        if !self
+            .selected_session()
+            .is_some_and(|session| same_launch_target(session, &pending))
+        {
+            self.end_resume_attempt();
+            return ResumeStep::Wait;
+        }
+        if let Some(launch) = self.preflight.ready_launch(&pending).cloned() {
+            self.pending_resume = None;
+            if self.conflict_blocks_launch(&pending) {
+                // A scan observed a live CLI after Resume was requested.
+                self.resume_gate = ResumeGate::Armed(session_key(&pending), Instant::now());
+                return ResumeStep::Rearmed;
+            }
+            return ResumeStep::Launch(Box::new((pending, launch)));
+        }
+        if let SessionPreflightState::Unavailable(error) = self.preflight.state() {
+            self.error = Some(error.clone());
+            self.end_resume_attempt();
+        }
+        ResumeStep::Wait
+    }
+
+    /// Apply one Escape press: leave a focused editor (the caller moves the
+    /// focus), else dismiss a pending warning, else close. Leaving an editor
+    /// never dismisses the warning, so the next Enter can still confirm it.
+    fn escape(&mut self, editor_focused: bool) -> SessionEscape {
+        let action = session_escape_action(editor_focused, self.confirmation_armed());
+        match action {
+            SessionEscape::LeaveEditor => {}
+            SessionEscape::CancelConfirmation => self.cancel_confirmation(),
+            SessionEscape::Close => {
+                self.is_open = false;
+                self.cancel_resume();
+            }
+        }
+        action
+    }
+
+    /// Remember an organization change the user made, so a conversation it
+    /// moves out of the view is explained as their own change.
+    fn note_own_change(&mut self, key: SessionKey, change: OwnChange) {
+        self.own_change = Some((key, change));
+    }
+
+    /// The user's own change that may have moved the selection out of view.
+    fn own_change_for_selection(&self) -> Option<OwnChange> {
+        self.own_change
+            .as_ref()
+            .filter(|(key, _)| self.selected.as_ref() == Some(key))
+            .map(|(_, change)| *change)
     }
 
     fn note_resumed(&mut self, session: &AgentSession) {
@@ -254,24 +682,56 @@ impl AgentSessionsState {
             });
     }
 
-    fn selected_session(&self) -> Option<&AgentSession> {
-        let (provider, id) = self.selected.as_ref()?;
-        self.catalog
-            .sessions
+    /// Catalog index of the selected conversation when it is in this view.
+    fn selected_index(&self, visible: &[usize]) -> Option<usize> {
+        let key = self.selected.as_ref()?;
+        visible
             .iter()
-            .find(|s| s.provider == *provider && s.id == *id)
+            .copied()
+            .find(|index| matches_key(&self.catalog.sessions[*index], key))
     }
 
+    /// The selected conversation, only while it is visible. Resume and
+    /// organization act on this; a hidden selection is never acted on.
+    fn selected_session(&self) -> Option<&AgentSession> {
+        self.selected_index(&self.visible())
+            .map(|index| &self.catalog.sessions[index])
+    }
+
+    /// Title of a selection that a refresh or another terminal moved out of
+    /// this view, for the notice that replaces its details.
+    fn detached_selection_title(&self, visible: &[usize]) -> Option<String> {
+        let key = self.selected.as_ref()?;
+        if self.selected_index(visible).is_some() {
+            return None;
+        }
+        Some(
+            self.catalog
+                .sessions
+                .iter()
+                .find(|session| matches_key(session, key))
+                .map(|session| {
+                    crate::review_text::visible_bounded(
+                        self.library_snapshot
+                            .facts(session.provider, &session.id)
+                            .display_title(&session.title),
+                        160,
+                    )
+                })
+                .unwrap_or_else(|| "The selected conversation".into()),
+        )
+    }
+
+    /// Fill an empty selection with the first visible row: the initial
+    /// population or an explicit filter/search edit. A selection is never
+    /// retargeted; if a background refresh hides or removes it, it stays
+    /// selected but detached until the user chooses another conversation.
     fn reconcile_selection(&mut self) {
-        let visible = self.visible();
-        if !visible.iter().any(|i| {
-            self.selected
-                .as_ref()
-                .is_some_and(|key| matches_key(&self.catalog.sessions[*i], key))
-        }) {
-            self.selected = visible
+        if self.selected.is_none() {
+            self.selected = self
+                .visible()
                 .first()
-                .map(|i| session_key(&self.catalog.sessions[*i]));
+                .map(|index| session_key(&self.catalog.sessions[*index]));
         }
     }
 
@@ -304,22 +764,30 @@ impl AgentSessionsState {
         if visible.is_empty() {
             return;
         }
-        let position = visible
-            .iter()
-            .position(|i| {
-                self.selected
-                    .as_ref()
-                    .is_some_and(|selected| matches_key(&self.catalog.sessions[*i], selected))
-            })
-            .unwrap_or(0);
+        let last = visible.len() - 1;
+        let position = visible.iter().position(|i| {
+            self.selected
+                .as_ref()
+                .is_some_and(|selected| matches_key(&self.catalog.sessions[*i], selected))
+        });
         let page = self.page_rows.max(1);
-        let next = match key {
-            egui::Key::ArrowUp => position.saturating_sub(1),
-            egui::Key::ArrowDown => (position + 1).min(visible.len() - 1),
-            egui::Key::PageUp => position.saturating_sub(page),
-            egui::Key::PageDown => position.saturating_add(page).min(visible.len() - 1),
-            egui::Key::Home => 0,
-            egui::Key::End => visible.len() - 1,
+        let next = match (position, key) {
+            // A detached or empty selection restarts from a list edge.
+            (None, egui::Key::End) => last,
+            (
+                None,
+                egui::Key::ArrowUp
+                | egui::Key::ArrowDown
+                | egui::Key::PageUp
+                | egui::Key::PageDown
+                | egui::Key::Home,
+            ) => 0,
+            (Some(position), egui::Key::ArrowUp) => position.saturating_sub(1),
+            (Some(position), egui::Key::ArrowDown) => (position + 1).min(last),
+            (Some(position), egui::Key::PageUp) => position.saturating_sub(page),
+            (Some(position), egui::Key::PageDown) => position.saturating_add(page).min(last),
+            (Some(_), egui::Key::Home) => 0,
+            (Some(_), egui::Key::End) => last,
             _ => return,
         };
         self.selected = Some(session_key(&self.catalog.sessions[visible[next]]));
@@ -347,10 +815,56 @@ impl AgentSessionsState {
         };
     }
 
-    fn refresh(&mut self) {
-        if self.scanner.refresh() {
-            self.last_refresh = Some(Instant::now());
+    /// Opening the manager, F5 and Refresh: rescan now (a running scan's
+    /// result is already on its way), reload the shared library and recheck
+    /// the selected conversation's project and CLI (which also recomputes its
+    /// resume command off the UI thread).
+    fn refresh_all(&mut self) {
+        // A scan that finished while the manager was closed is already old.
+        // Apply it now, so it cannot count as the "previous scan" and delay
+        // the fresh one by a whole refresh interval.
+        if let Some(catalog) = self.scanner.poll() {
+            self.replace_catalog(catalog);
         }
+        self.scanner.refresh();
+        self.library.refresh();
+        self.preflight.refresh();
+    }
+
+    /// Opening is an explicit action: a selection that is not listed under
+    /// the current filters (left over from the last visit) gives way to the
+    /// first match instead of a "no longer in this view" notice.
+    fn adopt_listed_selection(&mut self) {
+        if self.selected_session().is_none() {
+            self.selected = None;
+            self.reconcile_selection();
+        }
+    }
+
+    /// While open: start a scan once the previous one has been idle for the
+    /// refresh interval, and reload the library in the same step.
+    fn refresh_if_due(&mut self) {
+        if self.scanner.refresh_if_idle_for(SESSION_REFRESH_INTERVAL) {
+            self.library.refresh();
+        }
+    }
+
+    fn note_copied(&mut self, key: &SessionKey, kind: CopyKind) {
+        self.copy_receipt = Some(CopyReceipt {
+            key: key.clone(),
+            kind,
+            at: Instant::now(),
+        });
+    }
+
+    fn copy_receipt_remaining(&self, key: &SessionKey, kind: CopyKind) -> Option<Duration> {
+        let receipt = self
+            .copy_receipt
+            .as_ref()
+            .filter(|receipt| receipt.key == *key && receipt.kind == kind)?;
+        COPY_RECEIPT
+            .checked_sub(receipt.at.elapsed())
+            .filter(|remaining| !remaining.is_zero())
     }
 }
 
@@ -418,6 +932,7 @@ fn age_label(updated_at_ms: u64) -> String {
 struct SessionManagerActions {
     open: bool,
     resume: bool,
+    cancel_confirmation: bool,
     pin_change: Option<(SessionProvider, String, bool)>,
     details_change: Option<(SessionKey, String, String)>,
     archive_change: Option<(SessionKey, bool)>,
@@ -450,22 +965,30 @@ fn show_session_batch_controls(
     ui: &mut egui::Ui,
     state: &mut AgentSessionsState,
     visible: &[usize],
+    visible_fingerprint: u64,
 ) -> Option<(Vec<SessionKey>, SessionBatchAction)> {
     let mut change = None;
-    let visible_keys: Vec<_> = visible
-        .iter()
-        .map(|index| session_key(&state.catalog.sessions[*index]))
-        .collect();
-    let checked_keys = state.checked_keys();
-    ui.horizontal_wrapped(|ui| {
-        let visible_checked = visible
+    // An empty selection costs no key copies or per-row hashing. The visible
+    // set is bound to "Select visible" through its cached fingerprint.
+    let mut checked_keys = state.checked_keys();
+    let visible_checked = if state.checked.is_empty() {
+        0
+    } else {
+        let checked: HashSet<(SessionProvider, &str)> = state
+            .checked
+            .iter()
+            .map(|(provider, id)| (*provider, id.as_str()))
+            .collect();
+        visible
             .iter()
             .filter(|index| {
-                state
-                    .checked
-                    .contains(&session_key(&state.catalog.sessions[**index]))
+                let session = &state.catalog.sessions[**index];
+                checked.contains(&(session.provider, session.id.as_str()))
             })
-            .count();
+            .count()
+    };
+    let mut selection_changed = false;
+    ui.horizontal_wrapped(|ui| {
         ui.strong(format!(
             "{} selected · {} hidden by filters or refresh",
             state.checked.len(),
@@ -473,13 +996,18 @@ fn show_session_batch_controls(
         ));
         if ui
             .push_id(
-                ("select_visible_sessions", &visible_keys, &checked_keys),
+                (
+                    "select_visible_sessions",
+                    visible_fingerprint,
+                    &checked_keys,
+                ),
                 |ui| ui.add_enabled(!visible.is_empty(), egui::Button::new("Select visible")),
             )
             .inner
             .clicked()
         {
             state.library_notice = state.select_visible(visible).err();
+            selection_changed = true;
         }
         if ui
             .push_id(("clear_checked_sessions", &checked_keys), |ui| {
@@ -493,11 +1021,15 @@ fn show_session_batch_controls(
         {
             state.checked.clear();
             state.batch_notice = None;
+            selection_changed = true;
         }
     });
     if !state.checked.is_empty() {
-        let keys = state.checked_keys();
-        let enabled = state.library.is_loaded() && !state.library.is_busy();
+        if selection_changed {
+            checked_keys = state.checked_keys();
+        }
+        let keys = checked_keys;
+        let enabled = state.library.is_loaded() && !state.library.is_saving();
         ui.horizontal_wrapped(|ui| {
             for (label, action) in [
                 ("Pin selected", SessionBatchAction::Pin(true)),
@@ -510,14 +1042,18 @@ fn show_session_batch_controls(
                 }
             }
         });
+        let mut tag_problem = None;
         ui.horizontal_wrapped(|ui| {
-            ui.add(
+            let editor = ui.add(
                 egui::TextEdit::singleline(&mut state.batch_tag)
                     .id(egui::Id::new("session_batch_tag"))
                     .hint_text("One tag for the selected conversations")
-                    .char_limit(32)
+                    .char_limit(editor_char_limit(SESSION_TAGS_EDITOR_MAX_BYTES))
                     .desired_width(260.0),
             );
+            state.text_editors.push(editor.id);
+            // Validate after this frame's edit so the buttons match the text.
+            tag_problem = batch_tag_problem(&state.batch_tag);
             for (label, action) in [
                 (
                     "Add tag",
@@ -532,7 +1068,7 @@ fn show_session_batch_controls(
                     ui,
                     &keys,
                     &action,
-                    enabled && !state.batch_tag.trim().is_empty(),
+                    enabled && !state.batch_tag.trim().is_empty() && tag_problem.is_none(),
                     label,
                 )
                 .clicked()
@@ -541,7 +1077,13 @@ fn show_session_batch_controls(
                 }
             }
         });
-        ui.small(format!("Actions apply to all {} checked conversations, including hidden selections. Limit: {SESSION_BATCH_LIMIT}.", keys.len()));
+        if let Some(problem) = &tag_problem {
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                crate::review_text::visible_bounded(problem, 512),
+            );
+        }
+        ui.small(format!("Actions apply to all {} checked conversations, including hidden selections. Limit: {SESSION_BATCH_LIMIT}. A tag is at most {SESSION_TAG_MAX_BYTES} bytes.", keys.len()));
     }
     if let Some(notice) = &state.batch_notice {
         ui.small(notice);
@@ -549,21 +1091,16 @@ fn show_session_batch_controls(
     change
 }
 
+// The label is part of the identity: a press that began on one meaning can
+// never be released as another after a refresh or a new live-process scan.
 fn session_resume_button(
     ui: &mut egui::Ui,
     selected: Option<&SessionKey>,
     enabled: bool,
-    switch_to_tab: bool,
+    mode: ResumeButtonMode,
 ) -> egui::Response {
-    ui.push_id(("resume_agent_session", selected), |ui| {
-        ui.add_enabled(
-            enabled,
-            egui::Button::new(if switch_to_tab {
-                "Switch to Open Tab  ↵"
-            } else {
-                "Resume in New Tab  ↵"
-            }),
-        )
+    ui.push_id(("resume_agent_session", selected, mode), |ui| {
+        ui.add_enabled(enabled, egui::Button::new(mode.label()))
     })
     .inner
 }
@@ -644,6 +1181,294 @@ fn session_row_button(
     response
 }
 
+fn show_copy_receipt(
+    ui: &mut egui::Ui,
+    state: &AgentSessionsState,
+    key: &SessionKey,
+    kind: CopyKind,
+) {
+    if let Some(remaining) = state.copy_receipt_remaining(key, kind) {
+        ui.small(egui::RichText::new(kind.receipt()).color(egui::Color32::LIGHT_GREEN));
+        ui.ctx().request_repaint_after(remaining);
+    }
+}
+
+// Identity-bound like Resume: a press on one conversation's warning cannot be
+// released as a confirmation for a replacement.
+fn session_resume_anyway_button(ui: &mut egui::Ui, key: &SessionKey) -> egui::Response {
+    ui.push_id(("resume_agent_session_anyway", key), |ui| {
+        ui.button("Resume anyway")
+    })
+    .inner
+}
+
+/// Details for the selected, visible conversation. Only this function offers
+/// organize and resume-warning actions, so a detached selection has none.
+fn show_session_details(
+    ui: &mut egui::Ui,
+    state: &mut AgentSessionsState,
+    index: usize,
+    actions: &mut SessionManagerActions,
+) {
+    let session = state.catalog.sessions[index].clone();
+    let key = session_key(&session);
+    let facts = state.library_snapshot.facts(session.provider, &session.id);
+    let (pinned, archived, last_resumed, has_alias) = (
+        facts.pinned,
+        facts.archived,
+        facts.last_resumed_ms,
+        facts.alias.is_some(),
+    );
+    let title = crate::review_text::visible_bounded(facts.display_title(&session.title), 240);
+    // Periodic read-only reloads never disable organization; only a save does.
+    let can_organize = state.library.is_loaded() && !state.library.is_saving();
+    ui.heading(title);
+    ui.label(format!(
+        "{} · {} · {}",
+        session.provider.label(),
+        session.status.label(),
+        age_label(session.updated_at_ms)
+    ));
+    if session_pin_button(ui, &key, pinned, can_organize).clicked() {
+        actions.pin_change = Some((session.provider, session.id.clone(), !pinned));
+    }
+    if let Some(resumed) = last_resumed {
+        ui.small(format!(
+            "Last resumed {} · shared across your terminals",
+            age_label(resumed)
+        ));
+    }
+    let opened_here = state.opened.contains_key(&key);
+    if opened_here {
+        ui.colored_label(
+            egui::Color32::LIGHT_GREEN,
+            "Ready to switch to the open tab",
+        );
+    } else if state.preflight.ready_launch(&session).is_some() {
+        ui.colored_label(
+            egui::Color32::LIGHT_GREEN,
+            "Ready · project and CLI checked",
+        );
+    } else {
+        match state.preflight.state() {
+            SessionPreflightState::Unavailable(error) => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    crate::review_text::visible_bounded(error, 1024),
+                );
+            }
+            _ => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Checking project and CLI…");
+                });
+            }
+        }
+    }
+    if state.pending_resume.is_some() {
+        ui.small("Confirming a fresh readiness check…");
+    }
+    let live_pids = state.catalog.live_pids(&session);
+    if !live_pids.is_empty() {
+        ui.colored_label(
+            egui::Color32::LIGHT_GREEN,
+            format!(
+                "Live CLI process · PID {}",
+                live_pids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+        ui.small("Exact session-ID process match; recorded state remains separate.");
+    }
+    if opened_here {
+        ui.label("Open in this window · confirming switches to its tab");
+    } else if let Some(warning) = state.catalog.resume_conflict(&session) {
+        let armed = state.confirmation_armed_for(&key);
+        ui.group(|ui| {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                crate::review_text::visible_bounded(&warning, 1024),
+            );
+            if armed {
+                ui.label("Resume anyway only if you mean to run both CLIs, or after the other one exits.");
+                ui.horizontal_wrapped(|ui| {
+                    if session_resume_anyway_button(ui, &key).clicked() {
+                        actions.resume = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        actions.cancel_confirmation = true;
+                    }
+                });
+            } else {
+                ui.small("Resume asks for a second confirmation while that process is observed.");
+            }
+        });
+    }
+    ui.add_space(8.0);
+    let saved = SessionDetailsDraft::saved(&state.library_snapshot, &key);
+    let can_edit = state.library.is_loaded() && state.pending_details.as_ref() != Some(&key);
+    let editors = &mut state.text_editors;
+    let pending_details = state.pending_details.as_ref() == Some(&key);
+    let loaded = state.library.is_loaded();
+    let draft = state
+        .details_drafts
+        .entry(key.clone())
+        .or_insert_with(|| saved.clone());
+    draft.sync_saved(&saved);
+    egui::CollapsingHeader::new("Organize this conversation")
+        .id_salt(("session_details", session.provider.label(), &session.id))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.small(format!(
+                "Local alias · {} / {SESSION_ALIAS_MAX_BYTES} bytes",
+                draft.alias.len()
+            ));
+            let alias = ui.add_enabled(
+                can_edit,
+                egui::TextEdit::singleline(&mut draft.alias)
+                    .id_salt(("session_alias", session.provider.label(), &session.id))
+                    .hint_text("A recognizable name for this work")
+                    .char_limit(editor_char_limit(SESSION_ALIAS_MAX_BYTES))
+                    .desired_width(f32::INFINITY),
+            );
+            ui.small(format!(
+                "Tags · comma separated · up to {SESSION_TAG_LIMIT}, each at most {SESSION_TAG_MAX_BYTES} bytes"
+            ));
+            let tags = ui.add_enabled(
+                can_edit,
+                egui::TextEdit::singleline(&mut draft.tags)
+                    .id_salt(("session_tags", session.provider.label(), &session.id))
+                    .hint_text("review, release, research")
+                    .char_limit(editor_char_limit(SESSION_TAGS_EDITOR_MAX_BYTES))
+                    .desired_width(f32::INFINITY),
+            );
+            editors.extend([alias.id, tags.id]);
+            let changed = draft.alias != saved.alias || draft.tags != saved.tags;
+            // The same checks Save applies, live, so a byte limit or bad tag
+            // is explained while typing instead of after a rejected save.
+            let problem = validate_session_details(&draft.alias, &draft.tags).err();
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        can_organize && changed && problem.is_none(),
+                        egui::Button::new("Save details"),
+                    )
+                    .clicked()
+                {
+                    actions.details_change =
+                        Some((key.clone(), draft.alias.clone(), draft.tags.clone()));
+                }
+                if ui
+                    .add_enabled(can_edit && changed, egui::Button::new("Reset"))
+                    .clicked()
+                {
+                    *draft = saved.clone();
+                }
+                if pending_details {
+                    ui.small("Saving details…");
+                } else if !loaded {
+                    ui.small("Loading organization…");
+                } else if changed {
+                    ui.small("Unsaved changes");
+                }
+            });
+            if let Some(problem) = &problem {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    crate::review_text::visible_bounded(problem, 512),
+                );
+            }
+            if draft.is_dirty()
+                && (draft.original_alias != saved.alias || draft.original_tags != saved.tags)
+            {
+                ui.colored_label(egui::Color32::YELLOW, "Saved details changed in another terminal. Reset to use those details, or save your edits.");
+            }
+            ui.small("Alias and tags are shared across your four terminals. The provider's conversation stays intact.");
+            if has_alias {
+                ui.small(format!(
+                    "Original title: {}",
+                    crate::review_text::visible_bounded(&session.title, 240)
+                ));
+            }
+            if session_archive_button(ui, &key, archived, can_organize)
+                .on_hover_text("Moves this conversation between Active and Archived in the shared library. It does not delete history or stop a running agent.")
+                .clicked()
+            {
+                actions.archive_change = Some((key.clone(), !archived));
+            }
+        });
+    if !draft.is_dirty() {
+        state.details_drafts.remove(&key);
+    }
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Project").strong());
+    let project = session.cwd.to_string_lossy();
+    ui.label(crate::review_text::visible_bounded(&project, 1024));
+    ui.horizontal_wrapped(|ui| {
+        if ui.small_button("Copy path").clicked() {
+            ui.ctx()
+                .copy_text(crate::review_text::visible_bounded(&project, 4096));
+            state.note_copied(&key, CopyKind::Path);
+        }
+        show_copy_receipt(ui, state, &key, CopyKind::Path);
+    });
+    if let Some(branch) = &session.branch {
+        ui.label(format!(
+            "Branch: {}",
+            crate::review_text::visible_bounded(branch, 160)
+        ));
+    }
+    ui.label(format!(
+        "Session: {}",
+        crate::review_text::visible_bounded(&session.id, 160)
+    ));
+    ui.separator();
+    ui.label(egui::RichText::new("Latest context").strong());
+    ui.label(if session.preview.is_empty() {
+        "No message preview available".to_string()
+    } else {
+        crate::review_text::visible_bounded(&session.preview, 8192)
+    });
+    ui.add_space(10.0);
+    if opened_here {
+        return;
+    }
+    // The background readiness check computes the exact command together
+    // with its project and history checks, so this never touches the disk.
+    // A missing CLI still leaves the command copyable for another terminal.
+    ui.label(egui::RichText::new("Resume command").strong());
+    let command = state.preflight.command(&session).map(str::to_owned);
+    match &command {
+        Some(command) => {
+            ui.monospace(crate::review_text::visible_bounded(command, 1024));
+        }
+        None if matches!(
+            state.preflight.state(),
+            SessionPreflightState::Unavailable(_)
+        ) =>
+        {
+            // The readiness check above already shows the reason.
+            ui.small("Unavailable · the readiness check above explains why");
+        }
+        None => {
+            ui.small("Checking the resume command…");
+        }
+    }
+    ui.horizontal_wrapped(|ui| {
+        let copy = ui
+            .add_enabled(command.is_some(), egui::Button::new("Copy command"))
+            .on_disabled_hover_text("Available once the readiness check finds the conversation");
+        if let (true, Some(command)) = (copy.clicked(), &command) {
+            ui.ctx().copy_text(command.clone());
+            state.note_copied(&key, CopyKind::Command);
+        }
+        show_copy_receipt(ui, state, &key, CopyKind::Command);
+    });
+}
+
 // Render pure navigation/editor state and stage exact-identity actions. The
 // caller remains responsible for disk mutations, preflight and process launch.
 fn show_session_manager(
@@ -652,13 +1477,18 @@ fn show_session_manager(
     task_dashboard_enabled: bool,
 ) -> SessionManagerActions {
     let mut open = true;
-    let mut resume = false;
-    let mut pin_change = None;
-    let mut details_change = None;
-    let mut archive_change = None;
-    let mut batch_change = None;
-    let mut open_tasks = false;
-    egui::Window::new("Agent Sessions")
+    let mut actions = SessionManagerActions {
+        open: true,
+        resume: false,
+        cancel_confirmation: false,
+        pin_change: None,
+        details_change: None,
+        archive_change: None,
+        batch_change: None,
+        open_tasks: false,
+    };
+    state.text_editors.clear();
+    let window = egui::Window::new("Agent Sessions")
         .id(egui::Id::new("agent_sessions_manager"))
         .open(&mut open)
         .default_size(egui::vec2(1040.0, 700.0))
@@ -669,25 +1499,33 @@ fn show_session_manager(
                 ui.label(egui::RichText::new("Agent command center").size(20.0).strong());
                 if ui.add_enabled(task_dashboard_enabled, egui::Button::new("Task dashboard"))
                     .on_disabled_hover_text("Enable the Tasks sidebar in Settings to manage worktree tasks")
-                    .clicked() { open_tasks = true; }
+                    .clicked() { actions.open_tasks = true; }
             });
             ui.label("Organize conversations, browse projects and return to active work");
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                let total = state.catalog.sessions.len();
-                let codex = state.catalog.sessions.iter().filter(|s| s.provider == SessionProvider::Codex).count();
-                let waiting = state.catalog.sessions.iter().filter(|s| s.status == SessionStatus::Waiting).count();
-                let live = state.catalog.live_processes.len();
-                ui.label(egui::RichText::new(format!("{total} sessions   ·   {codex} Codex   ·   {} Claude   ·   {waiting} waiting   ·   {live} live processes   ·   {} pinned", total - codex, state.library_snapshot.pinned_count())).strong());
+                let stats = state.catalog_stats;
+                let live = stats.live_conversations;
+                ui.label(egui::RichText::new(format!(
+                    "{} sessions   ·   {} Codex   ·   {} Claude   ·   {} waiting   ·   {live} live CLI {}   ·   {} pinned",
+                    stats.total,
+                    stats.codex,
+                    stats.total - stats.codex,
+                    stats.waiting,
+                    if live == 1 { "conversation" } else { "conversations" },
+                    state.library_snapshot.pinned_count()
+                )).strong())
+                .on_hover_text("Live CLI conversations have an exact session-ID match to at least one local CLI process at the latest refresh.");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(!state.scanner.is_scanning(), egui::Button::new("Refresh  F5")).clicked() { state.refresh(); state.preflight.refresh(); state.library.refresh(); }
+                    if ui.add_enabled(!state.scanner.is_scanning(), egui::Button::new("Refresh  F5")).clicked() { state.refresh_all(); }
                     if state.scanner.is_scanning() { ui.spinner(); }
                 });
             });
             let previous_filters = state.filter_key();
             ui.horizontal(|ui| {
-                let response = ui.add(egui::TextEdit::singleline(&mut state.query).hint_text("Search · tag:review provider:codex project:core -term \"exact phrase\"").desired_width(f32::INFINITY).char_limit(1024));
+                let response = ui.add(egui::TextEdit::singleline(&mut state.query).hint_text("Search · tag:review provider:codex project:core -term \"exact phrase\"").desired_width(f32::INFINITY).char_limit(editor_char_limit(SESSION_QUERY_MAX_BYTES)));
                 state.search_widget = Some(response.id);
+                state.text_editors.push(response.id);
                 if state.focus_search { response.request_focus(); state.focus_search = false; }
             });
             ui.horizontal_wrapped(|ui| {
@@ -743,18 +1581,19 @@ fn show_session_manager(
                         }
                     });
             });
-            if state.filter_key() != previous_filters { state.filters_changed(); }
+            // An explicit filter or search edit may select its first match.
+            if !state.filter_matches(&previous_filters) { state.filters_changed(); }
             state.reconcile_selection();
-            let visible = state.visible();
+            let (visible, visible_fingerprint) = state.visible_rows();
             ui.separator();
-            batch_change = show_session_batch_controls(ui, state, &visible);
+            actions.batch_change = show_session_batch_controls(ui, state, &visible, visible_fingerprint);
             ui.small(format!("{} matching sessions · {}{}", visible.len(), state.sort.label(), if state.query.trim().is_empty() && state.sort == SessionSort::Relevance { " · newest first" } else { "" }));
-            if let Some(error) = SessionSearchIndex::query_error(&state.query) {
+            if let Some(error) = state.query_error() {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
             if let Some(error) = &state.error { ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024)); }
             if !state.library.is_loaded() { ui.small("Loading shared favorites and resume history…"); }
-            else if state.library.is_busy() { ui.small("Syncing favorites and resume history…"); }
+            else if state.library.is_saving() { ui.small("Saving favorites and organization…"); }
             if let Some(error) = state.library.error().or(state.library_notice.as_deref()) {
                 ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024));
             }
@@ -764,6 +1603,7 @@ fn show_session_manager(
                 });
             }
             let height = (ui.available_height() - 72.0).max(160.0);
+            let selected_before = state.selected_index(&visible);
             ui.columns(2, |columns| {
                 const ROW_HEIGHT: f32 = 70.0;
                 let stride = ROW_HEIGHT + columns[0].spacing().item_spacing.y;
@@ -776,7 +1616,7 @@ fn show_session_manager(
                     state.restore_anchor = false;
                 }
                 if state.scroll_selection {
-                    if let Some(row) = visible.iter().position(|i| state.selected.as_ref().is_some_and(|key| *key == session_key(&state.catalog.sessions[*i]))) {
+                    if let Some(row) = selected_before.and_then(|index| visible.iter().position(|i| *i == index)) {
                         let old_offset = state.scroll_anchor.as_ref().and_then(|_| state.anchor_offset(&visible, stride)).unwrap_or(0.0);
                         let top = row as f32 * stride;
                         let offset = if top < old_offset { top } else if top + stride > old_offset + height { (top + stride - height).max(0.0) } else { old_offset };
@@ -790,15 +1630,16 @@ fn show_session_manager(
                         return;
                     }
                     for row in range {
-                        let session = &state.catalog.sessions[visible[row]];
-                        let selected = state.selected.as_ref().is_some_and(|(p, id)| *p == session.provider && *id == session.id);
+                        let index = visible[row];
+                        let session = &state.catalog.sessions[index];
+                        let selected = selected_before == Some(index);
                         let live_pids = state.catalog.live_pids(session);
                         let live_badge = if live_pids.is_empty() { String::new() } else { format!("  ·  LIVE {}", live_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")) };
-                        let pinned = state.library_snapshot.is_pinned(session.provider, &session.id);
-                        let title = format!("{}{}{}", if pinned { "★ " } else { "" }, if state.library_snapshot.is_archived(session.provider, &session.id) { "[Archived] " } else { "" }, crate::review_text::visible_bounded(state.library_snapshot.display_title(session.provider, &session.id, &session.title), 160));
-                        let tags = state.library_snapshot.tags(session.provider, &session.id);
+                        // One identity lookup answers every library question for the row.
+                        let facts = state.library_snapshot.facts(session.provider, &session.id);
+                        let title = format!("{}{}{}", if facts.pinned { "★ " } else { "" }, if facts.archived { "[Archived] " } else { "" }, crate::review_text::visible_bounded(facts.display_title(&session.title), 160));
                         let project = crate::review_text::visible_bounded(&session.cwd.to_string_lossy(), 120);
-                        let context = if tags.is_empty() { project } else { format!("{}  ·  {}", project, tags.join(" · ")) };
+                        let context = if facts.tags.is_empty() { project } else { format!("{}  ·  {}", project, facts.tags.join(" · ")) };
                         let status = format!("{}  ·  {}  ·  {}{}", session.provider.label(), session.status.label(), age_label(session.updated_at_ms), live_badge);
                         let key = session_key(session);
                         let mut checked = state.checked.contains(&key);
@@ -816,131 +1657,71 @@ fn show_session_manager(
                             }).inner
                         }).inner;
                         if response.has_focus() { state.row_focus_widget = Some(response.id); }
-                        if response.clicked() { state.selected = Some((session.provider, session.id.clone())); }
+                        if response.clicked() { state.selected = Some(key); }
                     }
                 });
                 state.remember_anchor(&visible, list_output.state.offset.y, stride);
+                // A click in the list this frame is an explicit selection.
+                let selected_index = state.selected_index(&visible);
                 egui::ScrollArea::vertical().id_salt("agent_session_detail").max_height(height).show(&mut columns[1], |ui| {
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                    if let Some(session) = state.selected_session().cloned() {
-                        ui.heading(crate::review_text::visible_bounded(state.library_snapshot.display_title(session.provider, &session.id, &session.title), 240));
-                        ui.label(format!("{} · {} · {}", session.provider.label(), session.status.label(), age_label(session.updated_at_ms)));
-                        let pinned = state.library_snapshot.is_pinned(session.provider, &session.id);
-                        if session_pin_button(ui, &session_key(&session), pinned, state.library.is_loaded() && !state.library.is_busy()).clicked() {
-                            pin_change = Some((session.provider, session.id.clone(), !pinned));
-                        }
-                        if let Some(resumed) = state.library_snapshot.last_resumed(session.provider, &session.id) {
-                            ui.small(format!("Last resumed {} · shared across your terminals", age_label(resumed)));
-                        }
-                        if state.opened.contains_key(&session_key(&session)) {
-                            ui.colored_label(egui::Color32::LIGHT_GREEN, "Ready to switch to the open tab");
-                        } else if state.preflight.ready_launch(&session).is_some() {
-                            ui.colored_label(egui::Color32::LIGHT_GREEN, "Ready · project and CLI checked");
-                        } else {
-                            match state.preflight.state() {
-                                SessionPreflightState::Unavailable(error) => { ui.colored_label(egui::Color32::LIGHT_RED, crate::review_text::visible_bounded(error, 1024)); }
-                                _ => { ui.horizontal(|ui| { ui.spinner(); ui.label("Checking project and CLI…"); }); }
-                            }
-                        }
-                        if state.pending_resume.is_some() { ui.small("Confirming a fresh readiness check…"); }
-                        let live_pids = state.catalog.live_pids(&session);
-                        if !live_pids.is_empty() {
-                            ui.colored_label(egui::Color32::LIGHT_GREEN, format!("Live CLI process · PID {}", live_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
-                            ui.small("Exact session-ID process match; recorded state remains separate.");
-                        }
-                        if state.opened.contains_key(&(session.provider, session.id.clone())) {
-                            ui.label("Open in this window · confirming switches to its tab");
-                        }
-                        ui.add_space(8.0);
-                        let key = session_key(&session);
-                        let saved = SessionDetailsDraft::saved(&state.library_snapshot, &key);
-                        let can_edit = state.library.is_loaded() && state.pending_details.as_ref() != Some(&key);
-                        let can_save = state.library.is_loaded() && !state.library.is_busy();
-                        let draft = state.details_drafts.entry(key.clone()).or_insert_with(|| saved.clone());
-                        draft.sync_saved(&saved);
-                        egui::CollapsingHeader::new("Organize this conversation")
-                            .id_salt(("session_details", session.provider.label(), &session.id))
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                ui.small("Local alias");
-                                ui.add_enabled(can_edit, egui::TextEdit::singleline(&mut draft.alias)
-                                    .id_salt(("session_alias", session.provider.label(), &session.id))
-                                    .hint_text("A recognizable name for this work")
-                                    .char_limit(160).desired_width(f32::INFINITY));
-                                ui.small("Tags · comma separated");
-                                ui.add_enabled(can_edit, egui::TextEdit::singleline(&mut draft.tags)
-                                    .id_salt(("session_tags", session.provider.label(), &session.id))
-                                    .hint_text("review, release, research")
-                                    .char_limit(420).desired_width(f32::INFINITY));
-                                let changed = draft.alias != saved.alias || draft.tags != saved.tags;
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.add_enabled(can_save && changed, egui::Button::new("Save details")).clicked() {
-                                        details_change = Some((key.clone(), draft.alias.clone(), draft.tags.clone()));
-                                    }
-                                    if ui.add_enabled(can_edit && changed, egui::Button::new("Reset")).clicked() {
-                                        *draft = saved.clone();
-                                    }
-                                    if state.pending_details.as_ref() == Some(&key) { ui.small("Saving details…"); }
-                                    else if !state.library.is_loaded() { ui.small("Loading organization…"); }
-                                    else if changed { ui.small("Unsaved changes"); }
-                                });
-                                if draft.is_dirty() && (draft.original_alias != saved.alias || draft.original_tags != saved.tags) {
-                                    ui.colored_label(egui::Color32::YELLOW, "Saved details changed in another terminal. Reset to use those details, or save your edits.");
-                                }
-                                ui.small("Alias and tags are shared across your four terminals. The provider's conversation stays intact.");
-                                if state.library_snapshot.alias(session.provider, &session.id).is_some() {
-                                    ui.small(format!("Original title: {}", crate::review_text::visible_bounded(&session.title, 240)));
-                                }
-                                let archived = state.library_snapshot.is_archived(session.provider, &session.id);
-                                if session_archive_button(ui, &key, archived, can_save)
-                                    .on_hover_text("Moves this conversation between Active and Archived in the shared library. It does not delete history or stop a running agent.")
-                                    .clicked() { archive_change = Some((key.clone(), !archived)); }
-                            });
-                        if !draft.is_dirty() {
-                            state.details_drafts.remove(&key);
-                        }
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Project").strong());
-                        ui.label(crate::review_text::visible_bounded(&session.cwd.to_string_lossy(), 1024));
-                        if let Some(branch) = &session.branch { ui.label(format!("Branch: {}", crate::review_text::visible_bounded(branch, 160))); }
-                        ui.label(format!("Session: {}", crate::review_text::visible_bounded(&session.id, 160)));
-                        ui.separator();
-                        ui.label(egui::RichText::new("Latest context").strong());
-                        ui.label(if session.preview.is_empty() { "No message preview available".to_string() } else { crate::review_text::visible_bounded(&session.preview, 8192) });
-                        ui.add_space(10.0);
-                        if let Some(launch) = state.preflight.ready_launch(&session) {
-                            ui.label(egui::RichText::new("Resume command").strong());
-                            ui.monospace(crate::review_text::visible_bounded(&launch.display_command(), 1024));
-                            if ui.button("Copy command").clicked() { ui.ctx().copy_text(launch.display_command()); }
-                        }
-                    } else { ui.label("Select a conversation to inspect its project and latest context."); }
+                        if let Some(index) = selected_index {
+                            show_session_details(ui, state, index, &mut actions);
+                        } else if let Some(title) = state.detached_selection_title(&visible) {
+                            ui.colored_label(ui.visuals().warn_fg_color, format!("“{title}” is no longer in this view"));
+                            match state.own_change_for_selection() {
+                                Some(change) => ui.label(format!("{} Resume and organization are paused until you select a conversation.", change.explanation(&title))),
+                                None => ui.label("A refresh, another terminal or a filter moved the selected conversation out of this list. Resume and organization are paused until you select a conversation."),
+                            };
+                        } else { ui.label("Select a conversation to inspect its project and latest context."); }
                     });
                 });
             });
             ui.separator();
+            let selected_index = state.selected_index(&visible);
+            let selected_key = selected_index.map(|index| session_key(&state.catalog.sessions[index]));
+            let armed = selected_key.as_ref().is_some_and(|key| state.confirmation_armed_for(key));
             ui.horizontal(|ui| {
-                ui.small("↑ ↓ / PgUp PgDn / Home End select · Ctrl+L search · Enter resume · Esc close");
+                ui.small(if armed { "Enter or Resume anyway starts a second CLI · Esc cancels the warning" } else { "↑ ↓ / PgUp PgDn / Home End select · Ctrl+L search · Enter resume · Esc leaves a field, then closes" });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let can_resume = state.pending_resume.is_none() && (state.selected.as_ref().is_some_and(|key| state.opened.contains_key(key)) || state.selected_session().is_some_and(|s| state.preflight.ready_launch(s).is_some()));
-                    let switch_to_tab = state.selected.as_ref().is_some_and(|key| state.opened.contains_key(key));
-                    if session_resume_button(ui, state.selected.as_ref(), can_resume, switch_to_tab).clicked() { resume = true; }
+                    let switch_to_tab = selected_key.as_ref().is_some_and(|key| state.opened.contains_key(key));
+                    let can_resume = state.pending_resume.is_none() && (switch_to_tab || selected_index.is_some_and(|index| state.preflight.ready_launch(&state.catalog.sessions[index]).is_some()));
+                    let mode = if switch_to_tab { ResumeButtonMode::SwitchToTab } else if armed { ResumeButtonMode::ResumeAnyway } else { ResumeButtonMode::NewTab };
+                    if session_resume_button(ui, selected_key.as_ref(), can_resume, mode)
+                        .on_disabled_hover_text(if selected_key.is_none() { "Select a conversation in this view first" } else if matches!(state.preflight.state(), SessionPreflightState::Unavailable(_)) { "This conversation cannot be resumed here; its details explain why" } else { "Waiting for the project and CLI check" })
+                        .clicked() { actions.resume = true; }
                 });
             });
             ui.small("States are last recorded events. LIVE badges show exact session-ID process matches; they do not imply busy.");
         });
-    SessionManagerActions {
-        open,
-        resume,
-        pin_change,
-        details_change,
-        archive_change,
-        batch_change,
-        open_tasks,
+    if std::mem::take(&mut state.bring_to_front) {
+        if let Some(window) = &window {
+            ctx.move_to_top(window.response.layer_id);
+        }
     }
+    actions.open = open;
+    actions
 }
 
 impl TerminalApp {
     pub(crate) fn toggle_agent_sessions(&mut self) {
+        if self.agent_sessions.is_open {
+            self.agent_sessions.is_open = false;
+            self.agent_sessions.cancel_resume();
+        } else {
+            self.open_agent_sessions();
+        }
+    }
+
+    /// Open the manager, or bring an already open manager forward with its
+    /// search focused. Links such as the Tasks panel's "Conversation library"
+    /// use this, so a second click never closes it.
+    pub(crate) fn open_agent_sessions(&mut self) {
+        if self.agent_sessions.is_open {
+            self.agent_sessions.bring_to_front = true;
+            self.agent_sessions.focus_search = true;
+            return;
+        }
         let cwd = self
             .session_manager
             .sessions()
@@ -948,25 +1729,20 @@ impl TerminalApp {
             .and_then(|session| jterm_core::process::process_cwd(session.get_shell_pid()))
             .map(PathBuf::from);
         let state = &mut self.agent_sessions;
-        state.is_open = !state.is_open;
-        if !state.is_open {
-            state.cancel_resume();
+        state.is_open = true;
+        state.bring_to_front = true;
+        let previous = state.filter_key();
+        state.scope_cwd = cwd;
+        if state.scope_cwd.is_none() {
+            state.project_only = false;
         }
-        if state.is_open {
-            let previous = state.filter_key();
-            state.scope_cwd = cwd;
-            if state.scope_cwd.is_none() {
-                state.project_only = false;
-            }
-            if state.filter_key() != previous {
-                state.filters_changed();
-            }
-            state.focus_search = true;
-            state.error = None;
-            state.library.refresh();
-            state.library_refresh = Some(Instant::now());
-            state.refresh();
+        if !state.filter_matches(&previous) {
+            state.filters_changed();
         }
+        state.refresh_all();
+        state.adopt_listed_selection();
+        state.focus_search = true;
+        state.error = None;
     }
 
     /// Own the complete key batch, including the frame that closes or resumes.
@@ -991,7 +1767,7 @@ impl TerminalApp {
         }
         let metadata_changed_selection = previous_selection != self.agent_sessions.selected;
         if metadata_changed_selection {
-            self.agent_sessions.pending_resume = None;
+            self.agent_sessions.end_resume_attempt();
         }
         if !self.agent_sessions.is_open && self.agent_sessions.preflight.is_busy() {
             self.agent_sessions.preflight.poll();
@@ -1007,13 +1783,26 @@ impl TerminalApp {
         self.agent_sessions.reconcile_selection();
         let query_is_changing = query_edit_pending(&self.frame_events);
         if query_is_changing {
-            self.agent_sessions.pending_resume = None;
+            self.agent_sessions.end_resume_attempt();
         }
+        // egui drops focus on Escape before this prepass runs, so an editor
+        // that held focus last frame still counts as the Escape target.
+        let (focused, mut editor_focused) = ctx.memory(|memory| {
+            (
+                memory.focused(),
+                self.agent_sessions
+                    .text_editors
+                    .iter()
+                    .any(|id| memory.focused() == Some(*id) || memory.had_focus_last_frame(*id)),
+            )
+        });
         let session_confirmation = session_key_route(
-            ctx.memory(|memory| memory.focused()),
+            focused,
             self.agent_sessions.search_widget,
             self.agent_sessions.row_focus_widget,
         );
+        // A warning raised by Enter must be visible before Enter can confirm it.
+        let mut warning_raised = false;
         for event in self.frame_events.clone() {
             let egui::Event::Key {
                 key,
@@ -1027,18 +1816,37 @@ impl TerminalApp {
             };
             match key {
                 egui::Key::Escape => {
-                    self.agent_sessions.is_open = false;
-                    self.agent_sessions.cancel_resume();
-                    self.return_focus_to_terminal(ctx);
-                    break;
+                    match self.agent_sessions.escape(editor_focused) {
+                        SessionEscape::LeaveEditor => {
+                            let editors = &self.agent_sessions.text_editors;
+                            ctx.memory_mut(|memory| {
+                                for id in editors {
+                                    memory.surrender_focus(*id);
+                                }
+                            });
+                            editor_focused = false;
+                        }
+                        SessionEscape::CancelConfirmation => {}
+                        SessionEscape::Close => {
+                            self.return_focus_to_terminal(ctx);
+                            break;
+                        }
+                    }
+                    ctx.input_mut(|input| {
+                        input.consume_key(modifiers, key);
+                    });
                 }
                 egui::Key::Enter
                     if !repeat
                         && !query_is_changing
                         && !metadata_changed_selection
+                        && !warning_raised
                         && session_confirmation =>
                 {
+                    let gate_before = self.agent_sessions.resume_gate.clone();
                     self.resume_selected_agent_session(ctx);
+                    warning_raised =
+                        enter_raised_warning(&gate_before, &self.agent_sessions.resume_gate);
                     // A fresh check is asynchronous: later cancellation or
                     // navigation in this same key batch must still take effect.
                     if !self.agent_sessions.is_open {
@@ -1064,11 +1872,7 @@ impl TerminalApp {
                         input.consume_key(modifiers, key);
                     });
                 }
-                egui::Key::F5 if !repeat => {
-                    self.agent_sessions.refresh();
-                    self.agent_sessions.preflight.refresh();
-                    self.agent_sessions.library.refresh();
-                }
+                egui::Key::F5 if !repeat => self.agent_sessions.refresh_all(),
                 _ => {}
             }
         }
@@ -1099,6 +1903,12 @@ impl TerminalApp {
             }
             self.agent_sessions.opened.remove(&key);
         }
+        if !self.agent_sessions.admit_resume(&session) {
+            // The live-process warning and "Resume anyway" are now shown.
+            self.agent_sessions.error = None;
+            ctx.request_repaint();
+            return;
+        }
         self.agent_sessions.preflight.select(Some(&session));
         self.agent_sessions.preflight.refresh();
         self.agent_sessions.pending_resume = Some(session);
@@ -1107,36 +1917,13 @@ impl TerminalApp {
     }
 
     fn finish_pending_agent_resume(&mut self, ctx: &egui::Context) {
-        if !self.agent_sessions.is_open {
-            self.agent_sessions.pending_resume = None;
-            return;
-        }
-        self.agent_sessions.sync_preflight();
-        let Some(pending) = self.agent_sessions.pending_resume.clone() else {
-            return;
-        };
-        if !self.agent_sessions.is_open
-            || !self
-                .agent_sessions
-                .selected_session()
-                .is_some_and(|session| same_launch_target(session, &pending))
-        {
-            self.agent_sessions.pending_resume = None;
-            return;
-        }
-        if let Some(launch) = self
-            .agent_sessions
-            .preflight
-            .ready_launch(&pending)
-            .cloned()
-        {
-            self.agent_sessions.pending_resume = None;
-            self.spawn_ready_agent_session(pending, launch, ctx);
-        } else if let SessionPreflightState::Unavailable(error) =
-            self.agent_sessions.preflight.state()
-        {
-            self.agent_sessions.error = Some(error.clone());
-            self.agent_sessions.pending_resume = None;
+        match self.agent_sessions.advance_pending_resume() {
+            ResumeStep::Wait => {}
+            ResumeStep::Rearmed => ctx.request_repaint(),
+            ResumeStep::Launch(ready) => {
+                let (session, launch) = *ready;
+                self.spawn_ready_agent_session(session, launch, ctx)
+            }
         }
     }
 
@@ -1153,11 +1940,10 @@ impl TerminalApp {
             "{} · {}",
             session.provider.label(),
             crate::review_text::visible_bounded(
-                self.agent_sessions.library_snapshot.display_title(
-                    session.provider,
-                    &session.id,
-                    &session.title
-                ),
+                self.agent_sessions
+                    .library_snapshot
+                    .facts(session.provider, &session.id)
+                    .display_title(&session.title),
                 96
             )
         );
@@ -1189,6 +1975,7 @@ impl TerminalApp {
                 ));
             }
             Err(error) => {
+                self.agent_sessions.end_resume_attempt();
                 self.agent_sessions.error = Some(format!(
                     "Could not resume {}: {error}",
                     session.provider.label()
@@ -1224,22 +2011,10 @@ impl TerminalApp {
         let task_dashboard_enabled = self.config.experimental_task_sidebar;
         let state = &mut self.agent_sessions;
         state.poll_library();
-        if state
-            .library_refresh
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
-            && state.library.refresh()
-        {
-            state.library_refresh = Some(Instant::now());
-        }
         if let Some(catalog) = state.scanner.poll() {
             state.replace_catalog(catalog);
         }
-        if state
-            .last_refresh
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(10))
-        {
-            state.refresh();
-        }
+        state.refresh_if_due();
         state.sync_preflight();
         ctx.request_repaint_after(Duration::from_millis(
             if state.scanner.is_scanning() || state.library.is_busy() || state.preflight.is_busy() {
@@ -1251,6 +2026,7 @@ impl TerminalApp {
         let SessionManagerActions {
             open,
             mut resume,
+            cancel_confirmation,
             pin_change,
             details_change,
             archive_change,
@@ -1262,15 +2038,23 @@ impl TerminalApp {
             self.agent_sessions.cancel_resume();
             self.return_focus_to_terminal(ctx);
         }
+        if cancel_confirmation {
+            self.agent_sessions.cancel_confirmation();
+            resume = false;
+        }
         if let Some((provider, id, pinned)) = pin_change {
             self.agent_sessions.library_notice = self
                 .agent_sessions
                 .library
                 .set_pinned(provider, &id, pinned)
                 .err();
+            if !pinned && self.agent_sessions.library_notice.is_none() {
+                self.agent_sessions
+                    .note_own_change((provider, id), OwnChange::Unpinned);
+            }
         }
         if let Some((key, alias, tags)) = details_change {
-            self.agent_sessions.pending_resume = None;
+            self.agent_sessions.end_resume_attempt();
             match self
                 .agent_sessions
                 .library
@@ -1278,25 +2062,41 @@ impl TerminalApp {
             {
                 Ok(()) => {
                     self.agent_sessions.library_notice = None;
-                    self.agent_sessions.pending_details = Some(key);
+                    self.agent_sessions.pending_details = Some(key.clone());
+                    self.agent_sessions.note_own_change(key, OwnChange::Details);
                 }
                 Err(error) => self.agent_sessions.library_notice = Some(error),
             }
         }
         if let Some((key, archived)) = archive_change {
-            self.agent_sessions.pending_resume = None;
+            self.agent_sessions.end_resume_attempt();
             resume = false;
             self.agent_sessions.library_notice = self
                 .agent_sessions
                 .library
                 .set_archived(key.0, &key.1, archived)
                 .err();
+            if self.agent_sessions.library_notice.is_none() {
+                let change = if archived {
+                    OwnChange::Archived
+                } else {
+                    OwnChange::Restored
+                };
+                self.agent_sessions.note_own_change(key, change);
+            }
         }
         if let Some((keys, action)) = batch_change {
-            self.agent_sessions.pending_resume = None;
+            self.agent_sessions.end_resume_attempt();
             resume = false;
+            let selected_change = OwnChange::of_batch(&action).and_then(|change| {
+                let selected = self.agent_sessions.selected.as_ref()?;
+                keys.contains(selected).then(|| (selected.clone(), change))
+            });
             match self.agent_sessions.library.apply_batch(&keys, action) {
                 Ok(count) => {
+                    if let Some((key, change)) = selected_change {
+                        self.agent_sessions.note_own_change(key, change);
+                    }
                     self.agent_sessions.library_notice = None;
                     self.agent_sessions.batch_notice =
                         Some(format!("Saving changes to {count} selected conversations…"));
@@ -1308,14 +2108,10 @@ impl TerminalApp {
         if open_tasks {
             self.agent_sessions.is_open = false;
             self.agent_sessions.cancel_resume();
-            self.sidebar.note_files_user_intent();
-            self.sidebar.visible = true;
-            self.sidebar.view = crate::sidebar::SidebarView::Tasks;
-            self.config.sidebar_view = crate::sidebar::SidebarView::Tasks;
-            self.schedule_config_save();
+            self.open_tasks_view();
             return;
         }
-        if resume {
+        if resume && self.agent_sessions.is_open {
             self.resume_selected_agent_session(ctx);
         }
         self.finish_pending_agent_resume(ctx);
@@ -1442,7 +2238,7 @@ mod tests {
         });
         state.live_only = true;
         state.filters_changed();
-        assert_eq!(state.visible(), vec![0]);
+        assert_eq!(state.visible()[..], [0]);
         assert_eq!(
             state.selected_session().unwrap().status,
             SessionStatus::Idle
@@ -1484,7 +2280,7 @@ mod tests {
         state.scope_cwd = Some(PathBuf::from("/tmp/project"));
         state.project_only = true;
         state.filters_changed();
-        assert_eq!(state.visible(), vec![0]);
+        assert_eq!(state.visible()[..], [0]);
         let mut next = state.catalog.clone();
         next.sessions[0].preview = "updated".into();
         state.replace_catalog(next);
@@ -1492,7 +2288,7 @@ mod tests {
             state.scope_cwd.as_deref(),
             Some(std::path::Path::new("/tmp/project"))
         );
-        assert_eq!(state.visible(), vec![0]);
+        assert_eq!(state.visible()[..], [0]);
     }
 
     #[test]
@@ -1586,7 +2382,7 @@ mod tests {
             (SessionProvider::Codex, LIBRARY_A, false, None),
             (SessionProvider::Claude, LIBRARY_B, true, None),
         ]));
-        assert_eq!(state.visible(), vec![1]);
+        assert_eq!(state.visible()[..], [1]);
         assert_eq!(state.selected_session().unwrap().id, LIBRARY_B);
         assert_eq!(state.anchor_offset(&state.visible(), 74.0), Some(0.0));
         state.replace_library(library(&[(
@@ -1626,7 +2422,7 @@ mod tests {
             (SessionProvider::Codex, LIBRARY_A, false, Some(300)),
             (SessionProvider::Claude, LIBRARY_B, false, Some(200)),
         ]));
-        assert_eq!(state.visible(), vec![0, 1]);
+        assert_eq!(state.visible()[..], [0, 1]);
         assert_eq!(
             state.selected_session().unwrap().id,
             LIBRARY_B,
@@ -1733,7 +2529,7 @@ mod tests {
         wait(&mut state, |s| {
             !s.library_snapshot.is_archived(key.0, &key.1)
         });
-        assert_eq!(state.visible(), vec![0]);
+        assert_eq!(state.visible()[..], [0]);
         assert!(state.opened.is_empty());
         state
             .library
@@ -1844,7 +2640,7 @@ mod tests {
         state.query = "tag:review provider:codex".into();
         state.project_filter = Some("/work/core".into());
         state.filters_changed();
-        assert_eq!(state.visible(), vec![0]);
+        assert_eq!(state.visible()[..], [0]);
         let key = (SessionProvider::Codex, LIBRARY_A.to_string());
         let mut draft = SessionDetailsDraft::saved(&state.library_snapshot, &key);
         draft.alias = "Unsaved release plan".into();
@@ -1853,13 +2649,13 @@ mod tests {
         state.project_filter = None;
         state.archive = SessionArchiveFilter::Archived;
         state.filters_changed();
-        assert_eq!(state.visible(), vec![1]);
+        assert_eq!(state.visible()[..], [1]);
         assert_eq!(state.selected_session().unwrap().id, LIBRARY_B);
         assert_eq!(state.details_drafts[&key].alias, "Unsaved release plan");
         state.archive = SessionArchiveFilter::All;
         state.query = "\"Release review\"".into();
         state.filters_changed();
-        assert_eq!(state.visible(), vec![0]);
+        assert_eq!(state.visible()[..], [0]);
         assert!(state.pending_resume.is_none());
         assert!(
             state.opened.is_empty(),
@@ -1963,7 +2759,9 @@ mod tests {
                     |_ui| {
                         let action = show_session_manager(&ctx, &mut state, true);
                         assert!(action.open);
-                        assert!(!action.resume && !action.open_tasks);
+                        assert!(
+                            !action.resume && !action.open_tasks && !action.cancel_confirmation
+                        );
                         assert!(
                             action.details_change.is_none()
                                 && action.archive_change.is_none()
@@ -2108,7 +2906,7 @@ mod tests {
                 Some(egui::Id::new("search")),
                 None
             ));
-            let visible = state.visible();
+            let (visible, fingerprint) = state.visible_rows();
             let mut output = ctx.run_ui(
                 egui::RawInput {
                     events: if pressed {
@@ -2125,7 +2923,10 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    assert!(show_session_batch_controls(ui, &mut state, &visible).is_none());
+                    assert!(
+                        show_session_batch_controls(ui, &mut state, &visible, fingerprint)
+                            .is_none()
+                    );
                 },
             );
             output.textures_delta.clear();
@@ -2154,7 +2955,12 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    response = Some(session_resume_button(ui, Some(selected), true, false));
+                    response = Some(session_resume_button(
+                        ui,
+                        Some(selected),
+                        true,
+                        ResumeButtonMode::NewTab,
+                    ));
                 },
             );
             output.textures_delta.clear();
@@ -2257,5 +3063,774 @@ mod tests {
                 assert_eq!(frame(&state, pointer(false)).1, Some(initial));
             }
         }
+    }
+    fn text_shapes(shape: &egui::Shape, found: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => found.push((
+                text.galley.text().to_owned(),
+                text.galley.rect.translate(text.pos.to_vec2()),
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    text_shapes(shape, found);
+                }
+            }
+            _ => (),
+        }
+    }
+
+    fn rendered_text(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        let mut found = Vec::new();
+        for shape in &output.shapes {
+            text_shapes(&shape.shape, &mut found);
+        }
+        found
+    }
+
+    fn live(provider: SessionProvider, id: &str, pid: u32) -> LiveSessionProcess {
+        LiveSessionProcess {
+            provider,
+            id: id.into(),
+            pid,
+        }
+    }
+
+    #[test]
+    fn background_refresh_never_retargets_a_selection_it_hides_or_removes() {
+        use jterm_core::agent_sessions::SessionOrganization;
+        let a = session(SessionProvider::Codex, LIBRARY_A, "first");
+        let b = session(SessionProvider::Claude, LIBRARY_B, "second");
+        let mut state = state_with(vec![a.clone(), b.clone()]);
+        let b_key = session_key(&b);
+        state.selected = Some(b_key.clone());
+        state.sync_preflight();
+        state.pending_resume = Some(b.clone());
+        // Another terminal archives the inspected conversation.
+        state.replace_library(
+            SessionLibrarySnapshot::default()
+                .with_organization(
+                    b.provider,
+                    &b.id,
+                    SessionOrganization {
+                        archived: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        );
+        state.reconcile_selection();
+        assert_eq!(state.visible()[..], [0]);
+        assert_eq!(
+            state.selected.as_ref(),
+            Some(&b_key),
+            "a background refresh keeps the user's choice instead of selecting another row"
+        );
+        assert!(
+            state.selected_session().is_none(),
+            "a detached selection is never resumed or organized"
+        );
+        assert_eq!(
+            state.detached_selection_title(&state.visible()).as_deref(),
+            Some("second")
+        );
+        state.sync_preflight();
+        assert!(state.pending_resume.is_none());
+        assert!(matches!(
+            state.preflight.state(),
+            SessionPreflightState::Idle
+        ));
+        // A catalog refresh that drops the conversation keeps it detached too.
+        let mut next = state.catalog.clone();
+        next.sessions.retain(|session| session.id != LIBRARY_B);
+        assert!(state.replace_catalog(next));
+        assert_eq!(state.selected.as_ref(), Some(&b_key));
+        assert_eq!(
+            state.detached_selection_title(&state.visible()).as_deref(),
+            Some("The selected conversation")
+        );
+        // An explicit choice re-attaches, starting from the list edge.
+        state.navigate(egui::Key::ArrowDown);
+        assert_eq!(state.selected_session().unwrap().id, LIBRARY_A);
+        assert!(state.detached_selection_title(&state.visible()).is_none());
+        // An explicit search edit may still select its first match.
+        state.selected = Some((SessionProvider::Claude, "gone".into()));
+        state.query = "first".into();
+        state.filters_changed();
+        assert_eq!(state.selected_session().unwrap().id, LIBRARY_A);
+        // Initial population selects the first row of an empty selection.
+        let mut fresh = AgentSessionsState::default();
+        assert!(fresh.selected.is_none());
+        fresh.replace_catalog(SessionCatalog {
+            sessions: vec![a.clone()],
+            ..Default::default()
+        });
+        assert_eq!(fresh.selected.as_ref(), Some(&session_key(&a)));
+        assert!(state.opened.is_empty() && fresh.opened.is_empty());
+    }
+
+    #[test]
+    fn live_conflict_requires_a_second_confirmation_bound_to_one_identity() {
+        let a = session(SessionProvider::Codex, LIBRARY_A, "running elsewhere");
+        let b = session(SessionProvider::Claude, LIBRARY_B, "also running");
+        let mut state = AgentSessionsState::default();
+        state.replace_catalog(SessionCatalog {
+            sessions: vec![a.clone(), b.clone()],
+            live_processes: vec![
+                live(SessionProvider::Codex, LIBRARY_A, 4242),
+                live(SessionProvider::Claude, LIBRARY_B, 7),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(state.selected_session().unwrap().id, LIBRARY_A);
+        let t0 = Instant::now();
+        assert!(
+            !state.admit_resume_at(&a, t0),
+            "the first Resume only warns"
+        );
+        assert!(state.confirmation_armed_for(&session_key(&a)));
+        assert!(state.pending_resume.is_none());
+        assert!(state.conflict_blocks_launch(&a));
+        assert!(
+            !state.admit_resume_at(&b, t0 + SESSION_RESUME_ANYWAY_DELAY),
+            "a warning for one conversation never confirms another"
+        );
+        assert!(state.confirmation_armed_for(&session_key(&b)));
+        state.cancel_confirmation();
+        assert!(!state.confirmation_armed());
+        // Resume, then Resume anyway, for exactly the selected identity. The
+        // second click of a double-click cannot confirm the unread warning.
+        assert!(!state.admit_resume_at(&a, t0));
+        let early = t0 + SESSION_RESUME_ANYWAY_DELAY - Duration::from_millis(1);
+        assert!(!state.admit_resume_at(&a, early));
+        assert!(
+            matches!(&state.resume_gate, ResumeGate::Armed(key, at) if *key == session_key(&a) && *at == t0),
+            "an early repeat changes nothing"
+        );
+        assert!(state.admit_resume_at(&a, t0 + SESSION_RESUME_ANYWAY_DELAY));
+        assert_eq!(state.resume_gate, ResumeGate::Confirmed(session_key(&a)));
+        // As `resume_selected_agent_session` does once admitted.
+        state.pending_resume = Some(a.clone());
+        assert!(!state.conflict_blocks_launch(&a));
+        state.reconcile_resume_gate();
+        assert_eq!(state.resume_gate, ResumeGate::Confirmed(session_key(&a)));
+        assert!(
+            state.admit_resume(&a),
+            "repeating Resume while that attempt is pending keeps it"
+        );
+        // Selecting another conversation cancels the confirmation.
+        state.selected = Some(session_key(&b));
+        state.reconcile_resume_gate();
+        assert_eq!(state.resume_gate, ResumeGate::Clear);
+        // A warning ends with the observed process; Resume then proceeds directly.
+        state.selected = Some(session_key(&a));
+        assert!(!state.admit_resume(&a));
+        let mut ended = state.catalog.clone();
+        ended
+            .live_processes
+            .retain(|process| process.id != LIBRARY_A);
+        state.replace_catalog(ended);
+        state.reconcile_resume_gate();
+        assert!(!state.confirmation_armed());
+        assert!(state.admit_resume(&a));
+        // A scan that observes a live CLI after Resume was chosen blocks the
+        // launch until that exact identity is confirmed.
+        let mut started = state.catalog.clone();
+        started
+            .live_processes
+            .push(live(SessionProvider::Codex, LIBRARY_A, 99));
+        state.replace_catalog(started);
+        assert!(state.conflict_blocks_launch(&a));
+        // A refresh that removes the identity clears an armed warning.
+        assert!(!state.admit_resume(&a));
+        let mut removed = state.catalog.clone();
+        removed.sessions.retain(|session| session.id != LIBRARY_A);
+        state.replace_catalog(removed);
+        state.reconcile_resume_gate();
+        assert_eq!(state.resume_gate, ResumeGate::Clear);
+        state.resume_gate = ResumeGate::Armed(session_key(&b), Instant::now());
+        state.cancel_resume();
+        assert_eq!(state.resume_gate, ResumeGate::Clear);
+        assert!(state.opened.is_empty(), "confirmation logic never launches");
+    }
+
+    #[test]
+    fn escape_leaves_an_editor_before_dismissing_a_warning_or_closing() {
+        assert_eq!(
+            session_escape_action(true, true),
+            SessionEscape::LeaveEditor
+        );
+        assert_eq!(
+            session_escape_action(true, false),
+            SessionEscape::LeaveEditor
+        );
+        assert_eq!(
+            session_escape_action(false, true),
+            SessionEscape::CancelConfirmation
+        );
+        assert_eq!(session_escape_action(false, false), SessionEscape::Close);
+        let a = (SessionProvider::Codex, LIBRARY_A.to_string());
+        let b = (SessionProvider::Claude, LIBRARY_B.to_string());
+        let t = Instant::now();
+        for (before, after, raised) in [
+            (ResumeGate::Clear, ResumeGate::Armed(a.clone(), t), true),
+            (
+                ResumeGate::Armed(a.clone(), t),
+                ResumeGate::Armed(b.clone(), t),
+                true,
+            ),
+            (
+                ResumeGate::Confirmed(a.clone()),
+                ResumeGate::Armed(b.clone(), t),
+                true,
+            ),
+            (
+                ResumeGate::Armed(a.clone(), t),
+                ResumeGate::Confirmed(a.clone()),
+                false,
+            ),
+            (
+                ResumeGate::Armed(a.clone(), t),
+                ResumeGate::Armed(a.clone(), t),
+                false,
+            ),
+            (ResumeGate::Clear, ResumeGate::Clear, false),
+            (ResumeGate::Armed(a.clone(), t), ResumeGate::Clear, false),
+        ] {
+            assert_eq!(
+                enter_raised_warning(&before, &after),
+                raised,
+                "{before:?} -> {after:?}"
+            );
+        }
+
+        // egui clears focus for Escape before the manager's prepass. The
+        // editor that held focus is still recognized as the Escape target.
+        let ctx = egui::Context::default();
+        let mut state = state_with(vec![session(SessionProvider::Codex, LIBRARY_A, "first")]);
+        state
+            .checked
+            .insert((SessionProvider::Codex, LIBRARY_A.into()));
+        let frame = |state: &mut AgentSessionsState, events: Vec<egui::Event>| {
+            let mut prepass = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_ui| {
+                    prepass = Some(ctx.memory(|memory| {
+                        (
+                            memory.focused(),
+                            state.text_editors.iter().any(|id| {
+                                memory.focused() == Some(*id) || memory.had_focus_last_frame(*id)
+                            }),
+                        )
+                    }));
+                    show_session_manager(&ctx, state, false);
+                },
+            );
+            output.textures_delta.clear();
+            prepass.unwrap()
+        };
+        frame(&mut state, Vec::new());
+        assert_eq!(
+            state.text_editors.len(),
+            4,
+            "search, batch tag, alias and tags are all Escape targets"
+        );
+        let search = state.search_widget.unwrap();
+        assert!(state.text_editors.contains(&search));
+        ctx.memory_mut(|memory| memory.request_focus(search));
+        assert_eq!(frame(&mut state, Vec::new()), (Some(search), true));
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert_eq!(frame(&mut state, vec![escape.clone()]), (None, true));
+        assert_eq!(
+            frame(&mut state, vec![escape]),
+            (None, false),
+            "the next Escape is no longer an editor Escape"
+        );
+
+        // The handler: leaving an editor keeps an armed warning, so the next
+        // Enter can still confirm it. The next Escape dismisses the warning
+        // and only a third closes the manager.
+        let mut state = AgentSessionsState::default();
+        state.replace_catalog(SessionCatalog {
+            sessions: vec![session(SessionProvider::Codex, LIBRARY_A, "held")],
+            live_processes: vec![live(SessionProvider::Codex, LIBRARY_A, 9)],
+            ..Default::default()
+        });
+        state.is_open = true;
+        let held = state.selected_session().unwrap().clone();
+        assert!(!state.admit_resume(&held));
+        assert_eq!(state.escape(true), SessionEscape::LeaveEditor);
+        assert!(
+            state.confirmation_armed_for(&session_key(&held)),
+            "leaving an editor never dismisses the warning"
+        );
+        assert_eq!(state.escape(false), SessionEscape::CancelConfirmation);
+        assert!(!state.confirmation_armed());
+        assert!(state.is_open);
+        assert_eq!(state.escape(false), SessionEscape::Close);
+        assert!(!state.is_open);
+    }
+
+    #[test]
+    fn editors_follow_the_core_byte_budgets_and_never_silently_truncate() {
+        assert_eq!(editor_char_limit(SESSION_QUERY_MAX_BYTES), 4097);
+        let long_alias = "名".repeat(SESSION_ALIAS_MAX_BYTES / 3 + 1);
+        assert!(long_alias.chars().count() < editor_char_limit(SESSION_ALIAS_MAX_BYTES));
+        assert!(validate_session_details(&long_alias, "").is_err());
+        assert!(validate_session_details("Release review", "review, release").is_ok());
+        assert!(batch_tag_problem("").is_none());
+        assert!(batch_tag_problem(" Review ").is_none());
+        assert!(batch_tag_problem("review,release").is_some());
+        assert!(batch_tag_problem(&"t".repeat(SESSION_TAG_MAX_BYTES + 1)).is_some());
+        assert!(batch_tag_problem("bad\u{202e}tag").is_some());
+
+        // A pasted search keeps its trailing exclusion when within budget,
+        // and an oversized paste is explained instead of quietly broadened.
+        let within = format!("{} -tag:blocked", "x".repeat(4000));
+        let beyond = format!("{} -tag:blocked", "x".repeat(5000));
+        for (pasted, valid) in [(within, true), (beyond, false)] {
+            let ctx = egui::Context::default();
+            let mut state = state_with(vec![session(SessionProvider::Codex, LIBRARY_A, "first")]);
+            let frame = |state: &mut AgentSessionsState, events| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 900.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |_ui| {
+                        show_session_manager(&ctx, state, false);
+                    },
+                );
+                output.textures_delta.clear();
+            };
+            frame(&mut state, Vec::new());
+            ctx.memory_mut(|memory| memory.request_focus(state.search_widget.unwrap()));
+            frame(&mut state, Vec::new());
+            frame(&mut state, vec![egui::Event::Paste(pasted.clone())]);
+            if valid {
+                assert_eq!(state.query, pasted, "the core sees the full final term");
+                assert!(state.query_error().is_none());
+            } else {
+                assert!(state.query.len() > SESSION_QUERY_MAX_BYTES);
+                assert!(
+                    state.query_error().unwrap().contains("4,096 bytes"),
+                    "the shared parser explains the limit"
+                );
+                assert!(
+                    state.visible().is_empty(),
+                    "an over-budget search never shows a broadened result"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copy_command_and_display_use_the_exact_resume_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("ember-resume-command-{}", uuid::Uuid::new_v4()));
+        let project = root.join("project");
+        let history = root.join("codex-home").join("sessions").join("2026");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&history).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = history.join("rollout.jsonl");
+        std::fs::write(&source, "{}\n").unwrap();
+        let mut resumable = session(SessionProvider::Codex, LIBRARY_A, "resumable");
+        resumable.cwd = project.canonicalize().unwrap();
+        resumable.source = source;
+        let expected = resumable.resume_launch().unwrap().display_command();
+        assert!(
+            expected.contains("CODEX_HOME="),
+            "a provider-home override is part of the command: {expected}"
+        );
+        let mut state = state_with(vec![resumable.clone()]);
+        let ctx = egui::Context::default();
+        let frame = |state: &mut AgentSessionsState, events| {
+            let mut actions = SessionManagerActions {
+                open: true,
+                resume: false,
+                cancel_confirmation: false,
+                pin_change: None,
+                details_change: None,
+                archive_change: None,
+                batch_change: None,
+                open_tasks: false,
+            };
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 2400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| show_session_details(ui, state, 0, &mut actions),
+            );
+            output.textures_delta.clear();
+            assert!(!actions.resume && actions.details_change.is_none());
+            output
+        };
+        // Before the background check reports, nothing is computed on the
+        // UI thread: the pane says it is checking and Copy has nothing to copy.
+        let output = frame(&mut state, Vec::new());
+        let text = rendered_text(&output);
+        assert!(text
+            .iter()
+            .any(|(shown, _)| shown == "Checking the resume command…"));
+        assert!(!text.iter().any(|(shown, _)| *shown == expected));
+        state.sync_preflight();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.preflight.command(&resumable).is_none() {
+            state.preflight.poll();
+            assert!(
+                Instant::now() < deadline,
+                "the readiness check did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The CLI may be missing here; the command is still exact and copyable.
+        assert_eq!(state.preflight.command(&resumable), Some(expected.as_str()));
+        let output = frame(&mut state, Vec::new());
+        let text = rendered_text(&output);
+        assert!(
+            text.iter().any(|(shown, _)| *shown == expected),
+            "the displayed command is the exact resume command"
+        );
+        let button = text
+            .iter()
+            .find(|(shown, _)| shown == "Copy command")
+            .map(|(_, rect)| rect.center())
+            .unwrap();
+        let click = |pressed| {
+            vec![
+                egui::Event::PointerMoved(button),
+                egui::Event::PointerButton {
+                    pos: button,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        frame(&mut state, click(true));
+        let output = frame(&mut state, click(false));
+        assert!(output
+            .platform_output
+            .commands
+            .iter()
+            .any(|command| *command == egui::OutputCommand::CopyText(expected.clone())));
+        let key = session_key(&resumable);
+        assert!(state
+            .copy_receipt_remaining(&key, CopyKind::Command)
+            .is_some());
+        assert!(state.copy_receipt_remaining(&key, CopyKind::Path).is_none());
+        let output = frame(&mut state, Vec::new());
+        assert!(rendered_text(&output)
+            .iter()
+            .any(|(shown, _)| shown == "Copied the resume command"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overview_counts_live_conversations_not_processes() {
+        let catalog = SessionCatalog {
+            sessions: vec![
+                session(SessionProvider::Codex, LIBRARY_A, "two processes"),
+                session(SessionProvider::Claude, LIBRARY_B, "quiet"),
+            ],
+            live_processes: vec![
+                live(SessionProvider::Codex, LIBRARY_A, 1),
+                live(SessionProvider::Codex, LIBRARY_A, 2),
+                live(SessionProvider::Claude, LIBRARY_A, 3),
+            ],
+            ..Default::default()
+        };
+        let stats = CatalogStats::of(&catalog);
+        assert_eq!(
+            stats,
+            CatalogStats {
+                total: 2,
+                codex: 1,
+                waiting: 0,
+                live_conversations: 1,
+            }
+        );
+        let mut state = AgentSessionsState::default();
+        state.replace_catalog(catalog.clone());
+        assert_eq!(state.catalog_stats, stats);
+        // Select-visible gestures are bound to the identities shown.
+        let (_, before) = state.visible_rows();
+        assert_eq!(state.visible_rows().1, before);
+        let mut fewer = catalog;
+        fewer.sessions.pop();
+        state.replace_catalog(fewer);
+        assert_ne!(state.visible_rows().1, before);
+    }
+
+    fn settle_pending_resume(state: &mut AgentSessionsState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match state.advance_pending_resume() {
+                ResumeStep::Wait if state.pending_resume.is_none() => return,
+                ResumeStep::Wait => {}
+                step => panic!("the attempt must end without a launch: {step:?}"),
+            }
+            assert!(Instant::now() < deadline, "readiness check did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_resume_anyway_covers_only_the_attempt_it_started() {
+        let mut held = session(SessionProvider::Codex, LIBRARY_A, "held elsewhere");
+        held.cwd = PathBuf::from("/nonexistent-ember-resume-anyway-fixture");
+        let mut state = AgentSessionsState::default();
+        state.replace_catalog(SessionCatalog {
+            sessions: vec![held.clone()],
+            live_processes: vec![live(SessionProvider::Codex, LIBRARY_A, 4242)],
+            ..Default::default()
+        });
+        state.is_open = true;
+        let key = session_key(&held);
+        let t0 = Instant::now();
+        assert!(!state.admit_resume_at(&held, t0));
+        assert!(state.admit_resume_at(&held, t0 + SESSION_RESUME_ANYWAY_DELAY));
+        // What `resume_selected_agent_session` does once admitted.
+        state.preflight.select(Some(&held));
+        state.preflight.refresh();
+        state.pending_resume = Some(held.clone());
+        // The fresh check fails, so the attempt ends without a launch ...
+        settle_pending_resume(&mut state);
+        assert!(state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("project directory")));
+        // ... and its confirmation ends with it: the next Resume warns again
+        // instead of launching straight away once the problem is fixed.
+        assert_eq!(state.resume_gate, ResumeGate::Clear);
+        assert!(!state.admit_resume(&held));
+        assert!(state.confirmation_armed_for(&key));
+        // A confirmation without its attempt never authorizes anything.
+        state.resume_gate = ResumeGate::Confirmed(key.clone());
+        state.reconcile_resume_gate();
+        assert_eq!(state.resume_gate, ResumeGate::Clear);
+        state.resume_gate = ResumeGate::Confirmed(key.clone());
+        assert!(
+            !state.admit_resume(&held),
+            "a stale confirmation warns again"
+        );
+        assert!(state.confirmation_armed_for(&key));
+        // Editing the query (or any other way of dropping the attempt) also
+        // ends a confirmation.
+        state.resume_gate = ResumeGate::Confirmed(key.clone());
+        state.pending_resume = Some(held.clone());
+        state.end_resume_attempt();
+        assert_eq!(state.resume_gate, ResumeGate::Clear);
+        assert!(state.pending_resume.is_none());
+        // Closing ends an attempt as well.
+        state.resume_gate = ResumeGate::Confirmed(key);
+        state.pending_resume = Some(held);
+        state.is_open = false;
+        assert!(matches!(state.advance_pending_resume(), ResumeStep::Wait));
+        assert_eq!(state.resume_gate, ResumeGate::Clear);
+        assert!(state.opened.is_empty(), "the attempt never launched");
+    }
+
+    #[test]
+    fn own_changes_that_move_the_selection_out_of_view_are_explained() {
+        use jterm_core::agent_sessions::SessionOrganization;
+        let a = session(SessionProvider::Codex, LIBRARY_A, "first");
+        let b = session(SessionProvider::Claude, LIBRARY_B, "second");
+        let mut state = state_with(vec![a.clone(), b.clone()]);
+        let b_key = session_key(&b);
+        state.selected = Some(b_key.clone());
+        state.note_own_change(b_key.clone(), OwnChange::Archived);
+        // The archive lands and the conversation leaves the Active library.
+        state.replace_library(
+            SessionLibrarySnapshot::default()
+                .with_organization(
+                    b.provider,
+                    &b.id,
+                    SessionOrganization {
+                        archived: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        );
+        assert_eq!(state.selected.as_ref(), Some(&b_key), "never retargeted");
+        assert!(state.selected_session().is_none());
+        assert_eq!(state.own_change_for_selection(), Some(OwnChange::Archived));
+        let ctx = egui::Context::default();
+        let mut text = Vec::new();
+        // A new window's first frame only measures it.
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |_ui| {
+                    show_session_manager(&ctx, &mut state, false);
+                },
+            );
+            output.textures_delta.clear();
+            text = rendered_text(&output);
+        }
+        assert!(
+            text.iter().any(|(shown, _)| shown
+                .starts_with("You archived “second”, so it left this view. Choose Archived here")),
+            "the notice names the user's own change and the view that finds it: {:?}",
+            text.iter().map(|(shown, _)| shown).collect::<Vec<_>>()
+        );
+        // Another conversation's change never explains this one.
+        state.note_own_change(session_key(&a), OwnChange::Unpinned);
+        assert_eq!(state.own_change_for_selection(), None);
+        for (action, change) in [
+            (SessionBatchAction::Archive(true), Some(OwnChange::Archived)),
+            (
+                SessionBatchAction::Archive(false),
+                Some(OwnChange::Restored),
+            ),
+            (SessionBatchAction::Pin(false), Some(OwnChange::Unpinned)),
+            (SessionBatchAction::Pin(true), None),
+            (
+                SessionBatchAction::RemoveTag("review".into()),
+                Some(OwnChange::Details),
+            ),
+        ] {
+            assert_eq!(OwnChange::of_batch(&action), change, "{action:?}");
+        }
+        assert!(OwnChange::Unpinned
+            .explanation("x")
+            .contains("Turn off Pinned only"));
+    }
+
+    #[test]
+    fn opening_replaces_a_selection_that_is_no_longer_listed() {
+        use jterm_core::agent_sessions::SessionOrganization;
+        let a = session(SessionProvider::Codex, LIBRARY_A, "first");
+        let b = session(SessionProvider::Claude, LIBRARY_B, "second");
+        let mut state = state_with(vec![a.clone(), b.clone()]);
+        state.selected = Some(session_key(&b));
+        // Another terminal archived it while the manager was closed.
+        state.replace_library(
+            SessionLibrarySnapshot::default()
+                .with_organization(
+                    b.provider,
+                    &b.id,
+                    SessionOrganization {
+                        archived: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        );
+        assert!(state.selected_session().is_none());
+        state.adopt_listed_selection();
+        assert_eq!(state.selected_session().unwrap().id, LIBRARY_A);
+        // A listed selection is kept as it is.
+        state.adopt_listed_selection();
+        assert_eq!(state.selected.as_ref(), Some(&session_key(&a)));
+    }
+
+    #[test]
+    fn an_unresumable_conversation_offers_no_command_to_copy() {
+        let mut missing = session(SessionProvider::Codex, LIBRARY_A, "moved away");
+        missing.cwd = PathBuf::from("/nonexistent-ember-command-fixture");
+        let mut state = state_with(vec![missing.clone()]);
+        state.sync_preflight();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            state.preflight.state(),
+            SessionPreflightState::Unavailable(_)
+        ) {
+            state.preflight.poll();
+            assert!(
+                Instant::now() < deadline,
+                "the readiness check did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.preflight.command(&missing), None);
+        let ctx = egui::Context::default();
+        let frame = |state: &mut AgentSessionsState, events| {
+            let mut actions = SessionManagerActions {
+                open: true,
+                resume: false,
+                cancel_confirmation: false,
+                pin_change: None,
+                details_change: None,
+                archive_change: None,
+                batch_change: None,
+                open_tasks: false,
+            };
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 2400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| show_session_details(ui, state, 0, &mut actions),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let text = rendered_text(&frame(&mut state, Vec::new()));
+        assert!(text
+            .iter()
+            .any(|(shown, _)| shown == "Unavailable · the readiness check above explains why"));
+        let button = text
+            .iter()
+            .find(|(shown, _)| shown == "Copy command")
+            .map(|(_, rect)| rect.center())
+            .unwrap();
+        for pressed in [true, false] {
+            let output = frame(
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(button),
+                    egui::Event::PointerButton {
+                        pos: button,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert!(!output
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::OutputCommand::CopyText(_))));
+        }
+        assert!(state
+            .copy_receipt_remaining(&session_key(&missing), CopyKind::Command)
+            .is_none());
     }
 }

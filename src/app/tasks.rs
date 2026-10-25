@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_TASK_TITLE_DISPLAY_BYTES: usize = 160;
 const MAX_TASK_BRANCH_DISPLAY_BYTES: usize = 120;
@@ -60,7 +60,26 @@ pub enum TaskSidebarAction {
     AcceptReviewed(TaskId),
     ReviewDiff(TaskId),
     Archive(TaskId),
+    /// Return a hidden task to the lifecycle state it had when hidden.
+    Restore(TaskId),
 }
+
+/// The user's own native action expects an immediate result even when the
+/// runtime alone would poll slowly (an approval wait or an idle review point).
+fn native_action_needs_prompt_poll(action: &TaskSidebarAction) -> bool {
+    matches!(
+        action,
+        TaskSidebarAction::StartNative(_)
+            | TaskSidebarAction::StopCodex(_)
+            | TaskSidebarAction::FollowUp(..)
+            | TaskSidebarAction::FinishCodex(_)
+            | TaskSidebarAction::Approve(..)
+            | TaskSidebarAction::Deny(..)
+    )
+}
+
+/// How long the dashboard keeps polling at frame rate after such an action.
+const NATIVE_ACTION_FAST_POLL: Duration = Duration::from_secs(2);
 
 fn task_action_waits_for_recovery(action: &TaskSidebarAction, pending: &HashSet<TaskId>) -> bool {
     matches!(action, TaskSidebarAction::StartNative(id) | TaskSidebarAction::StartTerminal(id)
@@ -85,6 +104,31 @@ fn recovery_record_matches_task(
         && record.branch == task.branch
         && record.provider == task.provider
         && record.base_commit.as_ref() == Some(&task.base_commit)
+}
+
+/// Whether a blocked registration can still be confirmed: a recovery record
+/// for its worktree remains to confirm it or to retry from. Once the record is
+/// dismissed, nothing can confirm the task again.
+fn registration_confirmable(
+    task: &crate::agent::AgentTask,
+    records: &[crate::agent::recovery::Record],
+) -> bool {
+    records
+        .iter()
+        .any(|record| recovery_record_matches_task(task, record))
+}
+
+/// A hidden task whose Start still waits for this record, if any. Dismissing
+/// the record would leave that task restorable for review but never startable.
+fn hidden_task_waiting_on_record<'a>(
+    manager: &'a crate::agent::TaskManager,
+    hidden: &HashSet<TaskId>,
+    record: &crate::agent::recovery::Record,
+) -> Option<&'a crate::agent::AgentTask> {
+    hidden
+        .iter()
+        .filter_map(|id| manager.get(*id))
+        .find(|task| recovery_record_matches_task(task, record))
 }
 
 fn recovery_dismiss_blocked(
@@ -130,6 +174,240 @@ pub struct TaskSidebarState {
     recovery_job: Option<Receiver<Result<RecoveryResult, String>>>,
     dismiss_recovery: Option<uuid::Uuid>,
     unconfirmed_registrations: HashSet<TaskId>,
+    /// Lists hidden (archived) tasks for restoration instead of the dashboard.
+    show_hidden: bool,
+    query_error: DashboardQueryErrorCache,
+    /// Frame-rate polling after the user's own native action, see
+    /// [`NATIVE_ACTION_FAST_POLL`].
+    native_fast_poll_until: Option<Instant>,
+    /// Sidebar state that `task:toggle` replaced when it opened the dashboard.
+    toggle_return: Option<(bool, crate::sidebar::SidebarView)>,
+    /// Hidden tasks whose recovery marker was still unconfirmed when hidden.
+    /// Restore reinstates their Start block; hiding sets it aside so the
+    /// recovery record can still be dismissed.
+    hidden_unconfirmed_registrations: HashSet<TaskId>,
+}
+
+impl TaskSidebarState {
+    /// Leave the Hidden list for the dashboard. Opening the dashboard and
+    /// creating, registering or restoring a task all do this, so a task the
+    /// user is about to act on is never out of sight in the Hidden list.
+    fn show_dashboard(&mut self) {
+        self.show_hidden = false;
+    }
+}
+
+/// The Hidden list stays only while it has something to restore.
+fn hidden_view_shown(show_hidden: bool, hidden_count: usize) -> bool {
+    show_hidden && hidden_count > 0
+}
+
+/// The dashboard parses its query once for the projection; the explanation
+/// shown beside the search field is recomputed only when the text changes.
+#[derive(Default)]
+struct DashboardQueryErrorCache {
+    text: String,
+    error: Option<String>,
+}
+
+impl DashboardQueryErrorCache {
+    fn error(&mut self, text: &str) -> Option<&str> {
+        if self.text != text {
+            self.text.clear();
+            self.text.push_str(text);
+            self.error = jterm_core::agent_task::dashboard_query_error(text);
+        }
+        self.error.as_deref()
+    }
+}
+
+/// A hidden task as shown in the Hidden view. Restoring is its only action
+/// besides read-only diff review.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HiddenTaskRow {
+    id: TaskId,
+    title: String,
+    provider: AgentProvider,
+    project: String,
+    branch: String,
+    /// Recorded state to return to; `None` for older records, which cannot
+    /// be restored without guessing.
+    restores_to: Option<TaskStatus>,
+    updated_at_ms: u64,
+}
+
+fn hidden_task_rows(manager: &crate::agent::TaskManager) -> Vec<HiddenTaskRow> {
+    let mut rows: Vec<_> = manager
+        .tasks()
+        .iter()
+        .filter(|task| task.status == TaskStatus::Archived)
+        .map(|task| HiddenTaskRow {
+            id: task.id,
+            title: visible_bounded(&task.title, MAX_TASK_TITLE_DISPLAY_BYTES),
+            provider: task.provider,
+            project: visible_bounded(&task.repo_root.to_string_lossy(), 320),
+            branch: visible_bounded(&task.branch, MAX_TASK_BRANCH_DISPLAY_BYTES),
+            restores_to: task
+                .archived_from
+                .filter(|status| *status != TaskStatus::Archived),
+            updated_at_ms: task.updated_at_ms,
+        })
+        .collect();
+    // Most recently hidden first; the stable sort keeps creation order on ties.
+    rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at_ms));
+    rows
+}
+
+/// Execute Restore against the task as it is now. Restoring never starts an
+/// Agent, reruns validation or accepts work.
+fn restore_hidden_task(
+    manager: &mut crate::agent::TaskManager,
+    task_id: TaskId,
+) -> Result<String, String> {
+    manager
+        .restore(task_id)
+        .map_err(|error| format!("Could not restore the task: {error}"))?;
+    let status = manager
+        .get(task_id)
+        .map_or("unknown state", |task| task.status.label());
+    Ok(format!("Task restored · {status}"))
+}
+
+/// What Restore reports. A registration that is still unconfirmed says how it
+/// can be confirmed, or plainly that it no longer can.
+fn restore_status(message: String, still_unconfirmed: bool, confirmable: bool) -> String {
+    match (still_unconfirmed, confirmable) {
+        (false, _) => message,
+        (true, true) => format!(
+            "{message}; its registration is still unconfirmed, so Start waits for Retry registration or Reload"
+        ),
+        (true, false) => format!(
+            "{message}; its recovery record was dismissed, so its registration can no longer be confirmed and Start stays unavailable. Review its diff or create a new task instead"
+        ),
+    }
+}
+
+/// Move a task's unconfirmed-registration block between the visible and the
+/// hidden set. Restoring a task therefore keeps Start blocked until its
+/// recovery marker is confirmed, exactly as before it was hidden.
+fn carry_unconfirmed_registration(
+    from: &mut HashSet<TaskId>,
+    to: &mut HashSet<TaskId>,
+    task_id: TaskId,
+) -> bool {
+    let moved = from.remove(&task_id);
+    if moved {
+        to.insert(task_id);
+    }
+    moved
+}
+
+/// Why Hide is unavailable, from the same gate `archive` applies.
+fn hide_task_blocked_reason(
+    row: &TaskRowSnapshot,
+    gate: Result<(), crate::agent::TaskError>,
+) -> Option<&'static str> {
+    match gate {
+        Err(crate::agent::TaskError::UnknownTask(_)) => Some("This task is no longer available"),
+        Err(_) if row.validation_status == TaskValidationStatus::Running => {
+            Some("Wait for validation to finish before hiding this task")
+        }
+        Err(_) => Some("Stop or finish the Agent before hiding this task"),
+        Ok(()) if row.native_preparing => {
+            Some("Cancel the Agent preparation before hiding this task")
+        }
+        Ok(()) => None,
+    }
+}
+
+/// Sidebar tab text, plus the hover explanation when tasks need attention.
+pub(crate) fn tasks_tab_label(
+    counts: jterm_core::agent_task::DashboardAttentionCounts,
+) -> (String, Option<String>) {
+    match counts.total() {
+        0 => ("Tasks".into(), None),
+        total => (format!("Tasks {total}"), counts.summary()),
+    }
+}
+
+/// Label and hover text for the compact chrome indicator, shown only for an
+/// enabled dashboard that is out of sight while tasks wait for the user.
+pub(crate) fn task_attention_indicator(
+    enabled: bool,
+    sidebar_visible: bool,
+    counts: jterm_core::agent_task::DashboardAttentionCounts,
+) -> Option<(String, String)> {
+    if !enabled || sidebar_visible {
+        return None;
+    }
+    let summary = counts.summary()?;
+    Some((
+        format!("Tasks {}", counts.total()),
+        format!("{summary}\nOpen the Tasks dashboard"),
+    ))
+}
+
+pub(crate) fn task_attention_chip_width(ui: &egui::Ui, label: &str, font_size: f32) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            egui::FontId::proportional(font_size),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x
+        + 16.0
+}
+
+/// Paint the indicator inside custom-drawn chrome and report a click. Like
+/// the Vim9 launcher it never keeps keyboard focus, so terminal Space/Enter
+/// cannot activate it.
+pub(crate) fn task_attention_chip(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    hover: &str,
+    font_size: f32,
+) -> bool {
+    let id = ui.id().with("task_attention_indicator");
+    ui.memory_mut(|memory| memory.surrender_focus(id));
+    let response = ui.interact(rect, id, egui::Sense::CLICK);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    let warn = ui.visuals().warn_fg_color;
+    ui.painter().rect_filled(
+        rect,
+        5.0,
+        warn.gamma_multiply(if response.hovered() { 0.28 } else { 0.14 }),
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(font_size),
+        warn,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.on_hover_text(hover).clicked()
+}
+
+type SidebarPlacement = (bool, crate::sidebar::SidebarView);
+
+/// `task:toggle`: open the dashboard and remember what it replaced, or close
+/// it back to that state (hiding the sidebar when nothing was recorded).
+fn tasks_toggle_target(
+    current: SidebarPlacement,
+    previous: Option<SidebarPlacement>,
+) -> (SidebarPlacement, Option<SidebarPlacement>) {
+    use crate::sidebar::SidebarView;
+    if current.0 && current.1 == SidebarView::Tasks {
+        (previous.unwrap_or((false, SidebarView::Tasks)), None)
+    } else {
+        ((true, SidebarView::Tasks), Some(current))
+    }
 }
 
 struct PendingTaskCreation {
@@ -393,6 +671,7 @@ fn task_guidance(
     task: &crate::agent::AgentTask,
     row: &TaskRowSnapshot,
     registration_pending: bool,
+    registration_orphaned: bool,
 ) -> TaskGuidance {
     let mut guidance = TaskGuidance::from_task(
         task,
@@ -403,7 +682,10 @@ fn task_guidance(
             native_preparing: row.native_preparing,
         },
     );
-    if registration_pending {
+    if registration_pending && registration_orphaned {
+        guidance.title = "Registration cannot be confirmed";
+        guidance.detail = "Its recovery record was dismissed, so this task's registration can no longer be confirmed and Start stays blocked. Review its diff or hide it, and create a new task to continue the work.";
+    } else if registration_pending {
         guidance.title = "Confirm task registration";
         guidance.detail = "Registration is awaiting its durable recovery marker. Start remains blocked until confirmation succeeds.";
     }
@@ -449,6 +731,20 @@ fn render_task_inspector(ui: &mut egui::Ui, id: TaskId, inspector: &TaskInspecto
                 }
             });
     });
+}
+
+// A press on one hidden task, or on a task whose recorded state changed,
+// can never be released as a Restore of something else.
+fn hidden_task_restore_button(ui: &mut egui::Ui, row: &HiddenTaskRow) -> egui::Response {
+    ui.push_id(
+        (
+            "restore_hidden_task",
+            row.id,
+            row.restores_to.map(|status| status as u8),
+        ),
+        |ui| ui.add_enabled(row.restores_to.is_some(), egui::Button::new("Restore")),
+    )
+    .inner
 }
 
 fn task_accept_button(
@@ -817,11 +1113,7 @@ fn render_native_codex_view(
                     .small()
                     .strong(),
             );
-            ui.label(
-                egui::RichText::new(format!("{:?}", view.phase))
-                    .small()
-                    .weak(),
-            );
+            ui.label(egui::RichText::new(view.phase.label()).small().weak());
             if view.dropped_updates > 0 {
                 ui.label(
                     egui::RichText::new(format!("· This turn: {} updates omitted or compacted", view.dropped_updates))
@@ -1008,12 +1300,8 @@ fn render_native_approvals(
     for approval in &view.pending_approvals {
         ui.push_id(("native-approval", task_id, approval.id), |ui| {
             ui.separator();
-            let kind = match approval.kind {
-                CodexAppServerApprovalKind::Command => "Command approval",
-                CodexAppServerApprovalKind::FileChange => "File-change approval",
-            };
             let heading = ui.label(
-                egui::RichText::new(kind)
+                egui::RichText::new(format!("{} approval", approval.kind.label()))
                     .small()
                     .strong()
                     .color(ui.visuals().warn_fg_color),
@@ -1429,6 +1717,8 @@ impl TerminalApp {
             cancel,
             authored,
         });
+        // The new task and its "Creating…" progress belong on the dashboard.
+        self.task_sidebar.show_dashboard();
         self.task_sidebar.recovery_error = None;
         if authored {
             self.task_sidebar.composer.error = None;
@@ -1548,6 +1838,7 @@ impl TerminalApp {
             Ok(id) => {
                 self.task_sidebar.selected = Some(id);
                 self.task_sidebar.scroll_to_selected = true;
+                self.task_sidebar.show_dashboard();
                 if authored {
                     self.task_sidebar.dashboard_query.clear();
                     self.task_sidebar.dashboard_view = jterm_core::agent_task::DashboardView::All;
@@ -1630,13 +1921,19 @@ impl TerminalApp {
                         if another_runtime_won {
                             self.task_sidebar.recovery_error = Some("Another app window confirmed this worktree's registration. Use that window or Open worktree; archive this window's unconfirmed task rather than starting a duplicate.".into());
                         }
-                        self.task_sidebar.unconfirmed_registrations.retain(|id| {
-                            !self.task_manager.get(*id).is_some_and(|task| {
+                        let confirmed = |id: &TaskId| {
+                            self.task_manager.get(*id).is_some_and(|task| {
                                 records
                                     .iter()
                                     .any(|r| registration_marker_confirms(task, r))
                             })
-                        });
+                        };
+                        self.task_sidebar
+                            .unconfirmed_registrations
+                            .retain(|id| !confirmed(id));
+                        self.task_sidebar
+                            .hidden_unconfirmed_registrations
+                            .retain(|id| !confirmed(id));
                         self.task_sidebar.recovery_records = records;
                     }
                     Ok(RecoveryResult::Open(path, intent, epoch)) => {
@@ -1667,6 +1964,9 @@ impl TerminalApp {
                     Ok(RecoveryResult::Registered(records, id, provider, autostart)) => {
                         self.task_sidebar.recovery_records = records;
                         self.task_sidebar.unconfirmed_registrations.remove(&id);
+                        self.task_sidebar
+                            .hidden_unconfirmed_registrations
+                            .remove(&id);
                         self.task_sidebar.recovery_error = None;
                         self.set_status(if self.task_manager.get(id).is_some_and(|task| task.brief.is_some()) {
                             "Task created. Review its goal and choose Start when you are ready."
@@ -1730,6 +2030,12 @@ impl TerminalApp {
                     if dismiss_blocked { ui.label("Retry registration or Reload before dismissing this task's confirmation record."); }
                     if self.task_sidebar.dismiss_recovery == Some(record.id) {
                         ui.label("Forget this recovery record? Worktree, branch and files stay untouched; this removes its recovery entry.");
+                        if let Some(task) = hidden_task_waiting_on_record(&self.task_manager, &self.task_sidebar.hidden_unconfirmed_registrations, record) {
+                            ui.colored_label(ui.visuals().warn_fg_color, format!(
+                                "The hidden task “{}” still waits for this record to confirm its registration. After dismissing it, that task can be restored for review but never started.",
+                                visible_bounded(&task.title, MAX_TASK_TITLE_DISPLAY_BYTES)
+                            ));
+                        }
                         ui.horizontal(|ui| {
                             if ui.add_enabled(!busy && !dismiss_blocked, egui::Button::new("Dismiss record only")).clicked() { action = Some((record.id, 2)); self.task_sidebar.dismiss_recovery = None; }
                             if ui.button("Cancel").clicked() { self.task_sidebar.dismiss_recovery = None; }
@@ -1789,13 +2095,37 @@ impl TerminalApp {
 
     pub(crate) fn render_sidebar_tasks(&mut self, ui: &mut egui::Ui) {
         self.render_task_recovery(ui);
+        let hidden_count = self.task_manager.archived_count();
+        if !hidden_view_shown(self.task_sidebar.show_hidden, hidden_count) {
+            // For example after restoring the last hidden task.
+            self.task_sidebar.show_dashboard();
+        }
         ui.horizontal_wrapped(|ui| {
             ui.strong("Agent tasks");
             if ui.button("New task").clicked() {
                 self.open_task_composer();
             }
-            if ui.button("Conversation library").clicked() {
-                self.toggle_agent_sessions();
+            if ui
+                .button("Conversation library")
+                .on_hover_text("Open the Agent Sessions library; it stays open on a second click")
+                .clicked()
+            {
+                self.open_agent_sessions();
+            }
+            if (hidden_count > 0 || self.task_sidebar.show_hidden)
+                && ui
+                    .selectable_label(
+                        self.task_sidebar.show_hidden,
+                        format!("Hidden ({hidden_count})"),
+                    )
+                    .on_hover_text(if self.task_sidebar.show_hidden {
+                        "Return to the task dashboard"
+                    } else {
+                        "Show hidden tasks. Restore returns a task to the state it had when hidden"
+                    })
+                    .clicked()
+            {
+                self.task_sidebar.show_hidden = !self.task_sidebar.show_hidden;
             }
         });
         let mut composer_projects: Vec<_> = self
@@ -1817,6 +2147,10 @@ impl TerminalApp {
             if let Err(error) = self.begin_worktree_task(request) {
                 self.task_sidebar.composer.error = Some(error);
             }
+        }
+        if self.task_sidebar.show_hidden {
+            self.render_hidden_tasks(ui);
+            return;
         }
         let rows: Vec<_> = self
             .task_manager
@@ -1866,7 +2200,11 @@ impl TerminalApp {
             })
             .collect();
         let has_tasks = !rows.is_empty();
-        let open_result = dashboard_search(ui, &mut self.task_sidebar.dashboard_query);
+        let open_result = dashboard_search(
+            ui,
+            &mut self.task_sidebar.dashboard_query,
+            &mut self.task_sidebar.query_error,
+        );
         let mut projects: Vec<_> = self
             .task_manager
             .tasks()
@@ -1942,23 +2280,20 @@ impl TerminalApp {
                 )
             })
             .collect();
-        let project_dashboard = |view| {
-            jterm_core::agent_task::DashboardSnapshot::project_unsorted(
-                self.task_manager
-                    .tasks()
-                    .iter()
-                    .filter(|task| task.status != TaskStatus::Archived),
-                |id| activity.get(&id).copied().unwrap_or_default(),
-                jterm_core::agent_task::DashboardFilter {
-                    text: &self.task_sidebar.dashboard_query,
-                    provider: self.task_sidebar.dashboard_provider,
-                    repo_root: self.task_sidebar.dashboard_project.as_deref(),
-                    view,
-                    ..Default::default()
-                },
-            )
-        };
-        let search_matches = project_dashboard(DashboardView::All);
+        let search_matches = jterm_core::agent_task::DashboardSnapshot::project_unsorted(
+            self.task_manager
+                .tasks()
+                .iter()
+                .filter(|task| task.status != TaskStatus::Archived),
+            |id| activity.get(&id).copied().unwrap_or_default(),
+            jterm_core::agent_task::DashboardFilter {
+                text: &self.task_sidebar.dashboard_query,
+                provider: self.task_sidebar.dashboard_provider,
+                repo_root: self.task_sidebar.dashboard_project.as_deref(),
+                view: DashboardView::All,
+                ..Default::default()
+            },
+        );
         let views = [
             DashboardView::All,
             DashboardView::NeedsAttention,
@@ -1987,7 +2322,9 @@ impl TerminalApp {
             &mut self.task_sidebar.dashboard_attention,
             &mut self.task_sidebar.dashboard_view,
         );
-        let dashboard = search_matches.view(
+        // Narrow the searched scope in place; counts stay those of the search.
+        let mut dashboard = search_matches;
+        dashboard.apply_view(
             self.task_sidebar.dashboard_view,
             self.task_sidebar.dashboard_attention,
             self.task_sidebar.dashboard_sort,
@@ -2105,6 +2442,17 @@ impl TerminalApp {
                 ui.ctx().request_repaint_after(Duration::from_millis(75));
                 return;
             }
+            if hidden_count > 0 {
+                ui.label(egui::RichText::new("No visible Agent tasks").strong());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{hidden_count} hidden. Choose Hidden to review or restore them, or New task to start another goal.",
+                    ))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+                return;
+            }
             ui.label(egui::RichText::new("No Agent tasks yet").strong());
             ui.label(
                 egui::RichText::new(
@@ -2116,11 +2464,17 @@ impl TerminalApp {
             return;
         }
 
+        // Shared snapshots are reused until the provider view changes, so a
+        // frame never deep-copies agent text, command output or diffs.
         let mut selected_native_view = self
             .task_sidebar
             .selected
             .filter(|id| rows.iter().any(|row| row.id == *id))
-            .and_then(|id| self.agent_runtime.snapshot(id).map(|view| (id, view)));
+            .and_then(|id| {
+                self.agent_runtime
+                    .shared_snapshot(id)
+                    .map(|view| (id, view))
+            });
         let mut approval_navigation = selected_native_view
             .as_ref()
             .and_then(|(id, view)| native_approval_navigation(ui, *id, view));
@@ -2162,8 +2516,17 @@ impl TerminalApp {
                         let has_input = task.is_some_and(|task| task.brief.is_some() || task.source_context.is_some());
                         let has_validation = task.is_some_and(|task| task.validation_command().is_some());
                         let registration_pending = self.task_sidebar.unconfirmed_registrations.contains(&row.id);
+                        // Only a settled, successful record load can prove that
+                        // no record is left to confirm this registration.
+                        let records_settled = self.task_sidebar.recovery_loaded
+                            && self.task_sidebar.recovery_job.is_none()
+                            && self.task_sidebar.pending_creation.is_none()
+                            && self.task_sidebar.recovery_error.is_none();
                         if let Some(task) = task {
-                            render_task_guidance(ui, &task_guidance(task, row, registration_pending));
+                            let orphaned = registration_pending
+                                && records_settled
+                                && !registration_confirmable(task, &self.task_sidebar.recovery_records);
+                            render_task_guidance(ui, &task_guidance(task, row, registration_pending, orphaned));
                         }
                         if let Some(notice) = native_start_notice(row.provider) {
                             ui.label(egui::RichText::new(notice).small().color(egui::Color32::YELLOW));
@@ -2173,10 +2536,11 @@ impl TerminalApp {
                         let native_view = if selected_native_view.as_ref().is_some_and(|(id, _)| *id == row.id) {
                             selected_native_view.take().map(|(_, view)| view)
                         } else {
-                            self.agent_runtime.snapshot(row.id)
+                            self.agent_runtime.shared_snapshot(row.id)
                         };
                         retain_approval_navigation(&mut approval_navigation,
-                            self.task_sidebar.selected.filter(|id| *id == row.id), native_view.as_ref());
+                            self.task_sidebar.selected.filter(|id| *id == row.id), native_view.as_deref());
+                        let hide_blocked = hide_task_blocked_reason(row, self.task_manager.can_archive(row.id));
                         let native_idle = row.status == TaskStatus::ReadyForReview
                             && row.has_active_agent_stream
                             && native_view
@@ -2395,13 +2759,15 @@ impl TerminalApp {
                                 .clicked() {
                                 pending = Some(if manual_review { TaskSidebarAction::AcceptReviewed(row.id) } else { TaskSidebarAction::Complete(row.id) });
                             }
+                            // The task manager's own gate decides; the reason
+                            // names what must finish first.
                             if ui
                                 .add_enabled(
-                                    !row.is_running(),
+                                    hide_blocked.is_none(),
                                     egui::Button::new("Hide task"),
                                 )
-                                .on_hover_text("Hide task metadata; leave its worktree in place")
-                                .on_disabled_hover_text("Stop or finish the Agent and wait for validation to end before hiding this task")
+                                .on_hover_text("Hide this task from the dashboard; its worktree stays in place and Hidden can restore it")
+                                .on_disabled_hover_text(hide_blocked.unwrap_or_default())
                                 .clicked()
                             {
                                 pending = Some(TaskSidebarAction::Archive(row.id));
@@ -2587,13 +2953,20 @@ impl TerminalApp {
         }
     }
 
-    pub(crate) fn execute_pending_task_sidebar_action(&mut self) {
+    pub(crate) fn execute_pending_task_sidebar_action(&mut self, ctx: &egui::Context) {
         let Some(action) = self.task_sidebar.pending_action.take() else {
             return;
         };
         if task_action_waits_for_recovery(&action, &self.task_sidebar.unconfirmed_registrations) {
             self.task_sidebar.recovery_error = Some("Task registration is not durably confirmed. Retry registration or Reload recovery records before Start.".into());
             return;
+        }
+        if native_action_needs_prompt_poll(&action) {
+            // The runtime may legitimately poll slowly while it waits for
+            // this very decision; show its response without that delay.
+            self.task_sidebar.native_fast_poll_until =
+                Some(Instant::now() + NATIVE_ACTION_FAST_POLL);
+            ctx.request_repaint();
         }
         match action {
             TaskSidebarAction::StartNative(task_id) => self.start_task_native_agent(task_id),
@@ -2723,17 +3096,191 @@ impl TerminalApp {
             }
             TaskSidebarAction::Archive(task_id) => match self.task_manager.archive(task_id) {
                 Ok(()) => {
-                    self.agent_runtime.clear_retained(task_id);
-                    self.task_sidebar.follow_up_drafts.remove(&task_id);
-                    self.task_sidebar.unconfirmed_registrations.remove(&task_id);
+                    // Hiding is reversible: the retained native view (transcript,
+                    // approvals, exit evidence) and any follow-up draft stay, so
+                    // Restore shows the task exactly as it was.
+                    carry_unconfirmed_registration(
+                        &mut self.task_sidebar.unconfirmed_registrations,
+                        &mut self.task_sidebar.hidden_unconfirmed_registrations,
+                        task_id,
+                    );
                     if self.task_sidebar.selected == Some(task_id) {
                         self.task_sidebar.selected = None;
                     }
-                    self.set_status("Task hidden; worktree left in place");
+                    self.set_status("Task hidden; worktree left in place. Restore it from Hidden.");
                 }
                 Err(error) => self.set_status_for(error.to_string(), Duration::from_secs(5)),
             },
+            TaskSidebarAction::Restore(task_id) => {
+                match restore_hidden_task(&mut self.task_manager, task_id) {
+                    Ok(message) => {
+                        let still_unconfirmed = carry_unconfirmed_registration(
+                            &mut self.task_sidebar.hidden_unconfirmed_registrations,
+                            &mut self.task_sidebar.unconfirmed_registrations,
+                            task_id,
+                        );
+                        let confirmable = self.task_manager.get(task_id).is_some_and(|task| {
+                            registration_confirmable(task, &self.task_sidebar.recovery_records)
+                        });
+                        // Selected and shown on the dashboard, where it now is.
+                        self.task_sidebar.selected = Some(task_id);
+                        self.task_sidebar.scroll_to_selected = true;
+                        self.task_sidebar.show_dashboard();
+                        self.set_status(restore_status(message, still_unconfirmed, confirmable));
+                    }
+                    Err(error) => self.set_status_for(error, Duration::from_secs(6)),
+                }
+            }
         }
+    }
+
+    /// The Hidden view: archived tasks with Restore and read-only diff review.
+    /// No other task action is offered for a hidden task.
+    fn render_hidden_tasks(&mut self, ui: &mut egui::Ui) {
+        let rows = hidden_task_rows(&self.task_manager);
+        ui.label(
+            egui::RichText::new(format!(
+                "{} hidden · Restore returns a task to its state when hidden; it never starts an Agent",
+                rows.len()
+            ))
+            .small()
+            .color(ui.visuals().weak_text_color()),
+        );
+        if rows.is_empty() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("No hidden tasks").strong());
+            ui.label(
+                egui::RichText::new(
+                    "Hide task removes a finished task from the dashboard and leaves its worktree in place. Choose Hidden again to return.",
+                )
+                .small()
+                .color(ui.visuals().weak_text_color()),
+            );
+            return;
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let mut pending = None;
+        egui::ScrollArea::vertical()
+            .id_salt("hidden_agent_tasks")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for row in &rows {
+                    ui.push_id(("hidden_task", row.id), |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&row.title).strong()).truncate(),
+                        )
+                        .on_hover_text(&row.title);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{} · hidden while {}",
+                                    row.provider.display_name(),
+                                    row.restores_to
+                                        .map_or("in an unrecorded state", TaskStatus::label)
+                                ))
+                                .small(),
+                            )
+                            .truncate(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{} · {}", row.project, row.branch))
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .truncate(),
+                        );
+                        ui.label(
+                            egui::RichText::new(task_update_age(row.updated_at_ms, now_ms))
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            if hidden_task_restore_button(ui, row)
+                                .on_hover_text(format!(
+                                    "Return this task to {} on the dashboard. Its worktree, validation record and Agent transcript stay as they were; nothing starts.",
+                                    row.restores_to.map_or("its previous state", TaskStatus::label)
+                                ))
+                                .on_disabled_hover_text(
+                                    "This task was hidden without a recorded state to return to. Create a new task for its worktree.",
+                                )
+                                .clicked()
+                            {
+                                pending = Some(TaskSidebarAction::Restore(row.id));
+                            }
+                            if ui
+                                .button("Review diff")
+                                .on_hover_text("Read-only view of the worktree's changes")
+                                .clicked()
+                            {
+                                pending = Some(TaskSidebarAction::ReviewDiff(row.id));
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
+            });
+        if pending.is_some() {
+            self.task_sidebar.pending_action = pending;
+        }
+    }
+
+    /// Reveal the Tasks dashboard and remember it as the sidebar view.
+    pub(crate) fn open_tasks_view(&mut self) {
+        self.task_sidebar.show_dashboard();
+        self.sidebar.note_files_user_intent();
+        self.sidebar.visible = true;
+        self.sidebar.view = crate::sidebar::SidebarView::Tasks;
+        if self.config.sidebar_view != crate::sidebar::SidebarView::Tasks {
+            self.config.sidebar_view = crate::sidebar::SidebarView::Tasks;
+            self.schedule_config_save();
+        }
+    }
+
+    /// `task:toggle` (Ctrl+Alt+Shift+T): open the dashboard, or close it back
+    /// to the sidebar state it replaced. Explains how to enable it when off.
+    pub(crate) fn toggle_tasks_view(&mut self) {
+        if !self.config.experimental_task_sidebar {
+            self.set_status_for(
+                "The Tasks dashboard is off. Enable Settings → AI → “Show experimental Tasks dashboard” (experimental_task_sidebar = true) to use it.",
+                Duration::from_secs(6),
+            );
+            return;
+        }
+        let ((visible, view), previous) = tasks_toggle_target(
+            (self.sidebar.visible, self.sidebar.view),
+            self.task_sidebar.toggle_return.take(),
+        );
+        self.task_sidebar.toggle_return = previous;
+        if visible && view == crate::sidebar::SidebarView::Tasks {
+            self.task_sidebar.show_dashboard();
+        }
+        self.sidebar.note_files_user_intent();
+        self.sidebar.visible = visible;
+        if self.sidebar.view != view {
+            self.sidebar.view = view;
+            self.config.sidebar_view = view;
+            self.schedule_config_save();
+        }
+        if visible && view == crate::sidebar::SidebarView::Files {
+            if let Some(error) = self.sidebar.refresh() {
+                self.set_status(format!("Files refresh failed: {error}"));
+            }
+        }
+    }
+
+    /// The compact attention indicator for chrome that stays visible while
+    /// the sidebar is hidden.
+    pub(crate) fn chrome_task_attention(&self) -> Option<(String, String)> {
+        task_attention_indicator(
+            self.config.experimental_task_sidebar,
+            self.sidebar.visible,
+            self.task_manager.attention_counts(),
+        )
     }
 
     fn start_task_native_agent(&mut self, task_id: TaskId) {
@@ -2842,7 +3389,16 @@ impl TerminalApp {
                 )
             });
         }
-        if self.agent_runtime.needs_fast_poll() || report.budget_exhausted {
+        // Approval waits and idle review points poll slowly by design; the
+        // user's own action keeps frame-rate polling briefly instead.
+        let user_action_window = self
+            .task_sidebar
+            .native_fast_poll_until
+            .is_some_and(|until| Instant::now() < until);
+        if !user_action_window {
+            self.task_sidebar.native_fast_poll_until = None;
+        }
+        if self.agent_runtime.needs_fast_poll() || report.budget_exhausted || user_action_window {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.agent_runtime.has_any_activity() {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -3182,7 +3738,11 @@ fn dashboard_filter_label(
 }
 
 /// Use TextEdit's own Enter/focus handling; this is not a terminal shortcut.
-fn dashboard_search(ui: &mut egui::Ui, query: &mut String) -> bool {
+fn dashboard_search(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    query_error: &mut DashboardQueryErrorCache,
+) -> bool {
     let previous = query.clone();
     let rejected_input = egui::Id::new("agent-task-query-rejected-input");
     let search = ui.add(
@@ -3211,7 +3771,7 @@ fn dashboard_search(ui: &mut egui::Ui, query: &mut String) -> bool {
             "Search input exceeds 4 KiB. The previous query was kept in full.",
         );
     }
-    if let Some(error) = jterm_core::agent_task::dashboard_query_error(query) {
+    if let Some(error) = query_error.error(query) {
         ui.colored_label(ui.visuals().error_fg_color, error);
     }
     egui::CollapsingHeader::new("Search help")
@@ -3359,10 +3919,20 @@ mod management_v3_tests {
     fn registration_guidance_precedes_shared_review_without_changing_authority() {
         let (task, mut row, _) = fixture(TaskStatus::ReadyForReview, TaskValidationStatus::NotRun);
         row.has_active_agent_stream = true;
-        let guidance = task_guidance(&task, &row, false);
+        let guidance = task_guidance(&task, &row, false, false);
         assert_eq!(guidance.title, "Review or continue the live session");
-        let pending = task_guidance(&task, &row, true);
+        let pending = task_guidance(&task, &row, true, false);
         assert!(pending.detail.contains("durable recovery marker"));
+        // Once no record is left to confirm it, the card says so instead of
+        // promising a confirmation that can never happen.
+        let orphaned = task_guidance(&task, &row, true, true);
+        assert_eq!(orphaned.title, "Registration cannot be confirmed");
+        assert!(orphaned.detail.contains("recovery record was dismissed"));
+        assert_eq!(
+            task_guidance(&task, &row, false, true).title,
+            guidance.title,
+            "only a blocked registration can be orphaned"
+        );
         assert_eq!(task.status, TaskStatus::ReadyForReview);
         assert!(row.has_active_agent_stream);
     }
@@ -3457,7 +4027,11 @@ mod management_v3_tests {
                         ..Default::default()
                     },
                     |ui| {
-                        submitted = dashboard_search(ui, &mut query);
+                        submitted = dashboard_search(
+                            ui,
+                            &mut query,
+                            &mut DashboardQueryErrorCache::default(),
+                        );
                     },
                 );
                 output.textures_delta.clear();
@@ -3612,7 +4186,11 @@ mod management_v3_tests {
                     },
                     |ui| {
                         ui.strong("Agent command center");
-                        assert!(!dashboard_search(ui, &mut query));
+                        assert!(!dashboard_search(
+                            ui,
+                            &mut query,
+                            &mut DashboardQueryErrorCache::default()
+                        ));
                         let queue_rect = ui
                             .scope(|ui| {
                                 render_attention_queues(ui, &dashboard, &mut attention, &mut view);
@@ -3622,7 +4200,7 @@ mod management_v3_tests {
                         queue_height = queue_rect.height();
                         queue_right = queue_rect.right();
                         assert!(!task_row_button(ui, &row, &shared, true, 1_060_000).clicked());
-                        render_task_guidance(ui, &task_guidance(&task, &row, false));
+                        render_task_guidance(ui, &task_guidance(&task, &row, false, false));
                         render_task_inspector(ui, row.id, &TaskInspector::from_task(&task));
                     },
                 );
@@ -3947,7 +4525,7 @@ mod management_v2_tests {
                     ..Default::default()
                 },
                 |ui| {
-                    render_task_guidance(ui, &task_guidance(&reviewed, &row(id), false));
+                    render_task_guidance(ui, &task_guidance(&reviewed, &row(id), false, false));
                     render_task_inspector(ui, id, &inspector);
                     assert!(!task_accept_button(ui, &row(id), true, true).clicked());
                 },
@@ -4032,7 +4610,8 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    submitted = dashboard_search(ui, &mut query);
+                    submitted =
+                        dashboard_search(ui, &mut query, &mut DashboardQueryErrorCache::default());
                 },
             );
             output.textures_delta.clear();
@@ -5050,5 +5629,438 @@ mod approval_navigation_tests {
         assert_eq!(after.navigation_left, None);
         assert_eq!(after.action, None);
         assert!((after.offset - 1300.0).abs() < 1.0);
+    }
+}
+
+#[cfg(test)]
+mod hidden_and_attention_tests {
+    use super::*;
+    use crate::agent::{NewTask, TaskError, TaskManager};
+    use crate::sidebar::SidebarView;
+
+    fn add_task(manager: &mut TaskManager, title: &str) -> TaskId {
+        manager
+            .create(NewTask {
+                title: title.into(),
+                provider: AgentProvider::Codex,
+                repo_root: "/fixture".into(),
+                worktree_path: format!("/fixture/worktrees/{title}").into(),
+                branch: format!("task/{title}"),
+                base_commit: "a".repeat(40),
+                source_context: None,
+            })
+            .unwrap()
+    }
+
+    fn row(manager: &TaskManager, id: TaskId) -> TaskRowSnapshot {
+        let task = manager.get(id).unwrap();
+        TaskRowSnapshot {
+            id,
+            title: task.title.clone(),
+            provider: task.provider,
+            status: task.status,
+            runtime_kind: task.runtime_kind,
+            branch: task.branch.clone(),
+            project: task.repo_root.to_string_lossy().into_owned(),
+            has_agent_terminal: false,
+            has_validation_terminal: false,
+            has_active_agent_stream: false,
+            native_preparing: false,
+            terminal_retry_available: false,
+            native_terminal_fallback_available: false,
+            validation_status: task.validation.status,
+            validation_attempt: task.validation.attempt,
+            validation_detail: None,
+            needs_attention: task.needs_attention(),
+            status_detail: None,
+        }
+    }
+
+    #[test]
+    fn hidden_tasks_leave_the_dashboard_and_restore_to_their_recorded_state() {
+        let mut manager = TaskManager::new();
+        let visible = add_task(&mut manager, "visible");
+        let hidden = add_task(&mut manager, "reviewed");
+        manager
+            .update_status(hidden, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager.archive(hidden).unwrap();
+        assert_eq!(manager.archived_count(), 1);
+
+        let dashboard = DashboardSnapshot::project_unsorted(
+            manager
+                .tasks()
+                .iter()
+                .filter(|task| task.status != TaskStatus::Archived),
+            |_| Default::default(),
+            jterm_core::agent_task::DashboardFilter::default(),
+        );
+        assert_eq!(
+            dashboard.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [visible],
+            "the normal dashboard keeps excluding hidden tasks"
+        );
+        let rows = hidden_task_rows(&manager);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, hidden);
+        assert_eq!(rows[0].restores_to, Some(TaskStatus::ReadyForReview));
+        assert_eq!(rows[0].title, "reviewed");
+
+        // Restore and Hide never wait for recovery and never count as a
+        // native action; Restore re-resolves the task when it executes.
+        let action = TaskSidebarAction::Restore(hidden);
+        assert!(!task_action_waits_for_recovery(
+            &action,
+            &HashSet::from([hidden])
+        ));
+        assert!(!native_action_needs_prompt_poll(&action));
+        assert_eq!(
+            restore_hidden_task(&mut manager, hidden).unwrap(),
+            "Task restored · Ready for review"
+        );
+        let restored = manager.get(hidden).unwrap();
+        assert_eq!(restored.status, TaskStatus::ReadyForReview);
+        assert_eq!(restored.runtime_kind, TaskRuntimeKind::Unassigned);
+        assert_eq!(restored.validation.status, TaskValidationStatus::NotRun);
+        assert_eq!(manager.archived_count(), 0);
+        assert!(hidden_task_rows(&manager).is_empty());
+        assert!(restore_hidden_task(&mut manager, hidden)
+            .unwrap_err()
+            .contains("not hidden"));
+        assert!(restore_hidden_task(&mut manager, TaskId::new())
+            .unwrap_err()
+            .starts_with("Could not restore the task"));
+        assert_eq!(manager.get(visible).unwrap().status, TaskStatus::Created);
+    }
+
+    #[test]
+    fn restore_keeps_start_blocked_until_registration_is_confirmed() {
+        let task = TaskId::new();
+        let other = TaskId::new();
+        let mut unconfirmed = HashSet::from([task, other]);
+        let mut hidden = HashSet::new();
+        // Hiding sets the block aside, so the recovery record can be dismissed.
+        assert!(carry_unconfirmed_registration(
+            &mut unconfirmed,
+            &mut hidden,
+            task
+        ));
+        assert_eq!(unconfirmed, HashSet::from([other]));
+        assert!(!task_action_waits_for_recovery(
+            &TaskSidebarAction::StartNative(task),
+            &unconfirmed
+        ));
+        // Restoring reinstates it: Start waits for confirmation again.
+        assert!(carry_unconfirmed_registration(
+            &mut hidden,
+            &mut unconfirmed,
+            task
+        ));
+        assert!(hidden.is_empty());
+        for action in [
+            TaskSidebarAction::StartNative(task),
+            TaskSidebarAction::StartTerminal(task),
+            TaskSidebarAction::RunValidation(task),
+        ] {
+            assert!(task_action_waits_for_recovery(&action, &unconfirmed));
+        }
+        // A confirmed task carries nothing.
+        let confirmed = TaskId::new();
+        assert!(!carry_unconfirmed_registration(
+            &mut unconfirmed,
+            &mut hidden,
+            confirmed
+        ));
+        assert!(!carry_unconfirmed_registration(
+            &mut hidden,
+            &mut unconfirmed,
+            confirmed
+        ));
+        assert!(!unconfirmed.contains(&confirmed));
+    }
+
+    fn record_for(manager: &TaskManager, id: TaskId) -> crate::agent::recovery::Record {
+        let task = manager.get(id).unwrap();
+        crate::agent::recovery::Record {
+            id: uuid::Uuid::new_v4(),
+            repository: task.repo_root.clone(),
+            path: task.worktree_path.clone(),
+            branch: task.branch.clone(),
+            provider: task.provider,
+            stage: crate::agent::recovery::Stage::Prepared,
+            base_commit: Some(task.base_commit.clone()),
+            directory_identity: None,
+            registered_task_id: None,
+        }
+    }
+
+    #[test]
+    fn restore_after_the_record_was_dismissed_says_start_can_never_be_confirmed() {
+        let mut manager = TaskManager::new();
+        let id = add_task(&mut manager, "unconfirmed");
+        let record = record_for(&manager, id);
+        let mut records = vec![record.clone()];
+        let hidden = HashSet::from([id]);
+        // While hidden, dismissing its record is allowed but warned about.
+        assert_eq!(
+            hidden_task_waiting_on_record(&manager, &hidden, &record).map(|task| task.id),
+            Some(id)
+        );
+        assert!(hidden_task_waiting_on_record(&manager, &HashSet::new(), &record).is_none());
+        assert!(registration_confirmable(manager.get(id).unwrap(), &records));
+        assert!(restore_status("Task restored · Created".into(), true, true)
+            .contains("Start waits for Retry registration or Reload"));
+        // After the record is dismissed, nothing can confirm it any more.
+        records.clear();
+        assert!(!registration_confirmable(
+            manager.get(id).unwrap(),
+            &records
+        ));
+        let status = restore_status("Task restored · Created".into(), true, false);
+        assert!(status.starts_with("Task restored · Created; its recovery record was dismissed"));
+        assert!(!status.contains("Retry registration or Reload"));
+        assert_eq!(
+            restore_status("Task restored · Ready for review".into(), false, false),
+            "Task restored · Ready for review"
+        );
+        // A record for another worktree confirms nothing.
+        let mut other = record;
+        other.path = "/fixture/other-worktree".into();
+        assert!(!registration_confirmable(
+            manager.get(id).unwrap(),
+            &[other]
+        ));
+    }
+
+    #[test]
+    fn the_hidden_list_gives_way_to_the_dashboard() {
+        let mut state = TaskSidebarState {
+            show_hidden: true,
+            ..Default::default()
+        };
+        assert!(hidden_view_shown(state.show_hidden, 2));
+        assert!(
+            !hidden_view_shown(state.show_hidden, 0),
+            "nothing left to restore"
+        );
+        assert!(!hidden_view_shown(false, 2));
+        // Opening the dashboard, creating, registering or restoring a task.
+        state.show_dashboard();
+        assert!(!state.show_hidden);
+    }
+
+    #[test]
+    fn hide_is_gated_by_the_manager_and_explains_what_must_finish() {
+        let mut manager = TaskManager::new();
+        let id = add_task(&mut manager, "gated");
+        let mut snapshot = row(&manager, id);
+        assert_eq!(
+            hide_task_blocked_reason(&snapshot, manager.can_archive(id)),
+            None
+        );
+        snapshot.native_preparing = true;
+        assert!(hide_task_blocked_reason(&snapshot, manager.can_archive(id))
+            .unwrap()
+            .contains("preparation"));
+        snapshot.native_preparing = false;
+        manager
+            .bind_terminal_session(id, "agent-terminal".into())
+            .unwrap();
+        let gate = manager.can_archive(id);
+        assert_eq!(gate, Err(TaskError::CannotArchiveRunning(id)));
+        assert!(hide_task_blocked_reason(&snapshot, gate)
+            .unwrap()
+            .contains("Stop or finish the Agent"));
+        snapshot.validation_status = TaskValidationStatus::Running;
+        assert!(
+            hide_task_blocked_reason(&snapshot, Err(TaskError::CannotArchiveRunning(id)))
+                .unwrap()
+                .contains("validation")
+        );
+        let missing = TaskId::new();
+        assert!(
+            hide_task_blocked_reason(&snapshot, manager.can_archive(missing))
+                .unwrap()
+                .contains("no longer available")
+        );
+        assert_eq!(
+            manager.archive(id),
+            Err(TaskError::CannotArchiveRunning(id))
+        );
+    }
+
+    #[test]
+    fn attention_badge_counts_every_queue_and_explains_itself() {
+        let mut manager = TaskManager::new();
+        let reply = add_task(&mut manager, "reply");
+        let failed = add_task(&mut manager, "failed");
+        let hidden = add_task(&mut manager, "hidden");
+        manager
+            .update_status(reply, TaskStatus::WaitingForHuman, None)
+            .unwrap();
+        manager
+            .update_status(failed, TaskStatus::Failed, None)
+            .unwrap();
+        manager
+            .update_status(hidden, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager.archive(hidden).unwrap();
+        let counts = manager.attention_counts();
+        assert_eq!(counts.total(), 2, "hidden tasks never ask for attention");
+        assert_eq!(
+            tasks_tab_label(counts),
+            (
+                "Tasks 2".to_string(),
+                Some("2 tasks need you: 1 reply, 1 failed".to_string())
+            )
+        );
+        assert_eq!(
+            tasks_tab_label(Default::default()),
+            ("Tasks".to_string(), None)
+        );
+        assert!(task_attention_indicator(false, false, counts).is_none());
+        assert!(
+            task_attention_indicator(true, true, counts).is_none(),
+            "the sidebar tab already shows the count"
+        );
+        assert!(task_attention_indicator(true, false, Default::default()).is_none());
+        let (label, hover) = task_attention_indicator(true, false, counts).unwrap();
+        assert_eq!(label, "Tasks 2");
+        assert!(hover.starts_with("2 tasks need you: 1 reply, 1 failed"));
+        assert!(hover.contains("Open the Tasks dashboard"));
+    }
+
+    #[test]
+    fn task_toggle_opens_the_dashboard_and_returns_to_what_it_replaced() {
+        let (opened, previous) = tasks_toggle_target((true, SidebarView::Files), None);
+        assert_eq!(opened, (true, SidebarView::Tasks));
+        assert_eq!(previous, Some((true, SidebarView::Files)));
+        assert_eq!(
+            tasks_toggle_target(opened, previous),
+            ((true, SidebarView::Files), None)
+        );
+        let (opened, previous) = tasks_toggle_target((false, SidebarView::Sessions), None);
+        assert_eq!(opened, (true, SidebarView::Tasks));
+        assert_eq!(
+            tasks_toggle_target(opened, previous),
+            ((false, SidebarView::Sessions), None)
+        );
+        assert_eq!(
+            tasks_toggle_target((true, SidebarView::Tasks), None),
+            ((false, SidebarView::Tasks), None),
+            "without a record, closing hides the sidebar"
+        );
+        assert_eq!(
+            tasks_toggle_target(
+                (false, SidebarView::Tasks),
+                Some((true, SidebarView::Files))
+            )
+            .0,
+            (true, SidebarView::Tasks),
+            "a hidden Tasks view opens again"
+        );
+    }
+
+    #[test]
+    fn user_native_actions_poll_promptly_while_navigation_does_not() {
+        let task = TaskId::new();
+        let approval = ApprovalId::new();
+        for action in [
+            TaskSidebarAction::StartNative(task),
+            TaskSidebarAction::StopCodex(task),
+            TaskSidebarAction::FollowUp(task, "next".into()),
+            TaskSidebarAction::FinishCodex(task),
+            TaskSidebarAction::Approve(task, approval),
+            TaskSidebarAction::Deny(task, approval),
+        ] {
+            assert!(native_action_needs_prompt_poll(&action), "{action:?}");
+        }
+        for action in [
+            TaskSidebarAction::ReviewDiff(task),
+            TaskSidebarAction::Archive(task),
+            TaskSidebarAction::Restore(task),
+            TaskSidebarAction::FocusTerminal(task),
+        ] {
+            assert!(!native_action_needs_prompt_poll(&action), "{action:?}");
+        }
+        assert!(NATIVE_ACTION_FAST_POLL >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn query_error_cache_matches_the_shared_parser_across_edits() {
+        let mut cache = DashboardQueryErrorCache::default();
+        for text in [
+            "",
+            "provider:codex",
+            "status:nonsense",
+            "status:nonsense",
+            "\"unclosed",
+            "provider:codex attention:review",
+            "",
+        ] {
+            assert_eq!(
+                cache.error(text).map(str::to_owned),
+                jterm_core::agent_task::dashboard_query_error(text),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_release_cannot_retarget_another_hidden_task_or_unknown_state() {
+        let hidden = |restores_to| HiddenTaskRow {
+            id: TaskId::new(),
+            title: "hidden".into(),
+            provider: AgentProvider::Codex,
+            project: "/fixture".into(),
+            branch: "task/hidden".into(),
+            restores_to,
+            updated_at_ms: 1,
+        };
+        let first = hidden(Some(TaskStatus::ReadyForReview));
+        let mut changed_state = first.clone();
+        changed_state.restores_to = Some(TaskStatus::Failed);
+        for replacement in [hidden(Some(TaskStatus::ReadyForReview)), changed_state] {
+            let ctx = egui::Context::default();
+            let frame = |row: &HiddenTaskRow, events| {
+                let mut response = None;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| response = Some(hidden_task_restore_button(ui, row)),
+                );
+                output.textures_delta.clear();
+                response.unwrap()
+            };
+            let position = frame(&first, vec![]).rect.center();
+            let pointer = |pressed| {
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            };
+            assert!(!frame(&first, pointer(true)).clicked());
+            assert!(!frame(&replacement, pointer(false)).clicked());
+            assert!(!frame(&replacement, pointer(true)).clicked());
+            assert!(frame(&replacement, pointer(false)).clicked());
+        }
+        let ctx = egui::Context::default();
+        let mut enabled = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            enabled = Some(hidden_task_restore_button(ui, &hidden(None)).enabled());
+        });
+        output.textures_delta.clear();
+        assert_eq!(
+            enabled,
+            Some(false),
+            "an unknown prior state is never guessed"
+        );
     }
 }

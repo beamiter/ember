@@ -168,6 +168,10 @@ pub enum Command {
     /// 这是家族契约里最不该错的方向，所以 ember 让回家族键位。
     AgentToggle,
     AgentSessions,
+    /// Agent Tasks 仪表盘（侧边栏 Tasks 视图）的开关。默认
+    /// `ctrl+shift+alt+t`——与 anvil/forge 的 `ToggleTasksPanel`
+    /// （Ctrl+Alt+Shift+T）同键位。仪表盘未启用时只给出如何启用的提示。
+    TaskToggle,
     /// 持久化 AI 聊天库面板（anvil `ToggleAiPanel` 的 ember 对应物；会话级，
     /// 不绑定特定 pane，回复只读展示，绝不触碰 PTY）。默认
     /// `ctrl+shift+alt+a`——anvil/forge/frost 的 AI 面板键位，命令 id 用
@@ -289,6 +293,7 @@ impl std::fmt::Display for Command {
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
             Command::AgentToggle => write!(f, "agent:toggle"),
             Command::AgentSessions => write!(f, "agent:sessions"),
+            Command::TaskToggle => write!(f, "task:toggle"),
             Command::AiChatToggle => write!(f, "ai_chat:toggle"),
             Command::JshInstall => write!(f, "jsh:install"),
             Command::RemotePicker => write!(f, "remote:picker"),
@@ -398,6 +403,7 @@ impl std::str::FromStr for Command {
             "sidebar:toggle" => Ok(Command::SidebarToggle),
             "agent:toggle" => Ok(Command::AgentToggle),
             "agent:sessions" => Ok(Command::AgentSessions),
+            "task:toggle" => Ok(Command::TaskToggle),
             "ai_chat:toggle" => Ok(Command::AiChatToggle),
             "jsh:install" => Ok(Command::JshInstall),
             "remote:picker" => Ok(Command::RemotePicker),
@@ -525,6 +531,11 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+alt+g".to_string(), "agent:sessions".to_string());
+        // Agent Tasks 面板，与 anvil/forge 的 Ctrl+Alt+Shift+T 同键位；
+        // canonical 次序为 ctrl+shift+alt。ctrl+shift+t 仍是 session:new。
+        bindings
+            .bindings
+            .insert("ctrl+shift+alt+t".to_string(), "task:toggle".to_string());
 
         // AI 面板。两个键位都跟随 anvil/forge/frost：Ctrl+Alt+G 打开会执行
         // 命令的 Agent，Ctrl+Shift+Alt+A 打开只读的 AI 聊天库。存储用
@@ -1168,9 +1179,45 @@ mod tests {
             Command::HistoryPickerToggle,
             Command::WorkflowPickerToggle,
             Command::AiChatToggle,
+            Command::TaskToggle,
         ] {
             assert_eq!(command.to_string().parse::<Command>().unwrap(), command);
         }
+    }
+
+    #[test]
+    fn task_toggle_uses_the_family_chord_without_shadowing_session_new() {
+        let bindings = KeyBindings::default_bindings();
+        assert_eq!(Command::TaskToggle.to_string(), "task:toggle");
+        assert_eq!(
+            "task:toggle".parse::<Command>().unwrap(),
+            Command::TaskToggle
+        );
+        // anvil/forge spell it Ctrl+Alt+Shift+T; every modifier order
+        // normalizes to the one canonical chord.
+        for spelling in ["ctrl+alt+shift+t", "Ctrl+Shift+Alt+T", "shift+alt+ctrl+t"] {
+            assert_eq!(
+                bindings.get_command(spelling),
+                Some(Command::TaskToggle),
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            bindings
+                .bindings
+                .values()
+                .filter(|command| command.as_str() == "task:toggle")
+                .count(),
+            1
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+shift+t"),
+            Some(Command::SessionNew)
+        );
+        assert_eq!(
+            bindings.pretty_bindings_for("task:toggle"),
+            vec!["Ctrl+Shift+Alt+T".to_string()]
+        );
     }
 
     #[test]
@@ -1229,6 +1276,7 @@ mod tests {
             ("ctrl+shift+alt+a", Command::AiChatToggle),
             ("ctrl+alt+g", Command::AgentToggle),
             ("ctrl+shift+alt+g", Command::AgentSessions),
+            ("ctrl+shift+alt+t", Command::TaskToggle),
             ("ctrl+shift+a", Command::BlockSelectAll),
             ("ctrl+shift+i", Command::BlockReinputSelectedCommands),
             ("ctrl+shift+b", Command::BlockToggleBookmark),

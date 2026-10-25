@@ -1738,6 +1738,7 @@ impl TerminalApp {
                 }
             }
             keybindings::Command::AgentSessions => self.toggle_agent_sessions(),
+            keybindings::Command::TaskToggle => self.toggle_tasks_view(),
             keybindings::Command::AgentToggle => {
                 let session_id = self
                     .session_manager
