@@ -1516,7 +1516,11 @@ fn paint_run_ink(
 ) {
     let clip = run_rect
         .expand2(egui::vec2(font_size * 0.25, 0.0))
-        .intersect(view);
+        .intersect(view)
+        .intersect(painter.clip_rect());
+    if !clip.is_positive() {
+        return;
+    }
     let run_painter = painter.with_clip_rect(clip);
     // Backgrounds are already painted separately. Empty and ASCII-space
     // runs have no glyph ink, but their decorations must still be drawn.
@@ -1543,9 +1547,19 @@ fn paint_run_ink(
         // instead of letting the shaped advances accumulate across that run.
         let place_ascii_cells = run.text.is_ascii()
             && run.text.len() == run.cells
-            && !ascii_columns_match(&galley, run.cells, cell_width);
+            && !ascii_columns_match_for_paint(painter.ctx(), &galley, run.cells, cell_width);
         if place_ascii_cells {
-            for (column, ch) in run.text.chars().enumerate() {
+            // A cursor repaint or clipped split may expose only a few cells
+            // from this run. Keep the full-run measurement, but submit glyphs
+            // only for columns whose ink can reach the effective clip.
+            let columns = visible_ascii_columns(
+                run_rect,
+                clip.expand2(egui::vec2(font_size * 0.25, 0.0)),
+                cell_width,
+                run.cells,
+            );
+            for (offset, ch) in run.text[columns.clone()].chars().enumerate() {
+                let column = columns.start + offset;
                 let mut job = egui::text::LayoutJob::default();
                 let mut utf8 = [0; 4];
                 job.append(ch.encode_utf8(&mut utf8), 0.0, format.clone());
@@ -1566,8 +1580,11 @@ fn paint_run_ink(
     let thickness = ((font_size / 14.0).clamp(1.0, 2.0) / pixel).round() * pixel;
     let underline_y = run_rect.bottom() - thickness * 1.5;
     if run.style.undercurl {
-        let points = undercurl_points(run_rect, underline_y, thickness, pixel);
-        run_painter.add(egui::Shape::line(points, Stroke::new(thickness, special)));
+        let visible = run_rect.intersect(clip);
+        if visible.is_positive() {
+            let points = undercurl_points(visible, underline_y, thickness, pixel);
+            run_painter.add(egui::Shape::line(points, Stroke::new(thickness, special)));
+        }
     } else if run.style.underline {
         run_painter.line_segment(
             [
@@ -1588,6 +1605,19 @@ fn paint_run_ink(
     }
 }
 
+/// ASCII fallback has one source byte per Vim cell. Include every cell
+/// touched by the ink clip, including the caller's italic-overhang allowance.
+fn visible_ascii_columns(
+    rect: Rect,
+    clip: Rect,
+    cell_width: f32,
+    cells: usize,
+) -> std::ops::Range<usize> {
+    let start = ((clip.left() - rect.left()) / cell_width).floor().max(0.0) as usize;
+    let end = ((clip.right() - rect.left()) / cell_width).ceil().max(0.0) as usize;
+    start.min(cells)..end.min(cells)
+}
+
 /// Continuous screen-space phase keeps adjoining syntax runs on the same
 /// smooth wave; sampling follows physical pixels instead of a jagged zigzag.
 fn undercurl_points(rect: Rect, baseline: f32, thickness: f32, pixel: f32) -> Vec<egui::Pos2> {
@@ -1600,6 +1630,93 @@ fn undercurl_points(rect: Rect, baseline: f32, thickness: f32, pixel: f32) -> Ve
             egui::pos2(x, baseline - thickness * (0.75 + phase.sin() * 0.75))
         })
         .collect()
+}
+
+/// Short syntax fragments are cheaper to inspect than a context/cache
+/// lookup. A distant endpoint also rejects most proportional-font mismatches
+/// immediately; only long, potentially aligned shapes use the warm cache.
+fn ascii_columns_match_for_paint(
+    ctx: &egui::Context,
+    galley: &Arc<egui::Galley>,
+    cells: usize,
+    cell_width: f32,
+) -> bool {
+    if cells < 64 {
+        return ascii_columns_match(galley, cells, cell_width);
+    }
+    if galley.rows.len() != 1 || galley.rows[0].glyphs.len() != cells {
+        return false;
+    }
+    let last = &galley.rows[0].glyphs[cells - 1];
+    let error = (last.pos.x - (cells - 1) as f32 * cell_width).abs();
+    if error.is_nan() || error > 0.75 {
+        return false;
+    }
+    ctx.memory_mut(|memory| {
+        memory
+            .caches
+            .cache::<AsciiColumnCache>()
+            .matches(galley, cells, cell_width)
+    })
+}
+
+/// A galley is immutable and already belongs to egui's font/DPI cache. Keep
+/// it alive while its pointer is a key: address reuse must never certify a
+/// different shape. Only cell geometry participates, never paint-only colors.
+struct AsciiColumnEntry {
+    galley: Arc<egui::Galley>,
+    matches: bool,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct AsciiColumnCache {
+    entries: HashMap<(usize, usize, u32), AsciiColumnEntry>,
+    generation: u64,
+    #[cfg(test)]
+    checks: usize,
+}
+
+impl AsciiColumnCache {
+    fn matches(&mut self, galley: &Arc<egui::Galley>, cells: usize, cell_width: f32) -> bool {
+        let key = (Arc::as_ptr(galley) as usize, cells, cell_width.to_bits());
+        if let Some(entry) = self.entries.get_mut(&key) {
+            debug_assert!(Arc::ptr_eq(&entry.galley, galley));
+            entry.generation = self.generation;
+            return entry.matches;
+        }
+        let matches = ascii_columns_match(galley, cells, cell_width);
+        #[cfg(test)]
+        {
+            self.checks += 1;
+        }
+        // Multiple editor panes share a context; bound the combined live set
+        // even when a producer emits an unusually fragmented frame.
+        if self.entries.len() < 4096 {
+            self.entries.insert(
+                key,
+                AsciiColumnEntry {
+                    galley: galley.clone(),
+                    matches,
+                    generation: self.generation,
+                },
+            );
+        }
+        matches
+    }
+}
+
+impl egui::cache::CacheTrait for AsciiColumnCache {
+    fn update(&mut self) {
+        let generation = self.generation;
+        self.entries
+            .retain(|_, entry| entry.generation == generation);
+        self.generation = generation.wrapping_add(1);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 fn ascii_columns_match(galley: &egui::Galley, cells: usize, cell_width: f32) -> bool {
@@ -1615,6 +1732,120 @@ fn ascii_columns_match(galley: &egui::Galley, cells: usize, cell_width: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_grid_checks_reuse_immutable_galleys_and_retire_unused_entries() {
+        use egui::cache::CacheTrait;
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(2.0);
+        let mut shaped = Vec::new();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            for size in [14.0, 20.0] {
+                shaped.push(ui.painter().layout_no_wrap(
+                    "x".repeat(128),
+                    FontId::monospace(size),
+                    Color32::PLACEHOLDER,
+                ));
+            }
+        });
+        output.textures_delta.clear();
+        let mut cache = AsciiColumnCache::default();
+        let cells = shaped[0].text().len();
+        let width = shaped[0].rows[0].glyphs[0].advance_width;
+        let expected = ascii_columns_match(&shaped[0], cells, width);
+        assert!(expected);
+        for _ in 0..100 {
+            assert_eq!(cache.matches(&shaped[0], cells, width), expected);
+        }
+        assert_eq!(
+            cache.checks, 1,
+            "warm cursor paints must not rescan glyph advances"
+        );
+        assert!(cache.matches(&shaped[0], cells, width));
+        assert!(!cache.matches(&shaped[0], cells, width + 1.0));
+        assert!(!cache.matches(&shaped[0], cells + 1, width));
+        assert_eq!(
+            cache.matches(&shaped[1], cells, width),
+            ascii_columns_match(&shaped[1], cells, width)
+        );
+        assert_eq!(
+            cache.checks, 4,
+            "cell width, glyph count and new font/DPI shapes have distinct decisions"
+        );
+        assert!(cache
+            .entries
+            .values()
+            .any(|entry| Arc::ptr_eq(&entry.galley, &shaped[0])));
+        cache.update();
+        assert_eq!(cache.len(), 4);
+        cache.update();
+        assert_eq!(
+            cache.len(),
+            0,
+            "entries unused for one pass release their galley references"
+        );
+        for cells in 1..4200 {
+            let expected = ascii_columns_match(&shaped[0], cells, width);
+            assert_eq!(cache.matches(&shaped[0], cells, width), expected);
+        }
+        assert_eq!(
+            cache.len(),
+            4096,
+            "fragmented frames must respect the shared context budget"
+        );
+    }
+
+    #[test]
+    fn ascii_render_validation_bypasses_cache_for_short_and_misaligned_runs() {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(2.0);
+        let mut shapes = Vec::new();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            for cells in [8, 128] {
+                shapes.push(ui.painter().layout_no_wrap(
+                    "x".repeat(cells),
+                    FontId::monospace(14.0),
+                    Color32::PLACEHOLDER,
+                ));
+            }
+        });
+        output.textures_delta.clear();
+        let width = shapes[0].rows[0].glyphs[0].advance_width;
+        for _ in 0..100 {
+            assert_eq!(
+                ascii_columns_match_for_paint(&ctx, &shapes[0], 8, width),
+                ascii_columns_match(&shapes[0], 8, width)
+            );
+        }
+        assert_eq!(
+            ctx.memory_mut(|m| m.caches.cache::<AsciiColumnCache>().checks),
+            0
+        );
+        for _ in 0..100 {
+            assert_eq!(
+                ascii_columns_match_for_paint(&ctx, &shapes[1], 128, width),
+                ascii_columns_match(&shapes[1], 128, width)
+            );
+            assert!(!ascii_columns_match_for_paint(
+                &ctx,
+                &shapes[1],
+                128,
+                width + 1.0
+            ));
+            assert!(!ascii_columns_match_for_paint(&ctx, &shapes[1], 129, width));
+            assert!(!ascii_columns_match_for_paint(
+                &ctx,
+                &shapes[1],
+                128,
+                f32::NAN
+            ));
+        }
+        assert_eq!(
+            ctx.memory_mut(|m| m.caches.cache::<AsciiColumnCache>().checks),
+            1,
+            "only the long aligned shape should scan, once"
+        );
+    }
 
     #[test]
     fn background_elision_preserves_overlapping_layers_and_row_isolation() {
@@ -1710,6 +1941,116 @@ mod tests {
                 assert_eq!(decorations, usize::from(decoration != 0));
             }
         }
+    }
+
+    #[test]
+    fn clipped_runs_skip_hidden_ink_and_bound_long_line_decoration_work() {
+        let ctx = egui::Context::default();
+        let run = Vim9RenderRun {
+            text: "界e\u{301}".into(),
+            cells: 3,
+            style: Vim9RenderStyle {
+                italic: true,
+                undercurl: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(30.0, 20.0));
+        let view = Rect::from_min_size(egui::pos2(40.0, 0.0), egui::vec2(80.0, 20.0));
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            paint_run_ink(
+                ui.painter(),
+                &run,
+                (Color32::WHITE, Color32::WHITE),
+                rect,
+                view,
+                10.0,
+                20.0,
+                14.0,
+            );
+        });
+        output.textures_delta.clear();
+        assert!(output
+            .shapes
+            .iter()
+            .all(|s| !matches!(s.shape, egui::Shape::Text(_) | egui::Shape::Path(_))));
+        let rect = Rect::from_min_size(egui::pos2(-100000.25, -7.5), egui::vec2(200000.0, 20.0));
+        let view = Rect::from_min_size(egui::pos2(10.25, 0.0), egui::vec2(80.0, 10.0));
+        let columns = visible_ascii_columns(rect, view, 10.0, 20000);
+        assert_eq!(columns, 10001..10010);
+        let cell = Rect::from_min_size(egui::pos2(20.0, 0.0), egui::vec2(10.0, 20.0));
+        let whole = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 20.0));
+        assert_eq!(
+            visible_ascii_columns(whole, cell.expand2(egui::vec2(3.5, 0.0)), 10.0, 10),
+            1..4,
+            "adjacent italic glyphs may overhang into a boundary-aligned clip"
+        );
+        let visible = rect.intersect(view);
+        let points = undercurl_points(visible, rect.bottom() - 1.5, 1.0, 0.5);
+        assert_eq!(points.len(), 161);
+        assert!(points
+            .iter()
+            .all(|p| p.x >= view.left() && p.x <= view.right()));
+        assert_eq!(
+            points.first().unwrap().y,
+            undercurl_points(
+                Rect::from_min_size(visible.min, egui::vec2(1.0, 1.0)),
+                rect.bottom() - 1.5,
+                1.0,
+                0.5
+            )[0]
+            .y
+        );
+    }
+
+    #[test]
+    fn ascii_fallback_keeps_italic_neighbors_at_cell_aligned_clips() {
+        let ctx = egui::Context::default();
+        let run = Vim9RenderRun {
+            text: "abcdefghij".into(),
+            cells: 10,
+            style: Vim9RenderStyle {
+                italic: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 20.0));
+        let clip = Rect::from_min_size(egui::pos2(60.0, 0.0), egui::vec2(30.0, 20.0));
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            paint_run_ink(
+                &ui.ctx().layer_painter(egui::LayerId::background()),
+                &run,
+                (Color32::WHITE, Color32::WHITE),
+                rect,
+                clip,
+                30.0,
+                20.0,
+                14.0,
+            );
+        });
+        output.textures_delta.clear();
+        let glyphs: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            glyphs.iter().map(|g| g.galley.text()).collect::<String>(),
+            "bcd",
+            "both neighboring glyphs can overhang into the visible c cell"
+        );
+        assert_eq!(
+            glyphs.iter().map(|g| g.pos.x).collect::<Vec<_>>(),
+            vec![30.0, 60.0, 90.0]
+        );
+        assert!(glyphs
+            .iter()
+            .all(|g| g.galley.job.sections[0].format.italics));
     }
 
     #[test]
@@ -2821,12 +3162,13 @@ mod tests {
                 })
                 .collect();
             assert_eq!(text[0].pos.x, popup.left());
-            assert_eq!(
-                text.iter()
-                    .map(|shape| shape.galley.job.text.as_str())
-                    .collect::<String>(),
-                "menu"
-            );
+            let submitted = text
+                .iter()
+                .map(|shape| shape.galley.job.text.as_str())
+                .collect::<String>();
+            // The whole-run path submits the complete menu. ASCII fallback
+            // submits visible cells and their adjacent overhang candidates.
+            assert!(submitted == "men" || submitted == "menu", "{submitted}");
             assert!(text
                 .iter()
                 .all(|shape| shape.fallback_color == rgb(0x19c3a7)));

@@ -588,12 +588,9 @@ fn render_attention_queues(
             .small()
             .weak(),
     );
+    let counts = search_matches.attention_counts();
     let choices = DashboardAttentionKind::ALL.map(|kind| {
-        let count = search_matches
-            .rows
-            .iter()
-            .filter(|row| row.attention_kind() == Some(kind))
-            .count();
+        let count = counts.get(kind);
         (
             kind,
             format!("{} {count}", kind.label()),
@@ -612,6 +609,7 @@ fn render_attention_queues(
     }
 }
 
+#[cfg(test)]
 fn filter_attention_queue(
     dashboard: &mut DashboardSnapshot,
     attention: Option<DashboardAttentionKind>,
@@ -1945,7 +1943,7 @@ impl TerminalApp {
             })
             .collect();
         let project_dashboard = |view| {
-            jterm_core::agent_task::DashboardSnapshot::project(
+            jterm_core::agent_task::DashboardSnapshot::project_unsorted(
                 self.task_manager
                     .tasks()
                     .iter()
@@ -1989,13 +1987,11 @@ impl TerminalApp {
             &mut self.task_sidebar.dashboard_attention,
             &mut self.task_sidebar.dashboard_view,
         );
-        let mut dashboard = DashboardSnapshot::filter_rows(
-            &search_matches.rows,
-            "",
+        let dashboard = search_matches.view(
             self.task_sidebar.dashboard_view,
+            self.task_sidebar.dashboard_attention,
+            self.task_sidebar.dashboard_sort,
         );
-        filter_attention_queue(&mut dashboard, self.task_sidebar.dashboard_attention);
-        dashboard.sort_rows(self.task_sidebar.dashboard_sort);
         if open_result {
             if let Some(row) = dashboard.rows.first() {
                 self.task_sidebar.selected = Some(row.id);
@@ -2039,6 +2035,18 @@ impl TerminalApp {
             ui.ctx().request_repaint();
         }
         ui.horizontal_wrapped(|ui| {
+            let selected_project = self.task_sidebar.selected
+                .filter(|id| dashboard.selected_index(Some(*id)).is_some())
+                .and_then(|id| self.task_manager.get(id))
+                .map(|task| task.repo_root.clone());
+            if ui.add_enabled(selected_project.is_some(), egui::Button::new("Selected project"))
+                .on_hover_text("Narrow to the selected task's exact project; keep the current search and provider")
+                .clicked()
+            {
+                self.task_sidebar.dashboard_project = selected_project;
+                self.task_sidebar.scroll_to_selected = true;
+                ui.ctx().request_repaint();
+            }
             let previous = dashboard.step_selection(self.task_sidebar.selected, false);
             let next = dashboard.step_selection(self.task_sidebar.selected, true);
             if ui
@@ -2053,6 +2061,17 @@ impl TerminalApp {
                 .clicked()
             {
                 self.task_sidebar.selected = next;
+                self.task_sidebar.scroll_to_selected = true;
+            }
+            let previous_attention = dashboard.previous_attention(self.task_sidebar.selected);
+            if ui
+                .add_enabled(
+                    previous_attention.is_some(),
+                    egui::Button::new("Previous needs you"),
+                )
+                .clicked()
+            {
+                self.task_sidebar.selected = previous_attention;
                 self.task_sidebar.scroll_to_selected = true;
             }
             let attention = dashboard.next_attention(self.task_sidebar.selected);
@@ -3307,6 +3326,7 @@ mod management_v3_tests {
         assert_eq!(dashboard.rows[0].id, validation.id);
         assert_eq!(dashboard.selected_index(selected), None);
         assert_eq!(dashboard.next_attention(selected), Some(validation.id));
+        assert_eq!(dashboard.previous_attention(selected), Some(validation.id));
         let mut invalid = DashboardSnapshot::filter_rows(
             &dashboard.rows,
             "provider:not-a-provider",
@@ -3315,6 +3335,7 @@ mod management_v3_tests {
         filter_attention_queue(&mut invalid, Some(DashboardAttentionKind::Validation));
         assert!(invalid.rows.is_empty());
         assert_eq!(invalid.next_attention(selected), None);
+        assert_eq!(invalid.previous_attention(selected), None);
     }
 
     #[test]

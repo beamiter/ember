@@ -184,6 +184,17 @@ on demand even when the metadata/status panel is disabled.
 
 ## Native scrolling and text detail
 
+Clipped native text limits per-cell ASCII fallback submissions and diagnostic
+wave geometry to the visible span. Neighboring cells remain candidates for
+italic overhang; Unicode and combining text retain whole-run shaping.
+Fractional scroll baselines, Vim source columns and GUI colors are preserved.
+
+Long ASCII runs reuse the grid-alignment decision for the exact immutable
+shaped galley and current cell width. Font/DPI changes produce new galleys;
+unused entries retire after a pass. Short syntax fragments keep the direct
+check, and obvious long-run mismatches are rejected before a cache lookup.
+
+
 Wheel input is coalesced once per frame and targets the Vim split under the
 pointer. One wheel notch moves three lines. Trackpad pixel distances are divided
 by the actual line height, preserving fractional movement independently in each

@@ -37,11 +37,11 @@ def main():
                         help="Run the full native suite or the independent modal input gate")
     args = parser.parse_args()
     out = args.output.resolve()
-    out.mkdir(parents=True, exist_ok=False)
+    out.mkdir(mode=0o700, parents=True, exist_ok=False)
     for folder in ("config", "state", "data", "cache", "runtime", "project"):
         (out / folder).mkdir(mode=0o700)
     config = out / "config" / args.app
-    config.mkdir()
+    config.mkdir(mode=0o700)
     (config / "config.toml").write_text(
         'font_size = 20.0\ninitial_width = 1400.0\ninitial_height = 950.0\n'
         'terminal_mode = "normal"\nrestore_session = false\n'
@@ -49,6 +49,10 @@ def main():
         encoding="utf-8",
     )
     (config / "config.toml").chmod(0o600)
+    # Keep project discovery inside the fixture even when --output lives
+    # below a real repository (or a sandbox's ancestor .git placeholder).
+    # Search must never discover this script's own fixed no-match query.
+    (out / "project" / "Makefile").write_text("", encoding="utf-8")
     source = out / "project" / "native-buffer.txt"
     original = "GUI_TRUECOLOR_19C3A7\nASCII -> != ==\n中文与组合字 e\u0301\nStyled_underlines\n"
     source.write_text(original, encoding="utf-8")
