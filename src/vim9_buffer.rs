@@ -11,7 +11,7 @@ use jterm_core::vim9::{
     Vim9RenderRun, Vim9RenderStyle, Vim9RenderWindow, Vim9ScrollAnimation, Vim9Session,
     Vim9Viewport, Vim9ViewportAnchor,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 #[cfg(all(test, unix))]
@@ -1182,6 +1182,32 @@ pub(crate) fn direct_cursor_rect(
     .filter(Rect::is_positive)
 }
 
+/// Elide fills already supplied by the window backdrop. Once a row contains
+/// another color, preserve all later fills: a Normal run may erase a guide or
+/// selection beneath it. Empty sets allocate nothing for ordinary source text.
+struct BackgroundRows<C> {
+    normal: C,
+    changed: HashSet<usize>,
+}
+
+impl<C: Copy + PartialEq> BackgroundRows<C> {
+    fn new(normal: C) -> Self {
+        Self {
+            normal,
+            changed: HashSet::new(),
+        }
+    }
+
+    fn needs_fill(&mut self, row: usize, background: C) -> bool {
+        if background != self.normal {
+            self.changed.insert(row);
+            true
+        } else {
+            self.changed.contains(&row)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_direct(
     painter: &egui::Painter,
@@ -1214,9 +1240,13 @@ fn paint_direct(
         // Fill the stationary split once, including empty sampled margin rows.
         // Glyph rectangles retain their full height while only clipping changes.
         painter.rect_filled(view, 0.0, normal_bg);
+        let mut backgrounds = BackgroundRows::new(normal_bg);
         for projected in viewport.runs() {
             let (_, bg, _) = colors(&projected.run.style, normal);
-            painter.rect_filled(gui_rect(projected.rect), 0.0, bg);
+            // Pixel Y also identifies sampled rows outside the viewport.
+            if backgrounds.needs_fill(projected.rect.y.to_bits() as usize, bg) {
+                painter.rect_filled(gui_rect(projected.rect), 0.0, bg);
+            }
         }
         for projected in viewport.runs() {
             paint_run(
@@ -1385,11 +1415,14 @@ fn paint_view(
     painter.rect_filled(view.translate(egui::vec2(0.0, offset_y)), 0.0, normal_bg);
     // Backgrounds precede every glyph so a later style run cannot erase the
     // preceding italic glyph's natural overhang.
+    let mut backgrounds = BackgroundRows::new(normal_bg);
     for run in &frame.runs {
         if logical_view.contains(run.row, run.column) && run.cells > 0 {
             let (_, bg, _) = colors(&run.style, normal);
-            if let Some(rect) = geometry.cell_rect(run.row, run.column, run.cells) {
-                painter.rect_filled(gui_rect(rect), 0.0, bg);
+            if backgrounds.needs_fill(run.row, bg) {
+                if let Some(rect) = geometry.cell_rect(run.row, run.column, run.cells) {
+                    painter.rect_filled(gui_rect(rect), 0.0, bg);
+                }
             }
         }
     }
@@ -1485,45 +1518,49 @@ fn paint_run_ink(
         .expand2(egui::vec2(font_size * 0.25, 0.0))
         .intersect(view);
     let run_painter = painter.with_clip_rect(clip);
-    let font = if run.style.bold {
-        FontId::new(font_size, egui::FontFamily::Name("vim9-buffer-bold".into()))
-    } else {
-        FontId::monospace(font_size)
-    };
-    let format = egui::TextFormat {
-        font_id: font,
-        // Egui already caches galleys and invalidates them for font/DPI
-        // changes. Keep paint-only ink out of that cache key so cursor
-        // inversion and syntax color changes reuse the exact same shaping.
-        color: Color32::PLACEHOLDER,
-        italics: run.style.italic,
-        ..Default::default()
-    };
-    let mut job = egui::text::LayoutJob::default();
-    job.append(&run.text, 0.0, format.clone());
-    let galley = run_painter.layout_job(job);
-    // A configured or bold fallback face can be proportional even though
-    // the family is named Monospace. Keep Vim's cursor/hit testing aligned
-    // instead of letting the shaped advances accumulate across that run.
-    let place_ascii_cells = run.text.is_ascii()
-        && run.text.len() == run.cells
-        && !ascii_columns_match(&galley, run.cells, cell_width);
-    if place_ascii_cells {
-        for (column, ch) in run.text.chars().enumerate() {
-            let mut job = egui::text::LayoutJob::default();
-            let mut utf8 = [0; 4];
-            job.append(ch.encode_utf8(&mut utf8), 0.0, format.clone());
-            let glyph = run_painter.layout_job(job);
-            let y = run_rect.top() + (line_height - glyph.size().y) * 0.5;
-            run_painter.galley(
-                egui::pos2(run_rect.left() + column as f32 * cell_width, y),
-                glyph,
-                fg,
-            );
+    // Backgrounds are already painted separately. Empty and ASCII-space
+    // runs have no glyph ink, but their decorations must still be drawn.
+    if run.text.bytes().any(|byte| byte != b' ') {
+        let font = if run.style.bold {
+            FontId::new(font_size, egui::FontFamily::Name("vim9-buffer-bold".into()))
+        } else {
+            FontId::monospace(font_size)
+        };
+        let format = egui::TextFormat {
+            font_id: font,
+            // Egui already caches galleys and invalidates them for font/DPI
+            // changes. Keep paint-only ink out of that cache key so cursor
+            // inversion and syntax color changes reuse the exact same shaping.
+            color: Color32::PLACEHOLDER,
+            italics: run.style.italic,
+            ..Default::default()
+        };
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&run.text, 0.0, format.clone());
+        let galley = run_painter.layout_job(job);
+        // A configured or bold fallback face can be proportional even though
+        // the family is named Monospace. Keep Vim's cursor/hit testing aligned
+        // instead of letting the shaped advances accumulate across that run.
+        let place_ascii_cells = run.text.is_ascii()
+            && run.text.len() == run.cells
+            && !ascii_columns_match(&galley, run.cells, cell_width);
+        if place_ascii_cells {
+            for (column, ch) in run.text.chars().enumerate() {
+                let mut job = egui::text::LayoutJob::default();
+                let mut utf8 = [0; 4];
+                job.append(ch.encode_utf8(&mut utf8), 0.0, format.clone());
+                let glyph = run_painter.layout_job(job);
+                let y = run_rect.top() + (line_height - glyph.size().y) * 0.5;
+                run_painter.galley(
+                    egui::pos2(run_rect.left() + column as f32 * cell_width, y),
+                    glyph,
+                    fg,
+                );
+            }
+        } else {
+            let text_y = run_rect.top() + (line_height - galley.size().y) * 0.5;
+            run_painter.galley(egui::pos2(run_rect.left(), text_y), galley, fg);
         }
-    } else {
-        let text_y = run_rect.top() + (line_height - galley.size().y) * 0.5;
-        run_painter.galley(egui::pos2(run_rect.left(), text_y), galley, fg);
     }
     let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
     let thickness = ((font_size / 14.0).clamp(1.0, 2.0) / pixel).round() * pixel;
@@ -1578,6 +1615,102 @@ fn ascii_columns_match(galley: &egui::Galley, cells: usize, cell_width: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_elision_preserves_overlapping_layers_and_row_isolation() {
+        let normal = 0x102030;
+        let mut backgrounds = BackgroundRows::new(normal);
+        let mut full = [[normal; 12]; 4];
+        let mut reduced = full;
+        let mut state = 41_u32;
+        // Normal text, overlapping guides/selection, and a subsequent Normal
+        // layer exercise restoration as well as the no-fill common case.
+        for i in 0..300 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let row = (state as usize >> 8) % 4;
+            let start = (state as usize >> 16) % 10;
+            let end = (start + 1 + i % 4).min(12);
+            let color = if i % 7 < 5 { normal } else { state & 0xffffff };
+            full[row][start..end].fill(color);
+            if backgrounds.needs_fill(row, color) {
+                reduced[row][start..end].fill(color);
+            }
+            assert_eq!(full, reduced, "paint order changed at run {i}");
+        }
+        let mut backgrounds = BackgroundRows::new(normal);
+        assert!(!backgrounds.needs_fill(0, normal));
+        assert!(backgrounds.needs_fill(0, 0xabcdef));
+        assert!(backgrounds.needs_fill(0, normal));
+        assert!(!backgrounds.needs_fill(1, normal));
+    }
+
+    #[test]
+    fn background_elision_removes_plain_syntax_fills_without_allocating() {
+        let mut backgrounds = BackgroundRows::new(0x102030);
+        let fills = (0..10000)
+            .filter(|index| backgrounds.needs_fill(index / 100, 0x102030))
+            .count();
+        assert_eq!(fills, 0);
+        assert_eq!(backgrounds.changed.capacity(), 0);
+    }
+
+    #[test]
+    fn space_only_runs_skip_glyphs_but_keep_backgrounds_and_decorations() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(80.0, 20.0));
+        for text in ["", "        ", "   x   ", "·", "\u{a0}", "界", "e\u{301}"] {
+            for decoration in 0..4 {
+                let run = Vim9RenderRun {
+                    text: text.into(),
+                    cells: 8,
+                    style: Vim9RenderStyle {
+                        background: Some(0x123456),
+                        underline: decoration == 1,
+                        undercurl: decoration == 2,
+                        strikethrough: decoration == 3,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(Default::default(), |ui| {
+                    let painter = ui.ctx().layer_painter(egui::LayerId::background());
+                    painter.rect_filled(rect, 0.0, rgb(0x123456));
+                    paint_run(
+                        &painter,
+                        &run,
+                        &Vim9RenderStyle::default(),
+                        rect,
+                        rect,
+                        10.0,
+                        20.0,
+                        14.0,
+                    );
+                });
+                output.textures_delta.clear();
+                assert_eq!(
+                    output
+                        .shapes
+                        .iter()
+                        .any(|shape| matches!(shape.shape, egui::Shape::Text(_))),
+                    !text.is_empty() && text != "        ",
+                    "glyph submission for {text:?} with decoration {decoration}",
+                );
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Rect(shape) if shape.fill == rgb(0x123456))));
+                let decorations = output
+                    .shapes
+                    .iter()
+                    .filter(|shape| {
+                        matches!(
+                            shape.shape,
+                            egui::Shape::LineSegment { .. } | egui::Shape::Path(_)
+                        )
+                    })
+                    .count();
+                assert_eq!(decorations, usize::from(decoration != 0));
+            }
+        }
+    }
 
     #[test]
     fn ink_changes_reuse_the_same_shaped_galley_across_frames() {
