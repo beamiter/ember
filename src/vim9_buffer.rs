@@ -623,8 +623,12 @@ pub(crate) struct ScrollPresentation {
 
 struct WindowScroll {
     animation: Vim9ScrollAnimation,
-    /// Covering outgoing frame followed by newer candidates for a long gesture.
-    sources: VecDeque<(Arc<Vim9RenderFrame>, u64)>,
+    /// Covering outgoing frame followed by newer candidates for a long gesture,
+    /// each with its display-row position.
+    sources: VecDeque<(Arc<Vim9RenderFrame>, i64)>,
+    /// Display-row position of the current viewport. It starts at the first
+    /// topline and then advances by display rows, so a closed fold counts once.
+    position: i64,
 }
 
 impl ScrollPresentation {
@@ -688,10 +692,16 @@ impl ScrollPresentation {
                             self.windows.remove(&b.window);
                             continue;
                         }
-                        let delta = b.topline as f64 - a.topline as f64;
-                        if delta == 0.0 {
+                        if a.topline == b.topline {
                             continue;
                         }
+                        // Across a closed fold Vim moves topline by many lines
+                        // for one row; an unsampled distance must snap.
+                        let Some(shift) = a.topline_shift(b) else {
+                            self.windows.remove(&b.window);
+                            continue;
+                        };
+                        let delta = shift as f64;
                         // Large jumps, empty/legacy viewports and invalid
                         // geometry settle immediately instead of flying past.
                         if !delta.is_finite()
@@ -709,15 +719,17 @@ impl ScrollPresentation {
                             .or_insert_with(|| WindowScroll {
                                 animation: Vim9ScrollAnimation::default(),
                                 sources: VecDeque::new(),
+                                position: a.topline as i64,
                             });
                         let pixels = delta * f64::from(line_height);
                         entry.animation.retarget(pixels, now);
-                        entry.sources.push_back((Arc::clone(old), a.topline));
+                        entry.sources.push_back((Arc::clone(old), entry.position));
+                        entry.position += shift;
                         let offset = entry.animation.offset(now);
                         let height = b.view.rows as f64 * f64::from(line_height);
+                        let position = entry.position;
                         let covering_source = entry.sources.iter().rposition(|(_, top)| {
-                            let distance =
-                                (b.topline as f64 - *top as f64) * f64::from(line_height);
+                            let distance = (position - *top) as f64 * f64::from(line_height);
                             if offset >= 0.0 {
                                 offset <= distance && distance <= height
                             } else {
@@ -933,11 +945,11 @@ pub(crate) fn paint(
         return;
     }
     for view in frame.paint_views() {
-        let (window, top) = frame
+        let window = frame
             .windows
             .iter()
             .find(|window| &window.view == view)
-            .map_or((frame.window, 0), |window| (window.window, window.topline));
+            .map_or(frame.window, |window| window.window);
         let offset = if frame.has_overlays() {
             0.0
         } else {
@@ -946,7 +958,7 @@ pub(crate) fn paint(
         if let Some(scroll) = scroll.windows.get(&window).filter(|_| offset != 0.0) {
             if let Some((previous, source_top)) = scroll.sources.front() {
                 if let Some(old_view) = previous.windows.iter().find(|old| old.window == window) {
-                    let distance = (top as f64 - *source_top as f64) * f64::from(line_height);
+                    let distance = (scroll.position - *source_top) as f64 * f64::from(line_height);
                     paint_view(
                         painter,
                         previous,
@@ -1539,41 +1551,58 @@ fn paint_run_ink(
             italics: run.style.italic,
             ..Default::default()
         };
-        let mut job = egui::text::LayoutJob::default();
-        job.append(&run.text, 0.0, format.clone());
-        let galley = run_painter.layout_job(job);
-        // A configured or bold fallback face can be proportional even though
-        // the family is named Monospace. Keep Vim's cursor/hit testing aligned
-        // instead of letting the shaped advances accumulate across that run.
-        let place_ascii_cells = run.text.is_ascii()
-            && run.text.len() == run.cells
-            && !ascii_columns_match_for_paint(painter.ctx(), &galley, run.cells, cell_width);
-        if place_ascii_cells {
-            // A cursor repaint or clipped split may expose only a few cells
-            // from this run. Keep the full-run measurement, but submit glyphs
-            // only for columns whose ink can reach the effective clip.
-            let columns = visible_ascii_columns(
-                run_rect,
-                clip.expand2(egui::vec2(font_size * 0.25, 0.0)),
-                cell_width,
-                run.cells,
-            );
-            for (offset, ch) in run.text[columns.clone()].chars().enumerate() {
-                let column = columns.start + offset;
-                let mut job = egui::text::LayoutJob::default();
-                let mut utf8 = [0; 4];
-                job.append(ch.encode_utf8(&mut utf8), 0.0, format.clone());
-                let glyph = run_painter.layout_job(job);
-                let y = run_rect.top() + (line_height - glyph.size().y) * 0.5;
+        if let Some(glyph) = run.repeated_glyph().filter(|glyph| !glyph.is_ascii()) {
+            // Closed-fold filler: shape the glyph once and place it at every
+            // visible Vim cell, whatever advance its (fallback) font reports.
+            let mut job = egui::text::LayoutJob::default();
+            let mut utf8 = [0; 4];
+            job.append(glyph.encode_utf8(&mut utf8), 0.0, format.clone());
+            let shaped = run_painter.layout_job(job);
+            let y = run_rect.top() + (line_height - shaped.size().y) * 0.5;
+            for column in visible_ascii_columns(run_rect, clip, cell_width, run.cells) {
                 run_painter.galley(
                     egui::pos2(run_rect.left() + column as f32 * cell_width, y),
-                    glyph,
+                    shaped.clone(),
                     fg,
                 );
             }
         } else {
-            let text_y = run_rect.top() + (line_height - galley.size().y) * 0.5;
-            run_painter.galley(egui::pos2(run_rect.left(), text_y), galley, fg);
+            let mut job = egui::text::LayoutJob::default();
+            job.append(&run.text, 0.0, format.clone());
+            let galley = run_painter.layout_job(job);
+            // A configured or bold fallback face can be proportional even though
+            // the family is named Monospace. Keep Vim's cursor/hit testing aligned
+            // instead of letting the shaped advances accumulate across that run.
+            let place_ascii_cells = run.text.is_ascii()
+                && run.text.len() == run.cells
+                && !ascii_columns_match_for_paint(painter.ctx(), &galley, run.cells, cell_width);
+            if place_ascii_cells {
+                // A cursor repaint or clipped split may expose only a few cells
+                // from this run. Keep the full-run measurement, but submit glyphs
+                // only for columns whose ink can reach the effective clip.
+                let columns = visible_ascii_columns(
+                    run_rect,
+                    clip.expand2(egui::vec2(font_size * 0.25, 0.0)),
+                    cell_width,
+                    run.cells,
+                );
+                for (offset, ch) in run.text[columns.clone()].chars().enumerate() {
+                    let column = columns.start + offset;
+                    let mut job = egui::text::LayoutJob::default();
+                    let mut utf8 = [0; 4];
+                    job.append(ch.encode_utf8(&mut utf8), 0.0, format.clone());
+                    let glyph = run_painter.layout_job(job);
+                    let y = run_rect.top() + (line_height - glyph.size().y) * 0.5;
+                    run_painter.galley(
+                        egui::pos2(run_rect.left() + column as f32 * cell_width, y),
+                        glyph,
+                        fg,
+                    );
+                }
+            } else {
+                let text_y = run_rect.top() + (line_height - galley.size().y) * 0.5;
+                run_painter.galley(egui::pos2(run_rect.left(), text_y), galley, fg);
+            }
         }
     }
     let pixel = painter.ctx().pixels_per_point().max(0.1).recip();
@@ -2409,6 +2438,7 @@ mod tests {
                     row: 4,
                     line: top + 4,
                     byte_length: 4,
+                    fold_end: 0,
                     runs: vec![Vim9RenderRun {
                         window: 1,
                         column: 0,
@@ -3639,6 +3669,42 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn transitions_across_a_closed_fold_move_display_rows() {
+        let identity = Some(uuid::Uuid::new_v4());
+        let folded = |revision, top, lines: Vec<u64>, ends: Vec<u64>| {
+            let mut frame = (*scroll_frame(revision, top)).clone();
+            frame.windows[0].botline = lines.last().copied().unwrap_or(top);
+            frame.windows[0].display_lines = lines;
+            frame.windows[0].fold_ends = ends;
+            Arc::new(frame)
+        };
+        let mut scroll = ScrollPresentation::default();
+        // Rows 1, a closed fold 2..=40, then 41.. : two rows move topline to 41.
+        let rows = vec![1, 2, 41, 42, 43, 44, 45, 46, 47];
+        let ends = vec![0, 40, 0, 0, 0, 0, 0, 0, 0];
+        scroll.update(
+            identity,
+            Some(&folded(1, 1, rows, ends)),
+            20.0,
+            1.0,
+            true,
+            false,
+        );
+        scroll.update(identity, Some(&scroll_frame(2, 41)), 20.0, 1.0, true, false);
+        assert_eq!(
+            scroll.offset(1, 1.0),
+            40.0,
+            "two display rows, not forty source lines"
+        );
+        assert_eq!(scroll.windows[&1].sources.back().unwrap().1, 1);
+        assert_eq!(scroll.windows[&1].position, 3);
+        // A jump that neither sample covers snaps instead of animating a guess.
+        let far = folded(3, 300, vec![300, 301], vec![0, 0]);
+        scroll.update(identity, Some(&far), 20.0, 1.01, true, false);
+        assert_eq!(scroll.offset(1, 1.01), 0.0);
     }
 
     #[test]

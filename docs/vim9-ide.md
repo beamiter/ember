@@ -68,7 +68,11 @@ rows and split separators remain in the compatibility surface between buffer
 rectangles. Horizontal, vertical and mixed Vim splits paint every supported
 window through the same native RGB path, including inactive windows. Each
 window has its own clipping rectangle so italic overhang cannot cover a split
-separator or another buffer. Complex views (folds, diff, complex/scrolling completion,
+separator or another buffer. Closed folds are native rows (render protocol 8):
+the fold text and its filler use Vim's `Folded` colors, the filler glyph is
+placed per cell, and touchpad/wheel scrolling crosses a fold as one row while
+clicks in a folded split use Vim's own mouse handling. Complex views (diff,
+blockwise selections over folds, complex/scrolling completion,
 conceal and unsupported shaping) temporarily use **Compatible view**; hover
 the label for the runtime's reason. A disconnected bridge or a resized frame
 never leaves an old native frame over the terminal. The logical cell geometry

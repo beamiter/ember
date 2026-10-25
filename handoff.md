@@ -1,5 +1,21 @@
 # Engineering handoff
 
+## 2026-10-25 — native closed folds (shared core render protocol 8)
+
+- The shared core now negotiates render protocol 8: closed Vim folds are
+  painted as native rows (fold text and filler in `Folded` colors), rows below
+  keep Vim's positions, and source-bound touchpad/wheel scrolling crosses a
+  fold as one row via the bridge's `scroll_rows` acknowledgement. Folded
+  splits route clicks to Vim's own mouse handling. Contract:
+  `jterm_core/docs/vim9-native-folds.md`.
+- `src/vim9_buffer.rs` transition sources carry display-row positions
+  (`WindowScroll::position`, advanced by `topline_shift()`), so a transition
+  across a closed fold moves by one row and an unsampled distance snaps.
+  Repeated non-ASCII filler runs (`Vim9RenderRun::repeated_glyph()`) are
+  shaped once and placed at every Vim cell.
+- `packaging/jterm-core-src.tar.gz` is regenerated from the matching
+  `jterm_core` commit with `scripts/package-shared-core.sh`.
+
 ## 2026-10-20 — native Vim9 keyboard workbench
 
 - Added native Quick Open and Go to line dialogs around the real Vim process.
