@@ -16,7 +16,7 @@ static NEXT_HISTORY_OPENING: AtomicU64 = AtomicU64::new(0);
 
 fn next_history_opening() -> u64 {
     NEXT_HISTORY_OPENING
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("history picker opening identity exhausted")
 }
 
