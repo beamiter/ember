@@ -94,8 +94,10 @@ fn each_mode_submits_one_body_and_no_duplicate_status_card() {
 #[test]
 fn split_handoff_rejects_old_surface_without_resetting_life_or_voice() {
     let ctx = egui::Context::default();
-    let mut host = OrganismHost::default();
-    host.voice = CompanionVoice::new(17);
+    let mut host = OrganismHost {
+        voice: CompanionVoice::new(17),
+        ..OrganismHost::default()
+    };
     host.acquire(Some("left"), None, false);
     host.presentable = true;
     let config = Config {

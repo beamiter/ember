@@ -1,5 +1,21 @@
 # Engineering handoff
 
+## 2026-10-26 — companion regression fixture CI lint follow-up
+
+- Remote CI job `121571441866` reported
+  `clippy::field_reassign_with_default` in the new pane-handoff test. Its
+  deterministic `CompanionVoice` now uses an `OrganismHost` struct initializer
+  with the remaining defaults. No lint suppression or production behavior
+  change was added.
+- Validation: `cargo clippy --locked --all-targets -- -D warnings` passed;
+  `cargo test --locked --bin ember organism_ui::single_companion_tests:: -- --test-threads=1`
+  passed **9 tests, 0 failed, 0 ignored**. `cargo fmt --all -- --check` and
+  `git diff --check` passed. Both Cargo checks used the existing
+  `/tmp/organism-target` cache with `CARGO_PROFILE_TEST_DEBUG=0`,
+  `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=4`,
+  `CARGO_PROFILE_DEV_CODEGEN_UNITS=1`, and `CARGO_PROFILE_TEST_CODEGEN_UNITS=1`.
+  This follow-up did not repeat native desktop or GPU smoke validation.
+
 ## 2026-10-26 — one window, one ASCII companion
 
 - Removed the permanent Block companion status card, its second sprite, and
