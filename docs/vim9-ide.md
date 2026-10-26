@@ -71,8 +71,11 @@ window has its own clipping rectangle so italic overhang cannot cover a split
 separator or another buffer. Closed folds are native rows (render protocol 8):
 the fold text and its filler use Vim's `Folded` colors, the filler glyph is
 placed per cell, and touchpad/wheel scrolling crosses a fold as one row while
-clicks in a folded split use Vim's own mouse handling. Complex views (diff,
-blockwise selections over folds, complex/scrolling completion,
+clicks in a folded split use Vim's own mouse handling. Soft-wrapped lines are
+native rows too (render protocol 9): continuation rows, `showbreak`/`breakindent`
+and `smoothscroll` partial lines keep Vim's exact layout, and touchpad/wheel
+scrolling moves one wrapped row at a time. Complex views (diff,
+blockwise selections over folds, guides or virtual text on wrapped lines, complex/scrolling completion,
 conceal and unsupported shaping) temporarily use **Compatible view**; hover
 the label for the runtime's reason. A disconnected bridge or a resized frame
 never leaves an old native frame over the terminal. The logical cell geometry

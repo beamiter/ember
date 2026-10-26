@@ -692,11 +692,12 @@ impl ScrollPresentation {
                             self.windows.remove(&b.window);
                             continue;
                         }
-                        if a.topline == b.topline {
+                        if a.same_first_row(b) {
                             continue;
                         }
                         // Across a closed fold Vim moves topline by many lines
-                        // for one row; an unsampled distance must snap.
+                        // for one row, and 'smoothscroll' moves within a
+                        // wrapped topline; an unsampled distance must snap.
                         let Some(shift) = a.topline_shift(b) else {
                             self.windows.remove(&b.window);
                             continue;
@@ -2439,6 +2440,8 @@ mod tests {
                     line: top + 4,
                     byte_length: 4,
                     fold_end: 0,
+                    part: 0,
+                    parts: 1,
                     runs: vec![Vim9RenderRun {
                         window: 1,
                         column: 0,
