@@ -28,6 +28,9 @@ switching tabs or splitting a tab does not transfer another pane's momentum.
 - Following live output gently approaches the new tail. Browsing history
   retains its stable raw-row anchor, including the fractional offset, when
   output arrives, history is trimmed, or a command block changes height.
+- Resizing a pane or changing font size keeps a reader's position within the
+  anchored row, rather than snapping to a text-row boundary. A layout change
+  retires obsolete wheel motion; a live-following pane stays at the live edge.
 - Explicit navigation and scrollbar dragging replace the old destination.
   Selecting history stops pending motion and holds the reading position as
   more output arrives; typing or returning to live restores following. A
@@ -36,6 +39,12 @@ switching tabs or splitting a tab does not transfer another pane's momentum.
   preference disables interpolation while retaining precise coordinates.
 
 ## Rendering and scope
+
+Completed successful Block history shares the underlying canvas instead of
+painting a permanent card fill and border. Hover, selection, failures,
+background jobs and live input keep their existing semantic emphasis, but
+without floating shadows. These are paint-only changes: text insets, row
+heights, pointer regions and Chat's command/composer silhouettes are unchanged.
 
 The existing cell/version cache remains the source of text. Fractional frames
 update GPU uniforms and native chrome geometry; they do not reconstruct the

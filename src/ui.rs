@@ -2817,7 +2817,12 @@ impl TerminalRenderer {
             BlockCardEmphasis::Live => (accent, 12),        // live input
             BlockCardEmphasis::Failed => (self.block_outcome_color(entry.outcome), 28), // 0.11
             BlockCardEmphasis::Background => (accent, 18),  // 0.07
-            BlockCardEmphasis::Neutral => (foreground, 5),  // quiet history
+            BlockCardEmphasis::Neutral
+                if entry.outcome == crate::block_mode::BlockOutcome::Success =>
+            {
+                (foreground, 0) // completed history belongs to the canvas
+            }
+            BlockCardEmphasis::Neutral => (foreground, 5), // preserve unknown-state treatment
         };
         let alpha = (f32::from(alpha) * self.opacity.clamp(0.0, 1.0)).round() as u8;
         Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
@@ -2843,6 +2848,11 @@ impl TerminalRenderer {
             BlockCardEmphasis::Hovered => (1.0, foreground, 41), // 0.16
             BlockCardEmphasis::Live => (1.0, accent, 82),        // 0.32
             BlockCardEmphasis::Background => (1.0, accent, 61),  // 0.24
+            BlockCardEmphasis::Neutral
+                if entry.outcome == crate::block_mode::BlockOutcome::Success =>
+            {
+                (0.0, foreground, 0)
+            }
             BlockCardEmphasis::Failed | BlockCardEmphasis::Neutral => {
                 (1.0, foreground, 20) // 0.08
             }
@@ -3751,32 +3761,8 @@ impl TerminalRenderer {
             else {
                 continue;
             };
-            if !self.block_compact && geometry.top_closed && geometry.bottom_closed {
-                let shadow = if entry.live {
-                    Some(egui::Shadow {
-                        offset: [0, 2],
-                        blur: 8,
-                        spread: 0,
-                        color: Color32::from_black_alpha(
-                            (46.0 * self.opacity.clamp(0.0, 1.0)).round() as u8,
-                        ),
-                    })
-                } else if entry.hovered {
-                    Some(egui::Shadow {
-                        offset: [0, 4],
-                        blur: 14,
-                        spread: 0,
-                        color: Color32::from_black_alpha(
-                            (56.0 * self.opacity.clamp(0.0, 1.0)).round() as u8,
-                        ),
-                    })
-                } else {
-                    None
-                };
-                if let Some(shadow) = shadow {
-                    painter.add(shadow.as_shape(geometry.rect, geometry.rounding));
-                }
-            }
+            // History is one flat canvas. Hover/live state uses tint and
+            // outlines, not elevation that bleeds across adjacent output.
             painter.rect_filled(
                 geometry.rect,
                 geometry.rounding,
@@ -10042,6 +10028,27 @@ mod tests {
                     .is_none());
             }
         }
+    }
+
+    #[test]
+    fn completed_history_is_flat_but_hover_and_selection_remain_visible() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let mut entry = chrome_entry(crate::block_mode::BlockOutcome::Success, false);
+        assert_eq!(renderer.block_card_overlay(&entry).a(), 0);
+        assert_eq!(renderer.block_card_border(&entry).0, 0.0);
+        entry.hovered = true;
+        assert!(renderer.block_card_overlay(&entry).a() > 0);
+        assert!(renderer.block_card_border(&entry).0 > 0.0);
+        entry.hovered = false;
+        entry.selected = true;
+        assert!(renderer.block_card_overlay(&entry).a() > 0);
+        assert!(renderer.block_card_border(&entry).1.a() > 0);
     }
 
     #[test]

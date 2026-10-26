@@ -81,8 +81,23 @@ impl TranscriptCanvas {
             || self.visible_rows != visible_rows
             || self.line_height != height;
         if !self.initialized || geometry_changed {
+            // The projection supplies a reflowed whole-row anchor. Preserve
+            // the reader's position within that row across resize/font zoom,
+            // but never carry an obsolete wheel destination into new geometry.
+            // Ember projects ceil(position), so this remainder is non-positive.
+            let remainder =
+                if self.initialized && !self.follows_live && follows_live == self.expected_follow {
+                    self.motion.position() / self.line_height - self.expected_offset as f64
+                } else {
+                    0.0
+                };
+            let position = if self.initialized && self.follows_live && follows_live {
+                0.0
+            } else {
+                offset_rows as f64 + remainder
+            };
             self.motion.set_bounds(0.0, max);
-            self.motion.jump_to(offset_rows as f64 * height);
+            self.motion.jump_to(position * height);
             self.follows_live = follows_live;
             self.initialized = true;
         } else if follows_live != self.expected_follow {
@@ -213,6 +228,55 @@ mod tests {
         assert!(!frame.follows_live);
         let idle = present(&mut canvas, 1, 200, false, 3.0);
         assert_eq!(idle.translation, frame.translation);
+    }
+
+    #[test]
+    fn resize_and_font_zoom_preserve_fractional_reading_anchor() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 10, 200, false, 0.0);
+        canvas.scroll(5.0, true);
+        let before = present(&mut canvas, 10, 200, false, 0.016);
+        assert_eq!(before.offset_rows, 11);
+        let resized = canvas.present(16, 220, 2, 30, 100, false, 24.0, 0.032, false);
+        assert_eq!(resized.offset_rows, 16);
+        assert_eq!(resized.translation, 18.0);
+        assert!(!resized.follows_live);
+        assert!(!resized.animating);
+    }
+
+    #[test]
+    fn resize_during_streaming_keeps_follow_at_the_live_edge() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 0, 200, true, 0.0);
+        let moving = present(&mut canvas, 0, 205, true, 0.016);
+        assert!(moving.animating);
+        let resized = canvas.present(
+            moving.offset_rows,
+            205,
+            2,
+            30,
+            100,
+            true,
+            24.0,
+            0.032,
+            false,
+        );
+        assert_eq!(resized.offset_rows, 0);
+        assert_eq!(resized.translation, 0.0);
+        assert!(resized.follows_live);
+        assert!(!resized.animating);
+    }
+
+    #[test]
+    fn resize_does_not_preserve_fraction_over_explicit_return_to_live() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 10, 200, false, 0.0);
+        canvas.scroll(5.0, true);
+        present(&mut canvas, 10, 200, false, 0.016);
+        let live = canvas.present(0, 200, 2, 30, 100, true, 24.0, 0.032, false);
+        assert_eq!(live.offset_rows, 0);
+        assert_eq!(live.translation, 0.0);
+        assert!(live.follows_live);
     }
 
     #[test]
