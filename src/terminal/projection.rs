@@ -1612,6 +1612,8 @@ pub struct ProjectionViewState {
     pub(super) follow_bottom: bool,
     pub(super) top_anchor: Option<ProjectedTopAnchor>,
     pub(super) last_plan_key: Option<ProjectionPlanCacheKey>,
+    pub(super) canvas_margin: bool,
+    pub(super) canvas_managed: bool,
 }
 
 impl Default for ProjectionViewState {
@@ -1622,6 +1624,8 @@ impl Default for ProjectionViewState {
             follow_bottom: true,
             top_anchor: None,
             last_plan_key: None,
+            canvas_margin: false,
+            canvas_managed: false,
         }
     }
 }
@@ -1639,6 +1643,28 @@ impl ProjectionViewState {
 
     pub fn offset_from_bottom(&self) -> usize {
         self.offset_from_bottom
+    }
+
+    pub fn follows_bottom(&self) -> bool {
+        self.follow_bottom
+    }
+
+    pub fn set_canvas_offset(&mut self, offset: usize, follows_live: bool, margin: bool) {
+        self.offset_from_bottom = offset;
+        self.follow_bottom = follows_live;
+        self.canvas_margin = margin;
+        self.canvas_managed = true;
+    }
+
+    pub fn pause_canvas_follow(&mut self) {
+        self.follow_bottom = false;
+        self.canvas_managed = true;
+    }
+
+    pub fn clear_canvas(&mut self) {
+        self.canvas_managed = false;
+        self.canvas_margin = false;
+        self.follow_bottom = self.offset_from_bottom == 0;
     }
 
     pub fn set_offset(&mut self, offset: usize, viewport: &ProjectedViewport) {
@@ -2181,9 +2207,10 @@ pub struct ProjectedViewport {
     document_start: usize,
     top_padding: usize,
     effective_collapsed: Arc<BTreeSet<u64>>,
-    chat_documents: Option<Arc<Vec<Option<usize>>>>,
+    view_documents: Option<Arc<Vec<Option<usize>>>>,
     chat_commands: Arc<Vec<ChatCommandSpan>>,
     chat_composer: Option<std::ops::Range<usize>>,
+    canvas_margin: bool,
 }
 
 impl ProjectedViewport {
@@ -2222,9 +2249,10 @@ impl ProjectedViewport {
             document_start: key.scrollback_len.saturating_sub(key.scroll_offset),
             top_padding: 0,
             effective_collapsed: Arc::new(BTreeSet::new()),
-            chat_documents: None,
+            view_documents: None,
             chat_commands: Arc::new(Vec::new()),
             chat_composer: None,
+            canvas_margin: false,
         }
     }
 
@@ -2264,9 +2292,10 @@ impl ProjectedViewport {
             document_start,
             top_padding,
             effective_collapsed: Arc::new(effective_collapsed),
-            chat_documents: None,
+            view_documents: None,
             chat_commands: Arc::new(Vec::new()),
             chat_composer: None,
+            canvas_margin: false,
         }
     }
 
@@ -2276,9 +2305,14 @@ impl ProjectedViewport {
         commands: Vec<ChatCommandSpan>,
         composer: Option<std::ops::Range<usize>>,
     ) -> Self {
-        self.chat_documents = Some(Arc::new(documents));
+        self.view_documents = Some(Arc::new(documents));
         self.chat_commands = Arc::new(commands);
         self.chat_composer = composer;
+        self
+    }
+
+    pub(super) fn with_document_rows(mut self, documents: Vec<Option<usize>>) -> Self {
+        self.view_documents = Some(Arc::new(documents));
         self
     }
 
@@ -2353,8 +2387,17 @@ impl ProjectedViewport {
         self.top_padding
     }
 
+    pub fn visible_rows(&self) -> usize {
+        self.rows().saturating_sub(usize::from(self.canvas_margin))
+    }
+
+    pub(super) fn with_canvas_margin(mut self, margin: bool) -> Self {
+        self.canvas_margin = margin;
+        self
+    }
+
     pub fn max_scroll_offset(&self) -> usize {
-        self.document_rows.saturating_sub(self.rows())
+        self.document_rows.saturating_sub(self.visible_rows())
     }
 
     pub fn effective_collapsed(&self) -> &BTreeSet<u64> {
@@ -2362,7 +2405,7 @@ impl ProjectedViewport {
     }
 
     pub fn view_document_row(&self, display_row: usize) -> Option<usize> {
-        if let Some(documents) = &self.chat_documents {
+        if let Some(documents) = &self.view_documents {
             return documents.get(display_row).copied().flatten();
         }
         (display_row >= self.top_padding && display_row < self.rows()).then(|| {

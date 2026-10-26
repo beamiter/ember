@@ -123,4 +123,8 @@ pub struct GridUniforms {
     pub render_phase: f32,
     /// Sub-line pixel offset for smooth scrolling
     pub scroll_pixel_offset: f32,
+    /// First fixed Chat composer row, or -1 when the full surface flows.
+    pub fixed_start_row: f32,
+    pub fixed_pixel_offset: f32,
+    pub _canvas_pad: [f32; 2],
 }

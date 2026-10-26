@@ -1376,6 +1376,7 @@ pub struct TerminalRenderer {
     click_tracker_projection: Option<ProjectionCacheKey>,
     /// Sub-line pixel offset for smooth scrolling animation
     pub scroll_pixel_offset: f32,
+    pub canvas_geometry: crate::transcript_canvas::CanvasGeometry,
 
     /// Per-pane 链接检测缓存(多窗格路径用)。单窗格走 App 上的缓存,多窗格每个
     /// pane 一份,仅当完整 projection key 变化时重建,避免每帧重做检测+String 分配。
@@ -1497,6 +1498,7 @@ impl TerminalRenderer {
             click_tracker_terminal: None,
             click_tracker_projection: None,
             scroll_pixel_offset: 0.0,
+            canvas_geometry: crate::transcript_canvas::CanvasGeometry::default(),
             cached_links: std::sync::Arc::new(Vec::new()),
             cached_links_projection_key: None,
             cached_links_terminal_ptr: usize::MAX,
@@ -1562,6 +1564,139 @@ impl TerminalRenderer {
             policy,
             view_state,
         )
+    }
+
+    pub fn canvas_pointer_position(&self, mut point: egui::Pos2) -> egui::Pos2 {
+        if let Some(content) = self.last_content_rect {
+            point.y = self
+                .canvas_geometry
+                .inverse_y(point.y, content.top(), self.line_height);
+        }
+        point
+    }
+
+    pub fn canvas_history_contains(&self, point: egui::Pos2) -> bool {
+        self.last_content_rect.is_some_and(|content| {
+            content.contains(point)
+                && self.canvas_geometry.composer_start.is_none_or(|start| {
+                    point.y
+                        < content.top() + start as f32 * self.line_height
+                            - self.canvas_geometry.row_offset(start, self.line_height)
+                })
+        })
+    }
+
+    pub fn canvas_mapping_rect(&self, content: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_max(
+            content.min,
+            content.max
+                + egui::vec2(
+                    0.0,
+                    if self.canvas_geometry.margin {
+                        self.line_height
+                    } else {
+                        0.0
+                    },
+                ),
+        )
+    }
+
+    fn canvas_row_span(&self, content: egui::Rect, row: usize, line_height: f32) -> (f32, f32) {
+        let (y, height) = snapped_span(content.top(), row, line_height);
+        (
+            y - self.canvas_geometry.row_offset(row, line_height),
+            height,
+        )
+    }
+
+    fn canvas_row_content(&self, content: egui::Rect, row: usize) -> egui::Rect {
+        content.translate(egui::vec2(
+            0.0,
+            -self.canvas_geometry.row_offset(row, self.line_height),
+        ))
+    }
+
+    fn canvas_header_actions(
+        &self,
+        content: egui::Rect,
+        row: usize,
+        line_height: f32,
+    ) -> Option<(egui::Rect, egui::Rect)> {
+        let offset = egui::vec2(0.0, -self.canvas_geometry.row_offset(row, line_height));
+        block_header_actions(content, row, line_height)
+            .map(|(menu, collapse)| (menu.translate(offset), collapse.translate(offset)))
+    }
+
+    fn canvas_row_painter(
+        &self,
+        painter: &egui::Painter,
+        content: egui::Rect,
+        row: usize,
+    ) -> egui::Painter {
+        let mut clip = painter.clip_rect().intersect(content);
+        if let Some(start) = self.canvas_geometry.composer_start {
+            let top = content.top() + start as f32 * self.line_height
+                - self.canvas_geometry.row_offset(start, self.line_height);
+            if row < start {
+                clip.max.y = clip.max.y.min(top);
+            } else {
+                clip.min.y = clip.min.y.max(top);
+            }
+        }
+        painter.with_clip_rect(clip)
+    }
+
+    /// Materialize one real margin row while the viewport lies between rows.
+    /// Motion belongs to the session, so reusing a renderer cannot move a tab.
+    pub fn canvas_viewport(
+        &mut self,
+        terminal: &mut TerminalState,
+        policy: &crate::terminal::ProjectionPolicy,
+        state: &mut crate::terminal::ProjectionViewState,
+        canvas: &mut crate::transcript_canvas::TranscriptCanvas,
+        ctx: &egui::Context,
+    ) -> ProjectedViewport {
+        let viewport = self.projected_viewport_with_state(terminal, policy, state);
+        if !self.block_mode
+            || !viewport.is_transformed()
+            || self.native_vim9_identity.is_some()
+            || !terminal.kitty_graphics.get_placements().is_empty()
+        {
+            canvas.reset();
+            if self.canvas_geometry.translation != 0.0 {
+                self.scroll_pixel_offset = 0.0;
+            }
+            self.canvas_geometry = crate::transcript_canvas::CanvasGeometry::default();
+            state.clear_canvas();
+            return self.projected_viewport_with_state(terminal, policy, state);
+        }
+        let reduced = ctx.data(|data| {
+            data.get_temp::<bool>(egui::Id::new("organism_system_reduced_motion"))
+                .unwrap_or(false)
+        });
+        let frame = canvas.present(
+            viewport.scroll_offset(),
+            viewport.document_rows(),
+            viewport.plan_revision().unwrap_or(0),
+            terminal.grid.rows(),
+            viewport.columns(),
+            state.follows_bottom(),
+            self.line_height,
+            ctx.input(|input| input.time),
+            reduced,
+        );
+        state.set_canvas_offset(frame.offset_rows, frame.follows_live, frame.margin);
+        let viewport = self.projected_viewport_with_state(terminal, policy, state);
+        self.canvas_geometry = crate::transcript_canvas::CanvasGeometry {
+            translation: frame.translation,
+            margin: frame.margin,
+            composer_start: viewport.chat_composer_rows().map(|rows| rows.start),
+        };
+        self.scroll_pixel_offset = frame.translation;
+        if frame.animating {
+            ctx.request_repaint();
+        }
+        viewport
     }
 
     pub fn set_projection_frame(
@@ -2368,8 +2503,10 @@ impl TerminalRenderer {
             };
             let record_index = match kind {
                 crate::terminal::ProjectedRowKind::BlockHeader { sequence, .. } => {
-                    command_record_index_for_sequence(records, sequence)
-                        .filter(|index| records[*index].complete)
+                    command_record_index_for_sequence(records, sequence).filter(|index| {
+                        records[*index].complete
+                            || records[*index].state == crate::terminal::CommandState::Running
+                    })
                 }
                 crate::terminal::ProjectedRowKind::CollapsedSummary { key, .. } => {
                     command_record_index_for_sequence(records, key.zone_id)
@@ -2607,7 +2744,9 @@ impl TerminalRenderer {
         let font = FontId::monospace(self.font_size);
         for summary in summaries {
             let (_, row_height) = snapped_span(content_rect.top(), summary.row, line_height);
-            let y = content_rect.top() + summary.row as f32 * line_height + row_height * 0.5;
+            let y = self.canvas_row_content(content_rect, summary.row).top()
+                + summary.row as f32 * line_height
+                + row_height * 0.5;
             let Some(clip) = collapsed_summary_clip(content_rect, y, row_height, self.char_width)
             else {
                 continue;
@@ -2725,13 +2864,32 @@ impl TerminalRenderer {
         line_height: f32,
         viewport_rows: usize,
     ) -> Option<BlockCardGeometry> {
+        let offset = self
+            .canvas_geometry
+            .row_offset(entry.span.first_row, line_height);
+        let extended = egui::Rect::from_min_max(
+            content_rect.min,
+            content_rect.max
+                + egui::vec2(
+                    0.0,
+                    if self.canvas_geometry.margin {
+                        line_height
+                    } else {
+                        0.0
+                    },
+                ),
+        );
         block_card_geometry(
-            content_rect,
+            extended,
             entry.span,
             line_height,
             self.block_compact,
             Self::block_visual_bottom(entry, viewport_rows),
         )
+        .map(|mut geometry| {
+            geometry.rect = geometry.rect.translate(egui::vec2(0.0, -offset));
+            geometry
+        })
     }
 
     fn finished_block_at_position<'a>(
@@ -2749,7 +2907,11 @@ impl TerminalRenderer {
         {
             return None;
         }
-        let row = (((pos.y - content_rect.top()) / line_height)
+        let row = (((self
+            .canvas_geometry
+            .inverse_y(pos.y, content_rect.top(), line_height)
+            - content_rect.top())
+            / line_height)
             .floor()
             .max(0.0) as usize)
             .min(viewport_rows.saturating_sub(1));
@@ -2809,8 +2971,8 @@ impl TerminalRenderer {
                 return false;
             };
             let (row, col) = grid_position_from_content(
-                pos,
-                content_rect,
+                self.canvas_pointer_position(pos),
+                self.canvas_mapping_rect(content_rect),
                 self.char_width,
                 self.line_height,
                 viewport.columns(),
@@ -2927,8 +3089,8 @@ impl TerminalRenderer {
                 return false;
             };
             let (row, col) = grid_position_from_content(
-                pos,
-                content_rect,
+                self.canvas_pointer_position(pos),
+                self.canvas_mapping_rect(content_rect),
                 self.char_width,
                 self.line_height,
                 viewport.columns(),
@@ -3083,7 +3245,7 @@ impl TerminalRenderer {
             };
             let header_actions = entry
                 .metadata_row
-                .and_then(|row| block_header_actions(content_rect, row, line_height));
+                .and_then(|row| self.canvas_header_actions(content_rect, row, line_height));
             if let Some((_, collapse_rect)) = header_actions {
                 let record = &terminal.command_records()[entry.span.record_index];
                 let collapsed = self.requested_collapsed_zone_ids.contains(&record.sequence);
@@ -3708,7 +3870,7 @@ impl TerminalRenderer {
             let Some(record) = terminal.command_records().get(entry.span.record_index) else {
                 continue;
             };
-            let (top, height) = snapped_span(content.top(), row, line_height);
+            let (top, height) = self.canvas_row_span(content, row, line_height);
             let rect = egui::Rect::from_min_max(
                 egui::pos2(content.left(), top),
                 egui::pos2(content.right(), top + height),
@@ -3732,7 +3894,8 @@ impl TerminalRenderer {
                     foreground.gamma_multiply(0.035),
                 );
             }
-            let right = block_header_actions(content, row, line_height)
+            let right = self
+                .canvas_header_actions(content, row, line_height)
                 .map_or(rect.right() - 4.0, |(overflow, _)| overflow.left() - 6.0);
             let dot = egui::pos2(rect.left() + 9.0, rect.center().y);
             if right > dot.x + 3.0 {
@@ -3749,7 +3912,7 @@ impl TerminalRenderer {
                     crate::block_mode::local_utc_offset_secs(seconds),
                 ));
             }
-            if let Some(duration) = record.duration_ms {
+            if let Some(duration) = entry.duration_ms {
                 parts.push(crate::block_mode::format_block_duration(duration));
             }
             let clip = egui::Rect::from_min_max(
@@ -3799,7 +3962,7 @@ impl TerminalRenderer {
             else {
                 continue;
             };
-            let (top_y, _) = snapped_span(content_rect.top(), entry.span.first_row, line_height);
+            let (top_y, _) = self.canvas_row_span(content_rect, entry.span.first_row, line_height);
             let status = self.block_outcome_color(entry.outcome);
             let stripe_alpha = if entry.active || entry.live {
                 255
@@ -4231,6 +4394,12 @@ impl TerminalRenderer {
 
         let (content_rect, scrollbar_rect) = self.layout_rects(rect);
         self.last_content_rect = Some(content_rect);
+        // The extra materialized row is only a paint margin. It must never
+        // leak into the tab/pane padding while translating the document.
+        let painter = painter.with_clip_rect(egui::Rect::from_min_max(
+            egui::pos2(rect.left(), content_rect.top()),
+            egui::pos2(rect.right(), content_rect.bottom()),
+        ));
         if let (Some(_), Some(input), Some(snapshot)) = (
             &native_buffer,
             &self.native_vim9_input,
@@ -4333,13 +4502,19 @@ impl TerminalRenderer {
                 }
             })
             .unwrap_or_else(|| {
-                Some(cursor_rect(
-                    content_rect,
-                    cursor_pos.0,
-                    cursor_pos.1,
-                    char_width,
-                    line_height,
-                ))
+                Some(
+                    cursor_rect(
+                        content_rect,
+                        cursor_pos.0,
+                        cursor_pos.1,
+                        char_width,
+                        line_height,
+                    )
+                    .translate(egui::vec2(
+                        0.0,
+                        -self.canvas_geometry.row_offset(cursor_pos.0, line_height),
+                    )),
+                )
             });
 
         let ctx = ui.ctx();
@@ -4415,7 +4590,13 @@ impl TerminalRenderer {
         let primary_pressed =
             ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
         let pressed_summary = response.interact_pointer_pos().and_then(|pos| {
-            Self::summary_at_position(&summaries, pos, content_rect, line_height, rows)
+            Self::summary_at_position(
+                &summaries,
+                self.canvas_pointer_position(pos),
+                self.canvas_mapping_rect(content_rect),
+                line_height,
+                rows,
+            )
         });
         let press_app_mouse_eligible = primary_pressed
             && response.interact_pointer_pos().is_some_and(|pos| {
@@ -4442,7 +4623,7 @@ impl TerminalRenderer {
         let scrollbar_thumb_rect: Option<(egui::Rect, f32, f32, f32)> =
             if projected_scroll_range > 0 {
                 let total_lines = viewport.document_rows();
-                let visible_lines = rows;
+                let visible_lines = viewport.visible_rows();
                 if total_lines > visible_lines {
                     let scrollbar_height = scrollbar_rect.height();
                     let thumb_height =
@@ -4450,7 +4631,9 @@ impl TerminalRenderer {
                     // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
                     let thumb_y = scrollbar_height
                         - thumb_height
-                        - (viewport.scroll_offset() as f32 / projected_scroll_range as f32)
+                        - ((viewport.scroll_offset() as f32
+                            - self.canvas_geometry.translation / line_height)
+                            / projected_scroll_range as f32)
                             * (scrollbar_height - thumb_height);
                     let thumb_rect = egui::Rect::from_min_size(
                         egui::pos2(scrollbar_x, scrollbar_rect.top() + thumb_y),
@@ -4584,7 +4767,13 @@ impl TerminalRenderer {
             );
         }
         let summary_hit = click_pos.and_then(|pos| {
-            Self::summary_at_position(&summaries, pos, content_rect, line_height, rows)
+            Self::summary_at_position(
+                &summaries,
+                self.canvas_pointer_position(pos),
+                self.canvas_mapping_rect(content_rect),
+                line_height,
+                rows,
+            )
         });
         let modifiers = ui.input(|input| input.modifiers);
         let primary_block_gesture =
@@ -4726,7 +4915,14 @@ impl TerminalRenderer {
         let pointer_latest = ctx.input(|input| input.pointer.latest_pos());
         let pointer_display_cell = pointer_latest.and_then(|pos| {
             (pos.x < scrollbar_x && content_rect.contains(pos)).then(|| {
-                display_cell_from_content(pos, content_rect, char_width, line_height, cols, rows)
+                display_cell_from_content(
+                    self.canvas_pointer_position(pos),
+                    self.canvas_mapping_rect(content_rect),
+                    char_width,
+                    line_height,
+                    cols,
+                    rows,
+                )
             })
         });
         let scrolled = ui.input(|input| {
@@ -4750,7 +4946,14 @@ impl TerminalRenderer {
         }
         if primary_pressed {
             let press_cell = click_pos.filter(|pos| pos.x < scrollbar_x).map(|pos| {
-                display_cell_from_content(pos, content_rect, char_width, line_height, cols, rows)
+                display_cell_from_content(
+                    self.canvas_pointer_position(pos),
+                    self.canvas_mapping_rect(content_rect),
+                    char_width,
+                    line_height,
+                    cols,
+                    rows,
+                )
             });
             let plain = press_cell.is_some_and(|cell| {
                 viewport
@@ -4851,8 +5054,8 @@ impl TerminalRenderer {
         {
             if let Some(pos) = response.interact_pointer_pos() {
                 if pos.x < scrollbar_x {
-                    let clamped_y =
-                        (pos.y - content_rect.top()).clamp(0.0, content_rect.height().max(0.0));
+                    let clamped_y = (self.canvas_pointer_position(pos).y - content_rect.top())
+                        .clamp(0.0, rows as f32 * line_height);
                     let row = if line_height > 0.0 {
                         ((clamped_y / line_height) as usize).min(rows - 1)
                     } else {
@@ -4874,8 +5077,8 @@ impl TerminalRenderer {
                 if pos.x < scrollbar_x {
                     let clamped_x =
                         (pos.x - content_rect.left()).clamp(0.0, content_rect.width().max(0.0));
-                    let clamped_y =
-                        (pos.y - content_rect.top()).clamp(0.0, content_rect.height().max(0.0));
+                    let clamped_y = (self.canvas_pointer_position(pos).y - content_rect.top())
+                        .clamp(0.0, rows as f32 * line_height);
 
                     let col = if char_width > 0.0 {
                         ((clamped_x / char_width) as usize).min(cols - 1)
@@ -4908,8 +5111,8 @@ impl TerminalRenderer {
                     // Clamp position to rect bounds to prevent underflow
                     let clamped_x =
                         (pos.x - content_rect.left()).clamp(0.0, content_rect.width().max(0.0));
-                    let clamped_y =
-                        (pos.y - content_rect.top()).clamp(0.0, content_rect.height().max(0.0));
+                    let clamped_y = (self.canvas_pointer_position(pos).y - content_rect.top())
+                        .clamp(0.0, rows as f32 * line_height);
 
                     let col = if char_width > 0.0 {
                         ((clamped_x / char_width) as usize).min(cols - 1)
@@ -4945,8 +5148,8 @@ impl TerminalRenderer {
                     // Clamp position to rect bounds to prevent underflow
                     let clamped_x =
                         (pos.x - content_rect.left()).clamp(0.0, content_rect.width().max(0.0));
-                    let clamped_y =
-                        (pos.y - content_rect.top()).clamp(0.0, content_rect.height().max(0.0));
+                    let clamped_y = (self.canvas_pointer_position(pos).y - content_rect.top())
+                        .clamp(0.0, rows as f32 * line_height);
 
                     let col = if char_width > 0.0 {
                         ((clamped_x / char_width) as usize).min(cols - 1)
@@ -5144,7 +5347,7 @@ impl TerminalRenderer {
             let cell = &grid[crow][ccol];
             if !cell.flags.wide_continuation() {
                 let (x, snapped_width) = snapped_span(content_rect.left(), ccol, char_width);
-                let (y, snapped_height) = snapped_span(content_rect.top(), crow, line_height);
+                let (y, snapped_height) = self.canvas_row_span(content_rect, crow, line_height);
 
                 let cell_width = if cell.flags.wide() {
                     let (_, next_width) = snapped_span(content_rect.left(), ccol + 1, char_width);
@@ -5213,7 +5416,9 @@ impl TerminalRenderer {
 
             // 在光标下方显示预编辑文本
             let preedit_x = content_rect.left() + cursor_pos.1 as f32 * char_width;
-            let preedit_y = content_rect.top() + cursor_pos.0 as f32 * line_height + line_height;
+            let preedit_y = self.canvas_row_content(content_rect, cursor_pos.0).top()
+                + cursor_pos.0 as f32 * line_height
+                + line_height;
 
             // 确保不超出屏幕范围
             if preedit_y + line_height <= content_rect.bottom() {
@@ -5243,7 +5448,7 @@ impl TerminalRenderer {
             // Recompute thumb with current scroll_offset (may have changed from interaction)
             if let Some((_, scrollbar_height, _, scrollback_len_f)) = scrollbar_thumb_rect {
                 let total_lines = viewport.document_rows();
-                let visible_lines = rows;
+                let visible_lines = viewport.visible_rows();
                 let thumb_height =
                     Self::scrollbar_thumb_height(visible_lines, total_lines, scrollbar_height);
                 // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
@@ -5341,7 +5546,10 @@ impl TerminalRenderer {
             scroll_stable: terminal.scroll_offset == initial_scroll_offset,
             projected_scroll_pending: self.projected_scroll_request.is_some(),
         };
-        if self.companion_enabled && companion_facts.allows() {
+        if self.companion_enabled
+            && companion_facts.allows()
+            && self.canvas_geometry.translation == 0.0
+        {
             self.companion_surface = block_chrome
                 .as_deref()
                 .and_then(|entries| entries.iter().find(|entry| entry.live))
@@ -5847,6 +6055,16 @@ impl TerminalRenderer {
             atlas_height: atlas_h,
             render_phase: 0.0,
             scroll_pixel_offset: self.scroll_pixel_offset * ppp,
+            fixed_start_row: self
+                .canvas_geometry
+                .composer_start
+                .map_or(-1.0, |row| row as f32),
+            fixed_pixel_offset: if self.canvas_geometry.margin {
+                target_cell_height
+            } else {
+                0.0
+            },
+            _canvas_pad: [0.0; 2],
         };
 
         let foreground_uniforms = gpu::instance::GridUniforms {
@@ -6246,6 +6464,8 @@ impl TerminalRenderer {
         };
 
         for (row_idx, row) in grid.iter().enumerate().take(rows) {
+            let painter = self.canvas_row_painter(painter, content_rect, row_idx);
+            let row_offset = self.canvas_geometry.row_offset(row_idx, line_height);
             let sel_cols = terminal.row_selection_cols_projected(viewport, row_idx);
 
             for (col_idx, cell) in row.iter().enumerate().take(cols) {
@@ -6330,7 +6550,9 @@ impl TerminalRenderer {
                 }
 
                 let (x, snapped_width) = snapped_span(content_rect.left(), col_idx, char_width);
-                let (y, snapped_height) = snapped_span(content_rect.top(), row_idx, line_height);
+                let (base_y, snapped_height) =
+                    snapped_span(content_rect.top(), row_idx, line_height);
+                let y = base_y - row_offset;
                 let cell_w = if cell.flags.wide() {
                     let (_, next_width) =
                         snapped_span(content_rect.left(), col_idx + 1, char_width);
@@ -6357,9 +6579,11 @@ impl TerminalRenderer {
 
         // Phase 2: Render characters
         for (row_idx, row) in grid.iter().enumerate().take(rows) {
+            let painter = self.canvas_row_painter(painter, content_rect, row_idx);
+            let row_offset = self.canvas_geometry.row_offset(row_idx, line_height);
             let sel_cols = terminal.row_selection_cols_projected(viewport, row_idx);
             let (_, snapped_height) = snapped_span(content_rect.top(), row_idx, line_height);
-            let y = snapped_span(content_rect.top(), row_idx, line_height).0;
+            let y = snapped_span(content_rect.top(), row_idx, line_height).0 - row_offset;
 
             let mut col_idx = 0;
             while col_idx < cols {
@@ -10398,5 +10622,371 @@ mod block_spacing_tests {
         let long = block_metadata_cwd(Some(&"路".repeat(4096)));
         assert!(long.len() <= "cwd · ".len() + crate::review_text::MAX_TOAST_BYTES);
         assert_eq!(block_metadata_cwd(Some("/tmp/雪")), "cwd · /tmp/雪");
+    }
+}
+
+#[cfg(test)]
+mod transcript_canvas_tests {
+    use super::*;
+    use crate::terminal::{ProjectionPolicy, ProjectionViewState};
+    use crate::transcript_canvas::TranscriptCanvas;
+
+    fn text_row(viewport: &ProjectedViewport, text: &str) -> usize {
+        viewport
+            .cells()
+            .iter()
+            .position(|row| {
+                row.iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim()
+                    == text
+            })
+            .expect("visible fixture text")
+    }
+
+    #[test]
+    fn transcript_canvas_short_chat_streams_down_from_a_stable_origin() {
+        let (mut renderer, _, policy) = fixture(true);
+        let mut terminal = TerminalState::new(40, 24);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo first\r\n\x1b]133;C\x07firstline\r\n",
+        );
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let before =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(before.view_document_row(0), Some(0));
+        assert_eq!(before.top_padding(), 0);
+        assert_eq!(before.max_scroll_offset(), 0);
+        let first = text_row(&before, "firstline");
+        terminal.process_input(b"secondline\r\nthirdline\r\n");
+        let after = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(text_row(&after, "firstline"), first);
+        assert_eq!(text_row(&after, "secondline"), first + 1);
+        assert_eq!(text_row(&after, "thirdline"), first + 2);
+        assert_eq!(renderer.canvas_geometry.translation, 0.0);
+        terminal.process_input(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        let finished =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(text_row(&finished, "firstline"), first);
+        assert_eq!(text_row(&finished, "thirdline"), first + 2);
+        assert_eq!(renderer.canvas_geometry.translation, 0.0);
+    }
+
+    #[test]
+    fn transcript_canvas_short_chat_keeps_history_above_spare_space_and_one_composer() {
+        let (mut renderer, _, policy) = fixture(true);
+        let mut terminal = TerminalState::new(40, 24);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo first\r\n\x1b]133;C\x07firstline\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let before =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        let first = text_row(&before, "firstline");
+        let dock = before.chat_composer_rows().unwrap();
+        assert!(first + 2 < dock.start);
+        assert!(before.row_kinds()[first + 1..dock.start]
+            .contains(&crate::terminal::ProjectedRowKind::Padding));
+        assert_eq!(dock.end, 24);
+        terminal.process_input(b"echo second\r\n\x1b]133;C\x07secondline\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        let after = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(text_row(&after, "firstline"), first);
+        assert!(text_row(&after, "secondline") > first);
+        assert_eq!(after.chat_composer_rows().unwrap(), dock);
+        let mut sources = std::collections::HashSet::new();
+        for row in 0..after.rows() {
+            if let Some(source) = after.view_row_absolute(row) {
+                assert!(
+                    sources.insert(source),
+                    "source row is shown only once, including the dock"
+                );
+            }
+        }
+        assert_eq!(after.max_scroll_offset(), 0);
+        assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 24));
+    }
+
+    #[test]
+    fn transcript_canvas_collapsed_short_block_keeps_its_top_origin() {
+        let (mut renderer, _, mut policy) = fixture(false);
+        let mut terminal = TerminalState::new(40, 24);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo first\r\n\x1b]133;C\x07one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        let sequence = terminal.command_records().front().unwrap().sequence;
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let before =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        let command_row = text_row(&before, "$ echo first");
+        assert!(policy.collapse(sequence));
+        let collapsed =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(collapsed.document_rows() < collapsed.visible_rows());
+        assert_eq!(collapsed.top_padding(), 0);
+        assert_eq!(text_row(&collapsed, "$ echo first"), command_row);
+        assert_eq!(collapsed.view_document_row(23), None);
+        terminal.process_input(b"echo second\r\n\x1b]133;C\x07nextline\r\n");
+        let after = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(text_row(&after, "$ echo first"), command_row);
+        assert_eq!(after.max_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn transcript_canvas_split_completion_and_prompt_keep_fractional_reader() {
+        let (mut renderer, mut terminal, policy) = fixture(true);
+        terminal.process_input(b"printf lines\r\n\x1b]133;C\x07live\r\n");
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        canvas.scroll(87.5, true);
+        let before =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        let translation = renderer.canvas_geometry.translation;
+        let source = (0..before.rows())
+            .find_map(|row| {
+                before
+                    .raw_anchor_at(DisplayPoint::new(row, 0))
+                    .map(|anchor| (row, anchor))
+            })
+            .unwrap();
+        for bytes in [
+            b"\x1b]133;D;0\x07".as_slice(),
+            b"\x1b]133;A\x07$ \x1b]133;B\x07".as_slice(),
+        ] {
+            terminal.process_input(bytes);
+            let after =
+                renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+            assert!(
+                after.is_transformed(),
+                "shell marker read boundaries never expose the raw grid"
+            );
+            assert_eq!(
+                after.raw_anchor_at(DisplayPoint::new(source.0, 0)),
+                Some(source.1)
+            );
+            assert_eq!(renderer.canvas_geometry.translation, translation);
+            assert!(!state.follows_bottom());
+        }
+    }
+
+    #[test]
+    fn transcript_canvas_gpu_shaders_validate_with_fixed_composer_clipping() {
+        let main = include_str!("gpu/shader.wgsl");
+        let dual = format!(
+            "enable dual_source_blending;\n{main}\n{}",
+            include_str!("gpu/shader_fg_dual.wgsl")
+        );
+        for source in [main, dual.as_str()] {
+            let module =
+                wgpu::naga::front::wgsl::parse_str(source).expect("valid canvas shader syntax");
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .expect("valid single/dual-source canvas shader");
+        }
+        assert_eq!(std::mem::size_of::<gpu::instance::GridUniforms>(), 48);
+    }
+
+    fn fixture(chat: bool) -> (TerminalRenderer, TerminalState, ProjectionPolicy) {
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Always,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        renderer.chat_mode = chat;
+        renderer.gpu_rendering = false;
+        renderer.line_height = 20.0;
+        renderer.char_width = 9.0;
+        let mut terminal = TerminalState::new(40, 16);
+        for index in 0..24 {
+            terminal.process_input(format!("\x1b]133;A\x07$ \x1b]133;B\x07echo {index}\r\n\x1b]133;C\x07canary_{index:02}\r\n\x1b]133;D;0\x07").as_bytes());
+        }
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let mut policy = ProjectionPolicy::new();
+        policy.set_block_chrome(true, 0);
+        policy.set_chat_mode(chat);
+        policy.set_block_spacing(chat);
+        (renderer, terminal, policy)
+    }
+
+    #[test]
+    fn transcript_canvas_overscan_preserves_cells_and_pty_dimensions() {
+        for chat in [false, true] {
+            let (mut renderer, mut terminal, policy) = fixture(chat);
+            let ctx = egui::Context::default();
+            let mut state = ProjectionViewState::new();
+            let mut canvas = TranscriptCanvas::default();
+            let before =
+                renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+            canvas.scroll(3.25, true);
+            let after =
+                renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+            assert_eq!(after.rows(), before.rows() + 1);
+            assert_eq!(after.visible_rows(), before.visible_rows());
+            assert_eq!(after.max_scroll_offset(), before.max_scroll_offset());
+            assert_eq!(after.view_document_row(1), before.view_document_row(0));
+            assert_eq!(
+                after.cells()[1]
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>(),
+                before.cells()[0]
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+            );
+            assert_eq!(renderer.canvas_geometry.translation, 16.75);
+            assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 16));
+            let content =
+                egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(360.0, 320.0));
+            let before_y = content.top();
+            let after_y = renderer.canvas_row_span(content, 1, renderer.line_height).0;
+            assert_eq!(after_y - before_y, 3.25);
+            canvas.scroll(0.5, true);
+            let subpixel =
+                renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+            assert!(std::sync::Arc::ptr_eq(&after.cells_arc(), &subpixel.cells_arc()),
+                "fractional frames reuse the materialized cells instead of rebuilding the transcript");
+            assert_eq!(renderer.canvas_geometry.translation, 16.25);
+        }
+    }
+
+    #[test]
+    fn transcript_canvas_chat_dock_and_pointer_stay_at_the_same_pixel() {
+        let (mut renderer, mut terminal, policy) = fixture(true);
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let before =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        let content = egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(360.0, 320.0));
+        renderer.last_content_rect = Some(content);
+        let row = before.cursor().row;
+        let before_y = renderer.canvas_row_span(content, row, 20.0).0;
+        let before_anchor = before.raw_anchor_at(DisplayPoint::new(row, 0));
+        assert!(before_anchor.is_some());
+        canvas.scroll(6.75, true);
+        let after = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        let row = after.cursor().row;
+        assert_eq!(renderer.canvas_row_span(content, row, 20.0).0, before_y);
+        let point = egui::pos2(content.left() + 1.0, before_y + 8.0);
+        let mapped = renderer.canvas_pointer_position(point);
+        let (mapped_row, mapped_col) = grid_position_from_content(
+            mapped,
+            renderer.canvas_mapping_rect(content),
+            9.0,
+            20.0,
+            after.columns(),
+            after.rows(),
+        );
+        assert_eq!(
+            after.raw_anchor_at(DisplayPoint::new(mapped_row, mapped_col)),
+            before_anchor
+        );
+        assert!(renderer.pointer_app_mouse_eligible_projected(&terminal, &after, point));
+    }
+
+    #[test]
+    fn transcript_canvas_renderer_reuse_does_not_move_another_tab() {
+        let (mut renderer, mut first, policy) = fixture(false);
+        let (_, mut second, _) = fixture(false);
+        let ctx = egui::Context::default();
+        let mut state_a = ProjectionViewState::new();
+        let mut state_b = ProjectionViewState::new();
+        let mut canvas_a = TranscriptCanvas::default();
+        let mut canvas_b = TranscriptCanvas::default();
+        renderer.canvas_viewport(&mut first, &policy, &mut state_a, &mut canvas_a, &ctx);
+        canvas_a.scroll(47.5, true);
+        let first_view =
+            renderer.canvas_viewport(&mut first, &policy, &mut state_a, &mut canvas_a, &ctx);
+        let translation = renderer.canvas_geometry.translation;
+        let second_view =
+            renderer.canvas_viewport(&mut second, &policy, &mut state_b, &mut canvas_b, &ctx);
+        assert_eq!(second_view.scroll_offset(), 0);
+        assert_eq!(renderer.canvas_geometry.translation, 0.0);
+        let restored =
+            renderer.canvas_viewport(&mut first, &policy, &mut state_a, &mut canvas_a, &ctx);
+        assert_eq!(
+            first_view.view_document_row(0),
+            restored.view_document_row(0)
+        );
+        assert_eq!(renderer.canvas_geometry.translation, translation);
+    }
+
+    #[test]
+    fn transcript_canvas_streaming_does_not_move_a_reading_anchor() {
+        let (mut renderer, mut terminal, policy) = fixture(false);
+        terminal.process_input(b"printf lines\r\n\x1b]133;C\x07");
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        canvas.scroll(87.5, true);
+        let before =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        let translation = renderer.canvas_geometry.translation;
+        let source = (0..before.rows())
+            .find_map(|row| {
+                before
+                    .raw_anchor_at(DisplayPoint::new(row, 0))
+                    .map(|anchor| (row, anchor))
+            })
+            .unwrap();
+        terminal.process_input(b"new one\r\nnew two\r\nnew three\r\n");
+        let after = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(
+            after.raw_anchor_at(DisplayPoint::new(source.0, 0)),
+            Some(source.1)
+        );
+        assert_eq!(renderer.canvas_geometry.translation, translation);
+        assert!(!state.follows_bottom());
+    }
+
+    #[test]
+    fn transcript_canvas_selection_at_live_tail_holds_the_next_output_chunk() {
+        let (mut renderer, mut terminal, policy) = fixture(true);
+        terminal.process_input(b"printf lines\r\n\x1b]133;C\x07");
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let before =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(state.follows_bottom());
+        let source = (0..before.rows())
+            .find_map(|row| {
+                before
+                    .raw_anchor_at(DisplayPoint::new(row, 0))
+                    .map(|anchor| (row, anchor))
+            })
+            .unwrap();
+        canvas.pause_follow();
+        state.pause_canvas_follow();
+        renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(
+            !state.follows_bottom(),
+            "zero offset does not override selection ownership"
+        );
+        terminal.process_input(b"new one\r\nnew two\r\nnew three\r\nnew four\r\nnew five\r\n");
+        let after = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(
+            after.raw_anchor_at(DisplayPoint::new(source.0, 0)),
+            Some(source.1)
+        );
+        assert!(!state.follows_bottom());
+        state.scroll_to_bottom();
+        renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(
+            state.follows_bottom(),
+            "explicit live navigation resumes following"
+        );
     }
 }

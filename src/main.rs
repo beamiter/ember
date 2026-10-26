@@ -55,6 +55,7 @@ mod tab_manager;
 mod terminal;
 mod terminal_ime;
 mod theme;
+mod transcript_canvas;
 mod ui;
 mod vim9_buffer;
 mod vim9_buffer_labels;
@@ -1460,8 +1461,8 @@ fn middle_paste_event_eligible(
         return false;
     };
     let (row, column) = crate::ui::grid_position_from_content(
-        pos,
-        content_rect,
+        renderer.canvas_pointer_position(pos),
+        renderer.canvas_mapping_rect(content_rect),
         renderer.char_width,
         renderer.line_height,
         viewport.columns(),
@@ -1472,8 +1473,8 @@ fn middle_paste_event_eligible(
             .raw_anchor_at(terminal::DisplayPoint::new(row, column))
             .is_some())
         && !pointer_is_block_decoration(
-            pos,
-            content_rect,
+            renderer.canvas_pointer_position(pos),
+            renderer.canvas_mapping_rect(content_rect),
             renderer.char_width,
             renderer.line_height,
             viewport,
@@ -7078,8 +7079,50 @@ impl eframe::App for TerminalApp {
         // ownership decisions for this frame. A wheel event admitted below is
         // intentionally applied on the next frame, so no viewport mutation can
         // split one pointer batch across two projection snapshots.
+        let canvas_scroll = self.config.command_cards_enabled()
+            && mouse_projection_viewport.is_transformed()
+            && session
+                .terminal
+                .lock()
+                .kitty_graphics
+                .get_placements()
+                .is_empty()
+            && active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer)
+                .native_vim9_identity
+                .is_none();
+        if canvas_scroll {
+            if !terminal_pointer_input_blocked
+                && pointer_over_active_terminal
+                && ctx.input(|input| input.pointer.any_pressed())
+            {
+                session.transcript_canvas.stop();
+                let renderer = active_pane_renderer_idx
+                    .and_then(|index| self.pane_renderers.get(index))
+                    .unwrap_or(&self.renderer);
+                let local_history_press = ctx
+                    .input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
+                    && pointer_pos.is_some_and(|point| {
+                        renderer.canvas_history_contains(point)
+                            && (!mouse_enabled
+                                || shift_mouse_bypass
+                                || !renderer.pointer_app_mouse_eligible_projected(
+                                    &session.terminal.lock(),
+                                    &mouse_projection_viewport,
+                                    point,
+                                ))
+                    });
+                if local_history_press {
+                    session.transcript_canvas.pause_follow();
+                    session.projection_view_state.pause_canvas_follow();
+                }
+            }
+            self.smooth_scroll_velocity = 0.0;
+            self.smooth_scroll_pixel_offset = 0.0;
+        }
         let mut viewport_changed_by_smooth_scroll = false;
-        if self.smooth_scroll_velocity.abs() > 0.1 {
+        if !canvas_scroll && self.smooth_scroll_velocity.abs() > 0.1 {
             self.smooth_scroll_velocity *= 0.88;
 
             let line_h = active_pane_renderer_idx
@@ -7223,8 +7266,8 @@ impl eframe::App for TerminalApp {
                         .unwrap_or_else(|| ctx.viewport_rect());
                     if let Some(link) = link_at_pointer(
                         &links,
-                        origin,
-                        content_rect,
+                        renderer.canvas_pointer_position(origin),
+                        renderer.canvas_mapping_rect(content_rect),
                         renderer.char_width,
                         renderer.line_height,
                         &mouse_projection_viewport,
@@ -7253,9 +7296,44 @@ impl eframe::App for TerminalApp {
             && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
             && !alternate_scroll_owns_wheel
         {
-            const SCROLL_VELOCITY_DAMPING: f32 = 0.35;
-            self.smooth_scroll_velocity +=
-                scroll_delta * self.config.scroll_speed as f32 * SCROLL_VELOCITY_DAMPING;
+            if canvas_scroll {
+                let renderer = active_pane_renderer_idx
+                    .and_then(|index| self.pane_renderers.get(index))
+                    .unwrap_or(&self.renderer);
+                for event in &self.frame_events {
+                    if let egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                        ..
+                    } = event
+                    {
+                        if modifiers.ctrl {
+                            continue;
+                        }
+                        let (pixels, precision) = match unit {
+                            egui::MouseWheelUnit::Point => (delta.y, true),
+                            egui::MouseWheelUnit::Line => (
+                                delta.y * renderer.line_height * self.config.scroll_speed as f32,
+                                false,
+                            ),
+                            egui::MouseWheelUnit::Page => (
+                                delta.y
+                                    * renderer.line_height
+                                    * mouse_projection_viewport.visible_rows() as f32,
+                                false,
+                            ),
+                        };
+                        session
+                            .transcript_canvas
+                            .scroll(f64::from(pixels), precision);
+                    }
+                }
+            } else {
+                const SCROLL_VELOCITY_DAMPING: f32 = 0.35;
+                self.smooth_scroll_velocity +=
+                    scroll_delta * self.config.scroll_speed as f32 * SCROLL_VELOCITY_DAMPING;
+            }
             ctx.request_repaint();
         }
 
@@ -7377,11 +7455,16 @@ impl eframe::App for TerminalApp {
             let content_rect = pointer_renderer
                 .last_content_rect
                 .unwrap_or_else(|| ctx.viewport_rect());
-            let (mouse_cols, mouse_rows) = session.terminal.lock().get_dimensions();
+            let (mouse_cols, mouse_rows) = (
+                mouse_projection_viewport.columns(),
+                mouse_projection_viewport.rows(),
+            );
             let display_cell = mouse_cell_for_current_dimensions(
-                pointer_pos.or(Some(content_rect.center())),
+                pointer_pos
+                    .or(Some(content_rect.center()))
+                    .map(|point| pointer_renderer.canvas_pointer_position(point)),
                 None,
-                content_rect,
+                pointer_renderer.canvas_mapping_rect(content_rect),
                 pointer_renderer.char_width,
                 pointer_renderer.line_height,
                 mouse_cols,
@@ -7389,8 +7472,8 @@ impl eframe::App for TerminalApp {
             );
             let application_cell = pointer_pos.and_then(|pointer| {
                 application_cell_at_pointer(
-                    pointer,
-                    content_rect,
+                    pointer_renderer.canvas_pointer_position(pointer),
+                    pointer_renderer.canvas_mapping_rect(content_rect),
                     pointer_renderer.char_width,
                     pointer_renderer.line_height,
                     &mouse_projection_viewport,
@@ -7559,9 +7642,12 @@ impl eframe::App for TerminalApp {
                 let (_, mouse_rows) = terminal.get_dimensions();
                 let projected_pointer_cell = mouse_uses_active_projection.then(|| {
                     pointer_pos.and_then(|pointer| {
+                        let renderer = active_pane_renderer_idx
+                            .and_then(|index| self.pane_renderers.get(index))
+                            .unwrap_or(&self.renderer);
                         application_cell_at_pointer(
-                            pointer,
-                            content_rect,
+                            renderer.canvas_pointer_position(pointer),
+                            renderer.canvas_mapping_rect(content_rect),
                             char_width,
                             line_height,
                             &mouse_projection_viewport,
@@ -7815,8 +7901,8 @@ impl eframe::App for TerminalApp {
                     .and_then(|(renderer, pointer, rect)| {
                         link_at_pointer(
                             &renderer.cached_links,
-                            pointer,
-                            rect,
+                            renderer.canvas_pointer_position(pointer),
+                            renderer.canvas_mapping_rect(rect),
                             renderer.char_width,
                             renderer.line_height,
                             &mouse_projection_viewport,
@@ -7842,8 +7928,8 @@ impl eframe::App for TerminalApp {
                     .and_then(|(pointer, rect)| {
                         link_at_pointer(
                             &self.cached_links,
-                            pointer,
-                            rect,
+                            self.renderer.canvas_pointer_position(pointer),
+                            self.renderer.canvas_mapping_rect(rect),
                             self.renderer.char_width,
                             self.renderer.line_height,
                             &mouse_projection_viewport,

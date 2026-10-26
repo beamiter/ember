@@ -1,5 +1,49 @@
 # Engineering handoff
 
+## 2026-10-26 — continuous Block and Chat transcript canvas
+
+- Each shell session now owns a pixel viewport over the existing projected
+  transcript. Raw touchpad pixels retain their final fractional position;
+  discrete wheel steps and live following use the shared elapsed-time
+  `CanvasMotion` spring. Selection holds the reading anchor through output,
+  explicit live navigation restores following, hidden-tab pauses settle old
+  motion, and settled canvases stop requesting animation frames. System
+  reduced motion keeps the same coordinates without interpolation.
+- One real adjacent row provides subpixel overscan without changing PTY
+  dimensions. GPU glyphs, CPU fallback, cards, selection, metadata controls,
+  links, cursor, IME, scrollbar and pointer mapping use the same transform.
+  Chat's real composer remains fixed with separate history/composer clips in
+  both GPU shader variants and CPU painting. Fractional-only frames reuse the
+  projected cells instead of rebuilding retained output.
+- Short Chat and collapsed Block transcripts start at a stable top origin;
+  spare space follows history. Docked input sources appear exactly once. A
+  running command reserves its metadata row before output, so completion does
+  not push existing text down. Separate completion and prompt PTY reads retain
+  the canvas and fractional reading anchor. Real native-takeover latches,
+  alternate screen, native Vim, and Kitty graphics retain their existing
+  compatibility behavior. There remains one window-owned ASCII companion.
+- Validation: **17 focused canvas tests**, **97 UI tests**, **16 existing Chat
+  terminal tests**, and **11 native Block chrome tests** passed. The focused
+  checks cover precision rest, append/prune/collapse anchors, fixed-capacity
+  history, tab ownership/resume, selection hold, margin-row provenance, dock
+  hit geometry, short streaming and completion, split shell markers, and both
+  WGSL shader variants. `cargo clippy --locked --all-targets -- -D warnings`
+  passed. Cargo used the existing `/tmp/organism-target` cache with debug info
+  and incremental compilation disabled, four jobs, and codegen-units=1;
+  repository profiles are unchanged. See `docs/transcript-canvas.md` for the
+  interaction contract and native verification boundary.
+- Final native acceptance used the actual Ember window, paced shell commands,
+  and X11 wheel events under Xvfb/software rendering. The first short-history
+  output stayed at **143 → 143 px in Chat** and **114 → 114 px in Block** after
+  a second command. Both modes showed **11 distinct painted wheel positions**
+  and stable images after settling. This is functional pixel evidence, not an
+  FPS or physical-GPU/Wayland latency measurement. The tested binary SHA256 is
+  `503c62927a5a473b2ed7fde28cdc5c63f94ef189e9d717cc23e7c764b8fd7c3b`;
+  result JSON, screenshots and GIFs are under
+  `/tmp/canvas-ui-qa/ember-chat-verified` and
+  `/tmp/canvas-ui-qa/ember-block-verified`. `cargo fmt --all -- --check` and
+  `git diff --check` also passed.
+
 ## 2026-10-26 — companion regression fixture CI lint follow-up
 
 - Remote CI job `121571441866` reported

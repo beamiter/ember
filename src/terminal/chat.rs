@@ -22,10 +22,19 @@ impl super::TerminalState {
         if self.chat_native_takeover_sequence.is_some() {
             return true;
         }
-        if !matches!(
-            self.chat_surface(),
-            ChatSurface::Prompt | ChatSurface::Running
-        ) || self.is_mouse_enabled()
+        // OSC D and the following prompt's A/B commonly arrive in separate
+        // PTY reads. A known completed shell turn retains its transcript in
+        // that gap; displaying the native grid for one frame would flash the
+        // whole canvas and discard its fractional reading position. A real
+        // native takeover remains latched until the following prompt.
+        let surface = self.chat_surface();
+        let completed_shell_turn = surface == ChatSurface::Passthrough
+            && self
+                .command_records
+                .back()
+                .is_some_and(|record| record.complete && record.start_mark_seen);
+        if (!matches!(surface, ChatSurface::Prompt | ChatSurface::Running) && !completed_shell_turn)
+            || self.is_mouse_enabled()
             || !self.kitty_graphics.get_placements().is_empty()
         {
             return true;
@@ -330,6 +339,23 @@ impl super::TerminalState {
                     .filter(|document| *document < plan.document_rows())
             })
             .collect();
+        if materialized.top_padding > 0 {
+            // Short conversations, including collapsed Block histories, grow
+            // down from one stable canvas origin. Unused space belongs after
+            // history (before Chat's fixed composer), never above the first
+            // command. Rotate only structural padding; real PTY cells and
+            // their provenance remain unchanged.
+            let padding = materialized.top_padding;
+            materialized.cells.rotate_left(padding);
+            materialized.row_wrapped.rotate_left(padding);
+            materialized.row_kinds.rotate_left(padding);
+            materialized.row_sources.rotate_left(padding);
+            documents.rotate_left(padding);
+            for origin in &mut materialized.origins {
+                origin.display_start.row -= padding;
+            }
+            materialized.top_padding = 0;
+        }
         let mut composer = None;
         if let Some(dock_start) = plan.chat_dock_start {
             let dock_rows = plan.document_rows().saturating_sub(dock_start);
@@ -338,9 +364,24 @@ impl super::TerminalState {
             if dock_rows > 0 && dock_rows < viewport_rows {
                 let target_start = viewport_rows - dock_rows;
                 let dock = self.materialize_projection_plan(plan, dock_start, dock_rows);
-                materialized
-                    .origins
-                    .retain(|span| span.display_start.row < target_start);
+                // A top-aligned short document contains the input's original
+                // source rows before the dock. Remove those display copies
+                // before placing the same sources at the fixed bottom edge.
+                // Neither copy/search nor pointer provenance may see an input
+                // row twice.
+                for (row, document) in documents.iter_mut().enumerate().take(target_start) {
+                    if document.is_some_and(|document| document >= dock_start) {
+                        materialized.cells[row].fill(TerminalCell::default());
+                        materialized.row_wrapped[row] = false;
+                        materialized.row_kinds[row] = ProjectedRowKind::Padding;
+                        materialized.row_sources[row] = None;
+                        *document = None;
+                    }
+                }
+                materialized.origins.retain(|span| {
+                    span.display_start.row < target_start
+                        && documents[span.display_start.row].is_some()
+                });
                 for mut origin in dock.origins {
                     origin.display_start.row += target_start;
                     materialized.origins.push(origin);
@@ -403,7 +444,7 @@ impl super::TerminalState {
             plan.effective_collapsed.clone(),
         );
         if !plan.chat_mode {
-            return viewport;
+            return viewport.with_document_rows(documents);
         }
         let mut commands = Vec::new();
         for command in &plan.chat_commands {

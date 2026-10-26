@@ -1,5 +1,9 @@
 # Chat mode
 
+Block and Chat now share a session-owned, continuous pixel canvas. Precision
+scrolling, animated wheel movement, fixed composer geometry, and anchored
+streaming updates are described in [Continuous transcript canvas](transcript-canvas.md).
+
 Chat is an opt-in terminal presentation alongside Normal and Block. It uses the
 same shell session and raw terminal cells. It does not add an AI conversation or
 a separate command executor.

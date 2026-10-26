@@ -36,6 +36,7 @@ pub mod sidebar;
 pub mod tab_manager;
 pub mod terminal;
 pub mod theme;
+pub mod transcript_canvas;
 pub mod ui;
 mod vim9_buffer;
 pub mod watch_adapter;

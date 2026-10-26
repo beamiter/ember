@@ -7,6 +7,9 @@ struct Uniforms {
     atlas_height: f32,
     render_phase: f32,
     scroll_pixel_offset: f32,
+    fixed_start_row: f32,
+    fixed_pixel_offset: f32,
+    canvas_pad: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -25,6 +28,8 @@ struct VertexOutput {
     @location(5) cell_local_pos: vec2<f32>,
     @location(6) @interpolate(flat) glyph_offset: vec2<f32>,
     @location(7) cell_px_pos: vec2<f32>,
+    @location(8) canvas_y: f32,
+    @location(9) @interpolate(flat) fixed_row: u32,
 };
 
 @vertex
@@ -82,7 +87,9 @@ fn vs_main(
 
     // Cell position in physical pixels relative to viewport origin (with smooth scroll offset)
     let px = f32(col_row.x) * u.cell_width + px_in_cell.x + snap.x;
-    let py = f32(col_row.y) * u.cell_height + px_in_cell.y - u.scroll_pixel_offset + snap.y;
+    let fixed = u.fixed_start_row >= 0.0 && f32(col_row.y) >= u.fixed_start_row;
+    let offset = select(u.scroll_pixel_offset, u.fixed_pixel_offset, fixed);
+    let py = f32(col_row.y) * u.cell_height + px_in_cell.y - offset + snap.y;
 
     // Convert to NDC (viewport is set to content_rect by egui-wgpu)
     let ndc_x = (px / u.viewport_width) * 2.0 - 1.0;
@@ -98,6 +105,8 @@ fn vs_main(
     out.cell_local_pos = px_in_cell / vec2<f32>(cell_w, u.cell_height);
     out.glyph_offset = glyph_offset;
     out.cell_px_pos = px_in_cell;
+    out.canvas_y = py;
+    out.fixed_row = select(0u, 1u, fixed);
 
     return out;
 }
@@ -260,12 +269,21 @@ fn compute_fragment_color(in: VertexOutput, linear_target: bool) -> vec4<f32> {
 
 @fragment
 fn fs_main_gamma(in: VertexOutput) -> @location(0) vec4<f32> {
+    canvas_clip(in);
     return compute_fragment_color(in, false);
 }
 
 @fragment
 fn fs_main_linear(in: VertexOutput) -> @location(0) vec4<f32> {
+    canvas_clip(in);
     let result_gamma = compute_fragment_color(in, true);
     let result_linear_rgb = linear_from_gamma_rgb(result_gamma.rgb);
     return vec4<f32>(result_linear_rgb, result_gamma.a);
+}
+
+fn canvas_clip(in: VertexOutput) {
+    if u.fixed_start_row >= 0.0 {
+        let dock_top = u.fixed_start_row * u.cell_height - u.fixed_pixel_offset;
+        if (in.fixed_row == 0u && in.canvas_y >= dock_top) || (in.fixed_row == 1u && in.canvas_y < dock_top) { discard; }
+    }
 }

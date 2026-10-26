@@ -5120,7 +5120,12 @@ impl super::TerminalState {
         candidates.retain(|(anchor, _)| !shared.contains(&anchor.row_id));
         let headers = candidates
             .iter()
-            .filter(|(_, record)| record.complete && policy.block_headers())
+            // Reserve the metadata lane as soon as output starts. Inserting
+            // it only on completion moves every existing result line down a
+            // row, which breaks the continuous canvas's writing origin.
+            .filter(|(_, record)| {
+                policy.block_headers() && (record.complete || record.state == CommandState::Running)
+            })
             .map(|(anchor, record)| (*anchor, record.sequence))
             .collect();
         let status = candidates
@@ -5726,8 +5731,8 @@ impl super::TerminalState {
             return self.projected_viewport(projection, true);
         };
         self.enter_transformed_selection_space(&plan);
-        let viewport_rows = self.grid.rows();
-        let max_offset = plan.document_rows().saturating_sub(viewport_rows);
+        let visible_rows = self.grid.rows();
+        let max_offset = plan.document_rows().saturating_sub(visible_rows);
         if view_state.last_plan_key.as_ref() != Some(&plan_key) {
             if view_state.follow_bottom {
                 view_state.offset_from_bottom = 0;
@@ -5745,6 +5750,8 @@ impl super::TerminalState {
                 view_state.offset_from_bottom = view_state.offset_from_bottom.min(max_offset);
             }
         }
+        let margin = view_state.canvas_margin && view_state.offset_from_bottom > 0;
+        let viewport_rows = visible_rows + usize::from(margin);
         let document_start = max_offset.saturating_sub(view_state.offset_from_bottom);
         let cursor_row_id = self.grid.row_id(self.cursor_row.min(self.grid.rows() - 1));
         let viewport_key = TransformedViewportCacheKey {
@@ -5758,13 +5765,15 @@ impl super::TerminalState {
         };
         let viewport = match &self.transformed_viewport_cache {
             Some((cached_key, viewport)) if *cached_key == viewport_key => viewport.clone(),
-            _ => self.materialize_chat_or_block_viewport(
-                &plan,
-                document_start,
-                viewport_rows,
-                cursor_row_id,
-                view_state.offset_from_bottom,
-            ),
+            _ => self
+                .materialize_chat_or_block_viewport(
+                    &plan,
+                    document_start,
+                    viewport_rows,
+                    cursor_row_id,
+                    view_state.offset_from_bottom,
+                )
+                .with_canvas_margin(margin),
         };
         if self
             .transformed_viewport_cache
@@ -5774,7 +5783,11 @@ impl super::TerminalState {
             self.transformed_viewport_cache = Some((viewport_key, viewport.clone()));
         }
         view_state.offset_from_bottom = viewport.scroll_offset();
-        view_state.follow_bottom = view_state.offset_from_bottom == 0;
+        // Pixel follow can temporarily stand above the tail while retaining
+        // ownership of live output. The canvas caller preserves that intent.
+        if !view_state.canvas_managed {
+            view_state.follow_bottom = view_state.offset_from_bottom == 0;
+        }
         view_state.top_anchor = (!view_state.follow_bottom)
             .then(|| self.projected_top_anchor(&viewport))
             .flatten();

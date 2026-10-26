@@ -127,10 +127,12 @@ fn compute_fragment_dual(in: VertexOutput, linear_target: bool) -> DualSourceOut
 
 @fragment
 fn fs_fg_dual_gamma(in: VertexOutput) -> DualSourceOutput {
+    canvas_clip(in);
     return compute_fragment_dual(in, false);
 }
 
 @fragment
 fn fs_fg_dual_linear(in: VertexOutput) -> DualSourceOutput {
+    canvas_clip(in);
     return compute_fragment_dual(in, true);
 }

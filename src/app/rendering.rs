@@ -2736,10 +2736,12 @@ impl TerminalApp {
                         .shell
                         .foreground_pgid()
                         .map(|foreground| (session.shell.get_child_pid(), foreground));
-                    let viewport = renderer.projected_viewport_with_state(
+                    let viewport = renderer.canvas_viewport(
                         &mut terminal_guard,
                         projection_policy,
                         projection_view_state,
+                        &mut session.transcript_canvas,
+                        ctx,
                     );
                     renderer.set_projection_frame(
                         &terminal_guard,
@@ -3006,10 +3008,12 @@ impl TerminalApp {
                 let projection_view_state = &mut session.projection_view_state;
 
                 // 获取链接列表用于渲染（使用缓存）
-                let viewport = self.renderer.projected_viewport_with_state(
+                let viewport = self.renderer.canvas_viewport(
                     &mut terminal_guard,
                     projection_policy,
                     projection_view_state,
+                    &mut session.transcript_canvas,
+                    ctx,
                 );
                 self.renderer.set_projection_frame(
                     &terminal_guard,

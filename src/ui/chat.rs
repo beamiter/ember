@@ -72,6 +72,41 @@ fn row_rect(content: egui::Rect, rows: std::ops::Range<usize>, line_height: f32)
 }
 
 impl TerminalRenderer {
+    fn canvas_chat_row_rect(
+        &self,
+        content: egui::Rect,
+        rows: std::ops::Range<usize>,
+    ) -> egui::Rect {
+        let row = rows.start;
+        let extended = egui::Rect::from_min_max(
+            content.min,
+            content.max
+                + egui::vec2(
+                    0.0,
+                    if self.canvas_geometry.margin {
+                        self.line_height
+                    } else {
+                        0.0
+                    },
+                ),
+        );
+        let rect = row_rect(extended, rows, self.line_height).translate(egui::vec2(
+            0.0,
+            -self.canvas_geometry.row_offset(row, self.line_height),
+        ));
+        let mut clip = content;
+        if let Some(start) = self.canvas_geometry.composer_start {
+            let top = content.top() + start as f32 * self.line_height
+                - self.canvas_geometry.row_offset(start, self.line_height);
+            if row < start {
+                clip.max.y = clip.max.y.min(top);
+            } else {
+                clip.min.y = clip.min.y.max(top);
+            }
+        }
+        rect.intersect(clip)
+    }
+
     fn chat_cards(
         &self,
         terminal: &TerminalState,
@@ -86,7 +121,7 @@ impl TerminalRenderer {
         if entry.live {
             if let Some(rows) = viewport.chat_composer_rows() {
                 cards.push(ChatCard {
-                    rect: row_rect(content, rows, self.line_height),
+                    rect: self.canvas_chat_row_rect(content, rows),
                     command: false,
                     composer: true,
                     top_closed: true,
@@ -106,7 +141,7 @@ impl TerminalRenderer {
         let mut result_start =
             entry.span.first_row + usize::from(entry.metadata_row == Some(entry.span.first_row));
         if let Some(command) = command {
-            let mut rect = row_rect(content, command.rows.clone(), self.line_height);
+            let mut rect = self.canvas_chat_row_rect(content, command.rows.clone());
             rect.min.x = (content.left() + command.column as f32 * self.char_width
                 - self.char_width * 0.8)
                 .max(content.left());
@@ -118,7 +153,9 @@ impl TerminalRenderer {
                 rect,
                 command: true,
                 composer: false,
-                top_closed: entry.span.starts_in_viewport,
+                top_closed: entry.span.starts_in_viewport
+                    && command.rows.start as f32 * self.line_height
+                        >= self.canvas_geometry.translation,
                 // A clipped command must not acquire a tail at the dock boundary.
                 bottom_closed: chat_history_edge_closed(
                     command.rows.end,
@@ -141,14 +178,11 @@ impl TerminalRenderer {
         }
         if result_start <= entry.span.last_row {
             cards.push(ChatCard {
-                rect: row_rect(
-                    content,
-                    result_start..entry.span.last_row + 1,
-                    self.line_height,
-                ),
+                rect: self.canvas_chat_row_rect(content, result_start..entry.span.last_row + 1),
                 command: false,
                 composer: false,
-                top_closed: command.is_some() || entry.span.starts_in_viewport,
+                top_closed: (command.is_some() || entry.span.starts_in_viewport)
+                    && result_start as f32 * self.line_height >= self.canvas_geometry.translation,
                 // Be conservative where the dock skips offscreen history.
                 bottom_closed: entry.span.ends_in_viewport && entry.span.last_row + 1 < history_end,
             });
@@ -273,7 +307,8 @@ impl TerminalRenderer {
                     entry.start_mark_seen,
                     entry.completion_provenance,
                 ) {
-                    let rect = row_rect(content, row..row + 1, self.line_height)
+                    let rect = self
+                        .canvas_chat_row_rect(content, row..row + 1)
                         .shrink2(egui::vec2(6.0, 0.0));
                     painter.with_clip_rect(rect).text(
                         rect.right_center(),
@@ -316,8 +351,9 @@ impl TerminalRenderer {
             ) {
                 return false;
             }
-            let footer =
-                row_rect(content, row..row + 1, self.line_height).shrink2(egui::vec2(8.0, 1.0));
+            let footer = self
+                .canvas_chat_row_rect(content, row..row + 1)
+                .shrink2(egui::vec2(8.0, 1.0));
             let button_width = (self.font_size * 4.4).min(footer.width());
             let button = egui::Rect::from_min_max(
                 egui::pos2(footer.right() - button_width, footer.top()),
@@ -348,7 +384,7 @@ impl TerminalRenderer {
             viewport.chat_command_spans().iter().find(|command| command.sequence == record.sequence)
                 .filter(|command| matches!(viewport.row_kind(command.rows.end), Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. })))
                 .map(|command| {
-                    let row = row_rect(content, command.rows.end..command.rows.end + 1, self.line_height).shrink2(egui::vec2(4.0, 1.0));
+                    let row = self.canvas_chat_row_rect(content, command.rows.end..command.rows.end + 1).shrink2(egui::vec2(4.0, 1.0));
                     let label_width = ui.painter().layout_no_wrap("Interrupt".into(), FontId::proportional(self.font_size), self.theme.terminal_foreground()).size().x + 12.0;
                     let button = egui::Rect::from_min_size(row.min, egui::vec2((self.font_size * 6.0).max(label_width).min(row.width()), row.height()));
                     (ChatInputAction::Interrupt { sequence: record.sequence }, button, "Interrupt", "Send Ctrl+C to this terminal. Status changes only when the shell reports completion.")

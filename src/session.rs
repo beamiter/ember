@@ -145,6 +145,7 @@ pub struct Session {
     /// must never carry collapse state or projected scroll between sessions.
     pub projection_policy: ProjectionPolicy,
     pub projection_view_state: ProjectionViewState,
+    pub transcript_canvas: crate::transcript_canvas::TranscriptCanvas,
     /// Last policy/provenance generations whose requested collapses were
     /// checked for permanent eviction. Rendering can then keep the P1
     /// fail-closed cleanup off the steady-state frame path.
@@ -272,6 +273,7 @@ impl Session {
             pending_output: crate::output_batch::OutputBuffer::default(),
             projection_policy: ProjectionPolicy::new(),
             projection_view_state: ProjectionViewState::new(),
+            transcript_canvas: crate::transcript_canvas::TranscriptCanvas::default(),
             collapse_availability_cache: None,
             last_bell_toast: None,
         }
