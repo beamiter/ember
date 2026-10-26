@@ -1,5 +1,50 @@
 # Engineering handoff
 
+## 2026-10-26 — one window, one ASCII companion
+
+- Removed the permanent Block companion status card, its second sprite, and
+  all frontend companion document-row reservations. The one window-owned
+  `OrganismHost` uses `CompanionSurface::choose` to paint a full body, a compact
+  glyph, or nothing in the active pane's proven empty region. Normal mode
+  retains one shared footer. Static uses the same resting body; unavailable
+  owners no longer produce a passive replacement. Split/tab changes retain
+  life, ambient mind, temperament, and story position while retiring stale
+  command and pointer evidence. Hover inspection belongs to the sole body.
+- Added local Hello / Company / Story / Rest conversations to the command
+  palette and custom bindings. The personality seed comes from the configured
+  path, with a stable fallback, so restart does not randomly change its voice.
+  Palette actions retain the original session and revalidate it on dispatch.
+  Replies preserve running/failure/unknown outcomes and never write to the
+  shell, invoke an agent, or contact a model. Life and story progress remain
+  window-local and volatile; cross-process roaming is not implemented here.
+- Optional gentle care is disabled by default and persists the choice in
+  `ascii_organism_care_enabled`. Toggle/snooze palette commands use one shared
+  care clock, not one per pane. The existing heartbeat observes foreground
+  local use with recent accepted human input. A prompt needs the current
+  pass's actually painted owner, quiet known-idle context, and no selection,
+  IME, drag/held pointer, keys, alternate screen, app mouse ownership, or
+  protected reaction. Static motion does not disable explicitly enabled text
+  care. Rest clears accumulated time and allows 20 quiet minutes; snooze only
+  defers it. No new worker, timer, service, or memory format was introduced.
+- Validation: `cargo test --locked --bin ember organism_ui:: -- --test-threads=1`
+  passed **132 tests, 0 failed, 1 ignored**. Nine new tests cover actual egui
+  body counts across Normal/Block/Chat and Full/Calm/Static, real two-pane
+  `TerminalRenderer` focus handoffs without companion document rows, compact
+  fit, voice continuity, persisted opt-in care, stale admission, and current
+  paint/input care gates. The ignored portal test requires the dedicated
+  D-Bus native-motion runner and was not run in this session.
+- `cargo check --locked --all-targets`, `cargo fmt --all -- --check`, and
+  `git diff --check` passed. Cargo used debug information disabled, incremental
+  compilation disabled, four build jobs, and command-line codegen-units=1
+  after the existing compiler's empty-object archive issue appeared in an
+  initial default-profile build; repository profiles are unchanged. The
+  actual two-split egui mesh export was rendered and visually inspected: one
+  body in the active right pane, none in the left, and no duplicate status
+  card. This is CPU draw verification with synthetic PTY facts, not a live
+  desktop, physical-GPU, or Wayland smoke result.
+- The bundled shared core was synchronized to published
+  `90eec597ab93450f7d5ef7a2d8ae392552c59c84` by the release coordinator.
+
 ## 2026-10-26 — native pointer and guides on wrapped rows (shared core)
 
 - The bundled core keeps `native_pointer` in wrapped splits, so clicks and

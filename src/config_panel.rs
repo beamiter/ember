@@ -797,16 +797,16 @@ impl ConfigPanel {
                 });
         });
         organism_changed |= ui
-            .checkbox(&mut self.edit_organism_expanded, "Expanded companion card")
+            .checkbox(&mut self.edit_organism_expanded, "Full companion body")
             .changed();
-        ui.small("In Block mode, a low status card sits above the current input block, with a separate live body in proven empty space. Collapse the status card for a compact row.");
-        ui.label("Local terminal chrome; command cards optional. Memory is volatile.");
+        ui.small("One companion lives in this window and follows the active pane. Block and Chat place it in proven empty space; turn off Full companion body for a compact appearance.");
+        ui.label("The same companion keeps its mood and personality when you switch panes.");
         ui.label(organism_motion_explanation(self.edit_organism_motion));
         ui.label(
             "The live organism pauses while Settings or terminal-input overlays are open. Preview is independent.",
         );
         ui.label("In Full or Calm, hover over the live body briefly to say hello. It holds still during a visit; typing hides it briefly.");
-        ui.label("Changes apply now; Save persists them.");
+        ui.label("Use the command palette for hello, company, stories, or a break. Gentle break reminders are optional, start disabled, and remember your choice. Changes apply now; Save persists them.");
         if organism_changed {
             self.has_changes = true;
             actions.push(ConfigAction::OrganismChanged(

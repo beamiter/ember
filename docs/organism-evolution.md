@@ -4,6 +4,28 @@ The ASCII companion uses the shared, deterministic organism model. All changes
 below consume existing authoritative command events or presentation facts; none
 inspect output contents, invoke an LLM, write terminal input, or create a worker.
 
+## One companion per GUI
+
+`OrganismHost` is owned once by `TerminalApp`, outside the split renderers.
+`WindowLife`, `AmbientMind`, `CompanionVoice`, and optional `CompanionCare` live
+there. Pane changes revoke old attention tickets and command identities, while
+preserving the window's life, ambient mind, temperament, and story cursor.
+
+`CompanionSurface::choose` selects Body, Compact, or Hidden. In Block/Chat there
+is no permanent status-card sprite and no companion projection rows: only the
+same-frame active-pane region can paint the body. Static uses this same surface
+at frame zero. A narrow safe region can hold one compact glyph. Normal mode
+uses the shared footer; unavailable owners no longer create a passive duplicate.
+Inspection presents text about the body, including its latest reply.
+
+The command palette binds Hello, Company, Story, Rest, Care Toggle and Care Snooze
+to the session recorded when it opens. Admission revalidates that session after
+the palette closes, so a stale action cannot migrate to another pane. Replies
+are local authored text and preserve command/agent outcome state. The optional
+care clock starts disabled (the preference is saved), uses the existing heartbeat, counts only foreground
+local human activity, and waits for a quiet moment. It has no worker, new timer,
+network service, or shell authority.
+
 ## Work continues between reactions
 
 The ambient mind now receives `NativeOrganism::repo_vigil()`. A failed build or
@@ -38,8 +60,8 @@ presentation priority. Dormant owners retain their slower existing cadence.
 The body measures one fixed three-row, twelve-column envelope, then lays out only
 the final sprite. This removes the previous extra layout of the unmodified base
 pose. A future sprite outside that envelope fails closed. A missing or unfitting
-body contributes no animation wake; the visible status card retains its own
-existing scheduling policy.
+body contributes no animation wake; the window keeps its existing host
+scheduling policy without a second status body.
 
 Shared weighted animation clips supply breathing, blinking, grooming, greeting,
 walking and celebration poses through the existing sprite API. Full uses 100 ms
@@ -47,17 +69,21 @@ ticks; Calm and Static use frame zero. No independent animation clock is added.
 
 Settled work poses retain the theme's semantic color with softer borders than
 immediate reactions. Compact readouts name the actual behavior. Hover inspection
-on the status card explains the final context and describes the simulated
+on the sole body explains the final context and describes the simulated
 creature qualitatively, without command text, paths, percentages or assessments
 of the user. Inspection creates no greeting and does not modify life state.
 
-Live body and card/footer colors preserve the shared reaction's tone. A quiet
+Live body and footer colors preserve the shared reaction's tone. A quiet
 acknowledgment after a long ordinary command or repeated clean builds can keep
 its small celebration pose without turning into a bright success color. That
 tone applies only to the matching, unexpired, non-running live reaction; new
 work, greetings, ambient poses and previews retain their own color semantics.
 
 ## Verification scope
+
+`src/organism_ui/single_companion_tests.rs` checks actual egui submissions across
+Normal/Block/Chat and Full/Calm/Static, split handoff, compact fit, conversation
+admission, and one optional care clock.
 
 `src/organism_ui/evolution_tests.rs` exercises real parser lifecycle markers,
 failure/recovery/push continuity, unknown outcomes, context boundaries, CPU paint

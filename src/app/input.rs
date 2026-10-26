@@ -1699,6 +1699,37 @@ impl TerminalApp {
                     .map(|session| session.metadata.session_id.clone());
                 self.say_hello_to_organism(ctx, target.as_deref());
             }
+            keybindings::Command::OrganismCompany
+            | keybindings::Command::OrganismStory
+            | keybindings::Command::OrganismRest => {
+                let target = self
+                    .session_manager
+                    .sessions()
+                    .get(self.session_manager.active_index())
+                    .map(|session| session.metadata.session_id.clone());
+                let intent = match command {
+                    keybindings::Command::OrganismStory => {
+                        jterm_core::organism_companion::CompanionIntent::Story
+                    }
+                    keybindings::Command::OrganismRest => {
+                        jterm_core::organism_companion::CompanionIntent::Rest
+                    }
+                    _ => jterm_core::organism_companion::CompanionIntent::Company,
+                };
+                self.talk_to_organism(ctx, target.as_deref(), intent);
+            }
+            keybindings::Command::OrganismCareToggle | keybindings::Command::OrganismCareSnooze => {
+                let target = self
+                    .session_manager
+                    .sessions()
+                    .get(self.session_manager.active_index())
+                    .map(|session| session.metadata.session_id.clone());
+                self.configure_organism_care(
+                    ctx,
+                    target.as_deref(),
+                    command == keybindings::Command::OrganismCareSnooze,
+                );
+            }
             keybindings::Command::HelpToggle => {
                 self.help_panel.toggle();
                 self.set_status(if self.help_panel.is_open {
@@ -1790,6 +1821,41 @@ impl TerminalApp {
                 ctx.memory_mut(|memory| memory.surrender_focus(id));
             }
             self.say_hello_to_organism(ctx, hello_target.as_deref());
+            return false;
+        }
+        if matches!(
+            command,
+            keybindings::Command::OrganismCompany
+                | keybindings::Command::OrganismStory
+                | keybindings::Command::OrganismRest
+        ) {
+            if let Some(id) = query_id {
+                ctx.memory_mut(|memory| memory.surrender_focus(id));
+            }
+            let intent = match command {
+                keybindings::Command::OrganismStory => {
+                    jterm_core::organism_companion::CompanionIntent::Story
+                }
+                keybindings::Command::OrganismRest => {
+                    jterm_core::organism_companion::CompanionIntent::Rest
+                }
+                _ => jterm_core::organism_companion::CompanionIntent::Company,
+            };
+            self.talk_to_organism(ctx, hello_target.as_deref(), intent);
+            return false;
+        }
+        if matches!(
+            command,
+            keybindings::Command::OrganismCareToggle | keybindings::Command::OrganismCareSnooze
+        ) {
+            if let Some(id) = query_id {
+                ctx.memory_mut(|memory| memory.surrender_focus(id));
+            }
+            self.configure_organism_care(
+                ctx,
+                hello_target.as_deref(),
+                command == keybindings::Command::OrganismCareSnooze,
+            );
             return false;
         }
         self.dispatch_command(ctx, command)

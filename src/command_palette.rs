@@ -691,6 +691,36 @@ impl CommandPalette {
                 "Greet the local companion in Full or Calm mode; shared 8-second cooldown",
                 crate::keybindings::Command::OrganismHello,
             ),
+            CommandInfo::new(
+                "ASCII Organism: Keep me company",
+                CommandCategory::Window,
+                "A few words from your window's companion",
+                crate::keybindings::Command::OrganismCompany,
+            ),
+            CommandInfo::new(
+                "ASCII Organism: Tell me a story",
+                CommandCategory::Window,
+                "A short local story; the same companion remembers the next one",
+                crate::keybindings::Command::OrganismStory,
+            ),
+            CommandInfo::new(
+                "ASCII Organism: Take a break together",
+                CommandCategory::Window,
+                "A gentle invitation to rest, stretch, or drink some water",
+                crate::keybindings::Command::OrganismRest,
+            ),
+            CommandInfo::new(
+                "ASCII Organism: Toggle gentle break reminders",
+                CommandCategory::Window,
+                "Optional reminders after 45 minutes of active use; off by default, your choice is saved",
+                crate::keybindings::Command::OrganismCareToggle,
+            ),
+            CommandInfo::new(
+                "ASCII Organism: Snooze break reminders",
+                CommandCategory::Window,
+                "Give me another 20 minutes before a gentle reminder",
+                crate::keybindings::Command::OrganismCareSnooze,
+            ),
             // === 配置 ===
             CommandInfo::new(
                 "Open Settings",
@@ -1564,6 +1594,11 @@ mod tests {
             Command::HistoryPickerToggle,
             Command::WorkflowPickerToggle,
             Command::OrganismHello,
+            Command::OrganismCompany,
+            Command::OrganismStory,
+            Command::OrganismRest,
+            Command::OrganismCareToggle,
+            Command::OrganismCareSnooze,
             Command::TerminalSendSigint,
             Command::TerminalSendEof,
             Command::TerminalClear,

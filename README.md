@@ -147,24 +147,44 @@ full blank terminal row between commands. Metadata rows have no terminal copy, s
 application mouse origin.
 
 ASCII Organism is enabled by default; set `ascii_organism_enabled = false` to
-disable it. Its compact status card appears between history
-and the current input block, rather than duplicating the bottom companion strip.
-The separate live body uses only fully visible, proven empty space in the active
-card. Its font follows terminal scaling; its rounded border, subdued background
-and hover border match the Anvil/Forge native presentation. Typing, selection,
-composition, images, unsafe clipping and application mouse ownership hide the
-body instead of allowing it to cover text.
+disable it. One companion belongs to the window. Switching tabs or split panes
+moves that same companion and keeps its mood, personality, and story sequence.
+Block and Chat use only fully visible, proven empty space in the active card;
+the old permanent status card and its document rows are gone. Normal mode uses
+one shared bottom surface. Background panes and unavailable owners never paint
+a substitute body. Hover the body for its current state and latest reply.
 
-Full motion uses the reference's restrained 80-second edge-to-edge wander cycle;
-hovering holds its position. Calm retains a still body. Static keeps only the
-status card and disables the live body, hover greetings and periodic animation.
-The shared organism model remains the source of poses, body language, reactions
-and attention. Memory stays volatile.
-Full motion also uses the shared breathing, blinking, grooming, greeting and
-celebration choreography. Native pose transitions begin from a body actually
-painted on the same surface; typing, source changes and reduced motion retire
-that transition. The three-row, twelve-column body envelope stays fixed, and
-an unfitting body does not schedule its own animation wake.
+Its font follows terminal scaling. Full motion uses a restrained 80-second
+edge-to-edge wander cycle; hovering holds its position. Calm retains a still
+body, and Static keeps the same resting body without greetings or periodic
+animation. When a full body cannot fit, it becomes one compact glyph if that
+fits safely. `ascii_organism_expanded = false` also selects this compact form.
+Typing, selection, composition, images, unsafe clipping and application mouse
+ownership hide the body so it cannot cover terminal text.
+
+The shared organism model supplies breathing, blinking, grooming, greeting,
+celebration, body language, and attention. Native pose transitions begin from
+an actually painted body; typing, source changes, and reduced motion retire
+stale geometry. Window life and ambient personality continue across pane
+handoffs. The voice temperament is stable for the configuration location; life
+state and the story cursor remain volatile and window-local.
+
+Use the command palette's **ASCII Organism** actions to say hello, ask for
+company or a short story, or take a break together. These are authored offline
+replies in one of four temperaments, with three rotating stories per temperament.
+Replies appear in the status area and body inspection. They do not write to the
+shell or act on an agent. `organism:company`, `organism:story`, and
+`organism:rest` can also be assigned custom keybindings.
+
+Gentle break reminders are optional and disabled by default. Their setting
+`ascii_organism_care_enabled` survives a restart. Toggle them from the command
+palette (`organism:care_toggle`) and snooze them for
+20 minutes (`organism:care_snooze`). The shared window clock counts only focused
+local use with recent human input. After 45 minutes it can offer a brief water,
+stretch, or look-away invitation during a quiet, available moment. Typing,
+protected work, selections, background panes, and modal UI do not admit an
+invitation. Static motion does not disable an explicitly enabled text reminder. A five-minute break resets the accumulated time; opening more splits
+does not multiply reminders.
 
 Unresolved build/test failures now remain visible as a quiet vigil after the
 short error reaction. Repeated failures lower the posture, a successful rebuild
@@ -173,7 +193,7 @@ loop. An unknown command outcome cannot resolve a failure. These work facts
 belong to the observed owner and working directory; changing either resets them.
 Changed prompt directory metadata also retires an old vigil after `cd`, before
 another command starts.
-Hover the compact or expanded status card to inspect the current behavior and
+Hover the single compact or full body to inspect the current behavior and
 the creature's qualitative state. Inspection does not spend a greeting or change
 its state. Compact chrome now names the current behavior even when space is too
 narrow for a complete explanation.

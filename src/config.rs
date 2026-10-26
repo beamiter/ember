@@ -133,9 +133,13 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub ascii_organism_enabled: bool,
 
-    /// Show the full companion card unless explicitly collapsed.
+    /// Show the full companion body unless explicitly collapsed.
     #[serde(default = "default_true")]
     pub ascii_organism_expanded: bool,
+
+    /// Optional gentle reminders; the user's choice survives a restart.
+    #[serde(default)]
+    pub ascii_organism_care_enabled: bool,
 
     /// Missing means Automatic. Until a platform animation-preference adapter
     /// exists, Automatic resolves to Calm rather than claiming desktop parity.
@@ -655,6 +659,7 @@ impl Default for Config {
             vim9: jterm_core::vim9::Vim9UiConfig::default(),
             ascii_organism_enabled: true,
             ascii_organism_expanded: true,
+            ascii_organism_care_enabled: false,
             ascii_organism_motion: None,
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,

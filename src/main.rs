@@ -1370,7 +1370,7 @@ fn projected_viewport_for_session(
         .set_block_spacing(renderer.block_spacer_rows());
     session
         .projection_policy
-        .set_block_chrome(renderer.block_mode, renderer.companion_status_rows());
+        .set_block_chrome(renderer.block_mode, 0);
     session.projection_policy.set_chat_mode(renderer.chat_mode);
     let policy = &session.projection_policy;
     let view_state = &mut session.projection_view_state;

@@ -1002,50 +1002,6 @@ fn block_header_actions(
     Some((collapse.translate(egui::vec2(-width - 2.0, 0.0)), collapse))
 }
 
-fn companion_status_region(
-    viewport: &ProjectedViewport,
-    content: egui::Rect,
-    line_height: f32,
-) -> Option<egui::Rect> {
-    if !content.is_finite() || !line_height.is_finite() || line_height <= 0.0 {
-        return None;
-    }
-    let (start, before, total) =
-        viewport
-            .row_kinds()
-            .iter()
-            .enumerate()
-            .find_map(|(row, kind)| match *kind {
-                crate::terminal::ProjectedRowKind::CompanionStatus {
-                    before,
-                    index: 0,
-                    total,
-                } => Some((row, before, total)),
-                _ => None,
-            })?;
-    if total == 0 || start.checked_add(total)? > viewport.rows() {
-        return None;
-    }
-    for index in 0..total {
-        if viewport.row_kind(start + index)
-            != Some(crate::terminal::ProjectedRowKind::CompanionStatus {
-                before,
-                index,
-                total,
-            })
-        {
-            return None;
-        }
-    }
-    let (top, _) = snapped_span(content.top(), start, line_height);
-    let (bottom, _) = snapped_span(content.top(), start + total, line_height);
-    let rect = egui::Rect::from_min_max(
-        egui::pos2(content.left(), top),
-        egui::pos2(content.right(), bottom),
-    );
-    (rect.is_positive() && rect.bottom() <= content.bottom() + 0.5).then_some(rect)
-}
-
 const BLOCK_CARD_NORMAL_GAP: f32 = 2.0;
 const BLOCK_CARD_COMPACT_GAP: f32 = 1.0;
 const BLOCK_CARD_NORMAL_RADIUS: u8 = 10;
@@ -1340,9 +1296,6 @@ pub struct TerminalRenderer {
     /// Same-frame native active-card free space; never terminal or PTY allocation.
     pub companion_surface: Option<(String, ProjectionCacheKey, egui::Rect)>,
     pub companion_enabled: bool,
-    pub companion_status_surface: Option<egui::Rect>,
-    pub companion_status_enabled: bool,
-    pub companion_expanded: bool,
     pub opacity: f32,
     /// Whether to enable font ligatures (HarfRust shaping of ASCII runs)
     pub font_ligatures: bool,
@@ -1457,23 +1410,6 @@ pub struct TerminalRenderer {
 }
 
 impl TerminalRenderer {
-    pub fn companion_status_rows(&self) -> usize {
-        if !self.block_mode
-            || self.chat_mode
-            || !self.companion_status_enabled
-            || !self.line_height.is_finite()
-            || self.line_height <= 0.0
-        {
-            return 0;
-        }
-        if !self.companion_expanded {
-            return 1;
-        }
-        ((3.0 * self.font_size.max(1.0) * 0.82 * 1.2 + 22.0) / self.line_height)
-            .ceil()
-            .clamp(1.0, 32.0) as usize
-    }
-
     const SCROLLBAR_WIDTH: f32 = 8.0;
     const SCROLLBAR_GAP: f32 = 2.0;
     const MIN_THUMB_HEIGHT: f32 = 24.0;
@@ -1520,9 +1456,6 @@ impl TerminalRenderer {
             native_vim9_scroll: Default::default(),
             companion_surface: None,
             companion_enabled: false,
-            companion_status_surface: None,
-            companion_status_enabled: false,
-            companion_expanded: true,
             last_ime_rect: None,
             opacity: 1.0,
             font_ligatures: true,
@@ -4221,7 +4154,6 @@ impl TerminalRenderer {
         char_width: f32,
     ) -> Response {
         self.companion_surface = None;
-        self.companion_status_surface = None;
         self.chat_input_action = None;
         let initial_scroll_offset = terminal.scroll_offset;
         let pixels_per_point = ui.ctx().pixels_per_point().max(0.1);
@@ -5409,15 +5341,6 @@ impl TerminalRenderer {
             scroll_stable: terminal.scroll_offset == initial_scroll_offset,
             projected_scroll_pending: self.projected_scroll_request.is_some(),
         };
-        if self.block_mode
-            && self.companion_status_enabled
-            && !terminal.is_alt_buffer_active()
-            && companion_facts.scroll_stable
-            && !companion_facts.projected_scroll_pending
-        {
-            self.companion_status_surface =
-                companion_status_region(&viewport, content_rect, line_height);
-        }
         if self.companion_enabled && companion_facts.allows() {
             self.companion_surface = block_chrome
                 .as_deref()
@@ -10301,7 +10224,7 @@ mod block_spacing_tests {
         }
     }
     #[test]
-    fn native_block_header_and_status_geometry_follow_font_scale_and_dpi() {
+    fn native_block_headers_remain_scaled_without_companion_document_rows() {
         for font_size in [9.0, 14.0, 24.0, 36.0] {
             for pixels_per_point in [1.0, 1.5, 2.0] {
                 let mut renderer = TerminalRenderer::new(
@@ -10312,54 +10235,37 @@ mod block_spacing_tests {
                     crate::theme::Theme::default(),
                 );
                 renderer.block_mode = true;
-                renderer.companion_status_enabled = true;
                 renderer.line_height =
                     (font_size * 1.4 * pixels_per_point).round() / pixels_per_point;
-                for expanded in [false, true] {
-                    renderer.companion_expanded = expanded;
-                    let count = renderer.companion_status_rows();
-                    let required = if expanded {
-                        3.0 * font_size * 0.82 * 1.2 + 22.0
-                    } else {
-                        renderer.line_height
-                    };
-                    if !expanded {
-                        assert_eq!(count, 1);
-                    }
-                    assert!(count as f32 * renderer.line_height >= required);
-                    let mut terminal = TerminalState::new(40, 24);
-                    terminal.process_input(b"\x1b]133;A\x07$ ");
-                    let mut policy = crate::terminal::ProjectionPolicy::new();
-                    policy.set_block_chrome(true, count);
-                    let viewport = terminal.projected_viewport_with_state(
-                        HistoryProjection::identity(),
-                        true,
-                        &policy,
-                        &mut crate::terminal::ProjectionViewState::new(),
+                let mut terminal = TerminalState::new(40, 24);
+                terminal.process_input(b"\x1b]133;A\x07$ ");
+                let mut policy = crate::terminal::ProjectionPolicy::new();
+                policy.set_block_chrome(true, 0);
+                let viewport = terminal.projected_viewport_with_state(
+                    HistoryProjection::identity(),
+                    true,
+                    &policy,
+                    &mut crate::terminal::ProjectionViewState::new(),
+                );
+                assert!(!viewport.row_kinds().iter().any(|kind| matches!(
+                    kind,
+                    crate::terminal::ProjectedRowKind::CompanionStatus { .. }
+                )));
+                for width in [20.0, 70.0, 320.0, 1200.0] {
+                    let content = egui::Rect::from_min_size(
+                        egui::pos2(8.0, 8.0),
+                        egui::vec2(width, 24.0 * renderer.line_height),
                     );
-                    for width in [20.0, 70.0, 320.0, 1200.0] {
-                        let content = egui::Rect::from_min_size(
-                            egui::pos2(8.0, 8.0),
-                            egui::vec2(width, 24.0 * renderer.line_height),
-                        );
-                        let status =
-                            companion_status_region(&viewport, content, renderer.line_height)
-                                .unwrap();
-                        assert!(
-                            status.bottom()
-                                <= content.top()
-                                    + viewport.cursor().row as f32 * renderer.line_height
-                                    + 1.0
-                        );
-                        if let Some((overflow, collapse)) =
-                            block_header_actions(content, 0, renderer.line_height)
-                        {
-                            assert!(content.contains_rect(overflow));
-                            assert!(content.contains_rect(collapse));
-                            assert!(overflow.right() < collapse.left());
-                        }
+                    if let Some((overflow, collapse)) =
+                        block_header_actions(content, 0, renderer.line_height)
+                    {
+                        assert!(content.contains_rect(overflow));
+                        assert!(content.contains_rect(collapse));
+                        assert!(overflow.right() < collapse.left());
                     }
                 }
+                assert_eq!(terminal.grid.row_len(), 40);
+                assert_eq!(terminal.grid.rows(), 24);
             }
         }
     }
