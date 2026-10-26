@@ -1,9 +1,10 @@
 # ember configuration
 # Omitted values use the defaults of the installed binary, so upgrades pick
 # up the current defaults without duplicating them in this template.
-# The installer backs up your previous config.toml before replacing it.
-# Restore selected custom settings from config.toml.backup.* as needed.
-# Use scripts/install.sh --no-config to upgrade without resetting settings.
+# The installer keeps existing values when configuration fields are unchanged.
+# Changed fields trigger a config.toml.backup.* copy before replacement.
+# Restore selected custom settings from that private backup as needed.
+# Use scripts/install.sh --no-config to always keep your existing configuration.
 # Example customizations:
 # Main content and sidebar/top-bar sizes are independent (logical points).
 # An older config without ui_font_size inherits font_size once when loaded.
