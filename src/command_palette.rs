@@ -136,6 +136,15 @@ pub struct CommandPalette {
     max_recent: usize,
     /// 模糊匹配器
     matcher: SkimMatcherV2,
+    /// Resolve Enter only after the query widget applies this frame's edits.
+    confirm_requested: bool,
+}
+
+/// A confirmed palette action, resolved after the query widget has been edited.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PaletteAction {
+    Command(crate::keybindings::Command),
+    AskAi(String),
 }
 
 impl CommandPalette {
@@ -157,6 +166,7 @@ impl CommandPalette {
             recent_commands: VecDeque::new(),
             max_recent: 10,
             matcher,
+            confirm_requested: false,
         }
     }
 
@@ -812,6 +822,7 @@ impl CommandPalette {
         self.organism_target = None;
         self.query_widget_id = None;
         self.is_open = true;
+        self.confirm_requested = false;
         self.needs_focus = true;
         self.search_query.clear();
         self.ask_ai_input_too_large = false;
@@ -866,6 +877,41 @@ impl CommandPalette {
     /// 关闭调色板
     pub fn close(&mut self) {
         self.is_open = false;
+        self.confirm_requested = false;
+    }
+
+    pub fn request_confirm(&mut self) {
+        self.confirm_requested = self.is_open;
+    }
+
+    pub fn take_confirm_action(&mut self) -> Option<PaletteAction> {
+        if !std::mem::take(&mut self.confirm_requested) || !self.is_open {
+            return None;
+        }
+        if self.ask_ai_mode() {
+            self.ask_ai_request().map(PaletteAction::AskAi)
+        } else {
+            self.get_selected_command().map(PaletteAction::Command)
+        }
+    }
+
+    /// Keep keyboard confirmation and pointer rows on the same normalized query.
+    pub fn query_edit(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.search_query)
+                .hint_text("Search commands... (? asks AI)")
+                .return_key(None),
+        );
+        self.query_widget_id = Some(response.id);
+        if response.changed() {
+            let query = std::mem::take(&mut self.search_query);
+            self.set_query(query);
+        }
+        if self.needs_focus {
+            response.request_focus();
+            self.needs_focus = false;
+        }
+        response
     }
 
     /// Ordinary searches use the picker budget. Ask-AI validates the original
@@ -1011,6 +1057,117 @@ impl Default for CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query_frame(
+        ctx: &egui::Context,
+        palette: &mut CommandPalette,
+        events: Vec<egui::Event>,
+    ) -> Option<PaletteAction> {
+        let mut action = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                palette.query_edit(ui);
+                action = palette.take_confirm_action();
+            },
+        );
+        output.textures_delta.clear();
+        action
+    }
+
+    #[test]
+    fn palette_confirmation_uses_this_frames_text_and_paste() {
+        for edit in [
+            egui::Event::Text("Close Tab".into()),
+            egui::Event::Paste("Close Tab".into()),
+            egui::Event::Ime(egui::ImeEvent::Commit("Close Tab".into())),
+        ] {
+            let ctx = egui::Context::default();
+            let mut palette = CommandPalette::new();
+            palette.open();
+            query_frame(&ctx, &mut palette, vec![]);
+            assert_ne!(
+                palette.get_selected_command(),
+                Some(crate::keybindings::Command::SessionClose)
+            );
+            if matches!(edit, egui::Event::Ime(_)) {
+                query_frame(
+                    &ctx,
+                    &mut palette,
+                    vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "Close Tab".into(),
+                        active_range_chars: Some(0..9),
+                    })],
+                );
+            }
+            palette.request_confirm();
+            assert_eq!(
+                query_frame(
+                    &ctx,
+                    &mut palette,
+                    vec![
+                        edit,
+                        egui::Event::Key {
+                            key: egui::Key::Enter,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                ),
+                Some(PaletteAction::Command(
+                    crate::keybindings::Command::SessionClose
+                ))
+            );
+            assert_eq!(palette.take_confirm_action(), None);
+        }
+    }
+
+    #[test]
+    fn palette_confirmation_uses_this_frames_ai_mode_and_bounds() {
+        for (query, expected) in [
+            (
+                "? list files".into(),
+                Some(PaletteAction::AskAi("list files".into())),
+            ),
+            ("?".into(), None),
+            ("? bad\u{202e}request".into(), None),
+            (format!("? {}", "x".repeat(MAX_AI_QUERY_BYTES + 1)), None),
+            ("a command that does not exist 0123456789".into(), None),
+        ] {
+            let ctx = egui::Context::default();
+            let mut palette = CommandPalette::new();
+            palette.open();
+            query_frame(&ctx, &mut palette, vec![]);
+            palette.request_confirm();
+            assert_eq!(
+                query_frame(&ctx, &mut palette, vec![egui::Event::Paste(query)]),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn palette_close_and_reopen_retire_deferred_confirmation() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        palette.request_confirm();
+        palette.close();
+        assert_eq!(palette.take_confirm_action(), None);
+        palette.open();
+        assert_eq!(palette.take_confirm_action(), None);
+        palette.request_confirm();
+        palette.open();
+        assert_eq!(palette.take_confirm_action(), None);
+    }
 
     fn gesture_frame(ctx: &egui::Context, id: egui::Id, events: Vec<egui::Event>) -> bool {
         let mut clicked = false;

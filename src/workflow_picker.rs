@@ -43,8 +43,8 @@ pub fn display_command_preview(command: &str) -> String {
     crate::review_text::visible_bounded(command, MAX_PREVIEW_BYTES)
 }
 
-/// 工作流选择器状态。`entries` 在打开浮层时加载一次；之后磁盘上的新文件在
-/// 下一次打开时出现（与历史选择器的加载语义一致）。
+/// 工作流选择器状态。打开后异步接收一次库快照；重开和失败后的 Retry
+/// 会重新扫描，加载期间保留查询但不允许确认旧结果。
 pub struct WorkflowPickerState {
     opening_id: u64,
     target_session_id: Option<String>,
@@ -56,6 +56,10 @@ pub struct WorkflowPickerState {
     /// egui 的 `TextEdit` 所需可变缓冲。核心仍是查询的唯一真相；
     /// [`Self::sync_query`] 在编辑后立即规范化并写回。
     query_buffer: String,
+    library_revision: u64,
+    loading: bool,
+    load_error: Option<String>,
+    library_value: Option<std::sync::Arc<crate::workflows::LibraryScan>>,
 }
 
 impl WorkflowPickerState {
@@ -71,6 +75,10 @@ impl WorkflowPickerState {
             picker: WorkflowPicker::new(entries, PICKER_POLICY),
             scroll_to_selected: true,
             query_buffer: String::new(),
+            library_revision: 0,
+            loading: false,
+            load_error: None,
+            library_value: None,
         }
     }
 
@@ -89,11 +97,78 @@ impl WorkflowPickerState {
     }
 
     pub fn request_confirm(&mut self) {
-        self.confirm_requested = true;
+        self.confirm_requested = !self.loading;
     }
 
     pub fn take_confirm_request(&mut self) -> bool {
-        std::mem::take(&mut self.confirm_requested)
+        std::mem::take(&mut self.confirm_requested) && !self.loading
+    }
+
+    pub fn begin_loading(&mut self, revision: u64) {
+        self.library_revision = revision;
+        self.loading = true;
+        self.load_error = None;
+        self.confirm_requested = false;
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
+    }
+
+    /// A refreshed list must not inherit a pointer press on the previous list.
+    pub fn library_revision(&self) -> u64 {
+        self.library_revision
+    }
+
+    /// Update the current opening in place: user input and target ownership
+    /// survive loading, while a dropped/reopened picker has its own identity.
+    pub fn apply_library_snapshot(
+        &mut self,
+        snapshot: &jterm_core::workflows::RefreshSnapshot<crate::workflows::LibraryScan>,
+    ) -> bool {
+        if snapshot.revision < self.library_revision {
+            return false;
+        }
+        self.loading = snapshot.loading;
+        if snapshot.loading {
+            self.confirm_requested = false;
+            return false;
+        }
+        self.load_error.clone_from(&snapshot.error);
+        if snapshot.revision == self.library_revision {
+            return false;
+        }
+        self.library_revision = snapshot.revision;
+        let unchanged = self
+            .library_value
+            .as_ref()
+            .is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &snapshot.value))
+            || self.picker.entries() == snapshot.value.workflows.as_slice();
+        self.library_value = Some(std::sync::Arc::clone(&snapshot.value));
+        if unchanged {
+            return true;
+        }
+        let query = self.picker.query().to_owned();
+        let selected = self.picker.selected_workflow().cloned();
+        self.picker = WorkflowPicker::new(snapshot.value.workflows.clone(), PICKER_POLICY);
+        self.picker.set_query(query);
+        if let Some(selected) = selected {
+            let index = self.picker.filtered().iter().position(|candidate| {
+                selected.source_path.as_ref().map_or_else(
+                    || *candidate == &selected,
+                    |path| candidate.source_path.as_ref() == Some(path),
+                )
+            });
+            if let Some(index) = index {
+                self.picker.select(index);
+            }
+        }
+        self.scroll_to_selected = true;
+        true
     }
 
     pub fn query(&self) -> &str {
@@ -320,6 +395,178 @@ mod tests {
         }
     }
 
+    fn library_snapshot(
+        name: &str,
+        revision: u64,
+        loading: bool,
+        error: Option<&str>,
+    ) -> jterm_core::workflows::RefreshSnapshot<crate::workflows::LibraryScan> {
+        jterm_core::workflows::RefreshSnapshot {
+            value: std::sync::Arc::new(crate::workflows::LibraryScan {
+                workflows: vec![workflow(name, "", &[])],
+                refused: Vec::new(),
+            }),
+            revision,
+            loading,
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn loading_keeps_query_and_target_but_never_confirms_stale_entries() {
+        let mut picker =
+            WorkflowPickerState::new(vec![workflow("old", "", &[])]).with_target("original".into());
+        let opening = picker.opening_id();
+        picker.begin_loading(4);
+        *picker.query_buffer_mut() = "new".into();
+        picker.sync_query();
+        picker.request_confirm();
+        assert!(!picker.take_confirm_request());
+        assert!(!picker.apply_library_snapshot(&library_snapshot("old", 5, true, None)));
+        assert!(picker.is_loading());
+        assert!(picker.filtered().is_empty());
+        assert!(picker.apply_library_snapshot(&library_snapshot("new", 6, false, None)));
+        assert!(!picker.is_loading());
+        assert_eq!(picker.opening_id(), opening);
+        assert_eq!(picker.target_session_id(), Some("original"));
+        assert_eq!(picker.query(), "new");
+        assert_eq!(picker.selected_workflow().unwrap().name, "new");
+        assert!(
+            !picker.take_confirm_request(),
+            "loading Enter must not be replayed"
+        );
+        assert!(!picker.apply_library_snapshot(&library_snapshot("old", 5, false, None)));
+        assert_eq!(picker.selected_workflow().unwrap().name, "new");
+        picker.request_confirm();
+        assert!(picker.take_confirm_request());
+    }
+
+    #[test]
+    fn failed_refresh_keeps_last_good_entries_and_retry_clears_its_error() {
+        let mut picker = WorkflowPickerState::new(Vec::new()).with_target("A".into());
+        picker.begin_loading(4);
+        assert!(picker.apply_library_snapshot(&library_snapshot(
+            "last good",
+            6,
+            false,
+            Some("worker stopped")
+        )));
+        assert_eq!(picker.load_error(), Some("worker stopped"));
+        assert_eq!(picker.selected_workflow().unwrap().name, "last good");
+        let previous_row = egui::Id::new((picker.opening_id(), picker.library_revision(), 0));
+        picker.begin_loading(6);
+        assert!(picker.is_loading());
+        assert_eq!(picker.load_error(), None);
+        assert!(picker.apply_library_snapshot(&library_snapshot("new", 8, false, None)));
+        assert_ne!(
+            previous_row,
+            egui::Id::new((picker.opening_id(), picker.library_revision(), 0))
+        );
+        assert_eq!(picker.load_error(), None);
+    }
+
+    #[test]
+    fn refresh_keeps_selection_for_unchanged_or_reordered_workflows() {
+        let mut alpha = workflow("alpha", "", &[]);
+        alpha.source_path = Some("/workflows/alpha.toml".into());
+        let mut beta = workflow("beta", "", &[]);
+        beta.source_path = Some("/workflows/beta.toml".into());
+        let mut snapshot = jterm_core::workflows::RefreshSnapshot {
+            value: std::sync::Arc::new(crate::workflows::LibraryScan {
+                workflows: vec![alpha.clone(), beta.clone()],
+                refused: Vec::new(),
+            }),
+            revision: 2,
+            loading: false,
+            error: None,
+        };
+        let mut picker = WorkflowPickerState::new(Vec::new());
+        assert!(picker.apply_library_snapshot(&snapshot));
+        assert!(picker.select(1));
+        picker.take_scroll_to_selected();
+        let unchanged_entries = picker.picker.entries().as_ptr();
+
+        snapshot.revision = 4;
+        snapshot.error = Some("worker failed".into());
+        assert!(picker.apply_library_snapshot(&snapshot));
+        assert_eq!(picker.selected(), 1);
+        assert_eq!(picker.picker.entries().as_ptr(), unchanged_entries);
+        assert!(!picker.take_scroll_to_selected());
+
+        snapshot.revision = 6;
+        snapshot.error = None;
+        snapshot.value = std::sync::Arc::new((*snapshot.value).clone());
+        assert!(picker.apply_library_snapshot(&snapshot));
+        assert_eq!(picker.selected(), 1);
+        assert_eq!(picker.picker.entries().as_ptr(), unchanged_entries);
+
+        beta.command = "echo edited".into();
+        snapshot.revision = 8;
+        snapshot.value = std::sync::Arc::new(crate::workflows::LibraryScan {
+            workflows: vec![beta, alpha.clone()],
+            refused: Vec::new(),
+        });
+        assert!(picker.apply_library_snapshot(&snapshot));
+        assert_eq!(picker.selected(), 0);
+        assert_eq!(picker.selected_workflow().unwrap().command, "echo edited");
+
+        snapshot.revision = 10;
+        snapshot.value = std::sync::Arc::new(crate::workflows::LibraryScan {
+            workflows: vec![alpha],
+            refused: Vec::new(),
+        });
+        assert!(picker.apply_library_snapshot(&snapshot));
+        assert_eq!(picker.selected_workflow().unwrap().name, "alpha");
+    }
+
+    #[test]
+    fn blocked_background_scan_can_finish_into_reopened_picker_without_retargeting_it() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let library =
+            jterm_core::workflows::BackgroundRefresh::new(crate::workflows::LibraryScan::default());
+        let mut previous = WorkflowPickerState::new(Vec::new()).with_target("old terminal".into());
+        previous.begin_loading(library.snapshot().revision);
+        let previous_opening = previous.opening_id();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        assert!(library.refresh(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            crate::workflows::LibraryScan {
+                workflows: vec![workflow("arrived", "", &[])],
+                refused: Vec::new(),
+            }
+        }));
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(library.snapshot().loading);
+        drop(previous);
+        let mut current = WorkflowPickerState::new(Vec::new()).with_target("new terminal".into());
+        current.begin_loading(library.snapshot().revision);
+        assert!(!library.refresh(|| panic!("a second worker must not run")));
+        *current.query_buffer_mut() = "arrived".into();
+        current.sync_query();
+        current.request_confirm();
+        assert!(!current.take_confirm_request());
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let ready = loop {
+            let snapshot = library.snapshot();
+            if !snapshot.loading {
+                break snapshot;
+            }
+            assert!(Instant::now() < deadline, "background scan did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(current.apply_library_snapshot(&ready));
+        assert_ne!(current.opening_id(), previous_opening);
+        assert_eq!(current.target_session_id(), Some("new terminal"));
+        assert_eq!(current.query(), "arrived");
+        assert_eq!(current.selected_workflow().unwrap().name, "arrived");
+        assert!(!current.take_confirm_request());
+    }
+
     #[test]
     fn picker_opening_survives_query_navigation_but_not_reopening() {
         let entries = vec![workflow("alpha", "", &[]), workflow("beta", "", &[])];
@@ -361,7 +608,8 @@ mod tests {
         assert!(body.contains(".id(window_id)"));
         assert!(body.contains("TextEdit::singleline(state.query_buffer_mut())"));
         assert!(body.contains(".id_salt(\"workflow-results\")"));
-        assert!(body.contains("ui.make_persistent_id((\"workflow-row\", state.query(), index))"));
+        assert!(body.contains("state.library_revision()"));
+        assert!(body.contains("\"workflow-row\""));
     }
 
     #[test]

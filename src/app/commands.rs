@@ -2778,8 +2778,8 @@ impl TerminalApp {
         self.replay_sidebar_command(&target, false, true);
     }
 
-    /// `history:picker`: open/close the history picker. Opening loads a
-    /// bounded tail of the family-shared JSONL index; when recording is
+    /// `history:picker`: open immediately and load the bounded JSONL tail
+    /// off the UI thread. When recording is
     /// disabled the picker stays closed with frost's hint instead of opening
     /// an empty overlay.
     pub(crate) fn history_picker_toggle(&mut self) {
@@ -2791,7 +2791,62 @@ impl TerminalApp {
             self.set_status("Command history is disabled (command_history_enabled = false)");
             return;
         };
-        self.history_picker = Some(crate::history_picker::HistoryPickerState::load(&path));
+        let Some(target) = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .map(|session| session.metadata.session_id.clone())
+        else {
+            self.set_status("No terminal is available for history insertion");
+            return;
+        };
+        self.history_picker =
+            Some(crate::history_picker::HistoryPickerState::new(Vec::new()).with_target(target));
+        self.refresh_history_library(path);
+    }
+
+    pub(crate) fn refresh_history_library(&mut self, path: std::path::PathBuf) {
+        let Some(picker) = self.history_picker.as_mut() else {
+            return;
+        };
+        let previous = self.history_library.snapshot();
+        picker.begin_loading(path.clone(), previous.revision);
+        self.history_library.refresh(move || {
+            let mut loaded = crate::history_picker::HistoryLibrary::load(path);
+            if loaded.error.is_some() && loaded.path == previous.value.path {
+                loaded.records = previous.value.records.clone();
+                loaded.tail_truncated = previous.value.tail_truncated;
+            }
+            loaded
+        });
+    }
+
+    pub(crate) fn poll_history_library(&mut self, ctx: &egui::Context) {
+        let Some(path) = self
+            .history_picker
+            .as_ref()
+            .and_then(|picker| picker.source_path())
+        else {
+            return;
+        };
+        let snapshot = self.history_library.snapshot();
+        // A config reload can change the requested file while an earlier read
+        // is still in flight. Finish it without spawning parallel I/O, then
+        // read the new file; never expose the previous path's records.
+        if !snapshot.loading
+            && snapshot.error.is_none()
+            && snapshot.value.path.as_deref() != Some(path)
+        {
+            self.refresh_history_library(path.to_owned());
+            ctx.request_repaint_after(Duration::from_millis(75));
+            return;
+        }
+        if let Some(picker) = self.history_picker.as_mut() {
+            picker.apply_library_snapshot(&snapshot);
+        }
+        if snapshot.loading {
+            ctx.request_repaint_after(Duration::from_millis(75));
+        }
     }
 
     /// 历史选择器确认后的回填：把持久化历史里的命令写回活动 pane 的提示符，
@@ -2804,8 +2859,12 @@ impl TerminalApp {
     /// 工作流文件写入，不是执行日志，所以校验用
     /// [`PROMPT_FILL_MAX_COMMAND_BYTES`] 而不是 64 KiB 的日志预算——否则
     /// 选择器刚开始展示的 64 KiB–256 KiB 记录会条条可选、条条被拒。
-    pub(crate) fn fill_prompt_with_history_command(&mut self, command: &str) {
-        let _ = self.try_fill_prompt_with_history_command(command, None);
+    pub(crate) fn fill_prompt_with_history_command(&mut self, command: &str, target: Option<&str>) {
+        let Some(target) = target else {
+            self.set_status("The history picker's original terminal is unavailable");
+            return;
+        };
+        let _ = self.try_fill_prompt_with_history_command(command, Some(target));
     }
 
     /// Success acknowledges FIFO admission, not delivery by the asynchronous writer.
@@ -2829,7 +2888,7 @@ impl TerminalApp {
         if expected_session.is_some_and(|expected| {
             !crate::workflow_picker::workflow_target_is_active(expected, Some(&session_id))
         }) {
-            let message = "Return to the workflow's original terminal before inserting";
+            let message = "Return to the original terminal before inserting";
             self.set_status(message);
             return Err(message.to_owned());
         }
@@ -2940,9 +2999,7 @@ impl TerminalApp {
         Err(message)
     }
 
-    /// 工作流选择器开关（Ctrl+Shift+M）。发现/解析/校验全部在打开时同步完成
-    /// （有界目录扫描，与历史选择器的 load-on-open 同一模式）；anvil 的后台
-    /// 单飞刷新在单线程 egui 里没有对应物——见 workflows.rs 的移植说明。
+    /// Open immediately; discovery, reads and parsing run on the shared worker.
     pub(crate) fn workflow_picker_toggle(&mut self) {
         if self.workflow_picker.is_some() || self.workflow_args.is_some() {
             self.workflow_picker = None;
@@ -2958,12 +3015,33 @@ impl TerminalApp {
             self.set_status("No terminal is available for workflow insertion");
             return;
         };
-        let dirs = crate::workflows::workflow_dirs();
-        let scan = crate::workflows::scan(&dirs);
-        self.report_refused_workflows(&scan.refused);
-        self.workflow_picker = Some(
-            crate::workflow_picker::WorkflowPickerState::new(scan.workflows).with_target(target),
-        );
+        self.workflow_picker =
+            Some(crate::workflow_picker::WorkflowPickerState::new(Vec::new()).with_target(target));
+        self.refresh_workflow_library();
+    }
+
+    pub(crate) fn refresh_workflow_library(&mut self) {
+        let Some(picker) = self.workflow_picker.as_mut() else {
+            return;
+        };
+        picker.begin_loading(self.workflow_library.snapshot().revision);
+        self.workflow_library.refresh(|| {
+            let dirs = crate::workflows::workflow_dirs();
+            crate::workflows::scan(&dirs)
+        });
+    }
+
+    pub(crate) fn poll_workflow_library(&mut self, ctx: &egui::Context) {
+        let Some(picker) = self.workflow_picker.as_mut() else {
+            return;
+        };
+        let snapshot = self.workflow_library.snapshot();
+        let applied = picker.apply_library_snapshot(&snapshot);
+        if snapshot.loading {
+            ctx.request_repaint_after(Duration::from_millis(75));
+        } else if applied && snapshot.error.is_none() {
+            self.report_refused_workflows(&snapshot.value.refused);
+        }
     }
 
     /// Surface loader refusals once per changed path set. `load_all` logs the

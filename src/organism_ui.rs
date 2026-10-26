@@ -5318,15 +5318,16 @@ mod tests {
         assert!(palette.contains("memory.surrender_focus(id)"));
         assert!(palette.contains("self.say_hello_to_organism(ctx, hello_target.as_deref())"));
         let rendering = include_str!("app/rendering.rs");
-        let palette_render = rendering
-            .split(".hint_text(\"Search commands... (? asks AI)\")")
+        assert!(rendering.contains("self.command_palette.query_edit(ui)"));
+        let palette_source = include_str!("command_palette.rs");
+        let palette_query = palette_source
+            .split("pub fn query_edit(")
             .nth(1)
             .unwrap()
-            .split("ui.separator()")
+            .split("/// Ordinary searches")
             .next()
             .unwrap();
-        assert!(palette_render
-            .contains("self.command_palette.query_widget_id = Some(search_response.id)"));
+        assert!(palette_query.contains("self.query_widget_id = Some(response.id)"));
         let source = include_str!("organism_ui.rs");
         let admission = source
             .split("pub(crate) fn say_hello_to_organism")

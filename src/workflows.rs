@@ -42,10 +42,9 @@
 //! `welcome_notebook_path` is still not ported: ember has no notebook surface,
 //! and the core deliberately left that lookup in the two apps that have one.
 //!
-//! Refreshing stays synchronous-on-open (`workflow_picker_toggle`), matching
-//! the history picker: egui is single-threaded immediate-mode and the read
-//! caps keep the worst case small. The core exports anvil's `RefreshLatch` for
-//! the toolkit that needs it; ember does not.
+//! The native picker opens immediately and performs discovery and scanning on
+//! the shared background worker. Its persistent refresh owner coalesces opens
+//! while a slow disk is still serving the previous request.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

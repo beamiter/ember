@@ -172,6 +172,7 @@ fn history_picker_row(
 enum HistoryPickerAction {
     Close,
     Fill(String),
+    Retry,
 }
 
 fn draw_history_picker(
@@ -181,12 +182,14 @@ fn draw_history_picker(
 ) -> Option<HistoryPickerAction> {
     let mut accepted_history_command = None;
     let mut hovered_history_index = None;
+    let mut retry_requested = false;
     let pointer_moved = ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
     {
         let picker_rect = history_picker_rect(ctx.content_rect());
         let picker_height = picker_rect.height();
 
         egui::Window::new("Command History")
+            .id(egui::Id::new(("Command History", state.opening_id())))
             .title_bar(false)
             .resizable(false)
             .movable(false)
@@ -220,6 +223,28 @@ fn draw_history_picker(
                 });
 
                 ui.separator();
+                if state.is_loading() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading command history…");
+                    });
+                } else if let Some(error) = state.load_error() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!(
+                                "History could not load: {}",
+                                crate::review_text::visible_bounded(error, 256)
+                            ),
+                        );
+                        if ui.button("Retry").clicked() {
+                            retry_requested = true;
+                        }
+                    });
+                }
+                if state.tail_truncated() && !state.is_loading() {
+                    ui.label("Older history outside the recent read window is not shown.");
+                }
 
                 // Borrow cached visible rows. Only an accepted command needs a
                 // copy; repainting long history must not clone every payload.
@@ -230,33 +255,41 @@ fn draw_history_picker(
                 egui::ScrollArea::vertical()
                     .max_height((picker_height - 96.0).max(24.0))
                     .show(ui, |ui| {
-                        for (idx, record) in results.iter().enumerate() {
-                            let is_selected = idx == selected_index;
+                        ui.add_enabled_ui(!state.is_loading(), |ui| {
+                            for (idx, record) in results.iter().enumerate() {
+                                let is_selected = idx == selected_index;
 
-                            let click_response = history_picker_row(
-                                ui,
-                                ui.make_persistent_id(("history-row", state.query(), idx)),
-                                record,
-                                is_selected,
-                                current_theme,
-                            );
-                            if (is_selected && scroll_to_selected) || click_response.gained_focus()
-                            {
-                                click_response.scroll_to_me(Some(egui::Align::Center));
-                            }
-                            if (click_response.hovered() && pointer_moved)
-                                || click_response.gained_focus()
-                            {
-                                hovered_history_index = Some(idx);
-                            }
-                            if block_search_result_render_activation(&click_response) {
-                                accepted_history_command = Some(record.command.clone());
-                            }
+                                let click_response = history_picker_row(
+                                    ui,
+                                    ui.make_persistent_id((
+                                        "history-row",
+                                        state.library_revision(),
+                                        state.query(),
+                                        idx,
+                                    )),
+                                    record,
+                                    is_selected,
+                                    current_theme,
+                                );
+                                if (is_selected && scroll_to_selected)
+                                    || click_response.gained_focus()
+                                {
+                                    click_response.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                if (click_response.hovered() && pointer_moved)
+                                    || click_response.gained_focus()
+                                {
+                                    hovered_history_index = Some(idx);
+                                }
+                                if block_search_result_render_activation(&click_response) {
+                                    accepted_history_command = Some(record.command.clone());
+                                }
 
-                            ui.separator();
-                        }
-
-                        if results.is_empty() {
+                                ui.separator();
+                            }
+                        });
+                        if results.is_empty() && !state.is_loading() && state.load_error().is_none()
+                        {
                             let hint = if state.query().is_empty() {
                                 "No persisted commands yet (recorded via OSC 133 shell integration)"
                             } else {
@@ -284,6 +317,9 @@ fn draw_history_picker(
     if let Some(index) = hovered_history_index {
         state.select_hovered(index);
     }
+    if retry_requested {
+        return Some(HistoryPickerAction::Retry);
+    }
     if state.take_confirm_request() {
         Some(
             state
@@ -309,6 +345,7 @@ fn workflow_frame(current_theme: &theme::Theme) -> egui::Frame {
 enum WorkflowPickerAction {
     Close,
     Accept(crate::workflows::Workflow),
+    Refresh,
 }
 
 fn draw_workflow_picker(
@@ -318,6 +355,7 @@ fn draw_workflow_picker(
 ) -> Option<WorkflowPickerAction> {
     let mut accepted = None;
     let mut selected = None;
+    let mut refresh_requested = false;
     let pointer_moved = ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
     let rect = history_picker_rect(ctx.content_rect());
     let window_id = egui::Id::new(("Workflows", state.opening_id()));
@@ -345,33 +383,60 @@ fn draw_workflow_picker(
                 state.needs_focus = false;
             }
             ui.separator();
+            let loading = state.is_loading();
+            if loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading workflows…");
+                });
+            } else if let Some(error) = state.load_error() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        display_workflow_load_error(error),
+                    );
+                    if ui.button("Retry").clicked() {
+                        refresh_requested = true;
+                    }
+                });
+                if !state.filtered().is_empty() {
+                    ui.label("Showing previously loaded workflows.");
+                }
+            }
             let reveal = state.take_scroll_to_selected();
             egui::ScrollArea::vertical()
                 .id_salt("workflow-results")
                 .max_height((rect.height() - 96.0).max(1.0))
                 .show(ui, |ui| {
                     let results = state.filtered();
-                    for (index, workflow) in results.iter().enumerate() {
-                        let selected_row = state.selected() == index;
-                        let response = workflow_picker_row(
-                            ui,
-                            ui.make_persistent_id(("workflow-row", state.query(), index)),
-                            workflow,
-                            selected_row,
-                            current_theme,
-                        );
-                        if (selected_row && reveal) || response.gained_focus() {
-                            response.scroll_to_me(Some(egui::Align::Center));
+                    ui.add_enabled_ui(!loading, |ui| {
+                        for (index, workflow) in results.iter().enumerate() {
+                            let selected_row = state.selected() == index;
+                            let response = workflow_picker_row(
+                                ui,
+                                ui.make_persistent_id((
+                                    "workflow-row",
+                                    state.library_revision(),
+                                    state.query(),
+                                    index,
+                                )),
+                                workflow,
+                                selected_row,
+                                current_theme,
+                            );
+                            if (selected_row && reveal) || response.gained_focus() {
+                                response.scroll_to_me(Some(egui::Align::Center));
+                            }
+                            if response.gained_focus() || (response.hovered() && pointer_moved) {
+                                selected = Some(index);
+                            }
+                            if block_search_result_render_activation(&response) {
+                                accepted = Some((*workflow).clone());
+                            }
+                            ui.separator();
                         }
-                        if response.gained_focus() || (response.hovered() && pointer_moved) {
-                            selected = Some(index);
-                        }
-                        if block_search_result_render_activation(&response) {
-                            accepted = Some((*workflow).clone());
-                        }
-                        ui.separator();
-                    }
-                    if results.is_empty() {
+                    });
+                    if results.is_empty() && !loading && state.load_error().is_none() {
                         let hint = if state.query().is_empty() {
                             let directory = crate::workflows::user_workflow_dir()
                                 .map(|path| path.display().to_string())
@@ -396,6 +461,9 @@ fn draw_workflow_picker(
     if let Some(index) = selected {
         state.select(index);
     }
+    if refresh_requested {
+        return Some(WorkflowPickerAction::Refresh);
+    }
     if state.take_confirm_request() {
         Some(
             state
@@ -406,6 +474,13 @@ fn draw_workflow_picker(
     } else {
         accepted.map(WorkflowPickerAction::Accept)
     }
+}
+
+fn display_workflow_load_error(error: &str) -> String {
+    format!(
+        "Workflow refresh failed: {}",
+        crate::workflow_picker::display_label(error)
+    )
 }
 
 fn workflow_row_label(ui: &mut egui::Ui, rect: egui::Rect, label: egui::Label, align: egui::Align) {
@@ -3299,6 +3374,7 @@ impl TerminalApp {
         let mut clicked_palette_command = None;
         let mut hovered_palette_index = None;
         let mut accepted_ask_ai = None;
+        let palette_pointer_moved = ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
         if self.command_palette.is_open {
             let screen_rect = ctx.viewport_rect();
             let palette_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
@@ -3308,8 +3384,6 @@ impl TerminalApp {
                 screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
             );
             let ask_ai_mode = self.command_palette.ask_ai_mode();
-            let ask_ai_request = self.command_palette.ask_ai_request();
-            let ask_ai_too_large = self.command_palette.ask_ai_request_too_large();
 
             egui::Window::new("Command Palette")
                 .id(self.command_palette.window_id())
@@ -3333,23 +3407,14 @@ impl TerminalApp {
                     // 搜索输入框
                     ui.horizontal(|ui| {
                         ui.label(if ask_ai_mode { "✨" } else { "🔍" });
-                        let search_response = ui.add(
-                            egui::TextEdit::singleline(&mut self.command_palette.search_query)
-                                .hint_text("Search commands... (? asks AI)"),
-                        );
-                        self.command_palette.query_widget_id = Some(search_response.id);
-                        if search_response.changed() {
-                            let query = std::mem::take(&mut self.command_palette.search_query);
-                            self.command_palette.set_query(query);
-                        }
-                        if self.command_palette.needs_focus {
-                            search_response.request_focus();
-                            self.command_palette.needs_focus = false;
-                        }
+                        self.command_palette.query_edit(ui);
                     });
 
                     ui.separator();
 
+                    let ask_ai_mode = self.command_palette.ask_ai_mode();
+                    let ask_ai_request = self.command_palette.ask_ai_request();
+                    let ask_ai_too_large = self.command_palette.ask_ai_request_too_large();
                     if ask_ai_mode {
                         // anvil/forge 的 Ask-AI 模式：固定命令列表被替换为一条
                         // AI 行。Enter/点击只起草命令供审阅——绝不直接执行。
@@ -3514,7 +3579,7 @@ impl TerminalApp {
                                         egui::Sense::click(),
                                     )
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if click_response.hovered() {
+                                if click_response.hovered() && palette_pointer_moved {
                                     hovered_palette_index = Some(idx);
                                 }
                                 if click_response.clicked() {
@@ -3548,6 +3613,18 @@ impl TerminalApp {
                 });
         }
 
+        if let Some(action) = self.command_palette.take_confirm_action() {
+            match action {
+                command_palette::PaletteAction::Command(command) => {
+                    clicked_palette_command = Some(command);
+                    accepted_ask_ai = None;
+                }
+                command_palette::PaletteAction::AskAi(request) => {
+                    accepted_ask_ai = Some(request);
+                    clicked_palette_command = None;
+                }
+            }
+        }
         if let Some(index) = hovered_palette_index {
             self.command_palette.selected_index = index;
         }
@@ -3563,9 +3640,18 @@ impl TerminalApp {
         // Enter/点击只回填提示符，绝不执行。
         if let Some(state) = self.history_picker.as_mut() {
             if let Some(action) = draw_history_picker(ctx, state, &self.current_theme) {
-                self.history_picker = None;
-                if let HistoryPickerAction::Fill(command) = action {
-                    self.fill_prompt_with_history_command(&command);
+                match action {
+                    HistoryPickerAction::Retry => {
+                        if let Some(path) = state.source_path().map(std::path::Path::to_owned) {
+                            self.refresh_history_library(path);
+                        }
+                    }
+                    HistoryPickerAction::Fill(command) => {
+                        let target = state.target_session_id().map(str::to_owned);
+                        self.history_picker = None;
+                        self.fill_prompt_with_history_command(&command, target.as_deref());
+                    }
+                    HistoryPickerAction::Close => self.history_picker = None,
                 }
             }
         }
@@ -3575,6 +3661,7 @@ impl TerminalApp {
                 match action {
                     WorkflowPickerAction::Close => self.workflow_picker = None,
                     WorkflowPickerAction::Accept(workflow) => self.workflow_picker_accept(workflow),
+                    WorkflowPickerAction::Refresh => self.refresh_workflow_library(),
                 }
             }
         }
@@ -5320,6 +5407,54 @@ mod tests {
     }
 
     #[test]
+    fn workflow_loading_keeps_typed_query_without_delayed_acceptance() {
+        let ctx = egui::Context::default();
+        let mut state = crate::workflow_picker::WorkflowPickerState::new(Vec::new())
+            .with_target("original".into());
+        state.begin_loading(0);
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(500.0, 360.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            run_frame(&ctx, input(vec![]), |_ui| {
+                assert!(draw_workflow_picker(&ctx, &mut state, &theme::Theme::default()).is_none());
+            });
+        }
+        state.request_confirm();
+        run_frame(&ctx, input(vec![egui::Event::Text("run".into())]), |_ui| {
+            assert!(draw_workflow_picker(&ctx, &mut state, &theme::Theme::default()).is_none());
+        });
+        let mut workflow = workflow_ui_fixture(0);
+        workflow.name = "run".into();
+        state.apply_library_snapshot(&jterm_core::workflows::RefreshSnapshot {
+            value: std::sync::Arc::new(crate::workflows::LibraryScan {
+                workflows: vec![workflow],
+                refused: Vec::new(),
+            }),
+            revision: 2,
+            loading: false,
+            error: None,
+        });
+        assert_eq!(state.query(), "run");
+        assert_eq!(state.target_session_id(), Some("original"));
+        run_frame(&ctx, input(vec![]), |_ui| {
+            assert!(draw_workflow_picker(&ctx, &mut state, &theme::Theme::default()).is_none());
+        });
+        state.request_confirm();
+        run_frame(&ctx, input(vec![]), |_ui| {
+            assert!(matches!(
+                draw_workflow_picker(&ctx, &mut state, &theme::Theme::default()),
+                Some(WorkflowPickerAction::Accept(_))
+            ));
+        });
+    }
+
+    #[test]
     fn workflow_picker_same_frame_query_edit_selects_latest_match() {
         let ctx = egui::Context::default();
         let mut first = workflow_ui_fixture(0);
@@ -6213,6 +6348,99 @@ mod tests {
     }
 
     #[test]
+    fn history_reopen_retires_pointer_and_accessibility_actions() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let state_for = |command: &str| {
+            crate::history_picker::HistoryPickerState::new(vec![
+                jterm_core::command_history::CommandHistoryRecord {
+                    command: command.into(),
+                    cwd: None,
+                    exit_code: 0,
+                    end_time_ms: None,
+                },
+            ])
+        };
+        let frame = |state: &mut crate::history_picker::HistoryPickerState, events| {
+            let mut action = None;
+            let output = run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 480.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_ui| {
+                    action = draw_history_picker(&ctx, state, &theme::Theme::default());
+                },
+            );
+            (output, action)
+        };
+        let row = |output: &egui::FullOutput, command: &str| {
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find_map(|(id, node)| {
+                    (node.role() == egui::accesskit::Role::Button
+                        && node
+                            .label()
+                            .is_some_and(|label| label.starts_with(&format!("Recall {command};"))))
+                    .then(|| {
+                        let bounds = node.bounds().unwrap();
+                        (
+                            *id,
+                            egui::pos2(bounds.x0 as f32 + 8.0, bounds.y0 as f32 + 8.0),
+                        )
+                    })
+                })
+                .expect("history row is accessible")
+        };
+        let pointer = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let activate = |target_node| {
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node,
+                data: None,
+            })
+        };
+        let mut state = state_for("printf old");
+        let mut output = frame(&mut state, vec![]).0;
+        for _ in 0..2 {
+            output = frame(&mut state, vec![]).0;
+        }
+        let (old_node, pos) = row(&output, "printf old");
+        frame(&mut state, vec![egui::Event::PointerMoved(pos)]);
+        assert!(frame(&mut state, vec![pointer(pos, true)]).1.is_none());
+
+        // Another command was appended to the shared history between openings.
+        state = state_for("printf new");
+        for _ in 0..3 {
+            output = frame(&mut state, vec![]).0;
+        }
+        let (new_node, new_pos) = row(&output, "printf new");
+        assert_ne!(old_node, new_node);
+        assert!(frame(&mut state, vec![pointer(new_pos, false)]).1.is_none());
+        assert!(frame(&mut state, vec![activate(old_node)]).1.is_none());
+        assert_eq!(
+            frame(&mut state, vec![activate(new_node)]).1,
+            Some(HistoryPickerAction::Fill("printf new".into()))
+        );
+    }
+
+    #[test]
     fn history_picker_row_focus_and_stale_actions_respect_current_query() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -6295,6 +6523,62 @@ mod tests {
             "a stale click cannot retarget the replacement result at the same row index"
         );
         assert_eq!(state.selected_command().as_deref(), Some("git status"));
+    }
+
+    #[test]
+    fn history_loading_keeps_query_and_requires_fresh_confirmation() {
+        let ctx = egui::Context::default();
+        let mut state = crate::history_picker::HistoryPickerState::new(Vec::new())
+            .with_target("original pane".into());
+        let path = std::path::PathBuf::from("/history.jsonl");
+        state.begin_loading(path.clone(), 0);
+        let frame = |state: &mut crate::history_picker::HistoryPickerState, events| {
+            let mut action = None;
+            run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 480.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_ui| {
+                    action = draw_history_picker(&ctx, state, &theme::Theme::default());
+                },
+            );
+            action
+        };
+        for _ in 0..3 {
+            assert!(frame(&mut state, vec![]).is_none());
+        }
+        state.request_confirm();
+        assert!(frame(&mut state, vec![egui::Event::Text("new".into())]).is_none());
+        state.apply_library_snapshot(&jterm_core::workflows::RefreshSnapshot {
+            value: std::sync::Arc::new(crate::history_picker::HistoryLibrary {
+                path: Some(path),
+                records: vec![jterm_core::command_history::CommandHistoryRecord {
+                    command: "printf new".into(),
+                    cwd: None,
+                    exit_code: 0,
+                    end_time_ms: None,
+                }],
+                error: None,
+                tail_truncated: false,
+            }),
+            revision: 2,
+            loading: false,
+            error: None,
+        });
+        assert_eq!(state.query(), "new");
+        assert_eq!(state.target_session_id(), Some("original pane"));
+        assert!(frame(&mut state, vec![]).is_none());
+        state.request_confirm();
+        assert_eq!(
+            frame(&mut state, vec![]),
+            Some(HistoryPickerAction::Fill("printf new".into()))
+        );
     }
 
     #[test]

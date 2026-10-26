@@ -2839,6 +2839,7 @@ impl TerminalApp {
             keybindings,
             command_palette,
             history_picker: None,
+            history_library: jterm_core::workflows::BackgroundRefresh::new(Default::default()),
             prompt_fill_enter_latch: Default::default(),
             prompt_fill_enter_down: false,
             native_enter_ownership: Default::default(),
@@ -2847,6 +2848,7 @@ impl TerminalApp {
             ime_origin_terminal: None,
             workflow_picker: None,
             workflow_args: None,
+            workflow_library: jterm_core::workflows::BackgroundRefresh::new(Default::default()),
             workflow_refusals: Vec::new(),
             force_resize_session: false,
             current_theme,
@@ -5786,6 +5788,8 @@ impl eframe::App for TerminalApp {
         self.poll_task_creation(ctx);
         self.poll_native_agent_runtime(ctx);
         self.poll_session_export(ctx);
+        self.poll_workflow_library(ctx);
+        self.poll_history_library(ctx);
 
         // A stateful mouse edge admitted in an earlier frame is older than
         // every keyboard/IME event arriving now. Retry it before any session

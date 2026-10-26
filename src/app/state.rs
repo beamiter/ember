@@ -290,9 +290,11 @@ pub struct TerminalApp {
     // Command palette
     pub command_palette: command_palette::CommandPalette,
 
-    /// 历史命令选择器（Ctrl+Shift+H）。打开时从家族共享 JSONL 索引加载有界
-    /// 尾部；Enter 只回填提示符，绝不执行。`None` 表示浮层未打开。
+    /// 历史命令选择器（Ctrl+Shift+H）。后台加载家族共享 JSONL 索引的有界
+    /// 尾部；Enter 只回填打开时的原始终端，绝不执行。
     pub history_picker: Option<crate::history_picker::HistoryPickerState>,
+    pub history_library:
+        jterm_core::workflows::BackgroundRefresh<crate::history_picker::HistoryLibrary>,
     /// Own a confirming physical Enter until release, even after recall closes.
     pub prompt_fill_enter_latch: super::input::PromptFillEnterLatch,
     /// Passive state survives modal dispatch so pointer fills can claim Enter.
@@ -303,13 +305,16 @@ pub struct TerminalApp {
     pub ime_origin_terminal:
         Option<std::sync::Arc<parking_lot::Mutex<crate::terminal::TerminalState>>>,
 
-    /// 工作流选择器（Ctrl+Shift+M，anvil/forge 的 workflows）。打开时同步加载
+    /// 工作流选择器（Ctrl+Shift+M，anvil/forge 的 workflows）。打开后异步加载
     /// 有界目录扫描；Enter 对无参数工作流直接回填提示符，有参数则打开填写
     /// 对话框（`workflow_args`）。两者都为 `None` 表示浮层未打开。
     pub workflow_picker: Option<crate::workflow_picker::WorkflowPickerState>,
     /// 工作流参数填写对话框。只与 `workflow_picker` 同时存在；提交成功后两者
     /// 一起关闭。
     pub workflow_args: Option<crate::workflow_picker::WorkflowArgsState>,
+    /// Keep one refresh owner across closing/reopening the picker: slow disks
+    /// must not accumulate one detached worker for every open gesture.
+    pub workflow_library: jterm_core::workflows::BackgroundRefresh<crate::workflows::LibraryScan>,
     /// Paths refused by the last workflow scan. The picker refreshes on every
     /// open, but an unchanged broken file should not raise the same toast each
     /// time; a newly broken or fixed path changes this snapshot.

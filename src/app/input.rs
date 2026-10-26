@@ -2295,14 +2295,12 @@ impl TerminalApp {
     /// protocol replies and persistence must continue while the overlay stays
     /// open, otherwise a full event channel back-pressures the foreground job.
     /// Returns `(close_viewport, palette_owned_this_frame)`.
-    pub fn handle_command_palette_input(&mut self, ctx: &egui::Context) -> (bool, bool) {
+    pub fn handle_command_palette_input(&mut self, _ctx: &egui::Context) -> (bool, bool) {
         if !self.command_palette.is_open {
             return (false, false);
         }
 
         let events_copy = self.frame_events.clone();
-        let mut selected_command = None;
-        let mut ask_ai_request = None;
         for evt in &events_copy {
             let egui::Event::Key {
                 key,
@@ -2325,30 +2323,16 @@ impl TerminalApp {
                 egui::Key::ArrowDown => self.command_palette.select_next(),
                 egui::Key::Enter if *repeat => {}
                 egui::Key::Enter => {
-                    // `?` mode (anvil's palette Ask-AI flow): the request goes
-                    // to the review-only command suggestion, never to a PTY.
-                    ask_ai_request = self.command_palette.ask_ai_request();
-                    // Fail closed inside `?` mode: an empty or oversized
-                    // request must do nothing, never fall through and dispatch
-                    // whatever command happens to be highlighted.
-                    if ask_ai_request.is_none() && !self.command_palette.ask_ai_mode() {
-                        selected_command = self.command_palette.get_selected_command();
-                    }
+                    // Text/paste/IME in this batch has not reached TextEdit yet.
+                    // Resolve against its final normalized query during rendering.
+                    self.command_palette.request_confirm();
                     break;
                 }
                 _ => {}
             }
         }
 
-        if let Some(request) = ask_ai_request {
-            self.command_palette.close();
-            self.start_ai_command_suggestion(request);
-            return (false, true);
-        }
-        let close_requested = selected_command
-            .map(|command| self.dispatch_palette_command(ctx, command))
-            .unwrap_or(false);
-        (close_requested, true)
+        (false, true)
     }
 
     /// Handle keys the history picker owns (same routing pattern as the

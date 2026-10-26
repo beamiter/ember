@@ -68,6 +68,17 @@ moving its text or covering Vim's separator/status rows.
   old row coordinates when a match disappears or the active session changes
 - Closing Find stops the rest of that frame's search shortcuts, so a quick
   Escape/Enter sequence cannot keep navigating an invisible search.
+- The command palette confirms the current text after same-frame typing,
+  pasting or IME edits; switching to `?` uses the updated AI request. A resting
+  pointer no longer overrides keyboard selection.
+- The workflow picker opens immediately while templates load in the background.
+  Loading preserves the query and original terminal; Enter waits for results,
+  and failed refreshes retain the previous library with a Retry action.
+- Reopening command history starts a fresh interaction: an old mouse press or
+  accessibility action cannot recall a different command from the new list.
+- Command history loads in the background without blocking the workspace.
+  Queries survive loading, failed reads can be retried, and recalled commands
+  stay bound to the terminal where the picker was opened.
 - Failed semantic commands expose Fix, Explain, Retry, and Create Agent Task
   actions. Agent tasks retain the selected command's stable source identity,
   bounded C..D rendered-output snapshot and reported cwd. Experimental Codex

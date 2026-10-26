@@ -8,6 +8,17 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use jterm_core::command_history::{self, CommandHistoryRecord};
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+static NEXT_HISTORY_OPENING: AtomicU64 = AtomicU64::new(0);
+
+fn next_history_opening() -> u64 {
+    NEXT_HISTORY_OPENING
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("history picker opening identity exhausted")
+}
 
 /// 打开选择器时加载的最大条数。与 forge/frost 的历史面板一致：交互检索只
 /// 需要一个近期工作集，`read_recent` 本身也把读取限制在有界的文件尾部。
@@ -112,9 +123,66 @@ pub fn display_command(command: &str) -> String {
     shortened
 }
 
+/// Background result, including source identity so a changed configuration
+/// cannot publish the previous file into a newly opened picker.
+#[derive(Default)]
+pub struct HistoryLibrary {
+    pub path: Option<PathBuf>,
+    pub records: Vec<CommandHistoryRecord>,
+    pub error: Option<String>,
+    pub tail_truncated: bool,
+}
+
+impl HistoryLibrary {
+    pub fn load(path: PathBuf) -> Self {
+        let result = command_history::prepare_path(&path, false)
+            .and_then(|()| command_history::read_recent_with_status(&path, PICKER_MAX_ENTRIES));
+        let mut loaded = Self {
+            path: Some(path),
+            ..Self::default()
+        };
+        match result {
+            Ok(recent) => {
+                loaded.records = recent.records;
+                loaded.tail_truncated = recent.tail_truncated;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => loaded.error = Some(error.to_string()),
+        }
+        loaded
+    }
+}
+
+fn sanitize_entries(entries: &mut Vec<CommandHistoryRecord>) {
+    entries.retain_mut(|record| {
+        let Some(command) = sanitized_command(&record.command) else {
+            return false;
+        };
+        if command.len() != record.command.len() {
+            record.command = command.to_string();
+        }
+        if record
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| sanitized_cwd(cwd).is_none())
+        {
+            record.cwd = None;
+        }
+        true
+    });
+}
+
 /// 历史选择器状态。`entries` 最新在前（`read_recent` 的顺序），在打开浮层
 /// 时加载一次；期间新完成的命令会在下一次打开时出现。
 pub struct HistoryPickerState {
+    opening_id: u64,
+    target_session_id: Option<String>,
+    source_path: Option<PathBuf>,
+    library_revision: u64,
+    library_value: Option<Arc<HistoryLibrary>>,
+    loading: bool,
+    load_error: Option<String>,
+    tail_truncated: bool,
     query: String,
     query_buffer: String,
     /// 当前过滤结果中的高亮位置。
@@ -133,23 +201,16 @@ pub struct HistoryPickerState {
 
 impl HistoryPickerState {
     pub fn new(mut entries: Vec<CommandHistoryRecord>) -> Self {
-        entries.retain_mut(|record| {
-            let Some(command) = sanitized_command(&record.command) else {
-                return false;
-            };
-            if command.len() != record.command.len() {
-                record.command = command.to_string();
-            }
-            if record
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| sanitized_cwd(cwd).is_none())
-            {
-                record.cwd = None;
-            }
-            true
-        });
+        sanitize_entries(&mut entries);
         let mut state = Self {
+            opening_id: next_history_opening(),
+            target_session_id: None,
+            source_path: None,
+            library_revision: 0,
+            library_value: None,
+            loading: false,
+            load_error: None,
+            tail_truncated: false,
             query: String::new(),
             query_buffer: String::new(),
             selected: 0,
@@ -169,11 +230,98 @@ impl HistoryPickerState {
 
     /// 从持久化索引加载最近的一段。读取是有界的（文件尾部窗口 + 条数上限），
     /// 文件缺失或损坏时得到一个空的选择器而不是错误。
-    pub fn load(path: &std::path::Path) -> Self {
-        let records = command_history::prepare_path(path, false)
-            .and_then(|()| command_history::read_recent(path, PICKER_MAX_ENTRIES))
-            .unwrap_or_default();
-        Self::new(records)
+    #[cfg(test)]
+    pub fn load(path: &Path) -> Self {
+        Self::new(HistoryLibrary::load(path.to_owned()).records)
+    }
+
+    pub fn with_target(mut self, target: String) -> Self {
+        self.target_session_id = Some(target);
+        self
+    }
+
+    pub fn target_session_id(&self) -> Option<&str> {
+        self.target_session_id.as_deref()
+    }
+
+    pub fn begin_loading(&mut self, path: PathBuf, revision: u64) {
+        self.source_path = Some(path);
+        self.library_revision = revision;
+        self.loading = true;
+        self.load_error = None;
+        self.confirm_requested = false;
+    }
+
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
+    }
+
+    pub fn tail_truncated(&self) -> bool {
+        self.tail_truncated
+    }
+
+    pub fn library_revision(&self) -> u64 {
+        self.library_revision
+    }
+
+    pub fn apply_library_snapshot(
+        &mut self,
+        snapshot: &jterm_core::workflows::RefreshSnapshot<HistoryLibrary>,
+    ) -> bool {
+        if snapshot.revision < self.library_revision
+            || (!snapshot.loading
+                && snapshot.error.is_none()
+                && snapshot.value.path.as_deref() != self.source_path())
+        {
+            return false;
+        }
+        self.loading = snapshot.loading;
+        if snapshot.loading {
+            self.confirm_requested = false;
+            return false;
+        }
+        self.load_error = snapshot
+            .error
+            .clone()
+            .or_else(|| snapshot.value.error.clone());
+        if snapshot.revision == self.library_revision {
+            return false;
+        }
+        self.library_revision = snapshot.revision;
+        if snapshot.value.path.as_deref() != self.source_path() {
+            return false;
+        }
+        self.tail_truncated = snapshot.value.tail_truncated;
+        let unchanged = self
+            .library_value
+            .as_ref()
+            .is_some_and(|previous| Arc::ptr_eq(previous, &snapshot.value))
+            || self.entries == snapshot.value.records;
+        self.library_value = Some(Arc::clone(&snapshot.value));
+        if unchanged {
+            return true;
+        }
+        let selected = self.selected_command();
+        self.entries = snapshot.value.records.clone();
+        sanitize_entries(&mut self.entries);
+        self.rebuild_results();
+        self.selected = selected
+            .and_then(|selected| {
+                self.results
+                    .iter()
+                    .position(|index| self.entries[*index].command == selected)
+            })
+            .unwrap_or(0);
+        self.scroll_to_selected = true;
+        true
     }
 
     /// 当前过滤结果（最多 [`MAX_RESULTS`] 条）。空查询保持最新在前；否则按
@@ -188,6 +336,11 @@ impl HistoryPickerState {
 
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// Scope widget focus, scroll state and gestures to this opening.
+    pub fn opening_id(&self) -> u64 {
+        self.opening_id
     }
 
     /// egui edits a draft; sync it once after a real edit, never on idle frames.
@@ -257,11 +410,11 @@ impl HistoryPickerState {
     /// The input prepass records intent; the renderer confirms only after
     /// TextEdit applies this frame's text, paste and IME events.
     pub fn request_confirm(&mut self) {
-        self.confirm_requested = true;
+        self.confirm_requested = !self.loading;
     }
 
     pub fn take_confirm_request(&mut self) -> bool {
-        std::mem::take(&mut self.confirm_requested)
+        std::mem::take(&mut self.confirm_requested) && !self.loading
     }
 
     /// One-shot keyboard/query scroll intent; pointer and wheel retain control.
@@ -310,6 +463,127 @@ impl HistoryPickerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_for_history(
+        loader: &jterm_core::workflows::BackgroundRefresh<HistoryLibrary>,
+    ) -> jterm_core::workflows::RefreshSnapshot<HistoryLibrary> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let snapshot = loader.snapshot();
+            if !snapshot.loading {
+                return snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "history read did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn background_history_reopen_keeps_query_and_target_and_rejects_old_path() {
+        let root = TestDir::new("async-path-switch");
+        let old_path = root.join("old.jsonl");
+        let new_path = root.join("new.jsonl");
+        for (path, command) in [(&old_path, "printf old"), (&new_path, "printf new")] {
+            let bytes = format!(
+                "{}\n",
+                serde_json::to_string(&record(command, None, 0)).unwrap()
+            );
+            write_private(path, bytes);
+        }
+        let loader = jterm_core::workflows::BackgroundRefresh::new(HistoryLibrary::default());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let old_source = old_path.clone();
+        assert!(loader.refresh(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            HistoryLibrary::load(old_source)
+        }));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        let mut picker = HistoryPickerState::new(Vec::new()).with_target("new pane".into());
+        picker.begin_loading(new_path.clone(), loader.snapshot().revision);
+        let opening = picker.opening_id();
+        picker.set_query("new");
+        picker.request_confirm();
+        assert!(!picker.take_confirm_request());
+        assert!(!loader.refresh(|| panic!("a second read must be coalesced")));
+        release_tx.send(()).unwrap();
+        assert!(!picker.apply_library_snapshot(&wait_for_history(&loader)));
+        assert!(picker.is_loading());
+        assert!(picker.filtered().is_empty());
+
+        let baseline = loader.snapshot().revision;
+        picker.begin_loading(new_path.clone(), baseline);
+        assert!(loader.refresh(move || HistoryLibrary::load(new_path)));
+        assert!(picker.apply_library_snapshot(&wait_for_history(&loader)));
+        assert!(!picker.is_loading());
+        assert_eq!(picker.opening_id(), opening);
+        assert_eq!(picker.target_session_id(), Some("new pane"));
+        assert_eq!(picker.query(), "new");
+        assert_eq!(picker.selected_command().as_deref(), Some("printf new"));
+        assert!(
+            !picker.take_confirm_request(),
+            "loading Enter cannot accept later results"
+        );
+    }
+
+    #[test]
+    fn history_refresh_retains_selection_and_unchanged_snapshots_do_not_rescore() {
+        let path = PathBuf::from("/history.jsonl");
+        let mut picker = HistoryPickerState::new(Vec::new());
+        picker.begin_loading(path.clone(), 0);
+        let mut snapshot = jterm_core::workflows::RefreshSnapshot {
+            value: Arc::new(HistoryLibrary {
+                path: Some(path),
+                records: vec![record("first", None, 0), record("second", None, 0)],
+                error: None,
+                tail_truncated: true,
+            }),
+            revision: 2,
+            loading: false,
+            error: None,
+        };
+        assert!(picker.apply_library_snapshot(&snapshot));
+        picker.select_next();
+        let rebuilds = picker.rebuild_count;
+        snapshot.revision = 4;
+        snapshot.error = Some("worker failed".into());
+        assert!(picker.apply_library_snapshot(&snapshot));
+        assert_eq!(picker.selected_command().as_deref(), Some("second"));
+        assert_eq!(picker.rebuild_count, rebuilds);
+        assert_eq!(picker.load_error(), Some("worker failed"));
+        assert!(picker.tail_truncated());
+
+        snapshot.value = Arc::new(HistoryLibrary {
+            path: snapshot.value.path.clone(),
+            records: vec![record("second", None, 0), record("third", None, 0)],
+            error: None,
+            tail_truncated: false,
+        });
+        snapshot.revision = 6;
+        snapshot.error = None;
+        assert!(picker.apply_library_snapshot(&snapshot));
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.selected_command().as_deref(), Some("second"));
+        assert!(!picker.tail_truncated());
+        assert_eq!(picker.load_error(), None);
+    }
+
+    #[test]
+    fn history_load_distinguishes_missing_file_from_refused_source() {
+        let root = TestDir::new("read-errors");
+        let missing = HistoryLibrary::load(root.join("missing.jsonl"));
+        assert!(missing.error.is_none());
+        assert!(missing.records.is_empty());
+        let refused = HistoryLibrary::load(root.0.clone());
+        assert!(refused.error.is_some());
+        assert!(refused.records.is_empty());
+    }
 
     #[test]
     fn cwd_bound_matches_the_shared_history_writer() {
