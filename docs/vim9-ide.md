@@ -75,7 +75,7 @@ clicks in a folded split use Vim's own mouse handling. Soft-wrapped lines are
 native rows too (render protocol 9): continuation rows, `showbreak`/`breakindent`
 and `smoothscroll` partial lines keep Vim's exact layout, and touchpad/wheel
 scrolling moves one wrapped row at a time. Complex views (diff,
-blockwise selections over folds, guides or virtual text on wrapped lines, complex/scrolling completion,
+blockwise selections over folds, virtual text on wrapped lines, complex/scrolling completion,
 conceal and unsupported shaping) temporarily use **Compatible view**; hover
 the label for the runtime's reason. A disconnected bridge or a resized frame
 never leaves an old native frame over the terminal. The logical cell geometry
