@@ -453,6 +453,14 @@ fn bridge_allowed(expanded: bool, full: bool, visible_clip: bool, greeting: bool
     expanded && full && visible_clip && !greeting
 }
 
+/// The chrome strip replaces terminal rows, so it is window background, not an
+/// overlay. The window clears to transparent for window-level opacity; paint
+/// the strip like the terminal grid (theme background at the configured
+/// opacity) so the default opaque window never shows the desktop through it.
+fn chrome_background(background: egui::Color32, opacity: f32) -> egui::Color32 {
+    alpha(background, (opacity.clamp(0.0, 1.0) * 255.0) as u8)
+}
+
 fn host_height(enabled: bool, expanded: bool) -> f32 {
     if !enabled {
         0.0
@@ -2065,7 +2073,11 @@ impl OrganismHost {
                 config.ascii_organism_enabled,
                 config.ascii_organism_expanded,
             ))
-            .frame(egui::Frame::NONE.inner_margin(0.0))
+            .frame(
+                egui::Frame::NONE
+                    .inner_margin(0.0)
+                    .fill(chrome_background(self.palette.background, config.opacity)),
+            )
             .resizable(false)
             .show(ui, |ui| {
                 let rect = ui
@@ -2480,6 +2492,9 @@ impl crate::TerminalApp {
         // observed geometry; it does not defer or replay a rejected request.
         self.organism
             .set_available_geometry(ui.available_rect_before_wrap(), ui.clip_rect());
+        // The strip paints the current theme background before the terminal
+        // grid of this frame refreshes the shared palette.
+        self.organism.palette = NativePalette::from_theme(&self.current_theme);
         // Top-bar navigation may have changed the owner since event ingestion.
         self.prepare_organism(ui.ctx());
         // This is after active/background source ingestion. A repaint is only
@@ -4564,6 +4579,26 @@ mod tests {
         assert!(draw.contains("host_text(display, frame"));
         assert!(draw.contains("live_semantic_response(ui, rect, display)"));
         assert!(draw.contains("response.on_hover_text(self.inspect_text(display, true))"));
+    }
+
+    #[test]
+    fn chrome_strip_is_opaque_window_background_at_default_opacity() {
+        let background = crate::theme::Theme::default().terminal_background();
+        let opaque = chrome_background(background, 1.0);
+        assert_eq!(
+            opaque.to_srgba_unmultiplied(),
+            [background.r(), background.g(), background.b(), 255]
+        );
+        assert_eq!(chrome_background(background, 0.5).a(), 127);
+        assert_eq!(chrome_background(background, 2.0).a(), 255);
+        let draw = include_str!("organism_ui.rs")
+            .split_once("egui::Panel::bottom(\"ascii_organism_chrome\")")
+            .unwrap()
+            .1
+            .split_once(".show(ui,")
+            .unwrap()
+            .0;
+        assert!(draw.contains(".fill(chrome_background(self.palette.background, config.opacity))"));
     }
 
     #[test]
