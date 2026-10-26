@@ -51,7 +51,9 @@ def main():
                 return (control / name).exists()
             module.wait_for(ready, label)
         wait_ime_marker('connected', 'IME protocol connected')
-        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + args.mode + '"\nrestore_session = false\n')
+        # Use readable native glyphs in the visual fixture. At the 14px default,
+        # the yellow Chat preedit is only 10px high and OCR invents punctuation.
+        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + args.mode + '"\nrestore_session = false\nfont_size = 16.0\nui_font_size = 16.0\n')
         smoke.app = smoke.spawn([str(smoke.binary)], 'ember')
         module.wait_for(smoke.app_window, 'installed Ember IME window')
         time.sleep(2)
@@ -63,11 +65,17 @@ def main():
         assert (capture / 'live.bin').read_bytes() == b'', 'Modifier readiness leaked PTY bytes'
         result['keyboard_arguments'] = keyboard_module.KEYBOARD_ARGS
         result['modifier_roundtrip_verified'] = True
-        before = visual.snapshot(smoke, 'ime-visual-before', None, False)
+        before = visual.snapshot(smoke, 'ime-visual-before', None, False,
+                                 health_psm=11, health_footer=True)
         (control / 'start').touch()
         wait_ime_marker('preedit', 'genuine compositor preedit')
         time.sleep(0.5)
-        during = visual.snapshot(smoke, 'ime-preedit-zero-bytes', before, True)
+        # Chat renders this short preedit as a sparse line in a large card.
+        # Choose its layout before OCR, using the same immutable screenshot;
+        # psm6 invents a trailing colon on the retained CI Chat images.
+        during = visual.snapshot(smoke, 'ime-preedit-zero-bytes', before, True,
+                                 token_psm=11 if args.mode == 'chat' else 6,
+                                 health_psm=11, health_footer=True)
         preedit = (capture / 'live.bin').read_bytes()
         assert preedit == b'', ('preedit leaked terminal bytes', preedit.hex())
         (capture / 'preedit.bin').write_bytes(preedit)
@@ -75,7 +83,8 @@ def main():
         wait_ime_marker('committed', 'native composition Return consumed and grab released')
         expected = '你'.encode()
         module.wait_for(lambda: (capture / 'live.bin').read_bytes() == expected, 'commit text reaches PTY without CR')
-        after = visual.snapshot(smoke, 'ime-commit-without-cr', before, False)
+        after = visual.snapshot(smoke, 'ime-commit-without-cr', before, False,
+                                health_psm=11, health_footer=True)
         result['preedit_pixels'] = visual.verify_restoration(smoke, before, during, after)
         smoke.raw_finish(capture, identity, expected)
         (control / 'finish').touch()

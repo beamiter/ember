@@ -1,5 +1,54 @@
 # Bounded Block search: first real-app gate
 
+## Current observer: bounded-pixel-v2
+
+The default command and the compatibility `--observer-pilot` command now use the
+same strict pixel navigation observer. This explicitly replaces the old numeric
+`ROW000017`/query-token OCR check described in the historical specification
+below; it does not turn any historical failed result into a pass. Saved native
+screenshots showed correct navigation while OCR read zeros as letters and
+misread the leading token beside the selection stripe.
+
+Both commands emit a fixed 97-byte marker variant: the queried
+row 16 contains TARGET PAPAYA (raw) or TARGET WALNUT (snapshot), and the adjacent
+unqueried row 17 contains NEIGHBOR with the same suffix. Flush row 248
+contains LATEST CEDAR, seven rows above the end so card borders and following
+prompts cannot crowd its OCR baseline. Marker rows use spaces in place of
+trailing dot leaders so sparse-text OCR does not merge the control words into
+dense filler; all other rows retain their
+original bytes. Source byte counts, retention/search budgets, queries,
+exact public result identity, stopped/restarted raw flows and one pointer
+activation remain unchanged. Output manifests still verify the entire exact
+variant stream, not just the markers.
+
+Before opening search, the observer waits up to 30 seconds for a fresh screenshot
+to positively show LATEST CEDAR with no target/neighbor. A generator manifest and
+shell sentinel establish execution, but UI ingestion/painting of 100000 queued
+rows can still lag; the old single baseline screenshot raced that queue. Only
+observations repeat. Search input and pointer activation never repeat. An owned
+picker still closing after the click is likewise observed until closed within
+the existing final deadline; foreign PID/owner/tree failures remain fatal.
+Raw completion uses the existing exact owned AT-SPI status predicate (with fresh
+screenshot bracketing), since its long progress label can wrap across OCR lines.
+Its exact grammar includes the current operation progress suffix; the old
+adapter only matched the prefix and could never recognize production completion.
+This never replaces the independent final navigation pixel proof.
+Snapshot result identity omits only blank trailing terminal cells, while the
+emitter manifest continues to hash every emitted padding byte.
+
+Final proof requires the exact target and adjacent unqueried neighbor in one
+newly captured full screenshot after activation, with the original spatial,
+ownership, timestamp, negative-live-marker and no-open-picker controls. OCR
+remains unscaled PSM11 with no character substitution, case repair or alternate
+parameter retry. The ambiguous legacy row/token OCR is retained diagnostically
+in events. Wrong page, missing/duplicate marker, wrong neighbor, stale capture,
+wrong baseline ownership and still-open picker cannot satisfy this gate. Pure
+regressions include delayed live paint and failure to establish a live baseline.
+The old fixture bytes remain tested for provenance; both live entry points now
+report `fixture_version: bounded-pixel-v2`. Full E03 exclusions still apply.
+
+## Historical first-stage specification (superseded observer)
+
 This first fixture stage launches the installed, uninstrumented production Ember
 binary through the existing scale-one X11 desktop harness and drives the real
 Block Search picker through its actual Ctrl+Shift+G binding. Before typing,

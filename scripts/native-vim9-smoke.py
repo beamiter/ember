@@ -13,10 +13,10 @@ import argparse
 import csv
 import ctypes as C
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
-import select
 import shutil
 import subprocess
 import time
@@ -168,6 +168,7 @@ def main():
     runtime = out / "runtime"
     runtime.mkdir(mode=0o700)
     env = os.environ.copy()
+    env.pop("DISPLAY", None)
     env.pop("WAYLAND_DISPLAY", None)
     env.update(XDG_CONFIG_HOME=str(config.parent), XDG_STATE_HOME=str(out / "state"), XDG_DATA_HOME=str(out / "data"), XDG_CACHE_HOME=str(out / "cache"), XDG_RUNTIME_DIR=str(runtime), LIBGL_ALWAYS_SOFTWARE="1", WGPU_BACKEND=env.get("WGPU_BACKEND", "gl"), VIMINIT=r"set nocompatible viminfofile=NONE noswapfile nomore | set makeprg=printf\ native-build-output")
     # Delay only the cancellation fixture. Real ripgrep still owns indexing
@@ -240,14 +241,10 @@ def main():
         return json.loads(destination.read_text())
 
     try:
-        read_fd, write_fd = os.pipe()
-        server = spawn(["Xvfb", "-screen", "0", "1700x1100x24", "-nolisten", "tcp", "-displayfd", str(write_fd)], "xvfb", pass_fds=(write_fd,))
-        os.close(write_fd)
-        assert select.select([read_fd], [], [], 10)[0], "Xvfb startup timed out"
-        display = os.read(read_fd, 40).decode().strip()
-        os.close(read_fd)
-        assert display and server.poll() is None
-        env["DISPLAY"] = ":" + display
+        spec = importlib.util.spec_from_file_location('native_x11', Path(__file__).with_name('native-x11-display.py'))
+        display = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(display)
+        display.start_xvfb(spawn, env, out, '1700x1100x24')
         xinput = Input(env["DISPLAY"])
         app = spawn([str(args.binary.resolve(strict=True)), "--ide", str(source)], "ember")
         window = wait_for(xinput.window, "Ember native window")

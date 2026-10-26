@@ -153,6 +153,11 @@ class Tests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 driver.validate_manifest(dict(valid, **{key: wrong}), 'flush', 0, '123:/dev/pts/9')
 
+    def test_wrapped_completion_status_uses_exact_owned_public_evidence(self):
+        source = Path(driver.__file__).read_text()
+        self.assertIn("self.public.raw_result('complete', 'raw-complete')", source)
+        self.assertNotIn("self.wait_phrase('Complete for this retained output only'", source)
+
     def test_real_default_block_search_binding_is_used(self):
         self.assertEqual(driver.BLOCK_SEARCH_CHORD, ('g', ('ctrl', 'shift')))
         bindings = Path(__file__).parent.parent / 'src/keybindings.rs'

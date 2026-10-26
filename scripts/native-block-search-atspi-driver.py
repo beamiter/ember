@@ -91,7 +91,7 @@ def raw_hit(tree, expected, phase):
     elif phase=='complete':
         choices=[n for n in tree['nodes'] if n['parent']==picker['path'] and n['role']==29
                  and public.TEXT in n['interfaces'] and n.get('text')==n['name']
-                 and re.fullmatch(r'Retained blocks #[0-9]+–#[0-9]+ · Block #[0-9]+: Complete for this retained output only; [0-9]+ chunks this window',n['name'])]
+                 and re.fullmatch(r'Retained blocks #[0-9]+–#[0-9]+ · Block #[0-9]+: Complete for this retained output only; [0-9]+ chunks this window; [0-9]+ windows, [0-9]+ row decodes, [0-9]+ charged cells, [0-9]+\.[0-9]s',n['name'])]
         if not choices:raise MissingTarget('Missing exact completion status')
         if len(choices)!=1:raise RuntimeError('Ambiguous completion status')
         control=choices[0]
@@ -266,7 +266,14 @@ class Driver:
             if self.raw_deadline is None:raise RuntimeError('No current raw operation deadline')
             timeout=self.raw_deadline-time.monotonic()
             if timeout<=0:raise RuntimeError('Raw operation 9.5-second budget exhausted')
-        _,result=self.wait_evidence(lambda t:raw_hit(t,self.expected,phase),label,timeout=timeout)
+        def select(tree):
+            if phase == 'complete' and any(n['name'] == 'Stop search' for n in tree['nodes']):
+                # Completion is a transition: observe a fully validated active
+                # operation while it runs, without invoking Stop or restarting.
+                raw_hit(tree,self.expected,'active')
+                raise MissingTarget('Owned raw operation is still active')
+            return raw_hit(tree,self.expected,phase)
+        _,result=self.wait_evidence(select,label,timeout=timeout)
         return result
 
     def button(self, name, label):

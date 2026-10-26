@@ -20,6 +20,8 @@ PILOT_MARKERS = {
 }
 PILOT_COLUMN = 36
 PILOT_LIVE_MARKER = 'LATEST CEDAR'
+# Keep the live positive control clear of the card border and following prompt.
+PILOT_LIVE_ROW = 248
 
 
 def line(mode, index, record=0, observer_pilot=False):
@@ -31,11 +33,16 @@ def line(mode, index, record=0, observer_pilot=False):
     else:
         token = 'E03FLUSH'
     prefix = f'{token} ROW{index:06d} '
+    marker_row = observer_pilot and record == 0 and (
+        (mode in PILOT_MARKERS and index in (16, 17)) or (mode == 'flush' and index == PILOT_LIVE_ROW))
     if observer_pilot and mode in PILOT_MARKERS and record == 0 and index in (16, 17):
         prefix = prefix.ljust(PILOT_COLUMN) + PILOT_MARKERS[mode][index - 16] + '    '
-    elif observer_pilot and mode == 'flush' and record == 0 and index == 255:
+    elif observer_pilot and mode == 'flush' and record == 0 and index == PILOT_LIVE_ROW:
         prefix = prefix.ljust(PILOT_COLUMN) + PILOT_LIVE_MARKER + '    '
-    return (prefix + '.' * (WIDTH - len(prefix)) + '\n').encode('ascii')
+    # Quiet padding keeps sparse-text OCR from joining these independent
+    # control words to a dense dot leader. Width and source budgets stay fixed.
+    padding = ' ' if marker_row else '.'
+    return (prefix + padding * (WIDTH - len(prefix)) + '\n').encode('ascii')
 
 
 def emit(mode, record, output, manifest, require_tty=True, observer_pilot=False):

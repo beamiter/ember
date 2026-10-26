@@ -76,37 +76,19 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
     def run(self, args, **kwargs):
         return subprocess.run(args, env=self.env, check=True, timeout=30, **kwargs)
 
-    def spawn(self, args, label):
+    def spawn(self, args, label, **options):
         log = open(self.out / (label + '.log'), 'w')
         self.logs.append(log)
-        proc = subprocess.Popen(args, env=self.env, stdout=log, stderr=log)
+        proc = subprocess.Popen(args, env=self.env, stdout=log, stderr=log, **options)
         self.processes.append(proc)
         return proc
 
     def start_desktop(self):
         if self.backend == 'x11':
-            self.env['DISPLAY'] = ':99'
-            server = self.spawn(['Xvfb', ':99', '-screen', '0', '1280x900x24', '-nolisten', 'tcp'], 'xvfb')
-            deadline = time.monotonic() + 30
-            readiness = self.out / 'x11-readiness.jsonl'
-            def display_ready():
-                assert server.poll() is None, 'Xvfb exited before display readiness'
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                attempt = {'monotonic': time.monotonic()}
-                try:
-                    probe = subprocess.run(['xdpyinfo'], env=self.env, stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.PIPE, text=True, timeout=min(3, remaining))
-                    attempt.update(returncode=probe.returncode, stderr=probe.stderr[:512])
-                except subprocess.TimeoutExpired:
-                    attempt['timeout'] = True
-                with readiness.open('a') as log:
-                    log.write(json.dumps(attempt) + '\n')
-                return attempt.get('returncode') == 0
-            # Only readiness probes may repeat; no app launch or input is retried.
-            wait_for(display_ready, 'X11 display within 30 seconds', timeout=30)
-            assert server.poll() is None
+            spec = importlib.util.spec_from_file_location('native_x11', Path(__file__).with_name('native-x11-display.py'))
+            display = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(display)
+            display.start_xvfb(self.spawn, self.env, self.out, '1280x900x24')
             # Stock Openbox grabs Ctrl+Alt+Left/Right for desktop switching.
             # Keep the real Ember pane shortcuts; remove only those conflicting
             # test-WM bindings, with the original and effective config recorded.

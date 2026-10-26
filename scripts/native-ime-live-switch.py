@@ -28,7 +28,8 @@ def artifact_view(smoke, label):
     return view
 
 
-def composition_cycle(smoke, module, keyboard_module, visual, helper, identity, label, seat):
+def composition_cycle(smoke, module, keyboard_module, visual, helper, identity, label, seat,
+                      *, preedit_psm=6, health_psm=6, health_footer=False):
     view = artifact_view(smoke, label)
     control = view.out / 'ime-control'
     control.mkdir(exist_ok=False)
@@ -51,11 +52,18 @@ def composition_cycle(smoke, module, keyboard_module, visual, helper, identity, 
         module.wait_for(keyboard.ready, label + ' owned keyboard release roundtrip')
         assert seat.poll() is None
         assert (capture / 'live.bin').read_bytes() == b'', 'Modifier readiness leaked PTY bytes'
-        before = visual.snapshot(view, 'ime-visual-before', None, False)
+        health_options = {'health_psm': health_psm} if health_psm != 6 else {}
+        if health_footer:
+            health_options['health_footer'] = True
+        before = visual.snapshot(view, 'ime-visual-before', None, False, **health_options)
         (control / 'start').touch()
         marker('preedit')
         time.sleep(0.5)
-        during = visual.snapshot(view, 'ime-preedit-zero-bytes', before, True)
+        # Select Chat's sparse preedit layout before capture, never in response
+        # to OCR content. Keep custom lifecycle adapters on their own layout.
+        options = {'token_psm': preedit_psm} if preedit_psm != 6 else {}
+        during = visual.snapshot(view, 'ime-preedit-zero-bytes', before, True,
+                                 **health_options, **options)
         preedit = (capture / 'live.bin').read_bytes()
         assert preedit == b'', ('preedit leaked bytes', preedit.hex())
         (capture / 'preedit.bin').write_bytes(preedit)
@@ -64,7 +72,7 @@ def composition_cycle(smoke, module, keyboard_module, visual, helper, identity, 
         expected = '你'.encode()
         module.wait_for(lambda: (capture / 'live.bin').read_bytes() == expected,
                         label + ' exact commit without CR')
-        after = visual.snapshot(view, 'ime-commit-without-cr', before, False)
+        after = visual.snapshot(view, 'ime-commit-without-cr', before, False, **health_options)
         result['preedit_pixels'] = visual.verify_restoration(view, before, during, after)
         smoke.raw_finish(capture, identity, expected)
         (control / 'finish').touch()
@@ -119,7 +127,9 @@ def exercise(smoke, module, keyboard_module, visual, helper, seat):
         # their exact clipboard readback and zero raw PTY byte assertions.
         smoke.find_clipboard_ownership(identity, label)
         segment = composition_cycle(smoke, module, keyboard_module, visual,
-                                    helper, identity, label, seat)
+                                    helper, identity, label, seat,
+                                    preedit_psm=11 if mode == 'chat' else 6,
+                                    health_psm=11, health_footer=True)
         segment['mode'] = mode
         segments.append(segment)
         old = mode
@@ -154,7 +164,9 @@ def main():
         smoke.start_desktop()
         seat = smoke.spawn(['wtype', '-s', '600000', '-k', 'F24'], 'ime-seat-keyboard')
         time.sleep(0.5)
-        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = false\n')
+        # Keep the same readable visual-fixture fonts through every Settings
+        # switch; the tiny default Chat preedit makes OCR invent punctuation.
+        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = false\nfont_size = 16.0\nui_font_size = 16.0\n')
         smoke.app = smoke.spawn([str(smoke.binary)], 'ember')
         module.wait_for(smoke.app_window, 'live IME Ember window')
         time.sleep(2)

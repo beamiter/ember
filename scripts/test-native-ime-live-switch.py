@@ -21,8 +21,8 @@ class LiveTests(unittest.TestCase):
             smoke=SimpleNamespace(app=SimpleNamespace(poll=lambda:None),transcript=transcript,command=command,
                                   switch_mode=lambda old,new:events.append(('switch',old,new)),
                                   find_clipboard_ownership=lambda ident,label:events.append(('find',ident,label)))
-            def cycle(smoke,module,keyboard,visual,helper,identity,label,seat):
-                events.append(('ime',label));smoke.command(label+'-submitted');return {'status':'pass'}
+            def cycle(smoke,module,keyboard,visual,helper,identity,label,seat,**kwargs):
+                events.append(('ime',label));events.append(('layout',label,kwargs));smoke.command(label+'-submitted');return {'status':'pass'}
             with patch.object(live,'composition_cycle',side_effect=cycle):
                 result=live.exercise(smoke,None,None,None,None,SimpleNamespace(poll=lambda:None))
             self.assertEqual([x for x in events if x[0]=='switch'], [('switch','normal','block'),('switch','block','chat'),('switch','chat','normal')])
@@ -31,6 +31,8 @@ class LiveTests(unittest.TestCase):
             for index,mode in enumerate(live.MODES):
                 label=f'live-{index}-{mode}'
                 self.assertLess(events.index(('find','42:/dev/pts/0',label)),events.index(('ime',label)))
+                self.assertIn(('layout',label,{'preedit_psm':11 if mode=='chat' else 6,
+                                             'health_psm':11,'health_footer':True}),events)
 
     def test_transcript_requires_exact_order_identity_and_lf_bytes(self):
         mutations = {
@@ -50,7 +52,7 @@ class LiveTests(unittest.TestCase):
                 smoke=SimpleNamespace(app=SimpleNamespace(poll=lambda:None),transcript=transcript,
                                       command=command,switch_mode=lambda *args:None,
                                       find_clipboard_ownership=lambda *args:None)
-                def cycle(smoke,module,keyboard,visual,helper,identity,label,seat):
+                def cycle(smoke,module,keyboard,visual,helper,identity,label,seat,**kwargs):
                     smoke.command(label+'-submitted')
                     if label=='live-3-normal':transcript.write_bytes(mutate(transcript.read_bytes()))
                     return {'status':'pass'}

@@ -224,6 +224,37 @@ class VisualTests(unittest.TestCase):
         self.assertEqual(result['health_ocr_psm'], 6)
         self.assertEqual(len(self.smoke.word_calls), 1)
 
+    def test_preselected_sparse_health_layout_uses_same_image_in_every_phase(self):
+        before = self.fallback_fixture([word('terminal')], [self.smoke.anchor], baseline=False)
+        self.assertIsNone(before)
+        baseline = visual.snapshot(self.smoke, 'before', None, False, health_psm=11)
+        result = visual.snapshot(self.smoke, 'after', baseline, False, health_psm=11)
+        self.assertEqual(result['health_ocr_psm'], 11)
+        self.assertEqual(result['anchor_box'], baseline['anchor_box'])
+        self.assertEqual(self.smoke.captures, ['before', 'after'])
+        self.assertEqual(self.smoke.word_calls, [
+            ('before', {'psm': 6, 'capture': False}), ('before', {'psm': 11, 'capture': False}),
+            ('after', {'psm': 6, 'capture': False}), ('after', {'psm': 11, 'capture': False})])
+
+    def test_sparse_health_cannot_hide_wrong_anchor_token_or_mutated_pixels(self):
+        for case in ['missing', 'duplicate', 'outside', 'moved', 'token', 'sparse-token', 'mutated']:
+            with self.subTest(case=case):
+                self.smoke.words = Smoke.words.__get__(self.smoke, Smoke)
+                baseline = self.capture(label='before')
+                alternate = {'missing': [word('other')], 'duplicate': [self.smoke.anchor]*2,
+                             'outside': [dict(self.smoke.anchor, left='0')],
+                             'moved': [dict(self.smoke.anchor, left='16')],
+                             'sparse-token': [self.smoke.anchor, self.token]}.get(case, [self.smoke.anchor])
+                self.fallback_fixture([self.token] if case == 'token' else [word('terminal')],
+                                      alternate, baseline=False, mutate=case == 'mutated')
+                with self.assertRaises(RuntimeError):
+                    visual.snapshot(self.smoke, 'after', baseline, False, health_psm=11)
+
+    def test_invalid_health_layout_rejected_before_capture(self):
+        with self.assertRaises(RuntimeError):
+            visual.snapshot(self.smoke, 'invalid', None, False, health_psm=7)
+        self.assertEqual(self.smoke.captures, [])
+
     def test_primary_duplicate_wrong_box_or_missing_baseline_cannot_fallback(self):
         for primary, baseline in [([self.smoke.anchor]*2, True),
                                   ([dict(self.smoke.anchor, left='16')], True),
@@ -265,13 +296,13 @@ class SelectedLayoutTests(unittest.TestCase):
     def test_presence_layout_never_trims_arrow_or_fuzzy_text(self):
         for token,success in [('EMBERPREEDITMARKER',True),(' EMBERPREEDITMARKER',False),
                               ('→EMBERPREEDITMARKER',False),('EMBERPREEDITMARKER ',False),
-                              ('EMBERPREEOITMARKER',False),('→',False)]:
+                              ('EMBERPREEDITMARKER:',False),('EMBERPREEOITMARKER',False),('→',False)]:
             with self.subTest(token=token),tempfile.TemporaryDirectory() as d:
                 smoke=Smoke(d);before=visual.snapshot(smoke,'before',None,False)
                 calls=[]
                 def words(label,**kwargs):
                     calls.append(kwargs['psm'])
-                    return [smoke.anchor,word(' EMBERPREEDITMARKER' if kwargs['psm']==6 else token)]
+                    return [smoke.anchor,word('EMBERPREEDITMARKER:' if kwargs['psm']==6 else token)]
                 smoke.words=words
                 if success:
                     result=visual.snapshot(smoke,'during',before,True,token_psm=11)
@@ -297,6 +328,130 @@ class SelectedLayoutTests(unittest.TestCase):
                     return [smoke.anchor]+[token]*(2 if case=='duplicate' else 1)
                 smoke.words=words
                 with self.assertRaises(RuntimeError):visual.snapshot(smoke,'during',before,True,token_psm=11)
+
+
+class FooterSmoke(Smoke):
+    def __init__(self, out):
+        super().__init__(out)
+        self.node['rect'] = {'x': 0, 'y': 25, 'width': 1280, 'height': 875}
+        self.rows = [word('terminal', y=100)]
+        self.footer_rows = [word(visual.HEALTH_ANCHOR, x=174, y=7, width=46, height=10)]
+        self.footer_dimensions = '1280 24'
+        self.mutate_footer = None
+
+    def run(self, args, **kwargs):
+        if args[0] == 'convert' and str(args[-1]).endswith('-health-footer.png'):
+            self.commands.append((args, kwargs))
+            Path(args[-1]).write_bytes(b'footer pixels')
+            return SimpleNamespace(stdout='')
+        if args[0] == 'identify' and str(args[-1]).endswith('-health-footer.png'):
+            self.commands.append((args, kwargs))
+            return SimpleNamespace(stdout=self.footer_dimensions)
+        return super().run(args, **kwargs)
+
+    def words(self, label, **kwargs):
+        self.word_calls.append((label, kwargs))
+        if kwargs['psm'] == 7:
+            columns = list(word('header'))
+            tsv = '\t'.join(columns) + '\n'
+            tsv += ''.join('\t'.join(row.get(key, '') for key in columns) + '\n'
+                           for row in self.footer_rows)
+            (self.out / (label + '-psm7.tsv')).write_text(tsv)
+            if self.mutate_footer is not None:
+                self.mutate_footer(label)
+            return self.footer_rows
+        return self.rows
+
+
+class FooterHealthTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.smoke = FooterSmoke(self.temp.name)
+
+    def capture(self, label='test', baseline=None, **kwargs):
+        return visual.snapshot(self.smoke, label, baseline, False,
+                               health_psm=11, health_footer=True, **kwargs)
+
+    def test_fixed_footer_preserves_source_and_maps_exact_anchor_and_artifacts(self):
+        result = self.capture()
+        self.assertEqual(self.smoke.captures, ['test'])
+        self.assertEqual(result['health_ocr_psm'], 7)
+        self.assertEqual(result['anchor_box'], {'x': 174, 'y': 883, 'width': 46, 'height': 10})
+        self.assertEqual(result['image_sha256'], hashlib.sha256(b'fixture').hexdigest())
+        evidence = result['health_footer']
+        self.assertEqual(evidence['rectangle'], visual.FOOTER_RECT)
+        self.assertEqual(evidence['image_sha256'], hashlib.sha256(b'footer pixels').hexdigest())
+        self.assertEqual(evidence['ocr_psm'], 7)
+        self.assertTrue(Path(evidence['image']).is_file())
+        self.assertTrue(Path(evidence['tsv']).is_file())
+        self.assertEqual(Path(result['image']).read_bytes(), b'fixture')
+        convert = [args for args, _ in self.smoke.commands if args[0] == 'convert']
+        self.assertEqual(convert, [['convert', result['image'], '-crop',
+                                   '1280x24+0+876', '+repage', evidence['image']]])
+        self.assertEqual(self.smoke.word_calls, [
+            ('test', {'psm': 6, 'capture': False}), ('test', {'psm': 11, 'capture': False}),
+            ('test-health-footer', {'psm': 7, 'capture': False})])
+
+    def test_missing_duplicate_fuzzy_and_malformed_footer_fail_without_fallback(self):
+        anchor = self.smoke.footer_rows[0]
+        for rows in [[], [word('other')], [dict(anchor, text='master:')],
+                     [dict(anchor, text=' master')], [anchor]*2, [dict(anchor, conf='nan')]]:
+            with self.subTest(rows=rows):
+                self.smoke.footer_rows = rows
+                with self.assertRaises(RuntimeError):
+                    self.capture(health_fallback=True)
+
+    def test_every_local_word_must_fit_crop_before_coordinate_translation(self):
+        anchor = self.smoke.footer_rows[0]
+        for changes in [{'left': '-1'}, {'top': '-1'}, {'left': '1270'},
+                        {'top': '20'}, {'width': '0'}, {'height': '25'}, {'top': 'bad'}]:
+            for unrelated in (False, True):
+                with self.subTest(changes=changes, unrelated=unrelated):
+                    bad = dict(anchor, **changes)
+                    self.smoke.footer_rows = [anchor, dict(bad, text='other')] if unrelated else [bad]
+                    with self.assertRaises(RuntimeError):
+                        self.capture()
+
+    def test_footer_crop_must_be_owned_and_have_exact_geometry(self):
+        self.smoke.node['rect']['height'] = 800
+        with self.assertRaisesRegex(RuntimeError, 'outside owned'):
+            self.capture()
+        self.assertFalse(any(args[0] == 'convert' for args, _ in self.smoke.commands))
+        self.smoke.node['rect']['height'] = 875
+        for dimensions in ['', '1280 23', '1280 241280 24']:
+            self.smoke.footer_dimensions = dimensions
+            with self.subTest(dimensions=dimensions), self.assertRaises(RuntimeError):
+                self.capture()
+
+    def test_original_and_footer_bytes_must_remain_immutable_during_ocr(self):
+        for target in ('footer', 'original'):
+            with self.subTest(target=target):
+                def mutate(label):
+                    name = label if target == 'footer' else label.removesuffix('-health-footer')
+                    (self.smoke.out / (name + '.png')).write_bytes(b'changed pixels')
+                self.smoke.mutate_footer = mutate
+                with self.assertRaisesRegex(RuntimeError, 'changed during OCR'):
+                    self.capture()
+
+    def test_anchor_box_must_stay_fixed_across_lifecycle(self):
+        before = self.capture(label='before')
+        self.smoke.footer_rows = [dict(self.smoke.footer_rows[0], left='175')]
+        with self.assertRaisesRegex(RuntimeError, 'anchor moved'):
+            self.capture(label='after', baseline=before)
+
+    def test_full_frame_token_checks_cannot_be_hidden_by_healthy_footer(self):
+        terminal = word('terminal', y=100)
+        token = word(visual.PREEDIT_TOKEN, y=100)
+        for layout in (6, 11):
+            with self.subTest(layout=layout):
+                def words(label, **kwargs):
+                    if kwargs['psm'] == layout:
+                        return [terminal, token]
+                    return FooterSmoke.words(self.smoke, label, **kwargs)
+                self.smoke.words = words
+                with self.assertRaises(RuntimeError):
+                    self.capture()
 
 if __name__ == '__main__':
     unittest.main()

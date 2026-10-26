@@ -6,6 +6,7 @@ import math
 PREEDIT_TOKEN = 'EMBERPREEDITMARKER'
 HEALTH_ANCHOR = 'master'
 OUTPUT_RECT = {'x': 0, 'y': 0, 'width': 1280, 'height': 900}
+FOOTER_RECT = {'x': 0, 'y': 876, 'width': 1280, 'height': 24}
 
 
 def box(row):
@@ -65,7 +66,42 @@ def exact_matches(rows, rectangle, token=PREEDIT_TOKEN):
     return matches
 
 
-def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_psm=6):
+def footer_health(smoke, label, image, rectangle):
+    # Fixed geometry, selected before OCR; this is a pixel-preserving crop of
+    # the same immutable capture, never a retry, resize, mask or text repair.
+    if not contained(FOOTER_RECT, rectangle['rect']):
+        raise RuntimeError('Health footer lies outside owned surface')
+    footer_label = label + '-health-footer'
+    footer = smoke.out / (footer_label + '.png')
+    crop = f"{FOOTER_RECT['width']}x{FOOTER_RECT['height']}+{FOOTER_RECT['x']}+{FOOTER_RECT['y']}"
+    smoke.run(['convert', str(image), '-crop', crop, '+repage', str(footer)])
+    dimensions = smoke.run(['identify', '-format', '%w %h', str(footer)],
+                           capture_output=True, text=True).stdout
+    if dimensions != '1280 24':
+        raise RuntimeError('Unexpected health footer dimensions or image count')
+    footer_sha256 = hashlib.sha256(footer.read_bytes()).hexdigest()
+    rows = smoke.words(footer_label, psm=7, capture=False)
+    validate_rows(rows)
+    local_rectangle = dict(FOOTER_RECT, x=0, y=0)
+    mapped = []
+    for row in rows:
+        # Validate every local word before translating into original image
+        # coordinates; even an unrelated out-of-crop word invalidates evidence.
+        if not contained(box(row), local_rectangle):
+            raise RuntimeError('OCR word crosses health footer crop bounds')
+        mapped.append(dict(row, left=str(int(row['left']) + FOOTER_RECT['x']),
+                           top=str(int(row['top']) + FOOTER_RECT['y'])))
+    if hashlib.sha256(footer.read_bytes()).hexdigest() != footer_sha256:
+        raise RuntimeError('Health footer changed during OCR analysis')
+    return mapped, {'rectangle': dict(FOOTER_RECT), 'image': str(footer),
+                    'image_sha256': footer_sha256,
+                    'tsv': str(smoke.out / (footer_label + '-psm7.tsv')), 'ocr_psm': 7}
+
+
+def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_psm=6,
+             health_psm=6, health_footer=False):
+    if health_psm not in (6, 11):
+        raise RuntimeError('Unsupported health anchor layout')
     if token_psm not in (6,11) or (token_psm==11 and (not present or baseline is None)):
         raise RuntimeError('Alternate token layout requires a current-cycle presence baseline')
     def geometry(suffix):
@@ -103,9 +139,22 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
         if len(primary_tokens) > 1 or (primary_tokens and
                 [box(r) for r in primary_tokens] != [box(r) for r in selected_tokens]):
             raise RuntimeError('Token layouts disagree on exact token geometry')
-    anchors = exact_matches(rows, rectangle, HEALTH_ANCHOR)
-    health_ocr_psm = 6
-    if not anchors and health_fallback and baseline is not None:
+    # The footer is sparse text regardless of the terminal's content layout.
+    # Callers may select that layout before capture, for the entire lifecycle.
+    health_rows = rows
+    if health_psm == 11:
+        health_rows = token_rows if token_psm == 11 else smoke.words(label, psm=11, capture=False)
+        validate_rows(health_rows)
+        if not present and exact_matches(health_rows, rectangle):
+            raise RuntimeError('Sparse health layout still observes preedit token')
+    footer_evidence = None
+    health_ocr_psm = health_psm
+    if health_footer:
+        health_rows, footer_evidence = footer_health(smoke, label, image, rectangle)
+        health_ocr_psm = 7
+    anchors = exact_matches(health_rows, rectangle, HEALTH_ANCHOR)
+    if (not health_footer and not anchors and health_fallback
+            and health_psm == 6 and baseline is not None):
         # One alternate layout of the SAME immutable PNG, never a recapture or
         # an input retry. A known exact baseline box is required. Ambiguous or
         # displaced primary anchors cannot fall through to another analysis.
@@ -129,6 +178,8 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
               'expected_token_count': int(present), 'observed_token_count': len(matches),
               'matches': matches, 'image_sha256': image_sha256, 'health_ocr_psm': health_ocr_psm,
               'token_ocr_psm': token_psm}
+    if footer_evidence is not None:
+        result['health_footer'] = footer_evidence
     (smoke.out / (label + '-visual.json')).write_text(json.dumps(result, indent=2))
     return result
 

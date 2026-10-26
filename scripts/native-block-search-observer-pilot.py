@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Preregistered independent pixel observer experiment. Never read body node text as success."""
+"""Bounded pixel navigation oracle. Never read body node text as success.
+
+Promotes the independent target/neighbor controls after the legacy numeric OCR
+fixture produced false negatives. Historical failed verdicts remain unchanged.
+"""
 import hashlib
 import importlib.util
 import json
@@ -65,6 +69,10 @@ def pixel_claim(words, mode, capture, activation):
             'capture': capture, 'source': 'exact OCR words from one newly captured PNG'}
 
 
+class PickerOpen(RuntimeError):
+    """Owned picker has not closed yet; observation may wait, never reactivate."""
+
+
 def closed_picker(tree, owner, pid):
     base.public.probe.validate_tree(tree['nodes'], tree['root'], owner, pid, None)
     if tree['owner'] != owner or tree['pid'] != pid:
@@ -72,7 +80,7 @@ def closed_picker(tree, owner, pid):
     # Only closed-surface/ownership evidence is used; submitted-body text is NEVER inspected.
     forbidden = {'Search scope: All', 'Search scope: Cmd', 'Search scope: Out', 'Latest'}
     if any(n['name'] in forbidden or n['role'] == 79 for n in tree['nodes']):
-        raise RuntimeError('Picker/editor still present; pixels cannot prove final navigation')
+        raise PickerOpen('Picker/editor still present; pixels cannot prove final navigation')
 
 
 class PilotSmoke(base.SearchSmoke):
@@ -103,8 +111,20 @@ class PilotSmoke(base.SearchSmoke):
             tsv_sha256=hashlib.sha256(tsv.read_bytes()).hexdigest())
 
     def open_find(self, query):
-        words, capture = self.fresh_pixels('pilot-before-search')
-        live_baseline(words)
+        # A completed generator/sentinel proves PTY execution, not that the UI
+        # consumed and painted its queued output. Wait for positive live pixels
+        # before sending the one search action (100k-row raw output can lag).
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            words, capture = self.fresh_pixels('pilot-before-search')
+            try:
+                live_baseline(words)
+            except RuntimeError:
+                time.sleep(0.1)
+                continue
+            break
+        else:
+            raise RuntimeError('Live viewport pixel baseline deadline exhausted')
         mode = {'E03EARLYHIT': 'raw', 'E03SNAPSHOT00': 'snapshot'}.get(query)
         if mode is None: raise RuntimeError('Unregistered pilot query')
         self.pilot_baseline = dict(query=query, mode=mode, pid=self.app.pid,
@@ -130,7 +150,9 @@ class PilotSmoke(base.SearchSmoke):
             node = result['hit']
         else:
             if token != 'E03SNAPSHOT00': raise RuntimeError('Unexpected pilot snapshot token')
-            line = base.fixture.line(mode, row, 0, observer_pilot=True).decode().rstrip('\n')
+            # Captured terminal rows omit blank right-hand cells; the stream
+            # manifest above independently checks all 96 emitted columns.
+            line = base.fixture.line(mode, row, 0, observer_pilot=True).decode().rstrip(' \n')
             node = self.public.snapshot_result(line, 'snapshot-hit-visible')
         x, y, width, height = node['screen_extents']
         before_words, before_capture = self.fresh_pixels('pilot-before-activation')
@@ -145,7 +167,11 @@ class PilotSmoke(base.SearchSmoke):
         while time.monotonic() < deadline:
             label = f'{self.sequence + 1:04d}-pilot-final-output'
             before_tree = base.public.probe.discovery(self.app.pid, self.out / (label + '-before-picker.json'), None)
-            closed_picker(before_tree, self.public.owner, self.app.pid)
+            try:
+                closed_picker(before_tree, self.public.owner, self.app.pid)
+            except PickerOpen:
+                time.sleep(0.1)
+                continue
             if time.monotonic() >= deadline: raise RuntimeError('Pilot observation deadline exhausted')
             words, capture = self.fresh_pixels('pilot-final-output')  # Unchanged PSM11, no scaling.
             capture['activation'] = activation
@@ -167,5 +193,6 @@ class PilotSmoke(base.SearchSmoke):
 
     def exercise_search(self, scenario):
         result = super().exercise_search(scenario)
-        result['correctness'] = 'independent observer experiment only; legacy gate and full E03 remain separate'
+        result['correctness'] = 'bounded pixel navigation gate; full E03 exclusions remain'
+        result['pixel_oracle'] = 'exact target and adjacent unqueried neighbor with positive live baseline'
         return result

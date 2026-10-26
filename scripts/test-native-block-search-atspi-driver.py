@@ -100,9 +100,9 @@ class Tests(unittest.TestCase):
    d=self.driver(td)
    with self.assertRaises(RuntimeError):d.button('Latest','latest')
   source=Path(p.__file__).read_text();self.assertNotIn('SetText(',source);self.assertNotIn('refresh_block_search_hits',source)
- def test_legacy_search_oracles_and_budget_remain(self):
+ def test_search_identity_controls_and_budget_remain(self):
   source=Path(p.__file__).with_name('native-block-search.py').read_text()
-  for text in ['active_hit_claim(rows, token)',"stopped['claim'] == claim", "self.wait_active_hit('E03EARLYHIT', 'loading-return-rejected')", "'Complete for this retained output only'", "f'ROW{row + 1:06d}'", "'input p95 and presentation latency'",'self.memory_stop.wait(0.01)','for record in range(64)']:
+  for text in ['active_hit_claim(rows, token)',"stopped['claim'] == claim", "self.wait_active_hit('E03EARLYHIT', 'loading-return-rejected')", "self.public.raw_result('complete', 'raw-complete')", "f'ROW{row + 1:06d}'", "'input p95 and presentation latency'",'self.memory_stop.wait(0.01)','for record in range(64)']:
    self.assertIn(text,source)
   self.assertNotIn('self.query_point',source);self.assertEqual(source.count('self.key(*BLOCK_SEARCH_CHORD)'),1)
 
@@ -229,12 +229,29 @@ class RawEvidenceTests(unittest.TestCase):
    with self.subTest(label=label),self.assertRaises(RuntimeError):p.raw_hit(tree,'E03DISCOVERY','active')
  def test_exact_completion_text_and_stable_claim(self):
   tree=self.raw_tree();node=tree['nodes'][-1]
-  node.update(name='Retained blocks #1–#6 · Block #2: Complete for this retained output only; 100 chunks this window',role=29)
+  node.update(name='Retained blocks #1–#6 · Block #2: Complete for this retained output only; 100 chunks this window; 98 windows, 100001 row decodes, 16300163 charged cells, 4.3s',role=29)
   node['interfaces'].append(p.public.TEXT);node['text']=node['name']
   got=p.raw_hit(tree,'E03DISCOVERY','complete');self.assertEqual(got['claim']['retained_row'],18)
-  for text in ['Complete for this retained output only','Partial output: operation time limit; Continue this output']:
+  for text in ['Complete for this retained output only','Partial output: operation time limit; Continue this output',
+               node['name'] + '; forged', node['name'].replace('98 windows','-98 windows')]:
    bad=copy.deepcopy(tree);bad['nodes'][-1].update(name=text,text=text)
    with self.assertRaises(RuntimeError):p.raw_hit(bad,'E03DISCOVERY','complete')
+
+ def test_completion_waits_only_for_validated_active_operation(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory);active=self.raw_tree()
+   complete=copy.deepcopy(active);node=complete['nodes'][-1]
+   node.update(name='Retained blocks #1–#6 · Block #2: Complete for this retained output only; 100 chunks this window; 98 windows, 100001 row decodes, 16300163 charged cells, 4.3s',role=29)
+   node['interfaces'].append(p.public.TEXT);node['text']=node['name']
+   def wait(select,label,timeout):
+    with self.assertRaises(p.MissingTarget):select(active)
+    contradictory=copy.deepcopy(active);extra=copy.deepcopy(complete['nodes'][-1]);extra['path']+='stale'
+    contradictory['nodes'][2]['children'].append(extra['path']);contradictory['nodes'].append(extra)
+    with self.assertRaises(RuntimeError) as failure:select(contradictory)
+    self.assertNotIsInstance(failure.exception,p.MissingTarget)
+    return complete,select(complete)
+   driver.wait_evidence=wait
+   self.assertEqual(driver.raw_result('complete','complete')['claim']['retained_row'],18)
 
  def test_raw_budget_is_shared_from_action_not_reset_by_observation(self):
   with tempfile.TemporaryDirectory() as d:

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """First E03 real-app correctness gate. OCR is NOT a latency measurement.
 
+Both entry points use the exact target/neighbor pixel oracle; the former
+numeric OCR fixture remains available to pure regression tests only.
+
 No native geometry/IME handshake, app method injection, or instrumented binary.
 Run raw and snapshot scenarios in separate fresh app processes/HOMEs.
 """
@@ -266,7 +269,10 @@ class SearchSmoke(native.Smoke):
             self.click_phrase('Stop search', 'restart-flow-stop')
             self.wait_phrase('Restart this output', 'restart-flow-stopped')
             self.click_phrase('Restart this output', 'restart-once')
-            self.wait_phrase('Complete for this retained output only', 'raw-complete', timeout=30)
+            # Status text wraps with retained-range/progress chrome. Verify its
+            # exact owned public label instead of joining unrelated OCR lines;
+            # final navigation still requires independent target/neighbor pixels.
+            self.public.raw_result('complete', 'raw-complete')
             self.navigate('E03EARLYHIT', 16, pointer=True, raw=True)
         else:
             for record in range(64):
@@ -293,7 +299,7 @@ def main():
     parser.add_argument('--scenario', choices=['raw', 'snapshot'], required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--observer-pilot', action='store_true',
-                        help='Independent preregistered pixel-observer experiment; not the legacy gate')
+                        help='Compatibility entry point for the former independent pixel observer pilot')
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     out = args.output.resolve()
@@ -304,11 +310,13 @@ def main():
                               'natural-limit Continue', 'continuous PTY contention',
                               'pane/query/reset/eviction/alternate-screen race matrix',
                               'keyboard final navigation', 'Wayland'])
-    smoke_class = (load('e03_observer_pilot', 'native-block-search-observer-pilot.py').PilotSmoke
-                   if args.observer_pilot else SearchSmoke)
+    # The ambiguous numeric OCR observer is superseded, not character-repaired.
+    # Keep both CI entry points on the same strict positive/negative pixel proof.
+    smoke_class = load('e03_observer_pilot', 'native-block-search-observer-pilot.py').PilotSmoke
+    result['fixture_version'] = 'bounded-pixel-v2'
     smoke = smoke_class(binary, args.backend, out)
     if args.observer_pilot:
-        result['observer_pilot'] = 'preregistered experiment; legacy gate remains separate'
+        result['observer_pilot'] = 'compatibility entry point; bounded-pixel-v2 oracle'
     try:
         log = open(out/'private-dbus.log', 'w'); smoke.logs.append(log)
         smoke.bus_daemon = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address=1'],

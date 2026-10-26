@@ -3,6 +3,7 @@
 import copy, hashlib, importlib.util, io, json, tempfile, unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('pilot_test',Path(__file__).with_name('native-block-search-observer-pilot.py'))
 p=importlib.util.module_from_spec(spec);spec.loader.exec_module(p)
 
@@ -21,6 +22,33 @@ def tree():
         name='Ember',role=23,children=[],states=[0,0],interfaces=[])])
 
 class Tests(unittest.TestCase):
+    def test_live_baseline_waits_for_painted_output_before_single_search_action(self):
+        smoke=object.__new__(p.PilotSmoke)
+        smoke.app=SimpleNamespace(pid=42)
+        smoke.public=SimpleNamespace(window='owned')
+        smoke.events=[]
+        live=[word('LATEST',300,160,1),word('CEDAR',340,160,1)]
+        observations=iter([([],{'finished_ns':1}), (live,{'finished_ns':2})])
+        smoke.fresh_pixels=lambda label:next(observations)
+        with patch.object(p.base.SearchSmoke,'open_find') as action, patch.object(p.time,'sleep'):
+            smoke.open_find('E03EARLYHIT')
+        action.assert_called_once_with('E03EARLYHIT')
+        self.assertEqual(smoke.pilot_baseline['capture']['finished_ns'],2)
+
+    def test_missing_live_baseline_never_opens_search(self):
+        smoke=object.__new__(p.PilotSmoke)
+        smoke.fresh_pixels=lambda label:([],{})
+        with patch.object(p.base.SearchSmoke,'open_find') as action, \
+                patch.object(p.time,'monotonic',side_effect=[0,1,31]),patch.object(p.time,'sleep'):
+            with self.assertRaisesRegex(RuntimeError,'baseline deadline exhausted'):
+                smoke.open_find('E03EARLYHIT')
+        action.assert_not_called()
+
+    def test_both_native_entry_points_use_pixel_oracle(self):
+        source=Path(p.base.__file__).read_text()
+        self.assertIn("smoke_class = load('e03_observer_pilot', 'native-block-search-observer-pilot.py').PilotSmoke",source)
+        self.assertNotIn('if args.observer_pilot else SearchSmoke',source)
+
     def test_exact_pair_both_modes(self):
         for mode in ['raw','snapshot']:self.assertEqual(p.pixel_claim(words(mode),mode,capture(),100)['source'],'exact OCR words from one newly captured PNG')
     def test_picker_only_query_or_hit_is_not_body(self):
@@ -111,8 +139,10 @@ class Tests(unittest.TestCase):
                     self.assertEqual(new.index(marker),36)
                     self.assertIn(f'ROW{index:06d}'.encode(),new)
                     self.assertNotIn(marker,old)
-                elif mode == 'flush' and index == 255:
+                    self.assertTrue(new.rstrip(b' \n').endswith(marker))
+                elif mode == 'flush' and index == p.base.fixture.PILOT_LIVE_ROW:
                     self.assertEqual(new.index(p.base.fixture.PILOT_LIVE_MARKER.encode()),36)
+                    self.assertTrue(new.rstrip(b' \n').endswith(p.base.fixture.PILOT_LIVE_MARKER.encode()))
                 else:self.assertEqual(old,new)
         for record in range(1,64):
             for index in [16,17]:self.assertEqual(p.base.fixture.line('snapshot',index,record),p.base.fixture.line('snapshot',index,record,True))

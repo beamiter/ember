@@ -1,4 +1,11 @@
-# E03 independent pixel-observer pilot (preregistered)
+# E03 independent pixel-observer pilot (historical preregistration)
+
+This frozen experiment is superseded by `bounded-pixel-v2`, documented in
+[native-block-search-gate.md](native-block-search-gate.md). The marker words and
+strict pixel predicates are retained; v2 uses quiet space padding after marker
+words within the unchanged 97-byte row budget. Both live entry points now use that
+observer, with bounded positive-live-paint waiting to fix the raw ingestion race.
+The historical failed verdicts and preregistration below remain unchanged.
 
 Base: e465d0e13a2319eab2a5706c5cd203563f00a7ce. Freeze this specification and code
 before the first hosted run. This is an experiment, not a changed E03 gate.

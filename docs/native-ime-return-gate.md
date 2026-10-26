@@ -63,7 +63,26 @@ surface, the owned application PID, current focus and an unchanged positive
 rectangle contained in the output. The single output must have its expected
 1280x900 geometry, normal transform and scale one; each actual screenshot must
 also be exactly 1280x900. The rectangle and node identity match all three captures.
-Tesseract psm6 reads each original full screenshot once. Empty or malformed word
+Tesseract psm6 reads each original full screenshot once. For Chat's sparse
+preedit line, the caller selects psm11 before capture for presence only, on the
+same immutable PNG. The retained CI screenshots from run 40295228877 establish
+the reason: psm6 invents a trailing colon, while psm11 reads the literal token
+at the same box. Both initial-mode and live-switch fixtures also pin terminal
+and UI fonts to 16px: at the 14px default the yellow Chat glyphs are only 10px
+high, and even psm11 may invent a comma on another valid frame. These fixture
+settings remain unchanged across live Settings mode switches. This does not
+trim punctuation or retry input. The health anchor uses a fixed bottom 24px
+region of the verified 1280x900 surface and preselected psm7 (one line) in every
+lifecycle phase. Whole-page psm6 or psm11 may omit or misread the sparse gray
+footer as the terminal fills. This is an unscaled crop of the same immutable
+PNG, with no masking or changed pixels. Crop word boxes must fit inside that
+region before they are mapped back to original-image coordinates. The crop,
+TSV, hash and original-coordinate region are retained. Full-page psm6/psm11
+analysis remains required, including rejecting an exact token observed by
+either layout during absence. Before/after token absence checks still use
+psm6; the image hash,
+token uniqueness, ownership, cross-layout geometry and pixel restoration checks
+remain required. Empty or malformed word
 evidence fails. Every capture requires one literal `master` status-bar health
 anchor inside the owned surface and at the same bounding box. This fixture's
 checkout supplies that branch label; a missing or changed label fails closed.
