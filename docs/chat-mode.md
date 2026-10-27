@@ -123,3 +123,20 @@ Native IME acceptance still needs X11/Wayland testing: compose in pane A, switch
 to B (and back to A), confirm the old candidate, and verify neither PTY receives
 it. Repeat with a modal, window blur, pane closure, empty preedit before Commit,
 and candidate Enter press/release followed by a fresh Enter in the same frame.
+
+### Continuous output hierarchy
+
+Completed successful output now shares the canvas background without a second
+outline. Command bubbles, the composer, live/selected output, background output,
+and failed or unresolved outcomes retain their existing decoration. This is a
+paint-only distinction: terminal rows, projection, hit testing and input remain
+unchanged. The same quiet-output policy is used by both paint passes.
+
+### Compact footer hint discovery
+
+The Chat composer keyboard hint keeps its existing single-line clipped layout.
+Hovering the visible hint reveals its complete text, including in narrow splits.
+The hover-only target uses the same clipped rectangle as painting, does not
+extend over Run, and does not claim keyboard focus, clicks, or drags. A fully
+clipped hint creates neither a paint command nor a hover target. Terminal input,
+composition, action eligibility and projected geometry are unchanged.

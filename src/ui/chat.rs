@@ -11,6 +11,44 @@ struct ChatCard {
     bottom_closed: bool,
 }
 
+/// Finished neutral output belongs to the shared canvas rather than another
+/// outlined bubble. Keep unresolved/failed, selected and live surfaces visible.
+fn chat_output_is_quiet(
+    command: bool,
+    composer: bool,
+    selected: bool,
+    active: bool,
+    successful: bool,
+) -> bool {
+    !command && !composer && !selected && !active && successful
+}
+
+const CHAT_FOOTER_HINT: &str = "Shell  ·  Tab to complete  ·  Ctrl+C to interrupt";
+
+/// Observe only the visible hint, never the Run control or terminal input.
+/// A clipped keyboard hint must remain discoverable in narrow panes.
+fn draw_chat_footer_hint(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    font_size: f32,
+    color: egui::Color32,
+) {
+    let clip = rect.intersect(ui.clip_rect());
+    if !clip.is_positive() {
+        return;
+    }
+    ui.painter().with_clip_rect(clip).text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        CHAT_FOOTER_HINT,
+        egui::FontId::proportional(font_size),
+        color,
+    );
+    ui.interact(clip, id, egui::Sense::hover())
+        .on_hover_text(CHAT_FOOTER_HINT);
+}
+
 // Paint-only contract shared with the native GTK Chat surfaces. Never inset
 // text or alter projected rows to make a capsule fit. Both paint passes use it.
 fn chat_card_rounding(card: ChatCard) -> egui::CornerRadius {
@@ -196,6 +234,15 @@ impl TerminalRenderer {
     }
 
     fn chat_card_fill(&self, entry: &BlockChromeEntry, card: ChatCard) -> Color32 {
+        if chat_output_is_quiet(
+            card.command,
+            card.composer,
+            entry.selected,
+            entry.active,
+            matches!(entry.outcome, crate::block_mode::BlockOutcome::Success),
+        ) {
+            return Color32::TRANSPARENT;
+        }
         let color = if card.command {
             self.block_accent_color()
         } else {
@@ -261,6 +308,15 @@ impl TerminalRenderer {
         for entry in entries {
             for card in self.chat_cards(terminal, viewport, entry, content) {
                 if !card.rect.is_positive() {
+                    continue;
+                }
+                if chat_output_is_quiet(
+                    card.command,
+                    card.composer,
+                    entry.selected,
+                    entry.active,
+                    matches!(entry.outcome, crate::block_mode::BlockOutcome::Success),
+                ) {
                     continue;
                 }
                 let color = if card.composer || entry.active {
@@ -363,15 +419,17 @@ impl TerminalRenderer {
                 footer.min,
                 egui::pos2(button.left() - 8.0, footer.bottom()),
             );
-            if label_rect.is_positive() {
-                ui.painter().with_clip_rect(label_rect).text(
-                    label_rect.left_center(),
-                    egui::Align2::LEFT_CENTER,
-                    "Shell  ·  Tab to complete  ·  Ctrl+C to interrupt",
-                    FontId::proportional(self.font_size),
-                    self.theme.terminal_foreground().gamma_multiply(0.50),
-                );
-            }
+            draw_chat_footer_hint(
+                ui,
+                label_rect,
+                egui::Id::new((
+                    "chat-footer-hint",
+                    terminal as *const TerminalState as usize,
+                    record.sequence,
+                )),
+                self.font_size,
+                self.theme.terminal_foreground().gamma_multiply(0.50),
+            );
             Some((
                 ChatInputAction::Submit {
                     sequence: record.sequence,
@@ -595,6 +653,43 @@ mod tests {
 
     fn prompt(terminal: &mut TerminalState) {
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello");
+    }
+
+    #[test]
+    fn chat_neutral_output_joins_canvas_without_hiding_important_surfaces() {
+        assert!(chat_output_is_quiet(false, false, false, false, true));
+        let source = include_str!("chat.rs");
+        for body in [
+            source
+                .split_once("    fn chat_card_fill(")
+                .unwrap()
+                .1
+                .split_once("    pub(super) fn draw_chat_backgrounds")
+                .unwrap()
+                .0,
+            source
+                .split_once("    pub(super) fn draw_chat_foreground(")
+                .unwrap()
+                .1
+                .split_once("    pub(super) fn draw_chat_controls(")
+                .unwrap()
+                .0,
+        ] {
+            assert!(body.contains("crate::block_mode::BlockOutcome::Success"));
+            assert!(!body.contains("crate::block_mode::BlockOutcome::Background"));
+        }
+
+        for flags in [
+            (true, false, false, false, true),
+            (false, true, false, false, true),
+            (false, false, true, false, true),
+            (false, false, false, true, true),
+            (false, false, false, false, false),
+        ] {
+            assert!(!chat_output_is_quiet(
+                flags.0, flags.1, flags.2, flags.3, flags.4
+            ));
+        }
     }
 
     #[test]
@@ -1392,5 +1487,88 @@ mod capsule_geometry_tests {
                 }
             }
         }
+    }
+}
+#[cfg(test)]
+mod chat_footer_hint_tests {
+    use super::*;
+
+    #[test]
+    fn footer_hint_respects_parent_clip_and_does_not_claim_input() {
+        for width in [12.0, 48.0, 240.0] {
+            let ctx = egui::Context::default();
+            let clip = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(width, 16.0));
+            let rect = egui::Rect::from_min_size(egui::pos2(10.0, 18.0), egui::vec2(300.0, 20.0));
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                ui.set_clip_rect(clip);
+                draw_chat_footer_hint(ui, rect, egui::Id::new("hint"), 12.0, egui::Color32::WHITE);
+            });
+            output.textures_delta.clear();
+            let painted = output.shapes.iter().filter(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == CHAT_FOOTER_HINT)).collect::<Vec<_>>();
+            assert_eq!(painted.len(), 1);
+            assert_eq!(painted[0].clip_rect, clip.intersect(rect));
+            assert!(
+                ctx.interactive_rects_last_pass().is_empty(),
+                "hint must not take clicks or keyboard focus"
+            );
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn fully_clipped_footer_has_no_paint_or_hover_target() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.set_clip_rect(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(20.0, 20.0),
+            ));
+            draw_chat_footer_hint(
+                ui,
+                egui::Rect::from_min_size(egui::pos2(40.0, 40.0), egui::vec2(50.0, 20.0)),
+                egui::Id::new("hint"),
+                12.0,
+                egui::Color32::WHITE,
+            );
+        });
+        output.textures_delta.clear();
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == CHAT_FOOTER_HINT)));
+        assert!(ctx.interactive_rects_last_pass().is_empty());
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn narrow_footer_exposes_complete_hint_on_hover() {
+        let ctx = egui::Context::default();
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        let mut found_tooltip = false;
+        for frame in 0..4 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(frame as f64),
+                    events: vec![egui::Event::PointerMoved(egui::pos2(30.0, 28.0))],
+                    ..Default::default()
+                },
+                |ui| {
+                    draw_chat_footer_hint(
+                        ui,
+                        egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(24.0, 18.0)),
+                        egui::Id::new("hint"),
+                        12.0,
+                        egui::Color32::WHITE,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            found_tooltip |= output.shapes.iter().filter(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == CHAT_FOOTER_HINT)).count() >= 2;
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            found_tooltip,
+            "the clipped hint must also be available as full tooltip text"
+        );
     }
 }
