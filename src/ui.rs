@@ -851,6 +851,28 @@ pub enum ProjectedScrollRequest {
 /// Keep this independent of viewport contents so scrolling never resizes a PTY.
 const BLOCK_GUTTER_WIDTH: f32 = crate::block_mode::GUTTER_CLICK_BAND_PX;
 
+type ReferenceChromeScopes = std::collections::HashMap<egui::Id, (u64, bool, egui::Rect)>;
+
+/// Each visible native pane keeps its own scope. A later pane must never
+/// overwrite an earlier pane's open menu or its closing input batch.
+pub(crate) fn remember_reference_chrome_scope(
+    ctx: &egui::Context,
+    id: egui::Id,
+    rect: egui::Rect,
+    open: bool,
+) {
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|data| {
+        let key = egui::Id::new("reference-chrome-keyboard-scopes");
+        let mut scopes = data
+            .get_temp::<ReferenceChromeScopes>(key)
+            .unwrap_or_default();
+        scopes.retain(|_, (saved, _, _)| saved.saturating_add(1) >= frame);
+        scopes.insert(id, (frame, open, rect));
+        data.insert_temp(key, scopes);
+    });
+}
+
 /// Card controls own keyboard input while focused or while their menu is open.
 /// The remembered IDs are checked against current egui state, so switching panes
 /// cannot leave an unrelated terminal permanently blocked.
@@ -882,7 +904,28 @@ pub fn block_action_has_focus(ctx: &egui::Context) -> bool {
             _ => false,
         })
     });
+    // The closing Escape/Enter batch still belongs to a previously open
+    // composer menu even if egui has already closed its popup this frame.
+    let chrome_scopes = ctx
+        .data(|data| {
+            data.get_temp::<ReferenceChromeScopes>(egui::Id::new(
+                "reference-chrome-keyboard-scopes",
+            ))
+        })
+        .unwrap_or_default();
+    let composer_popup_owned = chrome_scopes.into_values().any(|(saved, open, rect)| {
+        saved.saturating_add(1) >= frame
+            && (open
+                || ctx.input(|input| {
+                    input.pointer.button_pressed(egui::PointerButton::Primary)
+                        && input
+                            .pointer
+                            .interact_pos()
+                            .is_some_and(|point| rect.contains(point))
+                }))
+    });
     pending_focus
+        || composer_popup_owned
         || ctx
             .data(|data| data.get_temp::<egui::Id>(egui::Id::new("block-action-focus")))
             .is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)))
@@ -1142,6 +1185,55 @@ fn active_companion_region(
     (region.is_positive() && content.contains_rect(region)).then_some(region)
 }
 
+/// The foreground footer is presentation-only. The app passes the SAME native
+/// rectangle to grid sizing, PTY resize, projection and this renderer.
+pub fn reference_foreground_rects(
+    outer: egui::Rect,
+    foreground: bool,
+) -> (egui::Rect, Option<egui::Rect>) {
+    if !foreground {
+        return (outer, None);
+    }
+    let height = jterm_core::reference_shell::COMPOSER_HEIGHT.min((outer.height() - 24.0).max(0.0));
+    let top = outer.bottom() - height;
+    (
+        egui::Rect::from_min_max(outer.min, egui::pos2(outer.right(), top)),
+        (height > 0.0).then(|| egui::Rect::from_min_max(egui::pos2(outer.left(), top), outer.max)),
+    )
+}
+
+/// Offer only structural canvas padding, never a raw terminal row, to the
+/// existing single companion. The fixed composer owns its entire white frame.
+fn canvas_padding_companion_region(
+    viewport: &ProjectedViewport,
+    content: egui::Rect,
+    line_height: f32,
+    composer_top: f32,
+) -> Option<egui::Rect> {
+    if !line_height.is_finite() || line_height <= 0.0 || !content.is_finite() {
+        return None;
+    }
+    let end = viewport.chat_composer_rows()?.start;
+    let start = (0..end)
+        .rev()
+        .take_while(|&row| {
+            viewport.row_kind(row) == Some(crate::terminal::ProjectedRowKind::Padding)
+                && viewport.view_document_row(row).is_none()
+                && viewport
+                    .cells()
+                    .get(row)
+                    .is_some_and(|cells| cells.iter().all(companion_cell_is_empty))
+        })
+        .last()?;
+    let bottom = composer_top.min(content.top() + end as f32 * line_height) - 8.0;
+    let top = (content.top() + start as f32 * line_height + 8.0).max(bottom - 88.0);
+    let rect = egui::Rect::from_min_max(
+        egui::pos2((content.right() - 280.0).max(content.left() + 8.0), top),
+        egui::pos2(content.right() - 8.0, bottom),
+    );
+    (rect.width() >= 100.0 && rect.height() >= 28.0 && content.contains_rect(rect)).then_some(rect)
+}
+
 fn block_card_geometry(
     content_rect: egui::Rect,
     span: crate::block_mode::VisibleBlockSpan,
@@ -1283,6 +1375,7 @@ pub struct TerminalRenderer {
     projected_kitty_rows_remaining: Option<usize>,
     /// The content rect from the last render, used for mouse-to-grid coordinate conversion
     pub last_content_rect: Option<egui::Rect>,
+    pub workspace_outer_rect: Option<egui::Rect>,
     /// Authenticated buffer text/GUI styles. Terminal cells remain only the
     /// compatibility surface outside this frame's buffer rectangle.
     pub native_vim9_frame: Option<std::sync::Arc<jterm_core::vim9::Vim9RenderFrame>>,
@@ -1306,8 +1399,13 @@ pub struct TerminalRenderer {
     pub block_mode: bool,
     /// Distinct conversation presentation; never changes terminal input ownership.
     pub chat_mode: bool,
+    /// Independent from the native composer dock: Block retains left-aligned cells.
+    pub chat_command_bubbles: bool,
     /// App-level optional-control admission; never gates native terminal input.
     pub chat_controls_enabled: bool,
+    pub chat_control_rect: Option<egui::Rect>,
+    /// Non-editable chrome outside the already reduced foreground PTY viewport.
+    pub foreground_footer_rect: Option<egui::Rect>,
     /// Same-frame explicit input action; target identity must be revalidated by the app.
     pub chat_input_action: Option<(usize, crate::terminal::ChatInputAction, i32)>,
     /// Native shell/foreground identity supplied by the owning session.
@@ -1448,6 +1546,7 @@ impl TerminalRenderer {
             requested_initial_focus: false,
             ime_enabled: false,
             last_content_rect: None,
+            workspace_outer_rect: None,
             native_vim9_frame: None,
             native_vim9_input_snapshot: None,
             native_vim9_font_size: None,
@@ -1463,7 +1562,10 @@ impl TerminalRenderer {
             click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             block_mode: true,
             chat_mode: false,
+            chat_command_bubbles: true,
             chat_controls_enabled: false,
+            chat_control_rect: None,
+            foreground_footer_rect: None,
             chat_input_action: None,
             chat_native_owner: None,
             chat_pressed_action: None,
@@ -1529,7 +1631,7 @@ impl TerminalRenderer {
     /// Native Block cards already have metadata headers and small edge gaps.
     /// Only Chat keeps full display-row separators between its capsules.
     pub fn block_spacer_rows(&self) -> bool {
-        self.chat_mode && !self.block_compact
+        self.chat_mode && self.chat_command_bubbles && !self.block_compact
     }
 
     /// Return the immutable viewport snapshot consumed by this renderer and
@@ -1539,6 +1641,8 @@ impl TerminalRenderer {
         if self.chat_mode {
             let mut policy = crate::terminal::ProjectionPolicy::new();
             policy.set_chat_mode(true);
+            policy.set_chat_footer_rows((28.0 / self.line_height).ceil() as usize);
+            policy.set_chat_command_bubbles(self.chat_command_bubbles);
             policy.set_block_spacing(true);
             policy.set_block_chrome(true, 0);
             terminal.projected_viewport_with_state(
@@ -1579,9 +1683,7 @@ impl TerminalRenderer {
         self.last_content_rect.is_some_and(|content| {
             content.contains(point)
                 && self.canvas_geometry.composer_start.is_none_or(|start| {
-                    point.y
-                        < content.top() + start as f32 * self.line_height
-                            - self.canvas_geometry.row_offset(start, self.line_height)
+                    point.y < self.shared_composer_rect(content, start..start + 1).top()
                 })
         })
     }
@@ -1635,8 +1737,7 @@ impl TerminalRenderer {
     ) -> egui::Painter {
         let mut clip = painter.clip_rect().intersect(content);
         if let Some(start) = self.canvas_geometry.composer_start {
-            let top = content.top() + start as f32 * self.line_height
-                - self.canvas_geometry.row_offset(start, self.line_height);
+            let top = self.shared_composer_rect(content, start..start + 1).top();
             if row < start {
                 clip.max.y = clip.max.y.min(top);
             } else {
@@ -1693,6 +1794,32 @@ impl TerminalRenderer {
             composer_start: viewport.chat_composer_rows().map(|rows| rows.start),
         };
         self.scroll_pixel_offset = frame.translation;
+        // Opt-in read-only native acceptance trace. No terminal content or
+        // filesystem labels are recorded and this never changes follow intent.
+        static TRACE_CANVAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE_CANVAS.get_or_init(|| std::env::var_os("JTERM_REFERENCE_CANVAS_TRACE").is_some())
+        {
+            let observation = format!(
+                "owner={} rows={} cols={} document={} offset={} follow={} translation={} anchor={:?}",
+                terminal as *const TerminalState as usize, viewport.rows(), viewport.columns(),
+                viewport.document_rows(), viewport.scroll_offset(), state.follows_bottom(),
+                frame.translation, viewport.first_raw_anchor_in_row(0));
+            let key = egui::Id::new((
+                "reference-canvas-observation",
+                terminal as *const TerminalState as usize,
+            ));
+            let changed = ctx.data_mut(|data| {
+                if data.get_temp::<String>(key).as_ref() == Some(&observation) {
+                    false
+                } else {
+                    data.insert_temp(key, observation.clone());
+                    true
+                }
+            });
+            if changed {
+                log::info!(target: "ember::reference_workspace", "REFERENCE_CANVAS_STATE {observation}");
+            }
+        }
         if frame.animating {
             ctx.request_repaint();
         }
@@ -4233,6 +4360,9 @@ impl TerminalRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // Compatibility entry point for native embedders; the workspace passes
+    // explicit rectangles so foreground chrome is excluded before PTY sizing.
+    #[allow(dead_code)]
     pub fn render(
         &mut self,
         ui: &mut Ui,
@@ -4303,6 +4433,7 @@ impl TerminalRenderer {
         char_width: f32,
     ) -> Response {
         self.companion_surface = None;
+        self.workspace_outer_rect = Some(rect);
         self.chat_input_action = None;
         let initial_scroll_offset = terminal.scroll_offset;
         let pixels_per_point = ui.ctx().pixels_per_point().max(0.1);
@@ -4378,13 +4509,19 @@ impl TerminalRenderer {
         );
         painter.rect_filled(rect, egui::CornerRadius::ZERO, bg_with_opacity);
 
-        let (content_rect, scrollbar_rect) = self.layout_rects(rect);
+        let (content_rect, mut scrollbar_rect) = self.layout_rects(rect);
+        if let Some(composer) = viewport.chat_composer_rows() {
+            scrollbar_rect.max.y = scrollbar_rect
+                .max
+                .y
+                .min(self.shared_composer_rect(content_rect, composer).top());
+        }
         self.last_content_rect = Some(content_rect);
         // The extra materialized row is only a paint margin. It must never
         // leak into the tab/pane padding while translating the document.
         let painter = painter.with_clip_rect(egui::Rect::from_min_max(
             egui::pos2(rect.left(), content_rect.top()),
-            egui::pos2(rect.right(), content_rect.bottom()),
+            egui::pos2(rect.right(), rect.bottom()),
         ));
         if let (Some(_), Some(input), Some(snapshot)) = (
             &native_buffer,
@@ -4405,6 +4542,35 @@ impl TerminalRenderer {
         // gutter hit test below and the chrome painting after the grid.
         // `None` while chrome is gated off (config, alt screen, reflow).
         let summaries = Self::projected_summary_rows(terminal, &viewport);
+        if self.chat_mode && terminal.dynamic_bg.is_none() {
+            let history_end = viewport
+                .chat_composer_rows()
+                .map_or(rows, |range| range.start);
+            let cells = std::sync::Arc::make_mut(&mut grid);
+            let [r, g, b] = jterm_core::reference_shell::color::TERMINAL;
+            let [fr, fg, fb] = jterm_core::reference_shell::color::CHROME_TEXT;
+            for (row_index, row) in cells.iter_mut().enumerate().take(history_end) {
+                if self.chat_command_bubbles
+                    && (!matches!(
+                        viewport.row_kind(row_index),
+                        Some(crate::terminal::ProjectedRowKind::Raw)
+                    ) || viewport
+                        .chat_command_spans()
+                        .iter()
+                        .any(|span| span.rows.contains(&row_index)))
+                {
+                    continue;
+                }
+                for cell in row {
+                    if cell.background == crate::terminal::Color::Default {
+                        cell.background = crate::terminal::Color::Rgb(r, g, b);
+                    }
+                    if cell.foreground == crate::terminal::Color::Default {
+                        cell.foreground = crate::terminal::Color::Rgb(fr, fg, fb);
+                    }
+                }
+            }
+        }
         let mut block_chrome = self.block_chrome_snapshot(terminal, &viewport, rows);
         if let Some(entries) = block_chrome.as_deref().filter(|_| !self.chat_mode) {
             let command_ranges: Vec<_> = entries
@@ -5261,6 +5427,7 @@ impl TerminalRenderer {
             );
         }
 
+        self.draw_reference_foreground_footer(ui, terminal);
         if self.chat_mode
             && self.draw_chat_controls(
                 ui,
@@ -5412,10 +5579,16 @@ impl TerminalRenderer {
                 let galley = ui.painter().layout_no_wrap(
                     preedit_display,
                     font_id,
-                    Color32::from_rgb(200, 200, 0), // 黄色标记
+                    Color32::from_rgb(40, 52, 76),
                 );
 
-                painter.galley(egui::pos2(preedit_x, preedit_y), galley, Color32::WHITE);
+                let origin = egui::pos2(preedit_x, preedit_y);
+                let chip = egui::Rect::from_min_size(
+                    origin - egui::vec2(2.0, 1.0),
+                    galley.size() + egui::vec2(16.0, 2.0),
+                );
+                painter.rect_filled(chip, 3, Color32::from_rgb(231, 237, 253));
+                painter.galley(origin, galley, Color32::WHITE);
             }
         }
 
@@ -5558,6 +5731,16 @@ impl TerminalRenderer {
                         line_height,
                         self.block_compact,
                     )
+                    .or_else(|| {
+                        viewport.chat_composer_rows().and_then(|rows| {
+                            canvas_padding_companion_region(
+                                &viewport,
+                                content_rect,
+                                line_height,
+                                self.shared_composer_rect(content_rect, rows).top(),
+                            )
+                        })
+                    })
                     .map(|region| (entry.id.clone(), viewport.key(), region))
                 });
         }
@@ -6041,10 +6224,16 @@ impl TerminalRenderer {
             atlas_height: atlas_h,
             render_phase: 0.0,
             scroll_pixel_offset: self.scroll_pixel_offset * ppp,
-            fixed_start_row: self
-                .canvas_geometry
-                .composer_start
-                .map_or(-1.0, |row| row as f32),
+            fixed_start_row: self.canvas_geometry.composer_start.map_or(-1.0, |row| {
+                let top = self.shared_composer_rect(content_rect, row..row + 1).top();
+                (top - content_rect.top()
+                    + if self.canvas_geometry.margin {
+                        self.line_height
+                    } else {
+                        0.0
+                    })
+                    / self.line_height
+            }),
             fixed_pixel_offset: if self.canvas_geometry.margin {
                 target_cell_height
             } else {
@@ -6882,6 +7071,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reference_chrome_popup_scope_survives_later_unfocused_pane() {
+        let ctx = egui::Context::default();
+        remember_reference_chrome_scope(
+            &ctx,
+            egui::Id::new("left-terminal"),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 28.0)),
+            true,
+        );
+        remember_reference_chrome_scope(
+            &ctx,
+            egui::Id::new("right-terminal"),
+            egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(80.0, 28.0)),
+            false,
+        );
+        assert!(block_action_has_focus(&ctx),"drawing a closed menu in the second pane must not release the first pane's keyboard owner");
+        remember_reference_chrome_scope(
+            &ctx,
+            egui::Id::new("left-terminal"),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 28.0)),
+            false,
+        );
+        assert!(
+            !block_action_has_focus(&ctx),
+            "explicitly closing the last active owner releases future native input"
+        );
+    }
+
+    #[test]
+    fn foreground_footer_uses_one_reduced_native_viewport_without_moving_ime_origin() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let outer = egui::Rect::from_min_size(egui::pos2(320.0, 103.0), egui::vec2(702.0, 590.0));
+        let (native, footer) = reference_foreground_rects(outer, true);
+        let footer = footer.unwrap();
+        assert_eq!(native.min, outer.min);
+        assert_eq!(native.right(), outer.right());
+        assert_eq!(footer.height(), 80.0);
+        assert_eq!(footer.top(), 613.0);
+        assert_eq!(native.bottom(), footer.top());
+        let full_content = renderer.layout_rects(outer).0;
+        let native_content = renderer.layout_rects(native).0;
+        assert_eq!(
+            full_content.min, native_content.min,
+            "IME/mouse/selection origins remain unchanged"
+        );
+        assert_eq!(full_content.width(), native_content.width());
+        let full_grid = renderer.grid_dimensions(outer.size());
+        let native_grid = renderer.grid_dimensions(native.size());
+        assert_eq!(full_grid.0, native_grid.0);
+        assert!(native_grid.1 < full_grid.1);
+        assert_eq!(
+            native_grid.1,
+            (native_content.height() / renderer.line_height)
+                .floor()
+                .max(1.0) as usize
+        );
+        assert_eq!(
+            reference_foreground_rects(outer, false),
+            (outer, None),
+            "Prompt does not reserve a second composer"
+        );
+    }
+
+    #[test]
     fn active_companion_frame_facts_fail_closed_individually() {
         let clear = CompanionFrameFacts {
             interactive: true,
@@ -6966,6 +7224,55 @@ mod tests {
         terminal.process_input(b"\x1b]8;;https://example.com\x07 \x1b]8;;\x07");
         assert!(!terminal.grid.get(0, 0).hyperlink_id.is_none());
         assert!(!companion_cell_is_empty(terminal.grid.get(0, 0)));
+    }
+
+    #[test]
+    fn active_companion_canvas_padding_never_borrows_raw_input_or_footer() {
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        use crate::terminal::{ProjectionPolicy, ProjectionViewState};
+        let before = format!("{:?}", terminal.grid.iter().collect::<Vec<_>>());
+        let mut policy = ProjectionPolicy::new();
+        policy.set_chat_mode(true);
+        policy.set_block_chrome(true, 0);
+        let viewport = terminal.projected_viewport_with_state(
+            HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut ProjectionViewState::new(),
+        );
+        let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let composer = viewport.chat_composer_rows().unwrap();
+        let composer_top = content.top() + composer.start as f32 * 20.0 - 6.0;
+        let region =
+            canvas_padding_companion_region(&viewport, content, 20.0, composer_top).unwrap();
+        assert!(
+            region.width() >= 264.0 && region.height() >= 80.0,
+            "the shared graphical body fits wholly inside proven structural padding"
+        );
+        assert!(region.bottom() < composer_top);
+        for row in
+            (region.top() / 20.0).floor() as usize..=(region.bottom() / 20.0).floor() as usize
+        {
+            assert_eq!(
+                viewport.row_kind(row),
+                Some(crate::terminal::ProjectedRowKind::Padding)
+            );
+            assert_eq!(viewport.view_document_row(row), None);
+            assert!(viewport.cells()[row].iter().all(companion_cell_is_empty));
+        }
+        assert_eq!(
+            before,
+            format!("{:?}", terminal.grid.iter().collect::<Vec<_>>()),
+            "decoration must not edit any PTY cell"
+        );
+        assert!(
+            canvas_padding_companion_region(&viewport, content, 20.0, 10.0).is_none(),
+            "no room above input means hidden"
+        );
+        assert!(
+            canvas_padding_companion_region(&viewport, content, f32::NAN, composer_top).is_none()
+        );
     }
 
     #[test]

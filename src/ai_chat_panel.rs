@@ -755,25 +755,21 @@ impl AiChatPanel {
                             .stick_to_bottom(true)
                             .show(ui, |ui| {
                                 for turn in self.store.active_history() {
-                                    let (label, strong) = match turn.role {
-                                        Role::User => ("You", true),
-                                        _ => ("Assistant", false),
+                                    let user = turn.role == Role::User;
+                                    let message = jterm_core::reference_conversation::Message {
+                                        role: if user { jterm_core::reference_conversation::Role::User } else { jterm_core::reference_conversation::Role::Assistant },
+                                        author: if user { "You".into() } else { "Assistant".into() }, avatar: if user { "Y".into() } else { "A".into() }, timing: None,
+                                        parts: vec![jterm_core::reference_conversation::Part::Paragraph(turn.text.clone())],
                                     };
-                                    let heading = egui::RichText::new(label).weak().small();
-                                    ui.label(heading);
-                                    let body = egui::RichText::new(&turn.text);
-                                    ui.add(egui::Label::new(if strong {
-                                        body.strong()
-                                    } else {
-                                        body
-                                    })
-                                    .wrap());
-                                    ui.add_space(6.0);
+                                    crate::reference_conversation_ui::draw_message(ui, &message);
+                                    ui.add_space(12.0);
                                 }
                                 let partial = self.store.active_partial();
                                 if !partial.is_empty() {
-                                    ui.label(egui::RichText::new("Assistant").weak().small());
-                                    ui.add(egui::Label::new(partial).wrap());
+                                    let message = jterm_core::reference_conversation::Message { role: jterm_core::reference_conversation::Role::Assistant,
+                                        author: "Assistant".into(), avatar: "A".into(), timing: Some("Receiving response".into()),
+                                        parts: vec![jterm_core::reference_conversation::Part::Paragraph(partial.to_owned())] };
+                                    crate::reference_conversation_ui::draw_message(ui, &message);
                                 }
                                 if history_len == 0 && partial.is_empty() {
                                     ui.label(

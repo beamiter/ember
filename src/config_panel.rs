@@ -1689,12 +1689,11 @@ impl ConfigPanel {
             ui.label("Terminal mode");
             egui::ComboBox::from_id_salt("terminal-mode")
                 .selected_text(match mode {
-                    crate::config::TerminalMode::Normal => "Normal",
+                    crate::config::TerminalMode::Normal => "Block",
                     crate::config::TerminalMode::Block => "Block",
                     crate::config::TerminalMode::Chat => "Chat",
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut mode, crate::config::TerminalMode::Normal, "Normal");
                     ui.selectable_value(&mut mode, crate::config::TerminalMode::Block, "Block");
                     ui.selectable_value(&mut mode, crate::config::TerminalMode::Chat, "Chat");
                 });

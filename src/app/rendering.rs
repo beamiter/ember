@@ -1834,6 +1834,7 @@ impl TerminalApp {
             renderer.click_moves_cursor = self.renderer.click_moves_cursor;
             renderer.block_mode = self.renderer.block_mode;
             renderer.chat_mode = self.renderer.chat_mode;
+            renderer.chat_command_bubbles = self.renderer.chat_command_bubbles;
             renderer.block_compact = self.renderer.block_compact;
             renderer.gpu_rendering = self.renderer.gpu_rendering;
             renderer.wgpu_render_state = self.renderer.wgpu_render_state.clone();
@@ -2555,8 +2556,9 @@ impl TerminalApp {
         let workspace_drag_active = self.tab_drag_is_active(ctx) || self.pane_drag.is_some();
         let terminal_interaction_enabled = interaction_enabled && !workspace_drag_active;
         // Static is the same companion at rest, not a separate status mascot.
-        let companion_enabled =
-            self.config.ascii_organism_enabled && self.config.command_cards_enabled();
+        let companion_enabled = self.config.ascii_organism_enabled
+            && self.config.command_cards_enabled()
+            && !jterm_core::reference_conversation::fixture_enabled();
         self.renderer.companion_enabled = companion_enabled;
         if !terminal_interaction_enabled {
             self.dragging_divider = None;
@@ -2624,7 +2626,18 @@ impl TerminalApp {
                 .collect()
         };
         self.ensure_pane_renderer_capacity(ctx);
-        let (cols, rows) = self.renderer.grid_dimensions(ui.available_size());
+        let foreground = self.renderer.chat_mode
+            && !self
+                .session_manager
+                .get_active_session_mut()
+                .terminal
+                .lock()
+                .chat_surface()
+                .composer_docked();
+        let (single_native_rect, single_footer) =
+            crate::ui::reference_foreground_rects(available_rect, foreground);
+        self.renderer.foreground_footer_rect = single_footer;
+        let (cols, rows) = self.renderer.grid_dimensions(single_native_rect.size());
         crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
 
         // 单窗格才按整窗口尺寸 resize 活跃会话;多窗格时各窗格在下方
@@ -2672,8 +2685,19 @@ impl TerminalApp {
                     break;
                 }
 
-                let content_rect = pane_chrome[pane_idx].1;
+                let pane_outer_rect = pane_chrome[pane_idx].1;
                 let session_idx = pane.session_idx;
+                let foreground = self.pane_renderers[pane_idx].chat_mode
+                    && self
+                        .session_manager
+                        .sessions()
+                        .get(session_idx)
+                        .is_some_and(|session| {
+                            !session.terminal.lock().chat_surface().composer_docked()
+                        });
+                let (content_rect, footer) =
+                    crate::ui::reference_foreground_rects(pane_outer_rect, foreground);
+                self.pane_renderers[pane_idx].foreground_footer_rect = footer;
                 let native_editor = self
                     .session_manager
                     .sessions()
@@ -2726,6 +2750,12 @@ impl TerminalApp {
                     session
                         .projection_policy
                         .set_chat_mode(self.pane_renderers[pane_idx].chat_mode);
+                    session.projection_policy.set_chat_footer_rows(
+                        (28.0 / self.pane_renderers[pane_idx].line_height).ceil() as usize,
+                    );
+                    session.projection_policy.set_chat_command_bubbles(
+                        self.pane_renderers[pane_idx].chat_command_bubbles,
+                    );
                     let projection_policy = &session.projection_policy;
                     let projection_view_state = &mut session.projection_view_state;
                     // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
@@ -3004,6 +3034,12 @@ impl TerminalApp {
                 session
                     .projection_policy
                     .set_chat_mode(self.renderer.chat_mode);
+                session
+                    .projection_policy
+                    .set_chat_footer_rows((28.0 / self.renderer.line_height).ceil() as usize);
+                session
+                    .projection_policy
+                    .set_chat_command_bubbles(self.renderer.chat_command_bubbles);
                 let projection_policy = &session.projection_policy;
                 let projection_view_state = &mut session.projection_view_state;
 
@@ -3038,14 +3074,16 @@ impl TerminalApp {
                     .shell
                     .foreground_pgid()
                     .map(|foreground| (session.shell.get_child_pid(), foreground));
-                self.renderer.render(
+                self.renderer.render_in_rect(
                     ui,
                     &mut terminal_guard,
+                    terminal_interaction_enabled,
                     terminal_interaction_enabled,
                     self.cursor_visible,
                     &self.search_state,
                     &self.cached_links,
                     &self.hovered_link,
+                    single_native_rect,
                 );
                 companion_surface = self
                     .renderer
@@ -3088,7 +3126,7 @@ impl TerminalApp {
             )
             .collect();
         if terminal_interaction_enabled
-            && self.config.chat_mode_enabled()
+            && self.config.command_cards_enabled()
             && super::input::chat_controls_allow_enter_state(
                 self.prompt_fill_enter_down,
                 self.prompt_fill_enter_latch,

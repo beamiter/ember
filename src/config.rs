@@ -637,11 +637,13 @@ fn default_font_ligatures() -> bool {
 
 impl Config {
     pub fn effective_terminal_mode(&self) -> TerminalMode {
-        self.terminal_mode.unwrap_or(if self.block_mode {
-            TerminalMode::Block
-        } else {
-            TerminalMode::Normal
-        })
+        // Persisted Normal/false values remain readable, but all non-Chat
+        // sessions now join the one retained Block presentation. Backend
+        // choice is no longer a third public display mode.
+        match self.terminal_mode {
+            Some(TerminalMode::Chat) => TerminalMode::Chat,
+            Some(TerminalMode::Block | TerminalMode::Normal) | None => TerminalMode::Block,
+        }
     }
 
     pub fn command_cards_enabled(&self) -> bool {
@@ -2442,14 +2444,7 @@ mod chat_mode_config_tests {
         assert!(default.block_mode);
         for legacy in [false, true] {
             let old: Config = toml::from_str(&format!("block_mode = {legacy}\n")).unwrap();
-            assert_eq!(
-                old.effective_terminal_mode(),
-                if legacy {
-                    TerminalMode::Block
-                } else {
-                    TerminalMode::Normal
-                }
-            );
+            assert_eq!(old.effective_terminal_mode(), TerminalMode::Block);
             assert_eq!(old.terminal_mode, None);
             for (value, expected) in [
                 ("normal", TerminalMode::Normal),
@@ -2460,14 +2455,20 @@ mod chat_mode_config_tests {
                     "block_mode = {legacy}\nterminal_mode = \"{value}\"\n"
                 ))
                 .unwrap();
-                assert_eq!(config.effective_terminal_mode(), expected);
+                let presentation = if expected == TerminalMode::Chat {
+                    TerminalMode::Chat
+                } else {
+                    TerminalMode::Block
+                };
+                assert_eq!(config.effective_terminal_mode(), presentation);
                 assert_eq!(
                     config.block_mode, legacy,
                     "never rewrite the user's legacy preference"
                 );
                 assert_eq!(
                     config.command_cards_enabled(),
-                    expected != TerminalMode::Normal
+                    true,
+                    "legacy raw modes must retain the canvas after migration"
                 );
                 let saved = toml::to_string(&config).unwrap();
                 let loaded: Config = toml::from_str(&saved).unwrap();

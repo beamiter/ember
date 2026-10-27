@@ -8601,6 +8601,58 @@ fn chat_prompt(terminal: &mut TerminalState, input: &str) {
 }
 
 #[test]
+fn chat_shared_composer_changes_history_alignment_without_moving_native_input() {
+    let mut terminal = TerminalState::new(80, 24);
+    chat_pair(&mut terminal, "printf retained", "retained output");
+    chat_prompt(&mut terminal, "printf 'unfinished café'");
+    let records = format!("{:?}", terminal.command_records());
+    let grid = terminal.get_visible_cells();
+    let mut state = ProjectionViewState::new();
+    let mut policy = chat_policy();
+    policy.set_chat_command_bubbles(false);
+    let block = spaced_view(&mut terminal, &policy, &mut state);
+    let block_command = block
+        .chat_command_spans()
+        .first()
+        .expect("real completed command");
+    assert_eq!(
+        block_command.column, 0,
+        "Block keeps traditional left-aligned cells"
+    );
+    let block_anchor = block.raw_anchor_at(DisplayPoint::new(block_command.rows.start, 0));
+    assert!(block_anchor.is_some());
+    let block_dock = block.chat_composer_rows().expect("one native composer");
+    let block_cursor = block.cursor();
+    let cursor_origin = block.raw_anchor_at(block_cursor);
+    assert!(cursor_origin.is_some());
+    policy.set_chat_command_bubbles(true);
+    let chat = spaced_view(&mut terminal, &policy, &mut state);
+    let chat_command = chat
+        .chat_command_spans()
+        .first()
+        .expect("same completed command");
+    assert!(
+        chat_command.column > 0,
+        "Chat alone aligns its command capsule right"
+    );
+    assert_eq!(
+        chat.raw_anchor_at(DisplayPoint::new(
+            chat_command.rows.start,
+            chat_command.column
+        )),
+        block_anchor
+    );
+    assert_eq!(chat.chat_composer_rows(), Some(block_dock));
+    assert_eq!(chat.raw_anchor_at(chat.cursor()), cursor_origin);
+    assert_eq!(
+        format!("{:?}", terminal.get_visible_cells()),
+        format!("{:?}", grid),
+        "presentation never rewrites any PTY cell or its attributes"
+    );
+    assert_eq!(format!("{:?}", terminal.command_records()), records);
+}
+
+#[test]
 fn chat_history_redraw_and_mode_switch_preserve_draft_and_command_identity() {
     let mut terminal = TerminalState::new(80, 24);
     chat_pair(&mut terminal, "printf first", "first");

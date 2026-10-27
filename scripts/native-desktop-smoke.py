@@ -348,21 +348,60 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         self.click(int(row['left']) + int(row['width']) // 2,
                    int(row['top']) + int(row['height']) // 2)
 
+    def reference_settings_words(self, label):
+        # Use the existing Settings Save oracle's deterministic grayscale
+        # inversion for dark dialog text. Original native pixels stay immutable;
+        # exact spelling, uniqueness, geometry and real input still gate actions.
+        spec = importlib.util.spec_from_file_location('settings_geometry', Path(__file__).with_name('native-settings-save-ocr.py'))
+        geometry = importlib.util.module_from_spec(spec); spec.loader.exec_module(geometry)
+        def owned():
+            return geometry.owned_rect(json.loads(self.run(['swaymsg','-t','get_tree','-r'],capture_output=True,text=True).stdout),self.app.pid)
+        before = owned()
+        self.screenshot(label)
+        source = self.out / (label + '.png')
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        analysis = self.out / (label + '-settings-gray-inverted.png')
+        self.run(['convert',str(source),'-colorspace','Gray','-negate',str(analysis)])
+        reply=self.run(['tesseract',str(analysis),'stdout','--psm','11','tsv'],capture_output=True,text=True)
+        (self.out / (label + '-settings-gray-inverted.tsv')).write_text(reply.stdout)
+        if owned()!=before or hashlib.sha256(source.read_bytes()).hexdigest()!=digest:
+            raise RuntimeError('Settings ownership, geometry or source pixels changed')
+        rows=[r for r in csv.DictReader(io.StringIO(reply.stdout),delimiter='\t',quoting=csv.QUOTE_NONE) if r['text'].strip()]
+        r=before['rect']
+        rows=[word for word in rows if int(word['left'])>=r['x'] and int(word['top'])>=r['y']
+              and int(word['left'])+int(word['width'])<=r['x']+r['width']
+              and int(word['top'])+int(word['height'])<=r['y']+r['height']]
+        (self.out / (label + '-settings-analysis.json')).write_text(json.dumps({'owned':before,'source_sha256':digest,
+            'analysis_sha256':hashlib.sha256(analysis.read_bytes()).hexdigest(),'algorithm':'ImageMagick -colorspace Gray -negate','ocr_psm':11},indent=2))
+        return rows
+
     def switch_mode(self, old, new):
         self.key('o', ('ctrl', 'shift'))
         time.sleep(0.4)
         # Disambiguate the Advanced tab from the Advanced Settings heading
         # using the actual tab-row anchors, never arbitrary first/top match.
-        words = self.words(new + '-settings')
+        observe = self.reference_settings_words if getattr(self, 'reference_shell_fixture', False) else self.words
+        words = observe(new + '-settings')
         anchors = []
-        for label in ('Appearance', 'Remote'):
-            matches = [r for r in words if r['text'] == label]
-            assert len(matches) == 1, ('ambiguous tab anchor', label, matches)
-            anchors.append(matches[0])
+        # The reference shell uses the same native Settings dialog, but its
+        # registered DejaVu chrome makes the far Remote word unstable to OCR.
+        # Font and Appearance are exact, unique same-row anchors; Advanced
+        # still must share both anchors' row, never a coordinate fallback.
         def shares_row(row, anchor):
             return max(int(row['top']), int(anchor['top'])) < min(
                 int(row['top']) + int(row['height']),
                 int(anchor['top']) + int(anchor['height']))
+        if getattr(self, 'reference_shell_fixture', False):
+            appearance = [r for r in words if r['text'] == 'Appearance']
+            assert len(appearance) == 1, ('ambiguous Appearance tab anchor', appearance)
+            font = [r for r in words if r['text'] == 'Font' and shares_row(r, appearance[0])]
+            assert len(font) == 1, ('ambiguous Font tab-row anchor', font)
+            anchors = [appearance[0], font[0]]
+        else:
+            for label in ('Appearance', 'Remote'):
+                matches = [r for r in words if r['text'] == label]
+                assert len(matches) == 1, ('ambiguous tab anchor', label, matches)
+                anchors.append(matches[0])
         # Selected tab backgrounds can introduce peripheral OCR punctuation.
         # Exact normalized word only: no fuzzy/substring or coordinate fallback.
         rows = [r for r in words if r['text'].strip("‘’'\".,:;()[]").casefold() == 'advanced'
@@ -371,10 +410,19 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         row = rows[0]
         self.click(int(row['left']) + int(row['width']) // 2,
                    int(row['top']) + int(row['height']) // 2)
-        row = settings_mode_selector(self.words(new + '-mode-selector'), old.title())
+        row = settings_mode_selector(observe(new + '-mode-selector'), old.title())
         self.click(int(row['left']) + int(row['width']) // 2,
                    int(row['top']) + int(row['height']) // 2)
-        self.click_word(new.title(), new + '-mode-menu')
+        if getattr(self, 'reference_shell_fixture', False):
+            # The same mode names also exist in the shared toolbar. Scope this
+            # exact target to the popup immediately below its observed field.
+            menu = [r for r in observe(new + '-mode-menu') if r['text'] == new.title()
+                    and abs(int(r['left']) - int(row['left'])) <= 100
+                    and int(row['top']) + int(row['height']) <= int(r['top']) <= int(row['top']) + 8 * int(row['height'])]
+            assert len(menu) == 1, ('missing or ambiguous native mode popup item',menu)
+            self.click(int(menu[0]['left'])+int(menu[0]['width'])//2,int(menu[0]['top'])+int(menu[0]['height'])//2)
+        else:
+            self.click_word(new.title(), new + '-mode-menu')
         if self.backend == 'wayland':
             spec = importlib.util.spec_from_file_location('settings_save', Path(__file__).with_name('native-settings-save-ocr.py'))
             settings_save = importlib.util.module_from_spec(spec)

@@ -25,6 +25,7 @@ def zero(capture, stage):
 
 
 FIXTURE_FONT_SIZE = 14.0
+REFERENCE_SHELL_LAYOUT = False
 
 
 def composition_layout(mode, font_size):
@@ -32,6 +33,11 @@ def composition_layout(mode, font_size):
         raise RuntimeError('Unknown terminal mode for composition layout')
     if font_size not in (14.0, 16.0):
         raise RuntimeError('Unregistered composition fixture font size')
+    # The reference preedit chip has one consistent dense layout across both
+    # public modes. Register the primary OCR layout before capture; retain
+    # legacy Normal/16pt Chat's existing sparse-layout checks.
+    if REFERENCE_SHELL_LAYOUT:
+        return 6
     return 11 if mode == 'normal' or (mode == 'chat' and font_size == 16.0) else 6
 
 
@@ -56,7 +62,7 @@ class FreshVisual:
         self.initial = None
         self.phase = 0
         self.health_options = ({'health_psm': 11, 'health_footer': True}
-                               if self.prior.get('health_footer') is not None else {})
+                               if self.prior.get('health_footer') is not None or self.prior.get('health_header') is not None else {})
         self.view = None
         # Destination mode selects layout before this cycle captures anything.
         self.preedit_psm = composition_layout(mode, fixture_font(smoke))
@@ -232,15 +238,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('binary', 'ime-client', 'preedit-client', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--renderer', choices=['wgpu', 'glow'], default='wgpu')
+    parser.add_argument('--reference-shell', action='store_true')
     args = parser.parse_args()
     scripts = Path(__file__).parent
     module = load('smoke', scripts / 'native-desktop-smoke.py')
     live = load('live', scripts / 'native-ime-live-switch.py')
     keyboard = load('keyboard', scripts / 'native-ime-keyboard.py')
     visual = load('visual', scripts / 'native-ime-visual.py')
+    if args.reference_shell:
+        global REFERENCE_SHELL_LAYOUT
+        REFERENCE_SHELL_LAYOUT = True
+        visual.REFERENCE_SHELL_HEALTH = True
+        live.MODES = ('block', 'chat', 'block')
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     smoke = module.Smoke(args.binary.resolve(strict=True), 'wayland', out)
+    smoke.reference_shell_fixture = args.reference_shell
     smoke.env['EMBER_SMOKE_CAPTURE'] = str((scripts / 'native-ime-preedit-capture.py').resolve())
     helper, observer = args.ime_client.resolve(strict=True), args.preedit_client.resolve(strict=True)
     result = {'status': 'running', 'scope': 'Settings-boundary cancellation of active compositor preedit',
@@ -250,7 +264,10 @@ def main():
         smoke.start_desktop()
         seat = smoke.spawn(['wtype', '-s', '600000', '-k', 'F24'], 'ime-seat-keyboard')
         time.sleep(0.5)
-        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = false\nfont_size = 14.0\nui_font_size = 14.0\n')
+        initial_mode = 'block' if args.reference_shell else 'normal'
+        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + initial_mode + '"\nrestore_session = false\nfont_size = 14.0\nui_font_size = 14.0\n')
+        with smoke.config.open('a') as config_file:
+            config_file.write('app_renderer = "' + args.renderer + '"\n')
         smoke.app = smoke.spawn([str(smoke.binary)], 'ember')
         module.wait_for(smoke.app_window, 'preedit switch Ember window')
         time.sleep(2)

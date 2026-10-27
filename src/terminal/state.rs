@@ -5170,7 +5170,19 @@ impl super::TerminalState {
             .back()
             .filter(|record| !record.complete)
             .map_or(content.saturating_add(1), |record| {
-                crate::block_mode::live_block_end_exclusive(record.prompt_start.line_id, content)
+                if policy.chat_mode() {
+                    // The reference composer retains the actual native input rows.
+                    // Retain all real cursor/content/completion rows; only
+                    // proven blank tail differs from Block's six-row floor.
+                    content
+                        .saturating_add(1)
+                        .max(record.prompt_start.line_id.saturating_add(1))
+                } else {
+                    crate::block_mode::live_block_end_exclusive(
+                        record.prompt_start.line_id,
+                        content,
+                    )
+                }
             });
         end.saturating_sub(self.total_lines_scrolled)
             .min(self.grid.rows() as u64) as usize
@@ -5196,6 +5208,8 @@ impl super::TerminalState {
             companion_status_rows: policy.companion_status_rows(),
             chrome_tail_keep: self.block_chrome_tail_keep(policy),
             chat_mode: policy.chat_mode(),
+            chat_command_bubbles: policy.chat_command_bubbles(),
+            chat_footer_rows: policy.chat_footer_rows(),
             chat_prompt_ready: policy.chat_mode() && self.chat_surface().composer_docked(),
             chat_content_revision: if policy.chat_mode() {
                 self.chat_content_revision()
@@ -5284,7 +5298,12 @@ impl super::TerminalState {
                 plan.splice_block_chrome(&headers, status, key.chrome_tail_keep, self.grid.rows());
         }
         if policy.chat_mode() {
-            self.apply_chat_plan(&mut plan, key.chrome_tail_keep);
+            self.apply_chat_plan(
+                &mut plan,
+                key.chrome_tail_keep,
+                policy.chat_command_bubbles(),
+                policy.chat_footer_rows(),
+            );
         }
         if !plan.has_transforms() {
             self.projection_plan_cache = Some((key, std::sync::Arc::new(plan)));
@@ -5335,7 +5354,9 @@ impl super::TerminalState {
                 .chat_commands
                 .iter()
                 .all(|command| command.rows.end <= plan.rows.len().saturating_sub(old_key.rows));
-        if old_key.chat_mode != new_key.chat_mode
+        if old_key.chat_footer_rows != new_key.chat_footer_rows
+            || old_key.chat_command_bubbles != new_key.chat_command_bubbles
+            || old_key.chat_mode != new_key.chat_mode
             || new_key.chat_mode && !chat_incremental
             || old_key.block_headers != new_key.block_headers
             || old_key.companion_status_rows != new_key.companion_status_rows

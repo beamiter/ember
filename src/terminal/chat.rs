@@ -164,7 +164,13 @@ impl super::TerminalState {
             .map_or(0, |column| column + 1)
     }
 
-    pub(super) fn apply_chat_plan(&self, plan: &mut ProjectionPlan, tail_keep: usize) {
+    pub(super) fn apply_chat_plan(
+        &self,
+        plan: &mut ProjectionPlan,
+        tail_keep: usize,
+        command_bubbles: bool,
+        footer_rows: usize,
+    ) {
         plan.chat_mode = true;
         let sources = self.chat_command_sources();
         let source_base = self.projection_source_base().unwrap_or(0);
@@ -257,7 +263,11 @@ impl super::TerminalState {
             let width = rows.iter().map(|(_, width)| *width).max().unwrap_or(0);
             // Two display columns are visual padding, not terminal cells. Long
             // commands deliberately retain full width instead of being cut.
-            let offset = plan.cols.saturating_sub(width.saturating_add(2));
+            let offset = if command_bubbles {
+                plan.cols.saturating_sub(width.saturating_add(2))
+            } else {
+                0
+            };
             for (index, content_end) in rows {
                 let row = &mut plan.rows[index];
                 row.raw_slices.retain_mut(|slice| {
@@ -298,24 +308,31 @@ impl super::TerminalState {
                 .and_then(|(absolute, _)| self.raw_row_id_at_absolute(absolute))
                 .and_then(|row_id| plan.raw_cell_document_row(RawCellAnchor { row_id, column: 0 }));
             if let Some(start) = plan.chat_dock_start {
-                if plan.document_rows().saturating_sub(start).saturating_add(1) < self.grid.rows() {
+                if plan
+                    .document_rows()
+                    .saturating_sub(start)
+                    .saturating_add(footer_rows)
+                    < self.grid.rows()
+                {
                     if let Some(before) = plan.rows[start].raw_slices.first().and_then(|slice| {
                         slice.origin.map(|origin| RawCellAnchor {
                             row_id: origin.row,
                             column: origin.col_start,
                         })
                     }) {
-                        plan.rows.push_back(ProjectionPlanRow {
-                            raw_slices: SmallVec::new(),
-                            row_source: None,
-                            wrapped: false,
-                            kind: ProjectedRowKind::CompanionStatus {
-                                before,
-                                index: 0,
-                                total: 1,
-                            },
-                        });
-                        plan.chrome_row_count += 1;
+                        for index in 0..footer_rows {
+                            plan.rows.push_back(ProjectionPlanRow {
+                                raw_slices: SmallVec::new(),
+                                row_source: None,
+                                wrapped: false,
+                                kind: ProjectedRowKind::CompanionStatus {
+                                    before,
+                                    index,
+                                    total: footer_rows,
+                                },
+                            });
+                            plan.chrome_row_count += 1;
+                        }
                     }
                 }
             }

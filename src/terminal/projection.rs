@@ -93,6 +93,8 @@ pub struct ProjectionPolicy {
     block_headers: bool,
     companion_status_rows: usize,
     chat_mode: bool,
+    chat_command_bubbles: bool,
+    chat_footer_rows: usize,
 }
 
 impl Default for ProjectionPolicy {
@@ -104,6 +106,8 @@ impl Default for ProjectionPolicy {
             block_headers: false,
             companion_status_rows: 0,
             chat_mode: false,
+            chat_command_bubbles: true,
+            chat_footer_rows: 3,
         }
     }
 }
@@ -137,6 +141,40 @@ impl ProjectionPolicy {
             return false;
         };
         self.chat_mode = enabled;
+        self.revision = revision;
+        true
+    }
+
+    pub fn chat_command_bubbles(&self) -> bool {
+        self.chat_command_bubbles
+    }
+
+    /// The shared native composer does not require Chat history styling.
+    pub fn set_chat_command_bubbles(&mut self, enabled: bool) -> bool {
+        if self.chat_command_bubbles == enabled {
+            return false;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.chat_command_bubbles = enabled;
+        self.revision = revision;
+        true
+    }
+
+    pub fn chat_footer_rows(&self) -> usize {
+        self.chat_footer_rows
+    }
+
+    pub fn set_chat_footer_rows(&mut self, rows: usize) -> bool {
+        let rows = rows.clamp(1, 8);
+        if self.chat_footer_rows == rows {
+            return false;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.chat_footer_rows = rows;
         self.revision = revision;
         true
     }
@@ -393,6 +431,8 @@ pub(super) struct ProjectionPlanCacheKey {
     pub(super) companion_status_rows: usize,
     pub(super) chrome_tail_keep: usize,
     pub(super) chat_mode: bool,
+    pub(super) chat_command_bubbles: bool,
+    pub(super) chat_footer_rows: usize,
     pub(super) chat_prompt_ready: bool,
     pub(super) chat_content_revision: u64,
     /// Canonical count of full-screen primary-buffer row transfers. Combined

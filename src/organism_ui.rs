@@ -321,6 +321,21 @@ fn native_walk_step(
     egui::Rect::from_min_size(egui::pos2(x, target.top()), target.size())
 }
 
+/// Quantize decoration geometry within the proven region. Fixed integer body
+/// extents then remain bit-exact while its route crosses fractional positions;
+/// a one-ulp width change must not invalidate the attention/hover owner.
+fn reference_body_rect(region: egui::Rect, desired: egui::Rect) -> Option<egui::Rect> {
+    let size = desired.size().round();
+    let minimum = (region.min.to_vec2() * 64.0).ceil() / 64.0;
+    let maximum = ((region.max.to_vec2() - size) * 64.0).floor() / 64.0;
+    if minimum.x > maximum.x || minimum.y > maximum.y {
+        return None;
+    }
+    let origin = ((desired.min.to_vec2() * 64.0).round() / 64.0).clamp(minimum, maximum);
+    let rect = egui::Rect::from_min_size(origin.to_pos2(), size);
+    region.contains_rect(rect).then_some(rect)
+}
+
 fn explicit_window_available(
     focused: Option<bool>,
     visible: Option<bool>,
@@ -607,6 +622,220 @@ fn companion_details(
         status_color,
         2,
     );
+}
+
+struct ReferenceCreaturePath {
+    points: Vec<egui::Pos2>,
+    closed: bool,
+    triangles: Vec<[u32; 3]>,
+}
+
+fn triangle_cross(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> f32 {
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+/// Ear clipping keeps the body's concave ear notch out of the filled mesh.
+/// Fail closed rather than falling back to an incorrect convex fan.
+fn triangulate_creature(points: &[egui::Pos2]) -> Vec<[u32; 3]> {
+    if points.len() < 3 {
+        return Vec::new();
+    }
+    let area: f32 = points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(a, b)| a.x * b.y - b.x * a.y)
+        .sum();
+    let direction = area.signum();
+    let mut remaining: Vec<_> = (0..points.len()).collect();
+    let mut triangles = Vec::new();
+    while remaining.len() > 3 {
+        let ear = (0..remaining.len()).find(|&i| {
+            let a = remaining[(i + remaining.len() - 1) % remaining.len()];
+            let b = remaining[i];
+            let c = remaining[(i + 1) % remaining.len()];
+            if triangle_cross(points[a], points[b], points[c]) * direction <= 0.000001 {
+                return false;
+            }
+            !remaining
+                .iter()
+                .copied()
+                .filter(|&p| p != a && p != b && p != c)
+                .any(|p| {
+                    triangle_cross(points[a], points[b], points[p]) * direction >= -0.000001
+                        && triangle_cross(points[b], points[c], points[p]) * direction >= -0.000001
+                        && triangle_cross(points[c], points[a], points[p]) * direction >= -0.000001
+                })
+        });
+        let Some(i) = ear else {
+            return Vec::new();
+        };
+        triangles.push([
+            remaining[(i + remaining.len() - 1) % remaining.len()] as u32,
+            remaining[i] as u32,
+            remaining[(i + 1) % remaining.len()] as u32,
+        ]);
+        remaining.remove(i);
+    }
+    triangles.push([
+        remaining[0] as u32,
+        remaining[1] as u32,
+        remaining[2] as u32,
+    ]);
+    triangles
+}
+
+fn reference_creature_paths() -> &'static [ReferenceCreaturePath] {
+    use jterm_core::reference_organism::{Command, SHAPES};
+    static PATHS: std::sync::OnceLock<Vec<ReferenceCreaturePath>> = std::sync::OnceLock::new();
+    PATHS.get_or_init(|| {
+        SHAPES
+            .iter()
+            .map(|shape| {
+                let mut points = Vec::new();
+                let mut cursor = egui::Pos2::ZERO;
+                let mut closed = false;
+                for command in shape.path {
+                    match *command {
+                        Command::Move(x, y) | Command::Line(x, y) => {
+                            cursor = egui::pos2(x, y);
+                            points.push(cursor);
+                        }
+                        Command::Cubic(ax, ay, bx, by, x, y) => {
+                            let start = cursor;
+                            for step in 1..=12 {
+                                let t = step as f32 / 12.0;
+                                let s = 1.0 - t;
+                                let p = start.to_vec2() * s.powi(3)
+                                    + egui::vec2(ax, ay) * (3.0 * s * s * t)
+                                    + egui::vec2(bx, by) * (3.0 * s * t * t)
+                                    + egui::vec2(x, y) * t.powi(3);
+                                points.push(p.to_pos2());
+                            }
+                            cursor = egui::pos2(x, y);
+                        }
+                        Command::Close => closed = true,
+                    }
+                }
+                if closed
+                    && points.len() > 1
+                    && points[0].distance(*points.last().unwrap()) < 0.0001
+                {
+                    points.pop();
+                }
+                let triangles = if shape.fill.is_some() && closed {
+                    triangulate_creature(&points)
+                } else {
+                    Vec::new()
+                };
+                ReferenceCreaturePath {
+                    points,
+                    closed,
+                    triangles,
+                }
+            })
+            .collect()
+    })
+}
+
+/// Paint only; the existing host retains the sole session owner and cadence.
+fn reference_creature(painter: &egui::Painter, rect: egui::Rect) {
+    use jterm_core::reference_organism::{SHAPES, SIZE};
+    let scale = rect.width().min(rect.height()) / SIZE;
+    let painter = painter.with_clip_rect(rect);
+    for (shape, path) in SHAPES.iter().zip(reference_creature_paths()) {
+        let points: Vec<_> = path
+            .points
+            .iter()
+            .map(|p| rect.min + p.to_vec2() * scale)
+            .collect();
+        if let Some([r, g, b, a]) = shape.fill {
+            let mut mesh = egui::Mesh::default();
+            let tint = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+            for point in &points {
+                mesh.colored_vertex(*point, tint);
+            }
+            for &[a, b, c] in &path.triangles {
+                mesh.add_triangle(a, b, c);
+            }
+            painter.add(egui::Shape::mesh(mesh));
+        }
+        if let Some([r, g, b, a]) = shape.stroke {
+            let stroke = egui::Stroke::new(
+                shape.stroke_width * scale,
+                egui::Color32::from_rgba_unmultiplied(r, g, b, a),
+            );
+            if path.closed {
+                painter.add(egui::Shape::closed_line(points, stroke));
+            } else if let (Some(first), Some(last)) = (points.first(), points.last()) {
+                painter.circle_filled(*first, stroke.width / 2.0, stroke.color);
+                painter.circle_filled(*last, stroke.width / 2.0, stroke.color);
+                painter.add(egui::Shape::line(points, stroke));
+            }
+        }
+    }
+}
+
+fn reference_creature_bubble(
+    ui: &mut Ui,
+    rect: egui::Rect,
+    expanded: bool,
+    context: RenderContext,
+    interactive: bool,
+) -> bool {
+    use jterm_core::reference_organism as visual;
+    let rgba = |[r, g, b, a]: [u8; 4]| egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+    let painter = ui.painter().with_clip_rect(rect);
+    if expanded {
+        painter.rect(
+            rect,
+            visual::SPEECH_RADIUS,
+            rgba(visual::SPEECH_SURFACE),
+            egui::Stroke::new(1.0, rgba(visual::SPEECH_BORDER)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    reference_creature(
+        &painter,
+        egui::Rect::from_min_size(
+            rect.min + egui::vec2(4.0, if expanded { 6.0 } else { 2.0 }),
+            egui::Vec2::splat(if expanded { 64.0 } else { 24.0 }),
+        ),
+    );
+    if expanded {
+        let text = egui::Rect::from_min_max(
+            rect.min + egui::vec2(76.0, 13.0),
+            rect.max - egui::vec2(28.0, 8.0),
+        );
+        painter.circle_filled(
+            text.min + egui::vec2(3.0, 5.0),
+            2.0,
+            rgba(visual::AWAKE_COLOR),
+        );
+        painter.text(
+            text.min + egui::vec2(11.0, 0.0),
+            egui::Align2::LEFT_TOP,
+            "Organism · here",
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_rgb(225, 233, 246),
+        );
+        companion_text(
+            ui,
+            egui::Rect::from_min_max(text.min + egui::vec2(0.0, 19.0), text.max),
+            live_behavior_explanation(context),
+            10.0,
+            egui::Color32::from_rgb(145, 162, 187),
+            2,
+        );
+    }
+    companion_toggle(ui, reference_creature_control(rect), expanded, interactive)
+}
+
+fn reference_creature_control(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        rect.right_top() + egui::vec2(-24.0, 4.0),
+        egui::vec2(20.0, 20.0),
+    )
 }
 
 /// A pointer-only control never requests keyboard focus or sends terminal input.
@@ -904,6 +1133,7 @@ pub struct OrganismHost {
     native_surface_region: Option<egui::Rect>,
     native_surface_frame: Option<u64>,
     native_surface_walking: bool,
+    native_toggle_requested: bool,
     palette: NativePalette,
     reaction_status: String,
     reaction_tone: Option<(Behavior, Tone)>,
@@ -956,6 +1186,7 @@ impl Default for OrganismHost {
             native_surface_region: None,
             native_surface_frame: None,
             native_surface_walking: false,
+            native_toggle_requested: false,
             palette: NativePalette::default(),
             reaction_status: "quiet · waiting for a real Block event".into(),
             reaction_tone: None,
@@ -1199,6 +1430,23 @@ impl OrganismHost {
             self.life.note_input(now);
             self.ambient.interrupt();
         }
+    }
+
+    /// The already-painted collapse control owns only its pointer rectangle.
+    /// It never claims keys or IME, and stale/different session bodies fail closed.
+    pub(crate) fn native_control_owns_pointer(&self, ctx: &egui::Context, session: &str) -> bool {
+        self.owner.as_deref() == Some(session)
+            && self.presented_body.as_ref().is_some_and(|(pass, owner)| {
+                owner == session && pass.saturating_add(1) >= ctx.cumulative_pass_nr()
+            })
+            && self.native_surface_rect.is_some_and(|rect| {
+                ctx.input(|input| {
+                    input
+                        .pointer
+                        .hover_pos()
+                        .is_some_and(|point| reference_creature_control(rect).contains(point))
+                })
+            })
     }
 
     pub fn batch(
@@ -1591,21 +1839,15 @@ impl OrganismHost {
             )
         });
         let font = organism_font(ui, Config::clamp_font_size(config.font_size));
-        // Keep a measured twelve-column envelope across all shared ASCII poses.
-        // This includes the reference 6x3 padding and 1px border on every side.
-        // Measure the fixed envelope once, then lay out only the final sprite.
-        // A future out-of-envelope pose fails closed at the final fit check.
+        // Retain the configured native cell width for the existing walk step.
+        // The graphical body has a fixed, completely checked paint envelope.
         let envelope = ui.painter().layout_no_wrap(
             "MMMMMMMMMMMM\nMMMMMMMMMMMM\nMMMMMMMMMMMM".into(),
             font.clone(),
             self.palette.quiet,
         );
-        let body_size = envelope.size() + egui::vec2(14.0, 8.0);
-        let compact_size = ui
-            .painter()
-            .layout_no_wrap("MMMMMMMM".into(), font.clone(), self.palette.quiet)
-            .size()
-            + egui::vec2(14.0, 8.0);
+        let body_size = egui::vec2(264.0, 80.0);
+        let compact_size = egui::vec2(52.0, 28.0);
         let region = surface.as_ref().map(|(_, _, _, region)| *region);
         let fits = |size: egui::Vec2| {
             region.is_some_and(|region| size.x <= region.width() && size.y <= region.height())
@@ -1628,14 +1870,6 @@ impl OrganismHost {
                 return;
             }
         };
-        let layout = |context: RenderContext, frame: u64, color| {
-            let text = if presentation == CompanionSurface::Body {
-                sprite_frame_with_context(context, frame).into_owned()
-            } else {
-                sticky_glyph_with_context(context, frame).into_owned()
-            };
-            ui.painter().layout_no_wrap(text, font.clone(), color)
-        };
         let identity = surface
             .as_ref()
             .map(|(session, block, projection, _)| (session.clone(), block.clone(), *projection));
@@ -1653,6 +1887,11 @@ impl OrganismHost {
         // Hover freezes even during cooldown: a visit never has to chase the cat.
         let pointer_over_previous =
             previous.is_some_and(|rect| pointer.is_some_and(|point| rect.contains(point)));
+        // Preserve only the already-painted pointer-only control through its
+        // press/release. Other button activity keeps the original hard gate.
+        let pointer_over_control = previous.is_some_and(|rect| {
+            pointer.is_some_and(|point| reference_creature_control(rect).contains(point))
+        });
         let wandering = full
             && presentation == CompanionSurface::Body
             && !self.running
@@ -1668,13 +1907,17 @@ impl OrganismHost {
                     previous
                 } else {
                     native_placement(region, size, context, frame, wandering)
+                        .and_then(|rect| reference_body_rect(region, rect))
                 }
             })
-            .filter(|_| !buttons_down);
+            .filter(|_| !buttons_down || pointer_over_control);
         let new_frame = self.native_surface_frame != Some(frame);
         if full && !pointer_over_previous {
             if let Some((previous, desired)) = previous.zip(target) {
-                let cell_width = envelope.size().x / 12.0;
+                // The fixed-size graphical body advances by a whole logical
+                // pixel. Fractional font advances otherwise change Rect::size
+                // by an ulp and incorrectly retire its hover/attention owner.
+                let cell_width = (envelope.size().x / 12.0).round().max(1.0);
                 target = Some(native_walk_step(previous, desired, cell_width, new_frame));
             }
         }
@@ -1738,14 +1981,8 @@ impl OrganismHost {
                 self.native_bridge.reset();
                 None
             };
-            let galley = if let Some(plan) = plan.as_ref() {
-                layout(plan.context, plan.frame, color)
-            } else {
-                layout(display, frame, color)
-            };
-            let inner = target.shrink2(egui::vec2(7.0, 4.0));
             if let Some((_, _, _, region)) = surface {
-                if galley.size().x <= inner.width() && galley.size().y <= inner.height() {
+                if region.contains_rect(target) {
                     let painter = ui.painter().with_clip_rect(region);
                     let border = if snapshot.is_some_and(|value| value.candidate_visible)
                         || pointer.is_some_and(|point| target.contains(point))
@@ -1769,14 +2006,22 @@ impl OrganismHost {
                     // Immediate-mode decoration: each frame submits only its
                     // current rectangle. Neither terminal cells nor GPU grid
                     // caches contain the old body, so movement leaves no trail.
-                    painter.rect(
+                    // Retain the host's state border as a restrained cue.
+                    if snapshot.is_some_and(|value| value.candidate_visible) {
+                        painter.rect_stroke(
+                            target,
+                            10.0,
+                            egui::Stroke::new(1.0, border),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    self.native_toggle_requested |= reference_creature_bubble(
+                        ui,
                         target,
-                        6.0,
-                        alpha(self.palette.background, 204),
-                        egui::Stroke::new(1.0, border),
-                        egui::StrokeKind::Inside,
+                        presentation == CompanionSurface::Body,
+                        display,
+                        interactive,
                     );
-                    painter.galley(inner.min, galley, color);
                     self.presented_body = self
                         .owner
                         .clone()
@@ -2428,6 +2673,12 @@ impl crate::TerminalApp {
         self.organism.palette = NativePalette::from_theme(&self.current_theme);
         self.organism
             .draw_native_body(ui, &self.config, surface, interactive);
+        if std::mem::take(&mut self.organism.native_toggle_requested) {
+            self.config.ascii_organism_expanded = !self.config.ascii_organism_expanded;
+            self.config_panel.sync_from_config(&self.config);
+            self.schedule_config_save();
+            ui.ctx().request_repaint();
+        }
         if !self.organism.care.enabled() {
             return;
         }
@@ -3026,6 +3277,58 @@ fn preview_next_wake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_creature_fill_preserves_concave_ear_notch_and_contour_area() {
+        use jterm_core::reference_organism::SHAPES;
+        for (path, shape) in reference_creature_paths().iter().zip(SHAPES) {
+            if shape.fill.is_none() {
+                continue;
+            }
+            assert_eq!(path.triangles.len(), path.points.len() - 2);
+            let area: f32 = path
+                .points
+                .iter()
+                .zip(path.points.iter().cycle().skip(1))
+                .take(path.points.len())
+                .map(|(a, b)| a.x * b.y - b.x * a.y)
+                .sum();
+            let triangles: f32 = path
+                .triangles
+                .iter()
+                .map(|&[a, b, c]| {
+                    triangle_cross(
+                        path.points[a as usize],
+                        path.points[b as usize],
+                        path.points[c as usize],
+                    )
+                    .abs()
+                })
+                .sum();
+            assert!((area.abs() - triangles).abs() < 0.01);
+        }
+        let body = reference_creature_paths()
+            .iter()
+            .zip(SHAPES)
+            .find(|(_, shape)| shape.fill == Some([19, 36, 66, 255]))
+            .unwrap()
+            .0;
+        let notch = egui::pos2(32.0, 13.0);
+        assert!(
+            !body.triangles.iter().any(|&[a, b, c]| {
+                let (a, b, c) = (
+                    body.points[a as usize],
+                    body.points[b as usize],
+                    body.points[c as usize],
+                );
+                let direction = triangle_cross(a, b, c).signum();
+                triangle_cross(a, b, notch) * direction >= 0.0
+                    && triangle_cross(b, c, notch) * direction >= 0.0
+                    && triangle_cross(c, a, notch) * direction >= 0.0
+            }),
+            "a convex fill incorrectly covers the gap between the ears"
+        );
+    }
 
     #[test]
     fn system_motion_coalesces_duplicates_and_keeps_explicit_choices() {
@@ -4299,7 +4602,7 @@ mod tests {
     fn companion_is_shared_chrome_before_both_terminal_views_and_preserves_input_bounds() {
         let main = include_str!("main.rs");
         let render = main
-            .split("self.render_bottom_bar(root_ui);")
+            .split("self.render_reference_topbar(root_ui);")
             .nth(1)
             .unwrap()
             .split("self.render_floating_panels(ctx);")

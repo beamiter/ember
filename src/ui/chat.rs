@@ -13,6 +13,282 @@ struct ChatCard {
 
 /// Finished neutral output belongs to the shared canvas rather than another
 /// outlined bubble. Keep unresolved/failed, selected and live surfaces visible.
+fn paint_reference_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    kind: jterm_core::reference_icons::Icon,
+    tint: Color32,
+) {
+    let scale = rect.width().min(rect.height()) / 24.0;
+    let stroke = egui::Stroke::new(1.5 * scale, tint);
+    for path in kind.paths() {
+        let points: Vec<_> = path
+            .iter()
+            .map(|&(x, y)| rect.min + egui::vec2(x, y) * scale)
+            .collect();
+        painter.add(egui::Shape::line(points.clone(), stroke));
+        if let (Some(first), Some(last)) = (points.first(), points.last()) {
+            painter.circle_filled(*first, stroke.width * 0.5, tint);
+            painter.circle_filled(*last, stroke.width * 0.5, tint);
+        }
+    }
+}
+
+/// Shared native tool slots for editable prompts and non-editable foreground
+/// chrome. This factory creates no text editor and never writes terminal bytes.
+fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: bool, owner: usize) {
+    use jterm_core::{
+        reference_icons::Icon,
+        reference_shell::{self as shell, color},
+    };
+    let rgb = |[r, g, b]: [u8; 3]| Color32::from_rgb(r, g, b);
+    let popup_color = |[r, g, b, a]: [u8; 4]| Color32::from_rgba_unmultiplied(r, g, b, a);
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(("reference-composer-tools", owner))
+            .max_rect(rect),
+        |ui| {
+            ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+            *ui.visuals_mut() = egui::Visuals::light();
+            ui.visuals_mut().disabled_alpha = 1.0;
+            let model_width = if rect.width() > 540.0 {
+                shell::COMPOSER_MODEL_MIN_WIDTH
+            } else {
+                0.0
+            };
+            let tools_right = rect.right() - model_width - shell::METADATA_GAP;
+            let mut x = rect.left();
+            for (kind, label, width, available) in [
+                (Icon::Plus, "", 28.0, false),
+                (Icon::Attach, "Attach", 57.0, false),
+                (Icon::Image, "Image", 57.0, false),
+                (Icon::Code, "Code", 52.0, false),
+                (Icon::Terminal, "Terminal", 72.0, true),
+                (Icon::Grid, "Tools", 70.0, true),
+            ] {
+                if x + width > tools_right {
+                    continue;
+                }
+                let bounds = egui::Rect::from_min_size(
+                    egui::pos2(x, rect.top()),
+                    egui::vec2(width, shell::CONTROL_HEIGHT),
+                );
+                let enabled = interactive && available;
+                let response = ui
+                    .push_id(("reference-footer-tool", label), |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            ui.put(
+                                bounds,
+                                egui::Button::new("")
+                                    .fill(rgb(color::CONTROL_SURFACE))
+                                    .stroke(egui::Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
+                                    .corner_radius(7),
+                            )
+                        })
+                        .inner
+                    })
+                    .inner;
+                paint_reference_icon(
+                    ui.painter(),
+                    egui::Rect::from_center_size(
+                        egui::pos2(x + 13.0, bounds.center().y),
+                        egui::vec2(14.0, 14.0),
+                    ),
+                    kind,
+                    rgb(color::DISABLED_TEXT),
+                );
+                if !label.is_empty() {
+                    ui.painter().text(
+                        egui::pos2(x + 24.0, bounds.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        FontId::proportional(shell::type_size::CONTROL),
+                        rgb(color::DISABLED_TEXT),
+                    );
+                }
+                if label == "Tools" {
+                    paint_reference_icon(
+                        ui.painter(),
+                        egui::Rect::from_center_size(
+                            egui::pos2(bounds.right() - 9.0, bounds.center().y),
+                            egui::vec2(12.0, 12.0),
+                        ),
+                        Icon::ChevronDown,
+                        rgb(color::DISABLED_TEXT),
+                    );
+                }
+                response
+                    .clone()
+                    .on_hover_text(CHAT_FOOTER_HINT)
+                    .on_disabled_hover_text(if interactive {
+                        "This attachment action is unavailable"
+                    } else {
+                        "Input belongs to the foreground program; message tools are unavailable"
+                    });
+                if label == "Tools" && interactive {
+                    let popup_id = egui::Popup::default_response_id(&response);
+                    let focused = response.has_focus();
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(egui::Id::new("block-action-popup"), popup_id);
+                        if focused {
+                            data.insert_temp(egui::Id::new("block-action-focus"), response.id);
+                        }
+                    });
+                    let visible = egui::Popup::menu(&response)
+                        .width(jterm_core::reference_popup::WIDTH)
+                        .frame(
+                            egui::Frame::NONE
+                                .fill(popup_color(jterm_core::reference_popup::SURFACE))
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    popup_color(jterm_core::reference_popup::BORDER),
+                                ))
+                                .corner_radius(jterm_core::reference_popup::RADIUS as u8)
+                                .inner_margin(jterm_core::reference_popup::PADDING),
+                        )
+                        .show(|ui| {
+                            use jterm_core::reference_popup::{self as popup, ToolCommandId};
+                            *ui.visuals_mut() = egui::Visuals::dark();
+                            ui.visuals_mut().disabled_alpha = 1.0;
+                            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                            ui.set_width(popup::WIDTH - 2.0 * popup::PADDING - 2.0);
+                            for command in popup::COMMANDS {
+                                if command.separator_before {
+                                    let (line, _) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 9.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().hline(
+                                        line.x_range(),
+                                        line.center().y,
+                                        egui::Stroke::new(1.0, popup_color(popup::BORDER)),
+                                    );
+                                }
+                                let item = ui
+                                    .push_id(command.title, |ui| {
+                                        ui.add_enabled_ui(!command.placeholder, |ui| {
+                                            ui.add_sized(
+                                                [ui.available_width(), popup::ROW_HEIGHT],
+                                                egui::Button::new("")
+                                                    .fill(Color32::TRANSPARENT)
+                                                    .stroke(egui::Stroke::NONE)
+                                                    .corner_radius(6),
+                                            )
+                                        })
+                                        .inner
+                                    })
+                                    .inner;
+                                item.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        !command.placeholder,
+                                        command.title,
+                                    )
+                                });
+                                if item.hovered() || item.has_focus() {
+                                    ui.painter().rect_filled(
+                                        item.rect,
+                                        6,
+                                        popup_color(popup::SELECTED),
+                                    );
+                                }
+                                let tint = if command.placeholder {
+                                    popup_color(popup::MUTED)
+                                } else {
+                                    popup_color(popup::FOREGROUND)
+                                };
+                                paint_reference_icon(
+                                    ui.painter(),
+                                    egui::Rect::from_center_size(
+                                        item.rect.left_center() + egui::vec2(12.0, 0.0),
+                                        egui::vec2(popup::ICON_SIZE, popup::ICON_SIZE),
+                                    ),
+                                    Icon::from_key(command.icon_key),
+                                    tint,
+                                );
+                                ui.painter().text(
+                                    item.rect.left_center() + egui::vec2(28.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    command.title,
+                                    FontId::proportional(10.0),
+                                    tint,
+                                );
+                                ui.painter().text(
+                                    item.rect.right_center() - egui::vec2(7.0, 0.0),
+                                    egui::Align2::RIGHT_CENTER,
+                                    command.description,
+                                    FontId::proportional(9.0),
+                                    popup_color(popup::MUTED),
+                                );
+                                if item.clicked() {
+                                    let intent = match command.id {
+                                        ToolCommandId::Terminal => "terminal",
+                                        ToolCommandId::CommandPalette => "launcher",
+                                        ToolCommandId::SearchCanvas => "search",
+                                        ToolCommandId::Attach
+                                        | ToolCommandId::Image
+                                        | ToolCommandId::Code => continue,
+                                    };
+                                    ui.ctx().data_mut(|data| {
+                                        data.insert_temp(
+                                            egui::Id::new("reference-tool-request"),
+                                            intent.to_owned(),
+                                        )
+                                    });
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .is_some();
+                    remember_reference_chrome_scope(
+                        ui.ctx(),
+                        ui.id().with("reference-tools-keyboard-scope"),
+                        response.rect,
+                        visible,
+                    );
+                }
+                x += width + shell::METADATA_GAP;
+            }
+            if model_width > 0.0 {
+                let bounds = egui::Rect::from_min_max(
+                    egui::pos2(rect.right() - model_width, rect.top()),
+                    rect.max,
+                );
+                ui.push_id("reference-model-unavailable", |ui| {
+                    ui.add_enabled_ui(false, |ui| {
+                        ui.put(
+                            bounds,
+                            egui::Button::new("")
+                                .fill(rgb(color::CONTROL_SURFACE))
+                                .stroke(egui::Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
+                                .corner_radius(7),
+                        )
+                    })
+                    .inner
+                })
+                .inner
+                .on_disabled_hover_text("No model is attached to this terminal input owner");
+                ui.painter().with_clip_rect(bounds).text(
+                    bounds.left_center() + egui::vec2(8.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    shell::MODEL_UNAVAILABLE_LABEL,
+                    FontId::proportional(shell::type_size::CONTROL),
+                    rgb(color::DISABLED_TEXT),
+                );
+                paint_reference_icon(
+                    ui.painter(),
+                    egui::Rect::from_center_size(
+                        bounds.right_center() - egui::vec2(9.0, 0.0),
+                        egui::vec2(12.0, 12.0),
+                    ),
+                    Icon::ChevronDown,
+                    rgb(color::DISABLED_TEXT),
+                );
+            }
+        },
+    );
+}
+
 fn chat_output_is_quiet(
     command: bool,
     composer: bool,
@@ -52,10 +328,10 @@ fn draw_chat_footer_hint(
 // Paint-only contract shared with the native GTK Chat surfaces. Never inset
 // text or alter projected rows to make a capsule fit. Both paint passes use it.
 fn chat_card_rounding(card: ChatCard) -> egui::CornerRadius {
-    let radius: f32 = if card.command || card.composer {
-        18.0
+    let radius: f32 = if card.composer {
+        jterm_core::reference_shell::COMPOSER_RADIUS
     } else {
-        16.0
+        jterm_core::reference_shell::CARD_RADIUS
     };
     let limit = (card.rect.width().min(card.rect.height()) * 0.5).max(0.0);
     let rounded = radius.min(limit) as u8;
@@ -145,6 +421,54 @@ impl TerminalRenderer {
         rect.intersect(clip)
     }
 
+    pub(crate) fn shared_composer_rect(
+        &self,
+        content: egui::Rect,
+        rows: std::ops::Range<usize>,
+    ) -> egui::Rect {
+        let native = self.canvas_chat_row_rect(content, rows);
+        // Standalone/native renderer users have the same dock contract even
+        // when no application panel has supplied the optional outer bounds.
+        let outer = self.workspace_outer_rect.unwrap_or_else(|| {
+            egui::Rect::from_min_max(
+                content.min - egui::vec2(self.padding + self.block_gutter_width(), self.padding),
+                content.max
+                    + egui::vec2(
+                        self.padding + Self::SCROLLBAR_WIDTH + Self::SCROLLBAR_GAP,
+                        self.padding,
+                    ),
+            )
+        });
+        let top = (outer.bottom() - jterm_core::reference_shell::COMPOSER_HEIGHT)
+            .min(native.top() - 6.0)
+            .max(outer.top());
+        egui::Rect::from_min_max(egui::pos2(outer.left(), top), outer.max)
+    }
+
+    fn composer_footer_rect(
+        &self,
+        content: egui::Rect,
+        rows: std::ops::Range<usize>,
+    ) -> egui::Rect {
+        let first_footer = rows
+            .end
+            .saturating_sub((28.0 / self.line_height).ceil() as usize)
+            .max(rows.start);
+        let native_footer = self.canvas_chat_row_rect(content, first_footer..rows.end);
+        let frame = self.shared_composer_rect(content, rows);
+        egui::Rect::from_min_max(
+            egui::pos2(
+                frame.left() + jterm_core::reference_shell::COMPOSER_CONTROL_LEFT,
+                (frame.bottom() - 36.0).max(native_footer.top()),
+            ),
+            frame.max
+                - egui::vec2(
+                    jterm_core::reference_shell::COMPOSER_CONTROL_RIGHT,
+                    jterm_core::reference_shell::COMPOSER_CONTROL_BOTTOM,
+                ),
+        )
+    }
+
     fn chat_cards(
         &self,
         terminal: &TerminalState,
@@ -159,13 +483,12 @@ impl TerminalRenderer {
         if entry.live {
             if let Some(rows) = viewport.chat_composer_rows() {
                 cards.push(ChatCard {
-                    rect: self.canvas_chat_row_rect(content, rows),
+                    rect: self.shared_composer_rect(content, rows),
                     command: false,
                     composer: true,
                     top_closed: true,
                     bottom_closed: true,
                 });
-                cards[0].rect.min.x -= self.char_width.min(8.0);
                 return cards;
             }
         }
@@ -178,7 +501,7 @@ impl TerminalRenderer {
             .find(|command| command.sequence == record.sequence);
         let mut result_start =
             entry.span.first_row + usize::from(entry.metadata_row == Some(entry.span.first_row));
-        if let Some(command) = command {
+        if let Some(command) = command.filter(|_| self.chat_command_bubbles) {
             let mut rect = self.canvas_chat_row_rect(content, command.rows.clone());
             rect.min.x = (content.left() + command.column as f32 * self.char_width
                 - self.char_width * 0.8)
@@ -234,6 +557,24 @@ impl TerminalRenderer {
     }
 
     fn chat_card_fill(&self, entry: &BlockChromeEntry, card: ChatCard) -> Color32 {
+        if card.composer {
+            let [r, g, b] = jterm_core::reference_shell::color::COMPOSER;
+            return Color32::from_rgba_unmultiplied(
+                r,
+                g,
+                b,
+                (255.0 * self.opacity.clamp(0.0, 1.0)) as u8,
+            );
+        }
+        if !card.command && !card.composer && !entry.selected && !entry.active {
+            let [r, g, b] = jterm_core::reference_shell::color::TERMINAL;
+            return Color32::from_rgba_unmultiplied(
+                r,
+                g,
+                b,
+                (255.0 * self.opacity.clamp(0.0, 1.0)) as u8,
+            );
+        }
         if chat_output_is_quiet(
             card.command,
             card.composer,
@@ -357,6 +698,24 @@ impl TerminalRenderer {
                 viewport.row_kind(row),
                 Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. })
             ) {
+                let header = self
+                    .canvas_chat_row_rect(content, row..row + 1)
+                    .shrink2(egui::vec2(6.0, 1.0));
+                let avatar = egui::Rect::from_min_size(header.min, egui::vec2(15.0, 15.0));
+                painter.rect_filled(avatar, 4, self.block_accent_color());
+                paint_reference_icon(
+                    painter,
+                    avatar.shrink(3.0),
+                    jterm_core::reference_icons::Icon::Terminal,
+                    Color32::WHITE,
+                );
+                painter.text(
+                    egui::pos2(header.left() + 21.0, header.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "Shell · Terminal output",
+                    FontId::proportional(10.0),
+                    self.theme.terminal_foreground(),
+                );
                 if let Some(status) = crate::block_mode::badge_text_with_lifecycle(
                     entry.outcome,
                     entry.duration_ms,
@@ -380,6 +739,81 @@ impl TerminalRenderer {
 }
 
 impl TerminalRenderer {
+    pub(super) fn draw_reference_foreground_footer(
+        &self,
+        ui: &mut egui::Ui,
+        terminal: &TerminalState,
+    ) {
+        let Some(rect) = self.foreground_footer_rect else {
+            return;
+        };
+        use jterm_core::{
+            reference_icons::Icon,
+            reference_shell::{self as shell, color},
+        };
+        let rgb = |[r, g, b]: [u8; 3]| Color32::from_rgb(r, g, b);
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        painter.rect_filled(rect, shell::COMPOSER_RADIUS, rgb(color::COMPOSER));
+        painter.rect_stroke(
+            rect,
+            shell::COMPOSER_RADIUS,
+            egui::Stroke::new(1.0, rgb(color::LIGHT_BORDER)),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.min + egui::vec2(12.0, 18.0),
+            egui::Align2::LEFT_CENTER,
+            "Input goes to the foreground program",
+            FontId::proportional(10.0),
+            rgb(color::CANVAS_MUTED),
+        );
+        let y = rect.bottom() - shell::COMPOSER_CONTROL_BOTTOM - shell::CONTROL_HEIGHT;
+        let controls = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + shell::COMPOSER_CONTROL_LEFT, y),
+            egui::pos2(
+                rect.right()
+                    - shell::COMPOSER_CONTROL_RIGHT
+                    - shell::CONTROL_HEIGHT
+                    - shell::METADATA_GAP,
+                rect.bottom() - shell::COMPOSER_CONTROL_BOTTOM,
+            ),
+        );
+        draw_reference_composer_tools(
+            ui,
+            controls,
+            false,
+            terminal as *const TerminalState as usize,
+        );
+        let can_interrupt = terminal.command_records().back().is_some_and(|record| {
+            crate::terminal::ChatInputAction::Interrupt {
+                sequence: record.sequence,
+            }
+            .is_current(terminal)
+        });
+        if !can_interrupt {
+            let stop = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.right() - shell::COMPOSER_CONTROL_RIGHT - shell::CONTROL_HEIGHT,
+                    y,
+                ),
+                egui::vec2(28.0, 28.0),
+            );
+            painter.rect_stroke(
+                stop,
+                7,
+                egui::Stroke::new(1.0, rgb(color::LIGHT_BORDER)),
+                egui::StrokeKind::Inside,
+            );
+            paint_reference_icon(
+                &painter,
+                stop.shrink(7.0),
+                Icon::Close,
+                rgb(color::CANVAS_MUTED),
+            );
+            ui.interact(stop,ui.id().with("foreground-unavailable-stop"),egui::Sense::hover()).on_hover_text("Stop is unavailable for this input owner; use the foreground program's native keys (Ctrl+C where supported)");
+        }
+    }
+
     pub(super) fn draw_chat_controls(
         &mut self,
         ui: &mut Ui,
@@ -389,6 +823,7 @@ impl TerminalRenderer {
         enabled: bool,
     ) -> bool {
         use crate::terminal::ChatInputAction;
+        self.chat_control_rect = None;
         let enabled = enabled && self.chat_controls_enabled;
         if !enabled {
             // Once interrupted, the old physical press cannot revive merely
@@ -407,37 +842,56 @@ impl TerminalRenderer {
             ) {
                 return false;
             }
-            let footer = self
-                .canvas_chat_row_rect(content, row..row + 1)
-                .shrink2(egui::vec2(8.0, 1.0));
-            let button_width = (self.font_size * 4.4).min(footer.width());
+            let footer = self.composer_footer_rect(content, composer);
+            let button_width = 28.0_f32.min(footer.width());
             let button = egui::Rect::from_min_max(
                 egui::pos2(footer.right() - button_width, footer.top()),
                 footer.max,
             );
             let label_rect = egui::Rect::from_min_max(
                 footer.min,
-                egui::pos2(button.left() - 8.0, footer.bottom()),
+                egui::pos2(
+                    button.left() - jterm_core::reference_shell::METADATA_GAP,
+                    footer.bottom(),
+                ),
             );
-            draw_chat_footer_hint(
-                ui,
-                label_rect,
-                egui::Id::new((
-                    "chat-footer-hint",
+            if label_rect.width() < 260.0 {
+                draw_chat_footer_hint(
+                    ui,
+                    label_rect,
+                    egui::Id::new(("chat-footer-hint", record.sequence)),
+                    self.font_size.min(10.0),
+                    self.theme.terminal_foreground().gamma_multiply(0.5),
+                );
+            } else {
+                draw_reference_composer_tools(
+                    ui,
+                    label_rect,
+                    true,
                     terminal as *const TerminalState as usize,
-                    record.sequence,
-                )),
-                self.font_size,
-                self.theme.terminal_foreground().gamma_multiply(0.50),
-            );
+                );
+            }
             Some((
                 ChatInputAction::Submit {
                     sequence: record.sequence,
                 },
                 button,
-                "Run",
+                "↑",
                 "Send Enter immediately when the shell and writer are ready. If unavailable, use the native keyboard; enhanced multi-byte button encodings are unsupported.",
             ))
+        } else if surface == jterm_core::chat_mode::ChatSurface::Running
+            && self.foreground_footer_rect.is_some()
+        {
+            if !(ChatInputAction::Interrupt {
+                sequence: record.sequence,
+            })
+            .is_current(terminal)
+            {
+                self.chat_pressed_action = None;
+                return false;
+            }
+            let footer = self.foreground_footer_rect.unwrap();
+            Some((ChatInputAction::Interrupt { sequence:record.sequence },egui::Rect::from_min_size(egui::pos2(footer.right()-36.0,footer.bottom()-36.0),egui::vec2(28.0,28.0)),"Stop","Send Ctrl+C to the current foreground command. Native ownership and IME guards are revalidated before writing."))
         } else if surface == jterm_core::chat_mode::ChatSurface::Running {
             viewport.chat_command_spans().iter().find(|command| command.sequence == record.sequence)
                 .filter(|command| matches!(viewport.row_kind(command.rows.end), Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. })))
@@ -460,14 +914,19 @@ impl TerminalRenderer {
         // wrapping. Hide an unreadable control in a tiny pane; the native
         // keyboard remains available. Clip both paint and hit testing to the
         // same footer/header rectangle without changing any global styles.
-        let label_size = ui
-            .painter()
-            .layout_no_wrap(
-                label.to_owned(),
-                FontId::proportional(self.font_size),
-                self.theme.terminal_foreground(),
-            )
-            .size();
+        let icon_control = matches!(action, ChatInputAction::Submit { .. })
+            || self.foreground_footer_rect.is_some();
+        let label_size = if icon_control {
+            egui::vec2(14.0, 14.0)
+        } else {
+            ui.painter()
+                .layout_no_wrap(
+                    label.to_owned(),
+                    FontId::proportional(self.font_size),
+                    self.theme.terminal_foreground(),
+                )
+                .size()
+        };
         if rect.width() < label_size.x + 12.0 || rect.height() < label_size.y + 2.0 {
             if self
                 .chat_pressed_action
@@ -499,11 +958,15 @@ impl TerminalRenderer {
                         ui.put(
                             rect,
                             egui::Button::new(
-                                egui::RichText::new(label).size(self.font_size),
+                                egui::RichText::new(if icon_control { "" } else { label }).size(if icon_control { 12.0 } else { self.font_size }).color(egui::Color32::WHITE),
                             )
                             .small()
                             .truncate()
-                            .corner_radius(12),
+                            .fill(if icon_control {
+                                let [r, g, b] = jterm_core::reference_shell::color::ACCENT;
+                                egui::Color32::from_rgb(r, g, b)
+                            } else { self.theme.terminal_background() })
+                            .corner_radius(7),
                         )
                     })
                     .inner
@@ -512,6 +975,19 @@ impl TerminalRenderer {
             .inner
             .on_hover_text(tooltip)
             .on_disabled_hover_text("This optional control needs a current native foreground and a supported one-byte key. Use the normal keyboard while it is unavailable.");
+        self.chat_control_rect = Some(rect);
+        if icon_control {
+            paint_reference_icon(
+                ui.painter(),
+                rect.shrink(7.0),
+                if matches!(action, ChatInputAction::Submit { .. }) {
+                    jterm_core::reference_icons::Icon::Send
+                } else {
+                    jterm_core::reference_icons::Icon::Close
+                },
+                Color32::WHITE,
+            );
+        }
         let target = (
             terminal as *const TerminalState as usize,
             action,
@@ -653,6 +1129,43 @@ mod tests {
 
     fn prompt(terminal: &mut TerminalState) {
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello");
+    }
+
+    #[test]
+    fn chat_composer_tools_do_not_alias_native_keyboard_focus() {
+        let ctx = egui::Context::default();
+        let mut renderer = renderer();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 800.0));
+        let (cols, rows) = renderer.grid_dimensions(screen.size());
+        let mut terminal = TerminalState::new(cols, rows);
+        prompt(&mut terminal);
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    let response = renderer.render_in_rect(
+                        ui,
+                        &mut terminal,
+                        true,
+                        true,
+                        true,
+                        &crate::search::SearchState::default(),
+                        &[],
+                        &None,
+                        screen,
+                    );
+                    response.request_focus();
+                    assert!(
+                        !crate::ui::block_action_has_focus(ui.ctx()),
+                        "native terminal focus must never look like composer Tools focus"
+                    );
+                },
+            );
+            output.textures_delta.clear();
+        }
     }
 
     #[test]
@@ -1009,10 +1522,9 @@ mod tests {
             &mut ProjectionViewState::new(),
         );
         let content = renderer.layout_rects(screen).0;
-        let row = view.chat_composer_rows().unwrap().end - 1;
-        let footer =
-            row_rect(content, row..row + 1, renderer.line_height).shrink2(egui::vec2(8.0, 1.0));
-        let pointer = egui::pos2(footer.right() - 24.0, footer.center().y);
+
+        let footer = renderer.composer_footer_rect(content, view.chat_composer_rows().unwrap());
+        let pointer = egui::pos2(footer.right() - 14.0, footer.center().y);
         let mut frame = |enabled, pressed: Option<bool>| {
             renderer.chat_controls_enabled = enabled;
             let mut events = vec![egui::Event::PointerMoved(pointer)];
@@ -1114,10 +1626,27 @@ mod tests {
                         // Clear before assertions so a failed assertion reports normally
                         // instead of aborting the whole suite in TexturesDelta::drop.
                         output.textures_delta.clear();
-                        let hits = ctx.interactive_rects_last_pass();
-                        assert_eq!(hits.len(), 1, "dpi={dpi}, size={size}, running={running}");
+                        let target = renderer
+                            .chat_control_rect
+                            .unwrap_or_else(|| panic!("native optional action remains visible: dpi={dpi}, size={size}, running={running}"));
+                        let hits: Vec<_> = ctx
+                            .interactive_rects_last_pass()
+                            .into_iter()
+                            .filter(|hit| target.contains_rect(*hit))
+                            .collect();
+                        assert_eq!(hits.len(), 1, "one action owns its exact rectangle: dpi={dpi}, size={size}, running={running}");
                         point = Some(hits[0].center());
-                        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == if running { "Interrupt" } else { "Run" })));
+                        if running {
+                            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "Interrupt")));
+                        } else {
+                            assert!(
+                                output
+                                    .shapes
+                                    .iter()
+                                    .any(|shape| matches!(&shape.shape, egui::Shape::Path(_))),
+                                "native vector send icon is painted"
+                            );
+                        }
                         output.drop_without_applying_deltas();
                     }
                     assert!(
@@ -1164,14 +1693,11 @@ mod tests {
                             &mut ProjectionViewState::new(),
                         );
                         let content = renderer.layout_rects(pane).0;
-                        let row = view.chat_composer_rows().unwrap().end - 1;
-                        let footer = row_rect(content, row..row + 1, renderer.line_height)
-                            .shrink2(egui::vec2(8.0, 1.0));
+
+                        let footer = renderer
+                            .composer_footer_rect(content, view.chat_composer_rows().unwrap());
                         let button = egui::Rect::from_min_max(
-                            egui::pos2(
-                                footer.right() - (font * 4.4).min(footer.width()),
-                                footer.top(),
-                            ),
+                            egui::pos2(footer.right() - 28.0_f32.min(footer.width()), footer.top()),
                             footer.max,
                         );
                         let pointer = match sample {
@@ -1201,14 +1727,7 @@ mod tests {
                                     ..Default::default()
                                 },
                                 |ui| {
-                                    let text_size = ui
-                                        .painter()
-                                        .layout_no_wrap(
-                                            "Run".to_owned(),
-                                            FontId::proportional(font),
-                                            Color32::WHITE,
-                                        )
-                                        .size();
+                                    let text_size = egui::vec2(14.0, 14.0);
                                     expected_visible = button.width() >= text_size.x + 12.0
                                         && button.height() >= text_size.y + 2.0;
                                     renderer
@@ -1216,7 +1735,11 @@ mod tests {
                                 },
                             );
                             output.textures_delta.clear();
-                            let hits = ctx.interactive_rects_last_pass();
+                            let hits: Vec<_> = ctx
+                                .interactive_rects_last_pass()
+                                .into_iter()
+                                .filter(|hit| button.intersects(*hit))
+                                .collect();
                             assert_eq!(
                                 hits.len(),
                                 usize::from(expected_visible),
@@ -1225,25 +1748,24 @@ mod tests {
                             for hit in &hits {
                                 assert!(button.contains_rect(*hit), "font={font}, width={width}: actual egui hit {hit:?} escapes button {button:?}");
                             }
-                            let mut run_labels = 0;
-                            for shape in output.shapes {
-                                if let egui::Shape::Text(text) = &shape.shape {
-                                    if text.galley.job.text == "Run" {
-                                        run_labels += 1;
-                                        let text_rect =
-                                            egui::Rect::from_min_size(text.pos, text.galley.size());
-                                        assert!(button.contains_rect(text_rect), "Run label must fit entirely: font={font}, width={width}, dpi={dpi}, {text_rect:?} vs {button:?}");
-                                    }
+                            let mut send_paths = 0;
+                            for shape in &output.shapes {
+                                let bounds = shape.shape.visual_bounding_rect();
+                                if matches!(shape.shape, egui::Shape::Path(_))
+                                    && button.contains_rect(bounds)
+                                {
+                                    send_paths += 1;
+                                    assert!(
+                                        footer.contains_rect(bounds),
+                                        "send path must fit its native footer"
+                                    );
                                 }
-                                let visible = shape
-                                    .shape
-                                    .visual_bounding_rect()
-                                    .intersect(shape.clip_rect);
+                                let visible = bounds.intersect(shape.clip_rect);
                                 if visible.is_positive() {
                                     assert!(footer.contains_rect(visible), "font={font}, width={width}: painted {visible:?} escapes footer {footer:?}");
                                 }
                             }
-                            assert_eq!(run_labels, usize::from(expected_visible));
+                            assert_eq!(send_paths, usize::from(expected_visible) * jterm_core::reference_icons::Icon::Send.paths().len(), "vector send paths must be present exactly when the optional action fits");
                         }
                         assert_eq!(
                             renderer.chat_input_action.is_some(),
@@ -1281,7 +1803,16 @@ mod tests {
                 for phase in 0..3 {
                     let view =
                         renderer.projected_viewport_with_state(&mut terminal, &policy, &mut state);
-                    let footer_row = view.chat_composer_rows().unwrap().end - 1;
+                    let composer = view.chat_composer_rows().unwrap();
+                    let footer_row = composer
+                        .clone()
+                        .find(|&row| {
+                            matches!(
+                                view.row_kind(row),
+                                Some(crate::terminal::ProjectedRowKind::CompanionStatus { .. })
+                            )
+                        })
+                        .expect("explicit synthetic footer rows");
                     assert_eq!(
                         view.row_kind(footer_row - 1),
                         Some(crate::terminal::ProjectedRowKind::Raw)
@@ -1369,11 +1900,10 @@ mod tests {
                     renderer.projected_viewport_with_state(&mut terminal, &policy, &mut state);
                 let content = renderer.layout_rects(screen).0;
                 if phase == 0 {
-                    let row = view.chat_composer_rows().unwrap().end - 1;
-                    pointer = egui::pos2(
-                        content.right() - 30.0,
-                        content.top() + (row as f32 + 0.5) * renderer.line_height,
-                    );
+                    renderer.workspace_outer_rect = Some(screen);
+                    let footer =
+                        renderer.composer_footer_rect(content, view.chat_composer_rows().unwrap());
+                    pointer = egui::pos2(footer.right() - 14.0, footer.center().y);
                 }
                 renderer.set_projection_frame(&terminal, view, &policy);
                 let events = if phase == 0 {
@@ -1439,9 +1969,9 @@ mod capsule_geometry_tests {
         for height in [0.0, 1.0, 8.0, 18.0, 32.0, 64.0] {
             for width in [0.0, 1.0, 8.0, 160.0] {
                 for (command, composer, radius) in [
-                    (true, false, 18.0_f32),
-                    (false, false, 16.0),
-                    (false, true, 18.0),
+                    (true, false, jterm_core::reference_shell::CARD_RADIUS),
+                    (false, false, jterm_core::reference_shell::CARD_RADIUS),
+                    (false, true, jterm_core::reference_shell::COMPOSER_RADIUS),
                 ] {
                     for top_closed in [false, true] {
                         for bottom_closed in [false, true] {

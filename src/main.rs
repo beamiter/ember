@@ -38,6 +38,8 @@ mod output_batch;
 mod pane_header;
 mod persistence_file;
 mod pty;
+mod reference_conversation_ui;
+mod reference_workspace;
 mod remote_fs;
 mod remote_picker;
 mod review_text;
@@ -153,16 +155,15 @@ fn register_font_family(
     font_name: &str,
     prepend: bool,
 ) {
-    if let Some(entries) = fonts.families.get_mut(&family) {
-        if entries.iter().any(|entry| entry == font_name) {
-            return;
-        }
+    let entries = fonts.families.entry(family).or_default();
+    if entries.iter().any(|entry| entry == font_name) {
+        return;
+    }
 
-        if prepend {
-            entries.insert(0, font_name.to_owned());
-        } else {
-            entries.push(font_name.to_owned());
-        }
+    if prepend {
+        entries.insert(0, font_name.to_owned());
+    } else {
+        entries.push(font_name.to_owned());
     }
 }
 
@@ -479,7 +480,32 @@ fn configure_fonts_and_gpu(
 ) {
     let mut fonts = egui::FontDefinitions::default();
     let mut loaded_font_paths = HashMap::new();
+    // One shared chrome face; terminal fonts and their existing zoom stay independent.
+    #[cfg(target_os = "linux")]
+    if let Some(path) = fontconfig_match_family_file(jterm_core::reference_shell::FONT_SANS) {
+        load_font_from_path(
+            &mut fonts,
+            &mut loaded_font_paths,
+            &path,
+            "reference_chrome_sans",
+            &[egui::FontFamily::Proportional],
+            true,
+        );
+    }
 
+    // egui RichText::strong changes color, not font weight. Bind the shared
+    // 700 headline face explicitly while keeping normal body text at 400.
+    #[cfg(target_os = "linux")]
+    if let Some(path) = fontconfig_match_bold_file(jterm_core::reference_shell::FONT_SANS) {
+        load_font_from_path(
+            &mut fonts,
+            &mut loaded_font_paths,
+            &path,
+            "reference_chrome_bold",
+            &[egui::FontFamily::Name("reference-chrome-bold".into())],
+            true,
+        );
+    }
     let configured_mono_family = cfg.get_font_family();
     let mono_loaded = load_first_matching_font(
         &mut fonts,
@@ -642,6 +668,20 @@ fn configure_fonts_and_gpu(
         egui::FontFamily::Name("organism-monospace-bold".into()),
         organism_bold_fallbacks,
     );
+    let chrome_fallbacks = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let chrome_bold = fonts
+        .families
+        .entry(egui::FontFamily::Name("reference-chrome-bold".into()))
+        .or_default();
+    for fallback in chrome_fallbacks {
+        if !chrome_bold.contains(&fallback) {
+            chrome_bold.push(fallback);
+        }
+    }
     ctx.set_fonts(fonts);
 
     if let (Some(render_state), Some(font_bytes)) = (wgpu_render_state, mono_font_data) {
@@ -771,7 +811,8 @@ fn main() -> Result<(), eframe::Error> {
         // WM_CLASS general class, so `StartupWMClass` in the entry is this same
         // string rather than the program name a GTK app would report.
         .with_app_id(WINDOW_APP_ID)
-        .with_transparent(transparent);
+        .with_transparent(transparent)
+        .with_decorations(false);
 
     // The .desktop entry only covers windows the shell can match to it. Without
     // an icon of its own the window has no _NET_WM_ICON at all, so anything
@@ -2807,7 +2848,7 @@ impl TerminalApp {
             search_state,
             sidebar: {
                 let mut sb = sidebar::Sidebar::new();
-                sb.visible = false; // 默认隐藏，opt-in 切换
+                sb.visible = true; // The reference workspace navigation is visible by default.
 
                 // 三个视图在两种 tab 栏布局下都可用：Top 模式下侧边栏的
                 // Sessions 列表与顶部 tab 栏并存(与 frost 一致)。
@@ -2833,7 +2874,7 @@ impl TerminalApp {
             block_review: None,
             reading_history: Default::default(),
             block_selection: None,
-            block_bar_user_hidden: false,
+            block_bar_user_hidden: true,
             block_search: Default::default(),
             block_bookmarks: Default::default(),
             pending_session_export: None,
@@ -3470,7 +3511,7 @@ impl TerminalApp {
                 root_ui.ctx().request_repaint_after(Duration::from_secs(5));
             }
         }
-        if !self.sidebar.visible {
+        if !self.sidebar.visible || self.reference_layout(root_ui.ctx()).navigation.is_none() {
             // 展开按钮统一由顶部栏内的 ☰ 负责(Top 模式在 tab 栏，Sidebar 模式在精简顶部栏)，
             // 不再使用浮动按钮，避免覆盖终端内容。后台结果仍需在上方收割，
             // 否则隐藏侧边栏会让自动 SSH follow 永久误判为“仍有操作”。
@@ -3595,65 +3636,41 @@ impl TerminalApp {
             },
         };
 
-        let panel_bg = theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
-        let panel_response = egui::Panel::left("file_tree")
-            .resizable(true)
-            .default_size(self.sidebar.width)
-            .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
+        let files_inspector = self.sidebar.view == sidebar::SidebarView::Files
+            && self.reference_layout(root_ui.ctx()).inspector.is_some();
+        let panel = if files_inspector {
+            egui::Panel::right("file_tree")
+        } else {
+            egui::Panel::left("file_tree")
+        };
+        let width = if files_inspector {
+            jterm_core::reference_shell::INSPECTOR_WIDTH
+        } else {
+            jterm_core::reference_shell::NAVIGATION_WIDTH
+        };
+        let panel_response = panel
+            .resizable(false)
+            .exact_size(width)
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE.fill(reference_workspace::rgb(jterm_core::reference_shell::color::NAVIGATION))
+                .inner_margin(jterm_core::reference_shell::NAVIGATION_PADDING))
             .show(root_ui, |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.horizontal_wrapped(|ui| {
-                    // Sessions 在两种 tab 栏布局下都可选：Top 模式下它是顶部
-                    // tab 栏之外的一份纵向标签列表，而非替代品。
-                    if ui
-                        .selectable_label(
-                            self.sidebar.view == sidebar::SidebarView::Sessions,
-                            egui::RichText::new("Sessions").strong(),
-                        )
-                        .clicked()
-                    {
-                        self.sidebar.view = sidebar::SidebarView::Sessions;
-                        view_changed = true;
-                    }
-                    if ui
-                        .selectable_label(
-                            self.sidebar.view == sidebar::SidebarView::Files,
-                            egui::RichText::new("Files").strong(),
-                        )
-                        .clicked()
-                    {
-                        self.sidebar.view = sidebar::SidebarView::Files;
-                        view_changed = true;
-                    }
-                    if ui
-                        .selectable_label(
-                            self.sidebar.view == sidebar::SidebarView::Commands,
-                            egui::RichText::new("Commands").strong(),
-                        )
-                        .clicked()
-                    {
-                        self.sidebar.view = sidebar::SidebarView::Commands;
-                        view_changed = true;
-                    }
-                    if self.config.experimental_task_sidebar {
-                        // One count across the five attention queues; the
-                        // hover names them, e.g. "2 tasks need you: …".
-                        let (label, summary) =
-                            crate::app::tasks::tasks_tab_label(self.task_manager.attention_counts());
-                        let tab = ui.selectable_label(
-                            self.sidebar.view == sidebar::SidebarView::Tasks,
-                            egui::RichText::new(label).strong(),
-                        );
-                        let tab = match summary {
-                            Some(summary) => tab.on_hover_text(summary),
-                            None => tab,
-                        };
-                        if tab.clicked() {
+                reference_workspace::chrome_style(ui, self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE);
+                if files_inspector {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(false, "Agent").clicked() {
                             self.sidebar.view = sidebar::SidebarView::Tasks;
                             view_changed = true;
                         }
-                    }
-                });
+                        if ui.selectable_label(false, "Context").clicked() {
+                            self.sidebar.view = sidebar::SidebarView::Sessions;
+                            view_changed = true;
+                        }
+                        let _ = ui.selectable_label(true, "Files");
+                    });
+                } else {
+                    view_changed |= self.render_reference_navigation(ui);
+                }
                 if self.sidebar.view == sidebar::SidebarView::Files {
                     ui.horizontal(|ui| {
                         let (pending, queued) = self.sidebar.scan_activity();
@@ -3903,7 +3920,13 @@ impl TerminalApp {
                 ui.separator();
 
                 match self.sidebar.view {
-                    sidebar::SidebarView::Sessions => self.render_sidebar_sessions(ui),
+                    sidebar::SidebarView::Sessions => {
+                        if jterm_core::reference_conversation::fixture_enabled() {
+                            self.render_reference_fixture_recent(ui);
+                        } else {
+                            self.render_sidebar_sessions(ui);
+                        }
+                    },
                     sidebar::SidebarView::Commands => self.render_sidebar_commands(ui),
                     sidebar::SidebarView::Tasks => self.render_sidebar_tasks(ui),
                     sidebar::SidebarView::Files => {
@@ -4192,6 +4215,9 @@ impl TerminalApp {
                             }
                         });
                     }
+                }
+                if self.sidebar.view != sidebar::SidebarView::Files {
+                    self.render_reference_spaces(ui);
                 }
             });
 
@@ -5580,60 +5606,67 @@ impl TerminalApp {
             self.clear_workspace_drag();
         }
 
-        let frame = egui::Frame::NONE.inner_margin(0.0);
-
-        // 顶部栏(全宽)：必须在 render_sidebar 之前声明，egui 会把先声明的面板
-        // 分配到容器边缘的完整范围 —— 因此顶栏横跨整个窗口，侧边栏落在其下方，
-        // 而不是侧边栏贯穿到顶部。
-        let mut close_requested = false;
-        let top_bar = egui::Panel::top("top_bar")
-            .frame(egui::Frame::NONE)
-            .resizable(false)
-            .show(root_ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                // Top 模式：完整水平标签栏(含 ☰ 与位置切换控件)。
-                // Sidebar 模式：精简顶栏(仅 ☰ 与位置切换控件)，标签在侧边栏内。
-                if self.show_top_tab_bar() {
-                    if self.render_tab_bar(ui, ctx) {
-                        close_requested = true;
-                    }
-                } else {
-                    self.render_sidebar_mode_top_bar(ui, ctx);
-                }
-            });
-        self.font_zoom.register(
-            top_bar.response.rect,
-            root_ui.layer_id(),
-            font_zoom::FontGroup::Ui,
-        );
-        if close_requested {
-            return;
+        // One shared native workspace shell surrounds both presentations.
+        // The existing terminal renderer still owns every PTY cell and input.
+        let terminal_theme = self.reference_terminal_theme();
+        self.renderer.theme = terminal_theme.clone();
+        self.renderer.chat_mode = true;
+        self.renderer.chat_command_bubbles = self.config.chat_mode_enabled();
+        for renderer in &mut self.pane_renderers {
+            renderer.theme = terminal_theme.clone();
+            renderer.chat_mode = true;
+            renderer.chat_command_bubbles = self.config.chat_mode_enabled();
         }
-
-        // ember prefers jsh as its shell, so it is worth noticing when the
-        // machine has none or an old one. The row draws nothing until the
-        // background check has something actionable to offer.
-        if self.render_jsh_notice(root_ui) {
-            self.install_or_update_jsh();
-        }
-
-        // 底部状态栏(全宽)：同顶栏一样在侧边栏之前声明，因此它横跨整个
-        // 窗口底边，侧边栏落在顶栏与它之间。
-        self.render_bottom_bar(root_ui);
+        self.observe_reference_shell(ctx);
+        self.render_reference_topbar(root_ui);
+        self.render_reference_optional_controls(root_ui);
+        self.render_reference_rail(root_ui);
+        self.render_reference_inspector(root_ui);
+        self.render_reference_files_navigation(root_ui);
+        self.render_sidebar(root_ui);
         self.render_organism(root_ui);
         self.render_vim9_workbench(root_ui);
-
-        // 侧边栏：在顶栏之后声明，占据顶栏下方区域的左侧。
-        self.render_sidebar(root_ui);
+        let frame = egui::Frame::NONE
+            .fill(reference_workspace::rgb(
+                jterm_core::reference_shell::color::CANVAS,
+            ))
+            .inner_margin(0.0);
 
         let main_panel = egui::CentralPanel::default()
             .frame(frame)
             .show(root_ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                theme::configure_workspace_text(ui.style_mut(), self.config.font_size);
-                self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);
+                self.render_reference_canvas_header(ui);
+                let bounds = ui.available_rect_before_wrap();
+                reference_workspace::paint_canvas_background(ui.painter(), bounds);
+                let inset = jterm_core::reference_shell::COMPOSER_INSET.min(bounds.width() * 0.08);
+                let content = egui::Rect::from_min_max(
+                    bounds.min + egui::vec2(inset, 12.0),
+                    bounds.max - egui::vec2(inset, jterm_core::reference_shell::COMPOSER_BOTTOM),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+                    ui.set_clip_rect(content.intersect(ui.clip_rect()));
+                    theme::configure_workspace_text(ui.style_mut(), self.config.font_size);
+                    self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);
+                    self.render_reference_rich_canvas(ui);
+                });
             });
 
+        if let Some(intent) =
+            ctx.data_mut(|data| data.remove_temp::<String>(egui::Id::new("reference-tool-request")))
+        {
+            match intent.as_str() {
+                "terminal" => self.return_focus_to_terminal(ctx),
+                "search" => self.search_state.open(),
+                "files" => {
+                    self.sidebar.visible = true;
+                    self.sidebar.view = sidebar::SidebarView::Files;
+                }
+                "launcher" => self.command_palette.open(),
+                "settings" => self.config_panel.open(&self.config),
+                _ => {}
+            }
+        }
         self.font_zoom.register(
             main_panel.response.rect,
             root_ui.layer_id(),
@@ -5791,7 +5824,7 @@ impl eframe::App for TerminalApp {
         // a no-op unless the theme changed or a session has not seen it yet.
         self.session_manager
             .set_terminal_default_colors(session_manager::terminal_default_colors(
-                &self.current_theme,
+                &self.reference_terminal_theme(),
             ));
         self.poll_task_creation(ctx);
         self.poll_native_agent_runtime(ctx);
@@ -6487,6 +6520,13 @@ impl eframe::App for TerminalApp {
         );
 
         terminal_pointer_input_blocked |= native_vim9_pointer_claimed;
+        // An admitted organism control is GUI chrome, so its pointer gesture
+        // must not become terminal selection/input or trigger typing retreat.
+        let organism_pointer_claimed = !terminal_pointer_input_blocked
+            && self
+                .organism
+                .native_control_owns_pointer(ctx, &active_session_id);
+        terminal_pointer_input_blocked |= organism_pointer_claimed;
 
         // Step 4: 处理普通键盘输入
         // 当搜索面板或配置面板打开时，不处理普通键盘输入（面板会处理输入）
@@ -8156,7 +8196,10 @@ impl eframe::App for TerminalApp {
         // PTY reporting and PRIMARY-copy release for this gesture.
         self.render_ui(
             root_ui,
-            terminal_pointer_input_blocked || link_press_override,
+            // Keep recomputing the creature's same-frame blank-region proof
+            // during its own pointer-only control. Every other barrier stays
+            // active; the main PTY pointer route above remains blocked.
+            (terminal_pointer_input_blocked && !organism_pointer_claimed) || link_press_override,
         );
 
         if !terminal_pointer_input_blocked && !self.terminal_input_blocked(ctx) {
@@ -10755,6 +10798,65 @@ mod tests {
             &mut state
         ));
         assert_eq!(release_frame.len(), 1);
+    }
+
+    #[test]
+    fn reference_chrome_named_font_registration_creates_family_without_changing_body_or_terminal() {
+        let mut fonts = egui::FontDefinitions::default();
+        let proportional = fonts.families[&egui::FontFamily::Proportional].clone();
+        let monospace = fonts.families[&egui::FontFamily::Monospace].clone();
+        let family = egui::FontFamily::Name("reference-chrome-bold".into());
+        assert!(!fonts.families.contains_key(&family));
+        super::register_font_family(&mut fonts, family.clone(), "resolved-bold", true);
+        super::register_font_family(&mut fonts, family.clone(), "fallback", false);
+        super::register_font_family(&mut fonts, family.clone(), "resolved-bold", false);
+        assert_eq!(fonts.families[&family], ["resolved-bold", "fallback"]);
+        assert_eq!(
+            fonts.families[&egui::FontFamily::Proportional],
+            proportional
+        );
+        assert_eq!(fonts.families[&egui::FontFamily::Monospace], monospace);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "native font proof requires installed shared reference faces"]
+    fn reference_chrome_real_bold_face_is_registered_and_wider_than_regular() {
+        let sans = jterm_core::reference_shell::FONT_SANS;
+        let regular_path =
+            super::fontconfig_match_family_file(sans).expect("installed shared sans");
+        let bold_path = super::fontconfig_match_bold_file(sans).expect("installed shared bold");
+        assert_ne!(regular_path, bold_path);
+        let bold_bytes = std::fs::read(&bold_path).unwrap();
+        let regular_bytes = std::fs::read(&regular_path).unwrap();
+        let ctx = egui::Context::default();
+        super::configure_fonts_and_gpu(&ctx, None, &crate::config::Config::default());
+        let fixture = jterm_core::reference_conversation::acceptance_fixture();
+        let headline = fixture
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| {
+                if let jterm_core::reference_conversation::Part::Heading(text) = part {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| ui.fonts_mut(|fonts| {
+            let family = egui::FontFamily::Name("reference-chrome-bold".into());
+            let names = fonts.definitions().families[&family].clone();
+            let proportional = fonts.definitions().families[&egui::FontFamily::Proportional].clone();
+            assert_eq!(names[0], "reference_chrome_bold");
+            assert_eq!(fonts.definitions().font_data[&names[0]].font.as_ref(), bold_bytes.as_slice());
+            assert_eq!(fonts.definitions().font_data[&proportional[0]].font.as_ref(), regular_bytes.as_slice());
+            let regular = fonts.layout_no_wrap(headline.clone(), egui::FontId::proportional(20.0), egui::Color32::BLACK).size().x;
+            let bold = fonts.layout_no_wrap(headline.clone(), egui::FontId::new(20.0, family), egui::Color32::BLACK).size().x;
+            assert!(bold > regular * 1.08, "bold={bold} regular={regular}");
+            assert!((550.0..565.0).contains(&bold), "shared 20px bold headline width={bold}");
+            println!("REFERENCE_CHROME_FONT_PROOF faces={names:?} bold_file={bold_path} regular_file={regular_path} bold_width={bold} regular_width={regular}");
+        }));
     }
 
     /// A fallback slot must stay empty when its font is missing.

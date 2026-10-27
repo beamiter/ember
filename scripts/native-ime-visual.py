@@ -2,9 +2,12 @@
 import hashlib
 import json
 import math
+import os
+import re
 
 PREEDIT_TOKEN = 'EMBERPREEDITMARKER'
 HEALTH_ANCHOR = 'master'
+REFERENCE_SHELL_HEALTH = False
 OUTPUT_RECT = {'x': 0, 'y': 0, 'width': 1280, 'height': 900}
 FOOTER_RECT = {'x': 0, 'y': 876, 'width': 1280, 'height': 24}
 
@@ -98,6 +101,76 @@ def footer_health(smoke, label, image, rectangle):
                     'tsv': str(smoke.out / (footer_label + '-psm7.tsv')), 'ocr_psm': 7}
 
 
+def reference_header_health(smoke, label, image, rectangle):
+    """Native-shell readiness without depending on a removed footer word.
+
+    The PID-owned/focused surface is verified before and after capture. Require
+    the immutable 42px toolbar's actual palette and a real PTY sentinel from
+    this same live shell. Preedit still uses exact OCR, pixel restoration and
+    byte assertions; no OCR rows are manufactured from the native proof.
+    """
+    owned = rectangle['rect']
+    region = dict(x=owned['x'], y=owned['y'], width=owned['width'], height=42)
+    if not contained(region, owned) or smoke.app.poll() is not None:
+        raise RuntimeError('Reference header lies outside live owned surface')
+    transcript = smoke.transcript.read_bytes()
+    matches = re.findall(rb'^preedit-switch-ready:([0-9]+):(/dev/pts/[0-9]+)$', transcript, re.M)
+    if len(matches) != 1:
+        raise RuntimeError('Missing exact real-PTY readiness identity')
+    shell_pid, terminal = matches[0]
+    os.kill(int(shell_pid), 0)
+    name = label + '-health-header'
+    target = smoke.out / (name + '.png')
+    crop = f"{region['width']}x{region['height']}+{region['x']}+{region['y']}"
+    smoke.run(['convert', str(image), '-crop', crop, '+repage', str(target)])
+    dimensions = smoke.run(['identify', '-format', '%w %h', str(target)], capture_output=True, text=True).stdout
+    if dimensions != f"{region['width']} {region['height']}":
+        raise RuntimeError('Unexpected reference header dimensions')
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    pixels = smoke.run(['convert', str(target), '-colorspace', 'sRGB', '-alpha', 'off', '-depth', '8', 'RGB:-'], capture_output=True).stdout
+    expected = region['width'] * region['height']
+    if len(pixels) != expected * 3:
+        raise RuntimeError('Unexpected native toolbar pixel count')
+    background = sum(pixels[i:i+3] == bytes((15,23,38)) for i in range(0,len(pixels),3))
+    # This positive visual signature is registered from reference_shell's
+    # exact titlebar palette, rather than inferred from OCR token failure.
+    if not expected * 0.5 <= background <= expected * 0.95:
+        raise RuntimeError('Native toolbar background/content signature absent')
+    if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+        raise RuntimeError('Reference header changed during analysis')
+    return {'rectangle': region, 'image': str(target), 'image_sha256': digest,
+            'scope': 'PID-owned native toolbar pixels and real PTY identity',
+            'background_rgb': [15,23,38], 'background_pixel_count': background,
+            'total_pixel_count': expected, 'shell_pid': int(shell_pid),
+            'tty': terminal.decode(), 'sentinel_transcript_sha256': hashlib.sha256(transcript).hexdigest()}
+
+
+def reference_token_rows(smoke, label, image, rectangle, psm):
+    """Exact token OCR in the entire native center, with unchanged pixels.
+
+    Reference geometry scopes the surface before analysis; token content never
+    selects the region. It excludes navigation/inspector text that otherwise
+    interferes with OCR segmentation of light/dark native message surfaces.
+    """
+    owned=rectangle['rect']
+    region={'x':owned['x']+292,'y':owned['y']+91,
+            'width':owned['width']-292-306,'height':owned['height']-91}
+    if not contained(region,owned):raise RuntimeError('Invalid reference native canvas crop')
+    name=label+'-native-canvas'
+    target=smoke.out/(name+'.png')
+    smoke.run(['convert',str(image),'-crop',f"{region['width']}x{region['height']}+{region['x']}+{region['y']}",'+repage',str(target)])
+    digest=hashlib.sha256(target.read_bytes()).hexdigest()
+    rows=smoke.words(name,psm=psm,capture=False)
+    validate_rows(rows)
+    local=dict(region,x=0,y=0)
+    mapped=[]
+    for row in rows:
+        if not contained(box(row),local):raise RuntimeError('Token OCR crosses native canvas bounds')
+        mapped.append(dict(row,left=str(int(row['left'])+region['x']),top=str(int(row['top'])+region['y'])))
+    if hashlib.sha256(target.read_bytes()).hexdigest()!=digest:raise RuntimeError('Token canvas crop changed during OCR')
+    return mapped,{'rectangle':region,'image':str(target),'image_sha256':digest,'ocr_psm':psm}
+
+
 def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_psm=6,
              health_psm=6, health_footer=False, after_capture=None):
     if after_capture is not None and (not callable(after_capture) or present or baseline is None):
@@ -140,10 +213,15 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
     # Layout is chosen by the caller before capture, never as a response to OCR
     # content. Primary rows remain validated; only rendered presence may use 11.
     token_rows = rows
+    token_region = None
+    if REFERENCE_SHELL_HEALTH:
+        token_rows, token_region = reference_token_rows(smoke,label,image,rectangle,token_psm)
     if token_psm == 11:
-        token_rows = smoke.words(label, psm=11, capture=False)
+        if not REFERENCE_SHELL_HEALTH:
+            token_rows = smoke.words(label, psm=11, capture=False)
         validate_rows(token_rows)
-        primary_tokens = exact_matches(rows, rectangle)
+        primary = reference_token_rows(smoke,label,image,rectangle,6)[0] if REFERENCE_SHELL_HEALTH else rows
+        primary_tokens = exact_matches(primary, rectangle)
         selected_tokens = exact_matches(token_rows, rectangle)
         if len(primary_tokens) > 1 or (primary_tokens and
                 [box(r) for r in primary_tokens] != [box(r) for r in selected_tokens]):
@@ -159,9 +237,14 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
     footer_evidence = None
     health_ocr_psm = health_psm
     if health_footer:
-        health_rows, footer_evidence = footer_health(smoke, label, image, rectangle)
-        health_ocr_psm = 7
-    anchors = exact_matches(health_rows, rectangle, HEALTH_ANCHOR)
+        if REFERENCE_SHELL_HEALTH:
+            footer_evidence = reference_header_health(smoke, label, image, rectangle)
+            health_ocr_psm = None
+        else:
+            health_rows, footer_evidence = footer_health(smoke, label, image, rectangle)
+            health_ocr_psm = 7
+    native_anchor = footer_evidence['rectangle'] if REFERENCE_SHELL_HEALTH and health_footer else None
+    anchors = [] if native_anchor is not None else exact_matches(health_rows, rectangle, HEALTH_ANCHOR)
     if (not health_footer and not anchors and health_fallback
             and health_psm == 6 and baseline is not None):
         # One alternate layout of the SAME immutable PNG, never a recapture or
@@ -175,11 +258,11 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
         health_ocr_psm = 11
     if hashlib.sha256(image.read_bytes()).hexdigest() != image_sha256:
         raise RuntimeError('Screenshot changed during OCR analysis')
-    if len(anchors) != 1:
+    if native_anchor is None and len(anchors) != 1:
         raise RuntimeError('Missing or ambiguous exact OCR health anchor')
-    anchor_box = box(anchors[0])
+    anchor_box = native_anchor if native_anchor is not None else box(anchors[0])
     if baseline is not None and anchor_box != baseline['anchor_box']:
-        raise RuntimeError('OCR health anchor moved')
+        raise RuntimeError('Native/OCR health anchor moved')
     matches = exact_matches(token_rows, rectangle)
     if len(matches) != int(present):
         raise RuntimeError(f'Expected {int(present)} exact preedit token, observed {len(matches)}')
@@ -187,8 +270,10 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
               'expected_token_count': int(present), 'observed_token_count': len(matches),
               'matches': matches, 'image_sha256': image_sha256, 'health_ocr_psm': health_ocr_psm,
               'token_ocr_psm': token_psm}
+    if token_region is not None:
+        result['token_region'] = token_region
     if footer_evidence is not None:
-        result['health_footer'] = footer_evidence
+        result['health_header' if REFERENCE_SHELL_HEALTH else 'health_footer'] = footer_evidence
     (smoke.out / (label + '-visual.json')).write_text(json.dumps(result, indent=2))
     return result
 

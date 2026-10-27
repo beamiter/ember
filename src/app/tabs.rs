@@ -844,6 +844,7 @@ impl TerminalApp {
                                             ui.visuals().text_color()
                                         }),
                                 )
+                                .truncate()
                                 .sense(egui::Sense::click_and_drag());
                                 // 这个按钮是右键菜单的宿主,菜单挂在它的 id 上。
                                 // 自动 id 是「本行第几个控件」推导出来的,而它前面
