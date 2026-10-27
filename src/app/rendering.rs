@@ -1847,7 +1847,7 @@ impl TerminalApp {
     /// The working directory and the foreground command are read from `/proc`,
     /// so the result goes through a per-session cache that refreshes a few
     /// times a second instead of on every frame.
-    fn pane_status(
+    pub(super) fn pane_status(
         &mut self,
         session_idx: usize,
         now: std::time::Instant,

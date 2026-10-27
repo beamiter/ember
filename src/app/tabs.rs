@@ -1483,59 +1483,20 @@ impl TerminalApp {
             font_size,
         );
 
-        // 关闭窗口按钮（最右侧，与顶部 tab 模式保持一致）
-        let close_win_size = 25.0;
-        let close_win_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                tab_rect.right() - close_win_size - 5.0,
-                tab_rect.top() + 5.0,
-            ),
-            egui::vec2(close_win_size, tab_height - 10.0),
-        );
-        let close_win_hovered = hover_pos
-            .map(|p| close_win_rect.contains(p))
-            .unwrap_or(false);
-        let close_win_bg = if close_win_hovered {
-            egui::Color32::from_rgb(200, 60, 55)
-        } else {
-            egui::Color32::TRANSPARENT
-        };
-        painter.rect_filled(close_win_rect, 6.0, close_win_bg);
-
-        let cw_cross = 5.0;
-        let cw_center = close_win_rect.center();
-        let cw_x_color = if close_win_hovered {
-            egui::Color32::WHITE
-        } else {
-            tb_inactive_text
-        };
-        painter.line_segment(
-            [
-                egui::pos2(cw_center.x - cw_cross, cw_center.y - cw_cross),
-                egui::pos2(cw_center.x + cw_cross, cw_center.y + cw_cross),
-            ],
-            egui::Stroke::new(1.5, cw_x_color),
-        );
-        painter.line_segment(
-            [
-                egui::pos2(cw_center.x + cw_cross, cw_center.y - cw_cross),
-                egui::pos2(cw_center.x - cw_cross, cw_center.y + cw_cross),
-            ],
-            egui::Stroke::new(1.5, cw_x_color),
-        );
-        if close_win_hovered {
-            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-            if mouse_released {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+        if ui
+            .put(
+                egui::Rect::from_min_size(
+                    egui::pos2(tab_rect.right() - 30.0, tab_rect.top() + 5.0),
+                    egui::vec2(25.0, tab_height - 10.0),
+                ),
+                egui::Button::new("+").frame(false),
+            )
+            .on_hover_text("New tab (Ctrl+Shift+T)")
+            .clicked()
+            && !workspace_drag_in_flight
+        {
+            self.new_tab();
         }
-        ui.interact(
-            close_win_rect,
-            egui::Id::new("sidebar_mode_close_window"),
-            egui::Sense::hover(),
-        )
-        .on_hover_text("Close window");
-
         if !workspace_drag_in_flight {
             self.render_blocks_nav_toggle(
                 ui,
@@ -2474,78 +2435,12 @@ impl TerminalApp {
             }
         }
 
-        // 关闭窗口按钮（最右侧）
-        let close_win_size = 25.0;
-        let close_win_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                tab_rect.right() - close_win_size - 5.0,
-                tab_rect.top() + 5.0,
-            ),
-            egui::vec2(close_win_size, tab_height - 10.0),
-        );
-
-        let close_win_hovered = if let Some(hover_pos) = hover_pos {
-            close_win_rect.contains(hover_pos)
-        } else {
-            false
-        };
-
-        let close_win_bg = if close_win_hovered {
-            egui::Color32::from_rgb(200, 60, 55)
-        } else {
-            egui::Color32::TRANSPARENT
-        };
-
-        painter.rect_filled(close_win_rect, 6.0, close_win_bg);
-
-        // 绘制 X 符号
-        let cw_cross = 5.0;
-        let cw_center = close_win_rect.center();
-        let cw_x_color = if close_win_hovered {
-            egui::Color32::WHITE
-        } else {
-            tb_inactive_text
-        };
-        painter.line_segment(
-            [
-                egui::pos2(cw_center.x - cw_cross, cw_center.y - cw_cross),
-                egui::pos2(cw_center.x + cw_cross, cw_center.y + cw_cross),
-            ],
-            egui::Stroke::new(1.5, cw_x_color),
-        );
-        painter.line_segment(
-            [
-                egui::pos2(cw_center.x + cw_cross, cw_center.y - cw_cross),
-                egui::pos2(cw_center.x - cw_cross, cw_center.y + cw_cross),
-            ],
-            egui::Stroke::new(1.5, cw_x_color),
-        );
-
-        // 检测关闭窗口按钮点击
-        if mouse_released
-            && !is_actually_dragging
-            && !any_tab_drag_in_flight
-            && !pane_drag_in_flight
-        {
-            if let Some(click_pos) = ctx.input(|i| i.pointer.latest_pos()) {
-                if close_win_rect.contains(click_pos) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
-
         ui.interact(
             plus_btn_rect,
             egui::Id::new("top_new_tab_btn"),
             egui::Sense::hover(),
         )
-        .on_hover_text("New tab");
-        ui.interact(
-            close_win_rect,
-            egui::Id::new("top_close_window_btn"),
-            egui::Sense::hover(),
-        )
-        .on_hover_text("Close window");
+        .on_hover_text("New tab (Ctrl+Shift+T)");
 
         // 向下移动光标
         ui.allocate_exact_size(
