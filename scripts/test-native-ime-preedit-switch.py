@@ -13,7 +13,7 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
 class Tests(unittest.TestCase):
-    def fixture(self, directory, inject=None, outcome='context-abandoned', cleanup_fail=False):
+    def fixture(self, directory, inject=None, outcome='context-abandoned', cleanup_fail=False, old='normal', new='block'):
         out=Path(directory);events=[];capture=out/'capture';capture.mkdir();(capture/'live.bin').write_bytes(b'')
         control=out/'segment'/'ime-control';state={'exit':None}
         class Process:
@@ -39,7 +39,9 @@ class Tests(unittest.TestCase):
         def snapshot(view,label,baseline,present,**kwargs):
             events.append(label)
             assert kwargs == dict(health_psm=11, health_footer=True,
-                                  **({'health_fallback': True} if label == 'after-challenge' else {}))
+                                  **({'health_fallback': True} if label == 'after-challenge' else {}),
+                                  **({'token_psm':11 if old in ('normal','chat') else 6}
+                                     if label == 'active-preedit' else {}))
             if inject==label:raise RuntimeError('visual failure')
             return {'rectangle':{'id':1,'pid':42,'rect':{}},'anchor_box':{},'observed_token_count':int(present)}
         def finish(path,identity,expected):
@@ -49,7 +51,7 @@ class Tests(unittest.TestCase):
             switch_mode=switch,raw_finish=finish)
         args=(smoke,SimpleNamespace(wait_for=wait),SimpleNamespace(artifact_view=artifact),
               SimpleNamespace(snapshot=snapshot),Path('/synthetic/observer'),'42:/dev/pts/0',
-              'normal','block',SimpleNamespace(poll=lambda:None))
+              old,new,SimpleNamespace(poll=lambda:None))
         return args,events,out/'segment/result.json'
 
     def test_both_native_outcomes_cancel_then_reap_before_drain(self):
@@ -61,6 +63,23 @@ class Tests(unittest.TestCase):
                 order=['active-preedit','switch','cancelled-preedit','challenge','after-challenge','wait','finish']
                 self.assertEqual([x for x in events if x in order],order)
                 self.assertEqual(json.loads(result.read_text())['status'],'pass')
+
+    def test_source_mode_layout_selected_for_every_transition_before_input(self):
+        for old,new in [('normal','block'),('block','chat'),('chat','normal')]:
+            with self.subTest(old=old),tempfile.TemporaryDirectory() as d,patch.object(m.time,'sleep'):
+                args,events,result=self.fixture(d,old=old,new=new)
+                m.transition(*args)
+                self.assertLess(events.index('active-preedit'),events.index('switch'))
+                self.assertEqual(json.loads(result.read_text())['status'],'pass')
+
+    def test_unknown_modes_fail_before_any_capture_or_input(self):
+        for old,new in [('unknown','block'),('normal','unknown')]:
+            with self.subTest(old=old,new=new),tempfile.TemporaryDirectory() as d:
+                args,events,result=self.fixture(d,old=old,new=new)
+                with self.assertRaisesRegex(RuntimeError,'Unknown terminal mode'):
+                    m.transition(*args)
+                self.assertEqual(events,[])
+                self.assertFalse(result.exists())
 
     def test_failure_never_finishes_capture_or_reports_pass(self):
         for failure in ['active-preedit','switch','cancelled-preedit','challenge','after-challenge']:
@@ -130,24 +149,24 @@ class Tests(unittest.TestCase):
 
 
 class HandoffTests(unittest.TestCase):
-    def fixture(self, directory, footer=False):
+    def fixture(self, directory, footer=False, mode='normal'):
         fixture = m.load('visual_fixture', Path(__file__).with_name('test-native-ime-visual.py'))
         smoke = (fixture.FooterSmoke if footer else fixture.Smoke)(directory)
         smoke.app.poll = lambda: None
         smoke.config = Path(directory) / 'config.toml'
-        smoke.config.write_text('terminal_mode = "normal"\n')
+        smoke.config.write_text(f'terminal_mode = "{mode}"\n')
         source = copy.copy(smoke)
-        source.out = smoke.out / 'preedit-chat-to-normal'
+        source.out = smoke.out / f'preedit-chat-to-{mode}'
         source.out.mkdir()
         prior = fixture.visual.snapshot(source, 'after-challenge', None, False,
             **({'health_psm':11,'health_footer':True} if footer else {}))
-        segment = {'status':'pass', 'identity':'42:/dev/pts/0', 'from':'chat', 'to':'normal',
+        segment = {'status':'pass', 'identity':'42:/dev/pts/0', 'from':'chat', 'to':mode,
                    'pty_bytes':0, 'after_challenge_visual':prior}
         view = copy.copy(smoke)
-        view.out = smoke.out / 'fresh-after-chat-to-normal'
+        view.out = smoke.out / f'fresh-after-chat-to-{mode}'
         view.out.mkdir()
         view.captures=[];view.word_calls=[];view.tree_calls=0
-        adapter=m.FreshVisual(fixture.visual,smoke,segment,'42:/dev/pts/0','normal')
+        adapter=m.FreshVisual(fixture.visual,smoke,segment,'42:/dev/pts/0',mode)
         return fixture,smoke,source,view,segment,adapter
 
     def test_footer_proof_is_preserved_through_fresh_composition(self):
@@ -178,6 +197,20 @@ class HandoffTests(unittest.TestCase):
             during=adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
             self.assertEqual(during['observed_token_count'],1)
             self.assertEqual(view.word_calls[-1][1],{'psm':11,'capture':False})
+
+    def test_fresh_destination_layout_applies_only_to_presence_in_each_mode(self):
+        for mode,psm in [('normal',11),('block',6),('chat',11)]:
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as d:
+                fixture,smoke,source,view,segment,adapter=self.fixture(d,footer=True,mode=mode)
+                self.assertEqual(adapter.preedit_psm,psm)
+                self.assertEqual(view.captures,[])
+                before=adapter.snapshot(view,'ime-visual-before',None,False)
+                view.rows=[fixture.word(fixture.visual.PREEDIT_TOKEN)]
+                during=adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
+                view.rows=[fixture.word('terminal')]
+                after=adapter.snapshot(view,'ime-commit-without-cr',before,False)
+                self.assertEqual([x['token_ocr_psm'] for x in [before,during,after]],[6,psm,6])
+                self.assertEqual([x['observed_token_count'] for x in [before,during,after]],[0,1,0])
 
     def test_validated_baseline_allows_same_png_psm11_only_after_zero_primary(self):
         with tempfile.TemporaryDirectory() as d:
@@ -257,12 +290,23 @@ class HandoffTests(unittest.TestCase):
             got=adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
             self.assertEqual(got['token_ocr_psm'],11)
             self.assertEqual(got['matches'][0]['text'],fixture.visual.PREEDIT_TOKEN)
-        for mode,layout in [('normal',11),('chat',6),('block',6)]:
+        for mode,layout in [('normal',11),('chat',11),('block',6)]:
             with tempfile.TemporaryDirectory() as d:
                 fixture,smoke,source,view,segment,adapter=self.fixture(d)
                 segment['to']=mode
                 chosen=m.FreshVisual(fixture.visual,smoke,segment,segment['identity'],mode)
                 self.assertEqual(chosen.preedit_psm,layout)
+
+    def test_registered_sparse_presence_rejects_duplicate_and_changed_source(self):
+        for case in ['duplicate','image']:
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as d:
+                fixture,smoke,view,adapter,before=self.begin_cycle(d)
+                view.rows=[view.anchor,fixture.word(fixture.visual.PREEDIT_TOKEN)]
+                if case=='duplicate':view.rows.append(fixture.word(fixture.visual.PREEDIT_TOKEN,x=70))
+                else:Path(before['image']).write_bytes(b'changed pixels')
+                with self.assertRaises(RuntimeError):
+                    adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
+                self.assertEqual(adapter.phase,0)
 
     def test_post_commit_fallback_requires_successful_ordered_preedit(self):
         with tempfile.TemporaryDirectory() as d:

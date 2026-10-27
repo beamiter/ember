@@ -24,6 +24,12 @@ def zero(capture, stage):
         raise AssertionError(f'{stage}: premature PTY bytes {actual.hex()}')
 
 
+def composition_layout(mode):
+    if mode not in ('normal', 'block', 'chat'):
+        raise RuntimeError('Unknown terminal mode for composition layout')
+    return 11 if mode in ('normal', 'chat') else 6
+
+
 class FreshVisual:
     """Bounded fresh-cycle health handoff from the completed transition."""
     def __init__(self, visual, smoke, segment, identity, mode):
@@ -41,7 +47,7 @@ class FreshVisual:
                                if self.prior.get('health_footer') is not None else {})
         self.view = None
         # Destination mode selects layout before this cycle captures anything.
-        self.preedit_psm = 11 if mode == 'normal' else 6
+        self.preedit_psm = composition_layout(mode)
 
     def snapshot(self, view, label, baseline, present):
         diagnostic = {'label': label, 'expected_token_present': present,
@@ -111,6 +117,8 @@ class FreshVisual:
 
 
 def transition(smoke, module, live, visual, helper, identity, old, new, seat):
+    preedit_psm = composition_layout(old)
+    composition_layout(new)  # Reject unknown destination before starting a collector.
     label = f'preedit-{old}-to-{new}'
     view = live.artifact_view(smoke, label)
     control = view.out / 'ime-control'
@@ -133,7 +141,11 @@ def transition(smoke, module, live, visual, helper, identity, old, new, seat):
         (control / 'start').touch()
         marker('preedit')
         time.sleep(0.5)
-        visual.snapshot(view, 'active-preedit', before, True, health_psm=11, health_footer=True)
+        # Register the source mode's sparse composition layout before capture,
+        # exactly as the standalone Normal/Chat IME lifecycle does.
+        visual.snapshot(view, 'active-preedit', before, True,
+                        token_psm=preedit_psm,
+                        health_psm=11, health_footer=True)
         zero(capture, 'visible active preedit')
         # The observer deliberately has NO keyboard grab. Real Settings input
         # remains routed by Ember; no helper forwards or replays the shortcut.

@@ -1,5 +1,28 @@
 # Engineering handoff
 
+## 2026-10-27 — finish active-preedit source-mode observation
+
+- Exact-head `352bc2b` hosted CI passed all five non-release jobs and every
+  native release gate except active-preedit Settings switching. Clipboard
+  hotplug wire, X11/Wayland interaction, both search paths, recovery, three-mode
+  Return, ordinary live mode switches and all six geometry cases passed.
+- The remaining failure occurred before the first Settings switch: Normal's
+  visible yellow token was missed by the transition's default dense OCR layout.
+  The immutable artifact (`12707836137`, SHA-256
+  `915409c3e1350bf921aa95ee591487bb7da2e38ae2599855ae7460974551ee18`)
+  contains the exact token in its original sparse-layout TSV on the same PNG.
+- Register source-mode token layout before capture (Normal/Chat sparse 11,
+  Block dense 6), also retaining the same policy for the fresh destination
+  cycle. Unknown modes fail before any collector or input. Absence remains
+  dense 6, and exact count, same-image provenance, layout disagreement,
+  duplicate rejection, source identity and zero-byte assertions are unchanged.
+  No conditional best-result OCR retry or font/visual threshold change.
+- Local regression covers all three source transitions and all three fresh
+  destination 0→1→0 cycles, including selected layout metadata, unknown modes,
+  duplicate tokens and changed baseline pixels. Hosted native validation of
+  this final transition correction remains required; 14px Chat composition
+  is not claimed proven by the separate 16px standalone fixture.
+
 ## 2026-10-27 — preserve Wayland clipboard devices across keyboard hotplug
 
 - Vendored official `smithay-clipboard 0.7.3` (MIT), retaining its original
