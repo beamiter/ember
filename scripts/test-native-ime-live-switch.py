@@ -134,13 +134,17 @@ class LiveTests(unittest.TestCase):
                     with self.assertRaisesRegex(AssertionError,'Exact sentinel transcript mismatch'):
                         live.exercise(smoke,None,None,None,None,SimpleNamespace(poll=lambda:None))
 
-    def cycle_fixture(self,directory,fail_preedit=False,wrong_identity=False):
+    def cycle_fixture(self,directory,fail_preedit=False,wrong_identity=False,fail_after=False,helper_wait=None):
         out=Path(directory);events=[];capture=out/'raw';capture.mkdir();(capture/'live.bin').write_bytes(b'')
         state={'status':None};seat=SimpleNamespace(poll=lambda:None)
         class Process:
             returncode=None
             def poll(self):return state['status']
-            def wait(self,timeout):events.append('helper-wait');state['status']=0;self.returncode=0
+            def wait(self,timeout):
+                events.append('helper-wait')
+                if helper_wait=='error':raise RuntimeError('helper wait failed')
+                state['status']=1 if helper_wait=='nonzero' else 0
+                self.returncode=state['status']
             def terminate(self):events.append('helper-terminate')
         helper=Process()
         class Smoke:
@@ -165,8 +169,12 @@ class LiveTests(unittest.TestCase):
             for control in out.glob('*/ime-control'):
                 if (control/'start').exists():(control/'preedit').touch()
             assert test(),label
-        def snapshot(view,label,baseline,present):
+        def snapshot(view,label,baseline,present,**kwargs):
             events.append(label)
+            if kwargs.get('after_capture') is not None:
+                kwargs['after_capture']()
+                events.append('post-commit-ocr')
+                if fail_after:raise RuntimeError('post-commit visual analysis failed')
             if present and fail_preedit:raise RuntimeError('preedit observation failed')
             return {'image':label}
         keyboard=SimpleNamespace(CompositionKeyboard=Keyboard,KEYBOARD_ARGS=['owned-barrier'])
@@ -180,9 +188,29 @@ class LiveTests(unittest.TestCase):
             self.assertEqual(result['status'],'pass');self.assertEqual(result['committed_hex'],'e4bda0')
             self.assertEqual(events.count('release-return'),1);self.assertEqual(events.count('submit'),1)
             self.assertLess(events.index('ime-preedit-zero-bytes'),events.index('release-return'))
-            self.assertLess(events.index('helper-wait'),events.index('submit'))
+            self.assertLess(events.index('helper-wait'),events.index('raw-finish'))
+            self.assertLess(events.index('raw-finish'),events.index('post-commit-ocr'))
+            self.assertLess(events.index('post-commit-ocr'),events.index('submit'))
             self.assertLess(events.index('keyboard-stop'),events.index('submit'))
             self.assertEqual(json.loads((Path(directory)/'segment/result.json').read_text())['status'],'pass')
+
+    def test_post_commit_analysis_failure_never_submits_after_draining(self):
+        with tempfile.TemporaryDirectory() as directory,patch.object(live.time,'sleep'):
+            smoke,module,keyboard,visual,seat,events=self.cycle_fixture(directory,fail_after=True)
+            with self.assertRaisesRegex(RuntimeError,'post-commit visual'):
+                live.composition_cycle(smoke,module,keyboard,visual,Path('/synthetic/helper'),'42:/dev/pts/0','segment',seat)
+            self.assertIn('raw-finish',events)
+            self.assertNotIn('submit',events)
+            self.assertEqual(json.loads((Path(directory)/'segment/result.json').read_text())['status'],'fail')
+
+    def test_failed_helper_finalization_prevents_drain_ocr_and_submit(self):
+        for failure in ['error','nonzero']:
+            with self.subTest(failure=failure),tempfile.TemporaryDirectory() as directory,patch.object(live.time,'sleep'):
+                smoke,module,keyboard,visual,seat,events=self.cycle_fixture(directory,helper_wait=failure)
+                with self.assertRaises((RuntimeError,AssertionError)):
+                    live.composition_cycle(smoke,module,keyboard,visual,Path('/synthetic/helper'),'42:/dev/pts/0','segment',seat)
+                for event in ['raw-finish','post-commit-ocr','submit']:self.assertNotIn(event,events)
+                self.assertEqual(json.loads((Path(directory)/'segment/result.json').read_text())['status'],'fail')
 
     def test_preedit_failure_never_releases_return_or_submits(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(live.time,'sleep'):
@@ -198,6 +226,7 @@ class LiveTests(unittest.TestCase):
             smoke,module,keyboard,visual,seat,events=self.cycle_fixture(directory,wrong_identity=True)
             with self.assertRaisesRegex(AssertionError,'identity'):
                 live.composition_cycle(smoke,module,keyboard,visual,Path('/synthetic/helper'),'42:/dev/pts/0','segment',seat)
+            self.assertNotIn('post-commit-ocr',events)
             self.assertNotIn('submit',events)
 
     def test_dead_persistent_seat_prevents_helper_or_input(self):

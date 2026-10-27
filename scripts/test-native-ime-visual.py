@@ -330,6 +330,57 @@ class SelectedLayoutTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):visual.snapshot(smoke,'during',before,True,token_psm=11)
 
 
+class PostCommitCaptureTests(unittest.TestCase):
+    def test_slow_passive_ocr_runs_after_bounded_input_finalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            smoke=Smoke(directory)
+            before=visual.snapshot(smoke,'before',None,False)
+            clock={'now':5,'open':True};events=[];original=smoke.words
+            def finalize():
+                self.assertTrue((smoke.out/'after.png').exists())
+                self.assertLess(clock['now'],15)
+                events.extend(['helper-exited','collector-drained'])
+                clock['open']=False
+            def slow_words(label,**kwargs):
+                clock['now']+=20
+                self.assertFalse(clock['open'],'OCR held collector past its 15-second bound')
+                events.append('offline-ocr')
+                return original(label,**kwargs)
+            smoke.words=slow_words
+            after=visual.snapshot(smoke,'after',before,False,after_capture=finalize)
+            self.assertEqual(after['observed_token_count'],0)
+            self.assertEqual(events,['helper-exited','collector-drained','offline-ocr'])
+            self.assertGreater(clock['now'],15)
+
+    def test_invalid_capture_never_finalizes_and_mutation_is_rejected(self):
+        for case in ['owner','mutation','initial','presence']:
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as directory:
+                smoke=Smoke(directory);before=visual.snapshot(smoke,'before',None,False);events=[]
+                def finalize():
+                    events.append('finalize')
+                    if case=='mutation':(smoke.out/'after.png').write_bytes(b'changed')
+                if case=='owner':smoke.node['pid']=99
+                with self.assertRaises(RuntimeError):
+                    visual.snapshot(smoke,'after',None if case=='initial' else before,
+                                    case=='presence',after_capture=finalize)
+                self.assertEqual(events,['finalize'] if case=='mutation' else [])
+
+    def test_missing_or_extra_input_still_rejected_before_offline_ocr(self):
+        spec=importlib.util.spec_from_file_location('capture_desktop',Path(__file__).with_name('native-desktop-smoke.py'))
+        desktop=importlib.util.module_from_spec(spec);spec.loader.exec_module(desktop)
+        for actual in [b'', '你'.encode()+b'\r']:
+            with self.subTest(actual=actual),tempfile.TemporaryDirectory() as directory:
+                smoke=Smoke(directory);before=visual.snapshot(smoke,'before',None,False)
+                capture=Path(directory)/'raw';capture.mkdir()
+                (capture/'bytes.bin').write_bytes(actual)
+                (capture/'result.json').write_text(json.dumps({'status':'pass','shell_pid':42,'tty':'/dev/pts/0'}))
+                count=len(smoke.word_calls)
+                def finalize():desktop.Smoke.raw_finish(smoke,capture,'42:/dev/pts/0','你'.encode())
+                with self.assertRaises(AssertionError):
+                    visual.snapshot(smoke,'after',before,False,after_capture=finalize)
+                self.assertEqual(len(smoke.word_calls),count)
+
+
 class RegisteredLayoutTests(unittest.TestCase):
     def test_layout_is_selected_before_observation_not_retried(self):
         source=Path(__file__).with_name('native-ime-return-smoke.py').read_text()

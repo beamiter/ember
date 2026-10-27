@@ -99,7 +99,9 @@ def footer_health(smoke, label, image, rectangle):
 
 
 def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_psm=6,
-             health_psm=6, health_footer=False):
+             health_psm=6, health_footer=False, after_capture=None):
+    if after_capture is not None and (not callable(after_capture) or present or baseline is None):
+        raise RuntimeError('Input finalization requires a final absence capture')
     if health_psm not in (6, 11):
         raise RuntimeError('Unsupported health anchor layout')
     if token_psm not in (6,11) or (token_psm==11 and (not present or baseline is None)):
@@ -126,6 +128,13 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
     if dimensions != '1280 900':
         raise RuntimeError('Unexpected screenshot dimensions or image count')
     image_sha256 = hashlib.sha256(image.read_bytes()).hexdigest()
+    # All input is complete and the final image is now captured with
+    # owned geometry and immutable provenance. End/drain the input collector
+    # before passive OCR; no later input is allowed until analysis succeeds.
+    if after_capture is not None:
+        after_capture()
+        if hashlib.sha256(image.read_bytes()).hexdigest() != image_sha256:
+            raise RuntimeError('Screenshot changed while finalizing input')
     rows = smoke.words(label, psm=6, capture=False)
     validate_rows(rows)
     # Layout is chosen by the caller before capture, never as a response to OCR

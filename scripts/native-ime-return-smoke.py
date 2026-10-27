@@ -83,13 +83,15 @@ def main():
         wait_ime_marker('committed', 'native composition Return consumed and grab released')
         expected = '你'.encode()
         module.wait_for(lambda: (capture / 'live.bin').read_bytes() == expected, 'commit text reaches PTY without CR')
+        def finalize_input():
+            (control / 'finish').touch()
+            ime.wait(timeout=5)
+            assert ime.returncode == 0
+            smoke.raw_finish(capture, identity, expected)
         after = visual.snapshot(smoke, 'ime-commit-without-cr', before, False,
-                                health_psm=11, health_footer=True)
+                                health_psm=11, health_footer=True,
+                                after_capture=finalize_input)
         result['preedit_pixels'] = visual.verify_restoration(smoke, before, during, after)
-        smoke.raw_finish(capture, identity, expected)
-        (control / 'finish').touch()
-        ime.wait(timeout=5)
-        assert ime.returncode == 0
         assert keyboard.process.poll() is None, 'Keyboard must stay alive through commit/release'
         keyboard.stop()
         assert smoke.command('ime-input-resumed') == identity

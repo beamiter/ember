@@ -38,16 +38,22 @@ class Tests(unittest.TestCase):
             if inject=='switch':(capture/'live.bin').write_bytes(b'\r')
         def snapshot(view,label,baseline,present,**kwargs):
             events.append(label)
+            finalize=kwargs.pop('after_capture',None)
+            assert (finalize is not None) == (label == 'after-challenge')
             assert kwargs == dict(health_psm=11, health_footer=True,
                                   **({'health_fallback': True} if label == 'after-challenge' else {}),
-                                  **({'token_psm':11 if old in ('normal','chat') else 6}
+                                  **({'token_psm':11 if old == 'normal' else 6}
                                      if label == 'active-preedit' else {}))
             if inject==label:raise RuntimeError('visual failure')
+            if finalize is not None:
+                finalize()
+                if inject=='after-analysis':raise RuntimeError('final visual analysis failed')
             return {'rectangle':{'id':1,'pid':42,'rect':{}},'anchor_box':{},'observed_token_count':int(present)}
         def finish(path,identity,expected):
             events.append('finish');assert state['exit']==0 and expected==b'' and identity=='42:/dev/pts/0'
             if inject=='identity':raise AssertionError('wrong collector identity')
-        smoke=SimpleNamespace(app=SimpleNamespace(poll=lambda:None),raw_start=lambda label:capture,
+        config=out/'config.toml';config.write_text('font_size = 14.0\n')
+        smoke=SimpleNamespace(config=config,app=SimpleNamespace(poll=lambda:None),raw_start=lambda label:capture,
             switch_mode=switch,raw_finish=finish)
         args=(smoke,SimpleNamespace(wait_for=wait),SimpleNamespace(artifact_view=artifact),
               SimpleNamespace(snapshot=snapshot),Path('/synthetic/observer'),'42:/dev/pts/0',
@@ -80,6 +86,27 @@ class Tests(unittest.TestCase):
                     m.transition(*args)
                 self.assertEqual(events,[])
                 self.assertFalse(result.exists())
+
+    def test_font_specific_layout_is_explicit_not_extrapolated_from_16px_chat(self):
+        for font in [14.0,16.0]:
+            for mode in ['normal','block','chat']:
+                expected=11 if mode=='normal' or (mode=='chat' and font==16.0) else 6
+                self.assertEqual(m.composition_layout(mode,font),expected)
+        for font in [13.0,15.0,18.0,None]:
+            with self.assertRaisesRegex(RuntimeError,'Unregistered'):
+                m.composition_layout('chat',font)
+        source=Path(__file__).with_name('native-ime-preedit-switch.py').read_text()
+        self.assertIn('font_size = 14.0\\nui_font_size = 14.0',source)
+
+    def test_final_challenge_analysis_failure_never_returns_health_handoff(self):
+        with tempfile.TemporaryDirectory() as d,patch.object(m.time,'sleep'):
+            args,events,result=self.fixture(d,inject='after-analysis')
+            with self.assertRaisesRegex(RuntimeError,'final visual analysis'):
+                m.transition(*args)
+            self.assertIn('finish',events)
+            report=json.loads(result.read_text())
+            self.assertEqual(report['status'],'fail')
+            self.assertNotIn('after_challenge_visual',report)
 
     def test_failure_never_finishes_capture_or_reports_pass(self):
         for failure in ['active-preedit','switch','cancelled-preedit','challenge','after-challenge']:
@@ -154,7 +181,7 @@ class HandoffTests(unittest.TestCase):
         smoke = (fixture.FooterSmoke if footer else fixture.Smoke)(directory)
         smoke.app.poll = lambda: None
         smoke.config = Path(directory) / 'config.toml'
-        smoke.config.write_text(f'terminal_mode = "{mode}"\n')
+        smoke.config.write_text(f'terminal_mode = "{mode}"\nfont_size = 14.0\n')
         source = copy.copy(smoke)
         source.out = smoke.out / f'preedit-chat-to-{mode}'
         source.out.mkdir()
@@ -198,8 +225,33 @@ class HandoffTests(unittest.TestCase):
             self.assertEqual(during['observed_token_count'],1)
             self.assertEqual(view.word_calls[-1][1],{'psm':11,'capture':False})
 
+    def test_ordered_post_commit_finalizes_once_before_passive_analysis(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture,smoke,source,view,segment,adapter=self.fixture(d,footer=True)
+            before=adapter.snapshot(view,'ime-visual-before',None,False)
+            view.rows=[fixture.word(fixture.visual.PREEDIT_TOKEN)]
+            adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
+            view.rows=[fixture.word('terminal')];events=[]
+            def finalize():
+                self.assertEqual(adapter.phase,1)
+                self.assertTrue((view.out/'ime-commit-without-cr.png').exists())
+                events.append('finalized')
+            adapter.snapshot(view,'ime-commit-without-cr',before,False,after_capture=finalize)
+            self.assertEqual(events,['finalized']);self.assertEqual(adapter.phase,2)
+            with self.assertRaises(RuntimeError):
+                adapter.snapshot(view,'ime-commit-without-cr',before,False,after_capture=finalize)
+            self.assertEqual(events,['finalized'])
+
+    def test_font_contract_change_rejects_before_new_capture(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture,smoke,source,view,segment,adapter=self.fixture(d)
+            smoke.config.write_text('terminal_mode = "normal"\nfont_size = 16.0\n')
+            with self.assertRaisesRegex(RuntimeError,'font contract'):
+                adapter.snapshot(view,'ime-visual-before',None,False)
+            self.assertEqual(view.captures,[])
+
     def test_fresh_destination_layout_applies_only_to_presence_in_each_mode(self):
-        for mode,psm in [('normal',11),('block',6),('chat',11)]:
+        for mode,psm in [('normal',11),('block',6),('chat',6)]:
             with self.subTest(mode=mode),tempfile.TemporaryDirectory() as d:
                 fixture,smoke,source,view,segment,adapter=self.fixture(d,footer=True,mode=mode)
                 self.assertEqual(adapter.preedit_psm,psm)
@@ -290,7 +342,7 @@ class HandoffTests(unittest.TestCase):
             got=adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
             self.assertEqual(got['token_ocr_psm'],11)
             self.assertEqual(got['matches'][0]['text'],fixture.visual.PREEDIT_TOKEN)
-        for mode,layout in [('normal',11),('chat',11),('block',6)]:
+        for mode,layout in [('normal',11),('chat',6),('block',6)]:
             with tempfile.TemporaryDirectory() as d:
                 fixture,smoke,source,view,segment,adapter=self.fixture(d)
                 segment['to']=mode

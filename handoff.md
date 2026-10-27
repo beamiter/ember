@@ -1,5 +1,33 @@
 # Engineering handoff
 
+## 2026-10-27 — end input capture before passive post-commit OCR
+
+- On `0329e05`, general Wayland selection passed; remaining native failures
+  were a live-cycle collector deadline during offline OCR and a 14px Chat
+  layout incorrectly extrapolated from the 16px standalone fixture.
+  Artifact `12710008252` SHA-256 is
+  `da732a6e89eade42c5e2cce7a321def10632fbe415ec8c34a61b9b688d8d67ce`.
+- The live-cycle raw PTY was ready at 04:32:16, had the exact three commit
+  bytes by :26, and expired at :30 while post-commit image analysis continued
+  to :32. The image was already captured at :26. Now, after its owned surface,
+  dimensions and hash are verified, the IME helper exits normally and the
+  original collector drains/checks exact bytes before passive OCR of that
+  same image. The active-preedit challenge observer uses this same finalization
+  boundary after its final capture. Subsequent Enter remains gated on successful OCR and exact
+  pixel restoration. The 15-second input bound and byte limits are unchanged.
+- The active-switch fixture explicitly pins its existing 14px font contract.
+  Its Chat uses registered dense layout 6; the separate 16px Chat fixture
+  keeps sparse 11. On both old and new 14px images the token pixels are
+  identical and dense OCR is exact; unrelated history made sparse OCR invent
+  a period. There is no text repair or failure-driven layout selection, and
+  the existing cross-layout disagreement guard is intact. Font contract
+  drift and unregistered sizes fail closed before a new capture.
+- Regression covers slow passive OCR beyond the input budget, invalid or
+  mutated captures, missing/extra PTY bytes, helper failure, ordered one-time
+  FreshVisual finalization, and no submission after later analysis failure.
+  Five immutable 14px/16px Chat PNGs across two heads replayed correctly with
+  their predeclared layouts. Hosted exact-head validation remains required.
+
 ## 2026-10-27 — scope mode selection to its Advanced section
 
 - Exact-head `8fabb86` passed the complete active-preedit cancellation/challenge

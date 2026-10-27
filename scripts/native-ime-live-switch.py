@@ -72,12 +72,14 @@ def composition_cycle(smoke, module, keyboard_module, visual, helper, identity, 
         expected = '你'.encode()
         module.wait_for(lambda: (capture / 'live.bin').read_bytes() == expected,
                         label + ' exact commit without CR')
-        after = visual.snapshot(view, 'ime-commit-without-cr', before, False, **health_options)
+        def finalize_input():
+            (control / 'finish').touch()
+            ime.wait(timeout=5)
+            assert ime.returncode == 0
+            smoke.raw_finish(capture, identity, expected)
+        after = visual.snapshot(view, 'ime-commit-without-cr', before, False,
+                                after_capture=finalize_input, **health_options)
         result['preedit_pixels'] = visual.verify_restoration(view, before, during, after)
-        smoke.raw_finish(capture, identity, expected)
-        (control / 'finish').touch()
-        ime.wait(timeout=5)
-        assert ime.returncode == 0
         assert keyboard.process.poll() is None, 'Composition keyboard exited before grab release'
         assert seat.poll() is None, 'Persistent seat keyboard exited'
         keyboard.stop()

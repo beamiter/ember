@@ -24,10 +24,22 @@ def zero(capture, stage):
         raise AssertionError(f'{stage}: premature PTY bytes {actual.hex()}')
 
 
-def composition_layout(mode):
+FIXTURE_FONT_SIZE = 14.0
+
+
+def composition_layout(mode, font_size):
     if mode not in ('normal', 'block', 'chat'):
         raise RuntimeError('Unknown terminal mode for composition layout')
-    return 11 if mode in ('normal', 'chat') else 6
+    if font_size not in (14.0, 16.0):
+        raise RuntimeError('Unregistered composition fixture font size')
+    return 11 if mode == 'normal' or (mode == 'chat' and font_size == 16.0) else 6
+
+
+def fixture_font(smoke):
+    font=tomllib.loads(smoke.config.read_text()).get('font_size')
+    if type(font) not in (int,float) or font != FIXTURE_FONT_SIZE:
+        raise RuntimeError('Composition fixture font contract changed')
+    return font
 
 
 class FreshVisual:
@@ -47,13 +59,13 @@ class FreshVisual:
                                if self.prior.get('health_footer') is not None else {})
         self.view = None
         # Destination mode selects layout before this cycle captures anything.
-        self.preedit_psm = composition_layout(mode)
+        self.preedit_psm = composition_layout(mode, fixture_font(smoke))
 
-    def snapshot(self, view, label, baseline, present):
+    def snapshot(self, view, label, baseline, present, *, after_capture=None):
         diagnostic = {'label': label, 'expected_token_present': present,
                       'fresh_cycle_phase': self.phase, 'status': 'running'}
         try:
-            result = self._snapshot(view, label, baseline, present)
+            result = self._snapshot(view, label, baseline, present, after_capture=after_capture)
             diagnostic.update(status='pass', image_sha256=result['image_sha256'],
                               health_ocr_psm=result['health_ocr_psm'])
             return result
@@ -63,7 +75,10 @@ class FreshVisual:
         finally:
             (view.out / 'ime-fresh-visual-phase.json').write_text(json.dumps(diagnostic, indent=2))
 
-    def _snapshot(self, view, label, baseline, present):
+    def _snapshot(self, view, label, baseline, present, *, after_capture=None):
+        fixture_font(self.smoke)
+        if after_capture is not None and (label != 'ime-commit-without-cr' or present or baseline is None):
+            raise RuntimeError('Input finalization requires the ordered post-commit capture')
         if baseline is not None:
             expected = [('ime-preedit-zero-bytes', True), ('ime-commit-without-cr', False)]
             if (self.initial is None or self.phase >= len(expected)
@@ -83,7 +98,7 @@ class FreshVisual:
             result = self.visual.snapshot(view, label, baseline, present,
                                           health_fallback=self.phase == 1,
                                           token_psm=self.preedit_psm if self.phase == 0 else 6,
-                                          **self.health_options)
+                                          after_capture=after_capture, **self.health_options)
             self.phase += 1
             return result
         if self.used or label != 'ime-visual-before' or present:
@@ -117,8 +132,9 @@ class FreshVisual:
 
 
 def transition(smoke, module, live, visual, helper, identity, old, new, seat):
-    preedit_psm = composition_layout(old)
-    composition_layout(new)  # Reject unknown destination before starting a collector.
+    preedit_psm = composition_layout(old, FIXTURE_FONT_SIZE)
+    composition_layout(new, FIXTURE_FONT_SIZE)  # Reject unknown destination before starting a collector.
+    fixture_font(smoke)
     label = f'preedit-{old}-to-{new}'
     view = live.artifact_view(smoke, label)
     control = view.out / 'ime-control'
@@ -160,15 +176,16 @@ def transition(smoke, module, live, visual, helper, identity, old, new, seat):
         assert len(outcomes) == 1, 'Ambiguous native context outcome'
         time.sleep(0.5)
         zero(capture, 'late commit quarantine or abandoned context')
+        def finalize_input():
+            (control / 'finish').touch()
+            ime.wait(timeout=5)
+            assert ime.returncode == 0
+            assert smoke.app.poll() is None and seat.poll() is None
+            # Observer exit precedes the final drain, including late bytes.
+            smoke.raw_finish(capture, identity, b'')
         verified_after = visual.snapshot(view, 'after-challenge', after, False, health_fallback=True,
-                                         health_psm=11, health_footer=True)
-        (control / 'finish').touch()
-        ime.wait(timeout=5)
-        assert ime.returncode == 0
-        assert smoke.app.poll() is None and seat.poll() is None
-        # Observer has exited before finishing collector; its final drain sees
-        # delayed PTY bytes too. This capture deliberately expects zero bytes.
-        smoke.raw_finish(capture, identity, b'')
+                                         health_psm=11, health_footer=True,
+                                         after_capture=finalize_input)
         result.update(status='pass', native_outcome=outcomes[0], pty_bytes=0,
                       after_challenge_visual=verified_after)
     except Exception as error:
@@ -232,7 +249,7 @@ def main():
         smoke.start_desktop()
         seat = smoke.spawn(['wtype', '-s', '600000', '-k', 'F24'], 'ime-seat-keyboard')
         time.sleep(0.5)
-        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = false\n')
+        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = false\nfont_size = 14.0\nui_font_size = 14.0\n')
         smoke.app = smoke.spawn([str(smoke.binary)], 'ember')
         module.wait_for(smoke.app_window, 'preedit switch Ember window')
         time.sleep(2)
