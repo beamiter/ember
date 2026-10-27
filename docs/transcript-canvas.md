@@ -25,7 +25,11 @@ switching tabs or splitting a tab does not transfer another pane's momentum.
 - A running command reserves its metadata row from the start, so completion
   changes its status without moving the output. Separately delivered shell
   completion and prompt markers retain the same canvas between PTY reads.
-- Following live output gently approaches the new tail. Browsing history
+- Following live output gently approaches the new tail. Large bursts limit
+  visual catch-up to two viewport heights instead of racing through thousands
+  of intermediate rows. This intentionally jumps ahead across the excess burst
+  before easing to live; all output remains available in the transcript.
+  Browsing history
   retains its stable raw-row anchor, including the fractional offset, when
   output arrives, history is trimmed, or a command block changes height.
 - Resizing a pane or changing font size keeps a reader's position within the

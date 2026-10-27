@@ -124,6 +124,13 @@ impl TranscriptCanvas {
                 // Preserve the old writing position, then move towards the
                 // newest output. Retargeting never restarts the spring clock.
                 self.motion.shift(appended);
+                // A large output burst is already in the document. Animate
+                // only a bounded distance to its tail, not thousands of rows
+                // of unread intermediate output in a fraction of a second.
+                let limit = visible_rows.saturating_mul(2).max(1) as f64 * height;
+                if self.motion.position() > limit {
+                    self.motion.jump_to(limit);
+                }
                 self.motion.set_target(0.0);
             } else {
                 let rebase = offset_rows as f64 - self.expected_offset as f64;
@@ -311,6 +318,84 @@ mod tests {
         assert_eq!(frame.offset_rows, 0);
         assert!(!frame.animating);
         assert!(frame.follows_live);
+    }
+
+    #[test]
+    fn large_streaming_bursts_bound_visual_catch_up_without_changing_extent() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 0, 200, true, 0.0);
+        let mut frame = present(&mut canvas, 0, 10_200, true, 0.016);
+        assert!(frame.animating);
+        assert!(frame.follows_live);
+        assert!(frame.offset_rows <= 40);
+        assert_eq!(canvas.document_rows, 10_200);
+        for tick in 2..180 {
+            frame = present(
+                &mut canvas,
+                frame.offset_rows,
+                10_200,
+                true,
+                tick as f64 / 60.0,
+            );
+        }
+        assert_eq!(frame.offset_rows, 0);
+        assert!(!frame.animating);
+    }
+
+    #[test]
+    fn repeated_bursts_stay_bounded_but_never_pull_a_reader_to_live() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 0, 200, true, 0.0);
+        let mut frame = present(&mut canvas, 0, 10_200, true, 0.016);
+        for tick in 2..20 {
+            frame = present(
+                &mut canvas,
+                frame.offset_rows,
+                200 + tick * 10_000,
+                true,
+                tick as f64 / 60.0,
+            );
+            assert!(frame.offset_rows <= 40);
+        }
+        canvas.scroll(5.25, true);
+        frame = present(&mut canvas, frame.offset_rows, 190_200, true, 0.34);
+        assert!(!frame.follows_live);
+        let held = frame;
+        frame = present(&mut canvas, held.offset_rows + 10_000, 200_200, false, 0.36);
+        assert_eq!(frame.offset_rows, held.offset_rows + 10_000);
+        assert_eq!(frame.translation, held.translation);
+        assert!(!frame.follows_live);
+        assert!(!frame.animating);
+    }
+
+    #[test]
+    fn large_burst_never_caps_an_old_history_reading_anchor() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 8_000, 10_200, false, 0.0);
+        canvas.scroll(7.25, true);
+        let before = present(&mut canvas, 8_000, 10_200, false, 0.016);
+        let after = present(
+            &mut canvas,
+            before.offset_rows + 10_000,
+            20_200,
+            false,
+            0.032,
+        );
+        assert_eq!(after.offset_rows, before.offset_rows + 10_000);
+        assert_eq!(after.translation, before.translation);
+        assert!(!after.follows_live);
+        assert!(!after.animating);
+    }
+
+    #[test]
+    fn reduced_motion_burst_goes_directly_to_live() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 0, 200, true, 0.0);
+        let frame = canvas.present(0, 10_200, 2, 20, 80, true, 20.0, 0.016, true);
+        assert_eq!(frame.offset_rows, 0);
+        assert_eq!(frame.translation, 0.0);
+        assert!(frame.follows_live);
+        assert!(!frame.animating);
     }
 
     #[test]
