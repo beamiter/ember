@@ -6,6 +6,7 @@ import unittest
 import copy
 import json
 import tempfile
+import subprocess
 from unittest.mock import Mock, patch
 spec=importlib.util.spec_from_file_location('probe',Path(__file__).with_name('native-block-search-atspi-probe.py'))
 p=importlib.util.module_from_spec(spec);spec.loader.exec_module(p)
@@ -13,7 +14,7 @@ p=importlib.util.module_from_spec(spec);spec.loader.exec_module(p)
 class Tests(unittest.TestCase):
     def test_environment_drops_all_host_routes(self):
         keys=('HOME','XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_STATE_HOME','XDG_CACHE_HOME',
-              'XDG_RUNTIME_DIR','EMBER_SMOKE_SHELL_TRACE','EMBER_SMOKE_CAPTURE','EMBER_SMOKE_RAW_ROOT')
+              'XDG_RUNTIME_DIR','EMBER_SMOKE_SHELL_TRACE','EMBER_SMOKE_CAPTURE','EMBER_SMOKE_RAW_ROOT','EMBER_SMOKE_SENTINELS')
         src={k:'/synthetic/'+k for k in keys}
         src.update(DISPLAY=':0',WAYLAND_DISPLAY='host',DBUS_SESSION_BUS_ADDRESS='host',
                    AT_SPI_BUS_ADDRESS='host',LD_PRELOAD='host',PYTHONPATH='host',
@@ -24,6 +25,20 @@ class Tests(unittest.TestCase):
             self.assertNotIn(k,out)
         self.assertEqual(out['WGPU_BACKEND'],'vulkan')
         self.assertEqual(out['PATH'],'/usr/bin:/bin')
+
+    def test_generated_sentinel_survives_isolation_and_shell_writes_owned_file(self):
+        spec=importlib.util.spec_from_file_location('isolated_desktop',Path(__file__).with_name('native-desktop-smoke.py'))
+        desktop=importlib.util.module_from_spec(spec);spec.loader.exec_module(desktop)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict('os.environ',{'EMBER_SMOKE_SENTINELS':'/untrusted-host-destination'}):
+                smoke=desktop.Smoke(Path('/bin/true'),'x11',Path(directory))
+            smoke.env.update(GITHUB_TOKEN='must-not-pass',LD_PRELOAD='must-not-pass')
+            child=p.child_environment(smoke.env)
+            self.assertEqual(child['EMBER_SMOKE_SENTINELS'],str(smoke.transcript))
+            self.assertNotIn('GITHUB_TOKEN',child);self.assertNotIn('LD_PRELOAD',child)
+            script='tty() { printf /dev/pts/fixture; }; '+desktop.sentinel_command('isolated')+'; printf %s "$$"'
+            result=subprocess.run(['bash','-c',script],env=child,check=True,capture_output=True,text=True)
+            self.assertEqual(smoke.transcript.read_text(),'isolated:'+result.stdout+':/dev/pts/fixture\n')
 
     def test_foreign_node_rejected(self):
         self.assertEqual(p.validate_address((':1.2',p.ROOT),':1.2'),(':1.2',p.ROOT))

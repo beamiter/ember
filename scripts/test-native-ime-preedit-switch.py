@@ -38,7 +38,8 @@ class Tests(unittest.TestCase):
             if inject=='switch':(capture/'live.bin').write_bytes(b'\r')
         def snapshot(view,label,baseline,present,**kwargs):
             events.append(label)
-            assert kwargs == ({'health_fallback': True} if label == 'after-challenge' else {})
+            assert kwargs == dict(health_psm=11, health_footer=True,
+                                  **({'health_fallback': True} if label == 'after-challenge' else {}))
             if inject==label:raise RuntimeError('visual failure')
             return {'rectangle':{'id':1,'pid':42,'rect':{}},'anchor_box':{},'observed_token_count':int(present)}
         def finish(path,identity,expected):
@@ -129,16 +130,17 @@ class Tests(unittest.TestCase):
 
 
 class HandoffTests(unittest.TestCase):
-    def fixture(self, directory):
+    def fixture(self, directory, footer=False):
         fixture = m.load('visual_fixture', Path(__file__).with_name('test-native-ime-visual.py'))
-        smoke = fixture.Smoke(directory)
+        smoke = (fixture.FooterSmoke if footer else fixture.Smoke)(directory)
         smoke.app.poll = lambda: None
         smoke.config = Path(directory) / 'config.toml'
         smoke.config.write_text('terminal_mode = "normal"\n')
         source = copy.copy(smoke)
         source.out = smoke.out / 'preedit-chat-to-normal'
         source.out.mkdir()
-        prior = fixture.visual.snapshot(source, 'after-challenge', None, False)
+        prior = fixture.visual.snapshot(source, 'after-challenge', None, False,
+            **({'health_psm':11,'health_footer':True} if footer else {}))
         segment = {'status':'pass', 'identity':'42:/dev/pts/0', 'from':'chat', 'to':'normal',
                    'pty_bytes':0, 'after_challenge_visual':prior}
         view = copy.copy(smoke)
@@ -147,6 +149,19 @@ class HandoffTests(unittest.TestCase):
         view.captures=[];view.word_calls=[];view.tree_calls=0
         adapter=m.FreshVisual(fixture.visual,smoke,segment,'42:/dev/pts/0','normal')
         return fixture,smoke,source,view,segment,adapter
+
+    def test_footer_proof_is_preserved_through_fresh_composition(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture,smoke,source,view,segment,adapter=self.fixture(d,footer=True)
+            before=adapter.snapshot(view,'ime-visual-before',None,False)
+            self.assertIsNotNone(before['health_footer'])
+            view.rows=[fixture.word(fixture.visual.PREEDIT_TOKEN)]
+            during=adapter.snapshot(view,'ime-preedit-zero-bytes',before,True)
+            self.assertIsNotNone(during['health_footer'])
+            view.rows=[fixture.word('terminal')]
+            after=adapter.snapshot(view,'ime-commit-without-cr',before,False)
+            self.assertIsNotNone(after['health_footer'])
+            self.assertTrue(all(x['health_ocr_psm']==7 for x in [before,during,after]))
 
     def test_success_preserves_current_cycle_baseline_and_single_use(self):
         with tempfile.TemporaryDirectory() as d:

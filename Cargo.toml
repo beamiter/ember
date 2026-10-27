@@ -78,3 +78,6 @@ opt-level = 3
 winit = { path = "vendor/winit" }
 eframe = { path = "vendor/eframe" }
 egui-winit = { path = "vendor/egui-winit" }
+
+# Preserve seat selection devices across virtual-keyboard hotplug.
+smithay-clipboard = { path = "vendor/smithay-clipboard" }

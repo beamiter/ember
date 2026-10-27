@@ -12,6 +12,52 @@ live = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(live)
 
 
+desktop = live.load('mode_desktop', Path(__file__).with_name('native-desktop-smoke.py'))
+
+
+class RawCollectorReadinessTests(unittest.TestCase):
+    def test_dead_app_is_not_ready_even_if_stale_marker_exists(self):
+        for status in [0, 1, None]:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                out=Path(directory); ready=out/'raw-pty'/'case'/'ready'
+                ready.parent.mkdir(parents=True); ready.touch(); actions=[]
+                smoke=SimpleNamespace(out=out, app=SimpleNamespace(poll=lambda:status),
+                    text=lambda value:actions.append(value), key=lambda value:actions.append(value))
+                with patch.object(desktop,'wait_for',side_effect=lambda check,label:check()):
+                    if status is None:
+                        self.assertEqual(desktop.Smoke.raw_start(smoke,'case'),ready.parent)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError,'Ember exited'):
+                            desktop.Smoke.raw_start(smoke,'case')
+                self.assertEqual(actions,['rawcheck case','Return'])
+
+
+class SettingsModeTargetTests(unittest.TestCase):
+    def rows(self):
+        def word(text, x, y, w, h=12):
+            return dict(text=text, left=str(x), top=str(y), width=str(w), height=str(h))
+        return [word('Appearance', 416, 196, 85), word('Remote', 633, 196, 56),
+                word('Terminal', 363, 552, 69), word('mode', 437, 552, 32),
+                word('Chat', 483, 552, 32), word('Chat', 1067, 35, 32)]
+
+    def test_selector_is_exact_value_beside_terminal_mode_not_title(self):
+        self.assertEqual(desktop.settings_mode_selector(self.rows(), 'Chat')['top'], '552')
+
+    def test_missing_label_ambiguous_value_and_wrong_geometry_fail(self):
+        import copy
+        for case in ['title-only', 'duplicate', 'label-missing', 'wrong-word', 'far', 'wrong-row', 'tabs']:
+            with self.subTest(case=case):
+                rows = copy.deepcopy(self.rows())
+                if case == 'title-only': rows.pop(4)
+                elif case == 'duplicate': rows.append(copy.deepcopy(rows[4]))
+                elif case == 'label-missing': rows[2]['text'] = 'Other'
+                elif case == 'wrong-word': rows[4]['text'] = 'Chatty'
+                elif case == 'far': rows[4]['left'] = '800'
+                elif case == 'wrong-row': rows[4]['top'] = '580'
+                else: rows[1]['top'] = '250'
+                with self.assertRaises(RuntimeError): desktop.settings_mode_selector(rows, 'Chat')
+
+
 class LiveTests(unittest.TestCase):
     def test_live_segments_switch_once_and_keep_one_shell(self):
         with tempfile.TemporaryDirectory() as directory:

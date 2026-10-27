@@ -1,5 +1,58 @@
 # Engineering handoff
 
+## 2026-10-27 — preserve Wayland clipboard devices across keyboard hotplug
+
+- Vendored official `smithay-clipboard 0.7.3` (MIT), retaining its original
+  manifest/features and license; archive SHA and precise patch provenance are
+  in `vendor/smithay-clipboard/EMBER-PATCH.md`. The only production behavior
+  change keeps selection devices until seat removal instead of keyboard loss.
+  The root lock change removes only this crate's registry source/checksum.
+- A real AF_UNIX scripted compositor reproduced the exact fatal `data_offer`
+  invalid-object-id / EINVAL failure before the patch and passed afterward.
+  It checks keyboard restoration, preserved selection, no duplicate data device,
+  and a real release request on seat removal. Primary-selection teardown is
+  reviewed via the SDK Drop implementation, not claimed as a wire-tested path.
+  CI explicitly runs the otherwise ignored native test with the original
+  dev features. The local independent harness omitted only the example-only
+  xkbcommon dev feature because its system development files are unavailable.
+- Raw PTY readiness now fails immediately on application exit (including exit
+  zero and a stale readiness marker), with the exit status and log location.
+  It does not retry/restart the app or convert protocol failures to passes.
+- Registered sparse-layout OCR is selected in advance for Normal IME tokens
+  and Remote tab targeting. The existing exact words, uniqueness, source-image
+  checks, 0→1→0 token counts and exact restored pixels remain unchanged.
+  Preedit-switch health checks use the already provenance-checked footer crop
+  through the entire subsequent fresh composition, not as a token substitute.
+- Local checks: all 219 tests across 14 native Python scripts passed; locked
+  Rust test type-check, all-target Clippy with warnings denied, and formatting
+  passed. Native desktop release CI for the new commit is still required.
+  The three user-retained DBus maintenance warnings remain unchanged.
+
+## 2026-10-27 — scope native Settings and recovery labels to their controls
+
+- Preserved the generated sentinel destination in the strict AT-SPI child
+  environment allowlist. The prior fixture change added the variable but
+  omitted this handoff, preventing isolated search shells from recording
+  readiness. A real shell regression now traverses the entire generated
+  Smoke environment → isolated child environment → sentinel command path;
+  inherited credentials, display routes and preload variables remain dropped.
+- The Settings current-mode click now requires the exact value beside the
+  dialog's `Terminal mode` label below its tab row. A matching mode in the
+  new shared window title is not a candidate; missing or duplicate dialog
+  values still fail before input.
+- Recovery-button phrases must have exact contiguous words on one OCR line,
+  ordered non-overlapping bounded horizontal gaps, common vertical overlap
+  and centers within the existing five-pixel tolerance. This recognizes
+  symmetric OCR box expansion without increasing a threshold or joining
+  unrelated explanatory text. Only one exact candidate can be clicked.
+- Added synthetic negative controls plus the expanded-box coordinates from
+  the `86dbbdf` native artifact, and wired the recovery regression into CI.
+  All 216 tests across the 14 native Python test scripts passed locally;
+  the corrected selectors also chose the right controls in the immutable
+  six recovery TSVs and Chat mode-selector TSV from that artifact. These
+  are targeting regressions, not evidence that Recheck/export or the full
+  native lifecycle has passed on the new commit; hosted CI remains required.
+
 ## 2026-10-27 — protect preedit and stabilize native observation fixtures
 
 - Link hover popups now yield while terminal preedit is nonempty, without

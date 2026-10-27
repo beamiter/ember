@@ -19,7 +19,7 @@ def child_environment(generated):
     # No host DISPLAY, bus, backend, preload, Python path, credentials or proxies.
     keys = ('HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
             'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR', 'EMBER_SMOKE_SHELL_TRACE',
-            'EMBER_SMOKE_CAPTURE', 'EMBER_SMOKE_RAW_ROOT')
+            'EMBER_SMOKE_CAPTURE', 'EMBER_SMOKE_RAW_ROOT', 'EMBER_SMOKE_SENTINELS')
     return dict({k: generated[k] for k in keys}, PATH='/usr/bin:/bin',
                 LANG='C.UTF-8', LC_ALL='C.UTF-8', SHELL='/bin/bash',
                 XDG_DATA_DIRS='/usr/local/share:/usr/share',

@@ -105,7 +105,9 @@ def main():
         smoke.key('o', ('ctrl', 'shift'))
         time.sleep(0.4)
         before = geometry.capture(smoke, 'remote-tab-before', args.scale, expected_rect, floating, measured)
-        rows = smoke.words('remote-tab-before', psm=6, capture=False)
+        # Tab labels form a sparse control row, not a dense prose paragraph.
+        # Select this layout before reading any text; no fallback or repair.
+        rows = smoke.words('remote-tab-before', psm=11, capture=False)
         target = geometry.remote_tab(rows, before)
         result['pointer_target'] = geometry.click(smoke, 'remote-tab', target, before, args.scale, expected_rect, floating)
         time.sleep(0.4)

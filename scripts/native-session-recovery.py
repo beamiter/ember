@@ -31,21 +31,41 @@ def require_phrases(smoke, label, phrases, text=None):
     return text
 
 
-def click_phrase(smoke, phrase, label):
-    rows = smoke.words(label)
+def phrase_target(rows, phrase):
+    # OCR backgrounds can enlarge a word box symmetrically. Compare its
+    # center and shared text line, not just its top edge; keep the same 5px
+    # alignment tolerance, exact words and one unique contiguous candidate.
+    lines = {}
+    for row in rows:
+        key = tuple(row[k] for k in ('page_num', 'block_num', 'par_num', 'line_num'))
+        lines.setdefault(key, []).append(row)
     wanted = phrase.split()
     matches = []
-    for index in range(len(rows) - len(wanted) + 1):
-        group = rows[index:index + len(wanted)]
-        if [row['text'].strip() for row in group] != wanted:
-            continue
-        # A button label must occupy one OCR row. Reject unrelated phrases
-        # joined across lines, and do not confuse the explanatory paragraph.
-        tops = [int(row['top']) for row in group]
-        if max(tops) - min(tops) <= 5:
+    for line in lines.values():
+        line.sort(key=lambda r: int(r['left']))
+        for index in range(len(line) - len(wanted) + 1):
+            group = line[index:index + len(wanted)]
+            if [r['text'] for r in group] != wanted:
+                continue
+            boxes = [tuple(int(r[k]) for k in ('left', 'top', 'width', 'height')) for r in group]
+            if any(min(w, h) <= 0 for _, _, w, h in boxes):
+                continue
+            centers = [2*y + h for _, y, _, h in boxes]
+            if max(centers) - min(centers) > 10:
+                continue
+            if max(y for _, y, _, _ in boxes) >= min(y+h for _, y, _, h in boxes):
+                continue
+            if any(not 0 <= bx-(ax+aw) <= min(ah, bh)
+                   for (ax, _, aw, ah), (bx, _, _, bh) in zip(boxes, boxes[1:])):
+                continue
             matches.append(group)
-    assert len(matches) == 1, (phrase, matches)
-    row = matches[0][0]
+    if len(matches) != 1:
+        raise RuntimeError(f'Absent or ambiguous exact phrase {phrase!r}: {len(matches)}')
+    return matches[0][0]
+
+
+def click_phrase(smoke, phrase, label):
+    row = phrase_target(smoke.words(label), phrase)
     smoke.click(int(row['left']) + int(row['width']) // 2,
                 int(row['top']) + int(row['height']) // 2)
 

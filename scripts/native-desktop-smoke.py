@@ -39,6 +39,41 @@ def sentinel_command(sentinel):
     return "printf '%s:%s:%s\\n' " + shlex.quote(sentinel) + ' "$$" "$(tty)" >> "$EMBER_SMOKE_SENTINELS"'
 
 
+def settings_mode_selector(rows, current):
+    """Exact mode value beside the Settings label, never the window title."""
+    def bounds(row):
+        x, y, w, h = (int(row[k]) for k in ('left', 'top', 'width', 'height'))
+        if min(w, h) <= 0:
+            raise RuntimeError('Invalid Settings OCR word bounds')
+        return x, y, w, h
+    def same_row(a, b):
+        _, ay, _, ah = bounds(a)
+        _, by, _, bh = bounds(b)
+        return max(ay, by) < min(ay + ah, by + bh) and abs((2*ay + ah) - (2*by + bh)) <= 10
+    tabs = []
+    for name in ('Appearance', 'Remote'):
+        matches = [r for r in rows if r['text'] == name]
+        if len(matches) != 1:
+            raise RuntimeError('Missing or ambiguous Settings tab anchor')
+        tabs.append(matches[0])
+    if not same_row(*tabs):
+        raise RuntimeError('Settings tab anchors are on different rows')
+    tab_bottom = max(bounds(r)[1] + bounds(r)[3] for r in tabs)
+    labels = [(a, b) for a in rows for b in rows
+              if a['text'] == 'Terminal' and b['text'] == 'mode'
+              and bounds(a)[1] > tab_bottom and same_row(a, b)
+              and 0 <= bounds(b)[0] - (bounds(a)[0] + bounds(a)[2]) <= min(bounds(a)[3], bounds(b)[3])]
+    if len(labels) != 1:
+        raise RuntimeError('Missing or ambiguous Settings Terminal mode label')
+    label = labels[0][1]
+    x, _, w, h = bounds(label)
+    values = [r for r in rows if r['text'] == current and same_row(r, label)
+              and 0 <= bounds(r)[0] - (x + w) <= 4 * h]
+    if len(values) != 1:
+        raise RuntimeError('Missing or ambiguous Settings mode value')
+    return values[0]
+
+
 class Smoke:
     def __init__(self, binary, backend, out):
         self.binary, self.backend, self.out = binary, backend, out
@@ -303,7 +338,9 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         row = rows[0]
         self.click(int(row['left']) + int(row['width']) // 2,
                    int(row['top']) + int(row['height']) // 2)
-        self.click_word(old.title(), new + '-mode-selector')
+        row = settings_mode_selector(self.words(new + '-mode-selector'), old.title())
+        self.click(int(row['left']) + int(row['width']) // 2,
+                   int(row['top']) + int(row['height']) // 2)
         self.click_word(new.title(), new + '-mode-menu')
         if self.backend == 'wayland':
             spec = importlib.util.spec_from_file_location('settings_save', Path(__file__).with_name('native-settings-save-ocr.py'))
@@ -337,7 +374,12 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         self.text('rawcheck ' + case)
         self.key('Return')
         out = self.out / 'raw-pty' / case
-        wait_for((out / 'ready').exists, 'real raw PTY collector ' + case)
+        def ready():
+            status = self.app.poll()
+            if status is not None:
+                raise RuntimeError(f'Ember exited {status} before raw PTY readiness: {case}; see ember.log')
+            return (out / 'ready').exists()
+        wait_for(ready, 'real raw PTY collector ' + case)
         return out
 
     def raw_finish(self, out, identity, expected):

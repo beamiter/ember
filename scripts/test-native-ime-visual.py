@@ -330,6 +330,14 @@ class SelectedLayoutTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):visual.snapshot(smoke,'during',before,True,token_psm=11)
 
 
+class RegisteredLayoutTests(unittest.TestCase):
+    def test_layout_is_selected_before_observation_not_retried(self):
+        source=Path(__file__).with_name('native-ime-return-smoke.py').read_text()
+        self.assertIn("token_psm=11 if args.mode in ('normal', 'chat') else 6", source)
+        geometry=Path(__file__).with_name('native-wayland-geometry-smoke.py').read_text()
+        self.assertIn("words('remote-tab-before', psm=11, capture=False)", geometry)
+
+
 class FooterSmoke(Smoke):
     def __init__(self, out):
         super().__init__(out)

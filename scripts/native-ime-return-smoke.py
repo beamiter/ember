@@ -70,11 +70,11 @@ def main():
         (control / 'start').touch()
         wait_ime_marker('preedit', 'genuine compositor preedit')
         time.sleep(0.5)
-        # Chat renders this short preedit as a sparse line in a large card.
+        # Normal and Chat render this preedit as a sparse line in a large surface.
         # Choose its layout before OCR, using the same immutable screenshot;
         # psm6 invents a trailing colon on the retained CI Chat images.
         during = visual.snapshot(smoke, 'ime-preedit-zero-bytes', before, True,
-                                 token_psm=11 if args.mode == 'chat' else 6,
+                                 token_psm=11 if args.mode in ('normal', 'chat') else 6,
                                  health_psm=11, health_footer=True)
         preedit = (capture / 'live.bin').read_bytes()
         assert preedit == b'', ('preedit leaked terminal bytes', preedit.hex())

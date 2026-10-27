@@ -37,6 +37,8 @@ class FreshVisual:
         self.used = False
         self.initial = None
         self.phase = 0
+        self.health_options = ({'health_psm': 11, 'health_footer': True}
+                               if self.prior.get('health_footer') is not None else {})
         self.view = None
         # Destination mode selects layout before this cycle captures anything.
         self.preedit_psm = 11 if mode == 'normal' else 6
@@ -74,7 +76,8 @@ class FreshVisual:
             # check, after this cycle's own successful rendered preedit control.
             result = self.visual.snapshot(view, label, baseline, present,
                                           health_fallback=self.phase == 1,
-                                          token_psm=self.preedit_psm if self.phase == 0 else 6)
+                                          token_psm=self.preedit_psm if self.phase == 0 else 6,
+                                          **self.health_options)
             self.phase += 1
             return result
         if self.used or label != 'ime-visual-before' or present:
@@ -92,7 +95,8 @@ class FreshVisual:
         if (hashlib.sha256(self.image.read_bytes()).hexdigest() != prior['image_sha256']
                 or json.loads(self.image.with_name('after-challenge-visual.json').read_text()) != prior):
             raise RuntimeError('Health handoff image or metadata provenance changed')
-        result = self.visual.snapshot(view, label, prior, False, health_fallback=True)
+        result = self.visual.snapshot(view, label, prior, False, health_fallback=True,
+                                      **self.health_options)
         self.initial = copy.deepcopy(result)
         self.view = view
         (view.out / 'ime-health-handoff.json').write_text(json.dumps({
@@ -125,17 +129,17 @@ def transition(smoke, module, live, visual, helper, identity, old, new, seat):
                 return (control / name).exists()
             module.wait_for(ready, label + ' ' + name)
         marker('connected')
-        before = visual.snapshot(view, 'before', None, False)
+        before = visual.snapshot(view, 'before', None, False, health_psm=11, health_footer=True)
         (control / 'start').touch()
         marker('preedit')
         time.sleep(0.5)
-        visual.snapshot(view, 'active-preedit', before, True)
+        visual.snapshot(view, 'active-preedit', before, True, health_psm=11, health_footer=True)
         zero(capture, 'visible active preedit')
         # The observer deliberately has NO keyboard grab. Real Settings input
         # remains routed by Ember; no helper forwards or replays the shortcut.
         smoke.switch_mode(old, new)
         zero(capture, 'Settings switch complete')
-        after = visual.snapshot(view, 'cancelled-preedit', None, False)
+        after = visual.snapshot(view, 'cancelled-preedit', None, False, health_psm=11, health_footer=True)
         assert after['rectangle'] == before['rectangle'], 'Switch changed owned surface'
         (control / 'challenge').touch()
         marker('challenged')
@@ -144,7 +148,8 @@ def transition(smoke, module, live, visual, helper, identity, old, new, seat):
         assert len(outcomes) == 1, 'Ambiguous native context outcome'
         time.sleep(0.5)
         zero(capture, 'late commit quarantine or abandoned context')
-        verified_after = visual.snapshot(view, 'after-challenge', after, False, health_fallback=True)
+        verified_after = visual.snapshot(view, 'after-challenge', after, False, health_fallback=True,
+                                         health_psm=11, health_footer=True)
         (control / 'finish').touch()
         ime.wait(timeout=5)
         assert ime.returncode == 0
