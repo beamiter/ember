@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -42,6 +43,25 @@ def row(text, left=0, line=1, block=1):
 
 
 class Tests(unittest.TestCase):
+    def test_sentinel_command_is_path_independent_and_writes_exact_identity(self):
+        commands = []
+        with tempfile.TemporaryDirectory() as root:
+            for folder in ['short', 'long artifact root with spaces ' * 5]:
+                out = Path(root) / folder
+                out.mkdir()
+                smoke = driver.native.Smoke(Path('/bin/true'), 'x11', out)
+                command = driver.native.sentinel_command("one'quoted")
+                commands.append(command)
+                self.assertNotIn(str(out), command)
+                # Exercise actual shell quoting/redirection without a compositor.
+                # The native gate still verifies the real PTY's tty separately.
+                script = 'tty() { printf /dev/pts/fixture; }; ' + command + '; printf %s "$$"'
+                result = subprocess.run(['bash', '-c', script], env=smoke.env,
+                                        check=True, capture_output=True, text=True)
+                self.assertEqual(smoke.transcript.read_text(),
+                                 "one'quoted:" + result.stdout + ':/dev/pts/fixture\n')
+            self.assertEqual(commands[0], commands[1])
+
     def test_failed_ocr_diagnostic_cannot_pass_or_change_phrase(self):
         with tempfile.TemporaryDirectory() as tmp:
             smoke = object.__new__(driver.SearchSmoke)
@@ -155,7 +175,7 @@ class Tests(unittest.TestCase):
 
     def test_wrapped_completion_status_uses_exact_owned_public_evidence(self):
         source = Path(driver.__file__).read_text()
-        self.assertIn("self.public.raw_result('complete', 'raw-complete')", source)
+        self.assertIn("self.public.complete_raw_search('raw-complete')", source)
         self.assertNotIn("self.wait_phrase('Complete for this retained output only'", source)
 
     def test_real_default_block_search_binding_is_used(self):

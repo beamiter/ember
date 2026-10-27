@@ -81,12 +81,33 @@ def raw_hit(tree, expected, phase):
     public.click_index(node)
     forbidden={'active':('Continue this output','Restart this output'),
                'stopped':('Stop search','Continue this output'),
+               'partial':('Stop search','Restart this output'),
                'complete':('Stop search','Continue this output','Restart this output')}
     if phase not in forbidden:raise RuntimeError('Unsupported raw phase')
     if any(n['name'] in forbidden[phase] or (phase!='complete' and
            'Complete for this retained output only' in n['name']) for n in tree['nodes']):
         raise RuntimeError('Raw phase conflicts with other operation state')
-    if phase in ('active','stopped'):
+    progress = None
+    if phase == 'partial':
+        control=action_button(tree,expected,'Continue this output')
+        pattern=(r'Retained blocks #(\d+)–#(\d+) · Partial output: operation time limit; '
+                 r'([1-9][0-9]*) windows, ([1-9][0-9]*) row decodes, '
+                 r'([1-9][0-9]*) charged cells, ([0-9]+\.[0-9])s; Continue this output')
+        statuses=[n for n in tree['nodes'] if n['parent']==picker['path'] and n['role']==29
+                  and public.TEXT in n['interfaces'] and n.get('text')==n['name']
+                  and re.fullmatch(pattern,n['name'])]
+        if len(statuses)!=1:raise RuntimeError('Missing/ambiguous exact operation-time-limit status')
+        status=statuses[0]
+        if (not all(public.state(status,b) for b in (25,30))
+                or not public.inside(status.get('screen_extents',[]),picker['screen_extents'])):
+            raise RuntimeError('Partial status not visibly bounded')
+        match_progress=re.fullmatch(pattern,status['name'])
+        progress=dict(retained_range=[int(match_progress[1]),int(match_progress[2])],
+                      windows=int(match_progress[3]),rows=int(match_progress[4]),
+                      cells=int(match_progress[5]),seconds=float(match_progress[6]))
+        if progress['retained_range'][0]>progress['retained_range'][1]:
+            raise RuntimeError('Invalid retained range')
+    elif phase in ('active','stopped'):
         control=action_button(tree,expected,'Stop search' if phase=='active' else 'Restart this output')
     elif phase=='complete':
         choices=[n for n in tree['nodes'] if n['parent']==picker['path'] and n['role']==29
@@ -101,7 +122,12 @@ def raw_hit(tree, expected, phase):
     else:raise RuntimeError('Unsupported raw phase')
     if phase!='active' and any(n['name']=='Stop search' for n in tree['nodes']):
         raise RuntimeError('Raw activation while loading')
-    return {'hit':node,'phase_control':control,
+    source_range = None
+    if phase in ('partial','complete'):
+        range_match=re.match(r'Retained blocks #(\d+)–#(\d+)',
+                             status['name'] if phase=='partial' else control['name'])
+        source_range=[int(range_match[1]),int(range_match[2])]
+    return {'hit':node,'phase_control':control,'progress':progress,'source_range':source_range,
             'claim':{'token':expected,'retained_row':int(match[3]),'result_path':node['path']}}
 
 
@@ -275,6 +301,57 @@ class Driver:
             return raw_hit(tree,self.expected,phase)
         _,result=self.wait_evidence(select,label,timeout=timeout)
         return result
+
+    def complete_raw_search(self, label):
+        """Finish with real Continue actions; never relabel partial as complete.
+
+        The same 30-second observation deadline covers all operations. Per-
+        operation counters reset on Continue, so they are recorded as work,
+        not falsely described as a public global resume cursor.
+        """
+        deadline=time.monotonic()+30
+        claim=None
+        retained_range=None
+        continuations=0
+        require_resumed=False
+        def select(tree):
+            nonlocal require_resumed
+            names=[n['name'] for n in tree['nodes']]
+            if 'Stop search' in names:
+                result=raw_hit(tree,self.expected,'active')
+                if claim is not None and result['claim']!=claim:
+                    raise RuntimeError('Continue changed retained hit identity')
+                require_resumed=False
+                # Active progress can legitimately finish during a screenshot.
+                # Validate its owned state but capture only a stable terminal
+                # phase, just as raw_result('complete') does.
+                raise MissingTarget('Owned raw operation is still active')
+            if 'Continue this output' in names:
+                result=raw_hit(tree,self.expected,'partial')
+                if require_resumed:
+                    raise MissingTarget('Continue has not shown a new active operation')
+                return ('partial',result)
+            return ('complete',raw_hit(tree,self.expected,'complete'))
+        while time.monotonic()<deadline:
+            tree,(phase,result)=self.wait_evidence(select,label,timeout=max(0,deadline-time.monotonic()))
+            if claim is not None and result['claim']!=claim:
+                raise RuntimeError('Continue changed retained hit identity')
+            claim=result['claim']
+            if retained_range is not None and result['source_range']!=retained_range:
+                raise RuntimeError('Continue changed retained range')
+            if phase=='complete':
+                self.event(event='raw-completion',continuations=continuations,claim=claim)
+                return result
+            progress=result['progress']
+            if retained_range is not None and progress['retained_range']!=retained_range:
+                raise RuntimeError('Continue changed retained range')
+            retained_range=progress['retained_range']
+            if time.monotonic()>=deadline:raise RuntimeError('Raw completion deadline exhausted')
+            operation=invoke_button(tree,self.expected,'Continue this output')
+            continuations+=1
+            self.event(event='public-continue',label=label,claim=claim,progress=progress,**operation)
+            require_resumed=True
+        raise RuntimeError('Raw completion deadline exhausted')
 
     def button(self, name, label):
         allowed=('Search this retained output','Stop search','Restart this output','Earlier history')

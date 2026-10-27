@@ -1,5 +1,37 @@
 # Engineering handoff
 
+## 2026-10-27 — protect preedit and stabilize native observation fixtures
+
+- Link hover popups now yield while terminal preedit is nonempty, without
+  changing link detection, cursor eligibility, or Ctrl-click activation. Normal
+  hover presentation resumes on commit/cancel. This fixes the popup obscuring
+  composition rather than weakening the IME visual assertion.
+- Native shell sentinels use an inherited, quoted destination variable, so
+  artifact directory length cannot add a wrapped command row to the viewport.
+  The shell still writes and verifies its real PID/TTY identity. A pure shell
+  regression covers short/long paths, spaces and quoted sentinel text.
+- The live block-search positive control has quiet neighboring padding rows.
+  Row identities, 97-byte line widths, stream counts, unique markers, exact
+  target/neighbor pixels and negative controls remain enforced; no OCR
+  confidence, matching requirement or timeout was relaxed.
+- The 100k-row raw fixture now explicitly uses the public Continue action
+  when a scan reaches its legitimate operation-time budget. A fresh owned
+  partial state must have the exact reason, positive per-operation work and
+  a unique Continue button, with no conflicting active/completed controls.
+  Resume preserves query/hit identity and retained range; the original total
+  30-second deadline and final complete + adjacent pixel requirements remain.
+  Active states are validated before capture, so normal completion during a
+  repaint cannot be mistaken for a stable mixed-phase screenshot. Per-operation
+  counters reset on Continue and are not claimed as a global resume cursor.
+- Integrated the concurrent title-bar commit `86dbbdf` and its checked-in core
+  snapshot `54a39ac`; did not replace them with the older validation checkout.
+- Local validation: all 210 tests in the 13 native Python regression scripts,
+  23 Rust link-related tests, formatting and all-target Clippy passed. The full
+  pre-title-bar binary unit runner had 2151 passes, five ignored tests and the same three
+  trusted-system-Git environment failures documented above. Pure fixture tests
+  are not compositor acceptance; hosted native screenshots/results remain
+  required for this change.
+
 ## 2026-10-27 — HarfRust 0.14 compatibility and clipboard lock repair
 
 - Migrated the GPU font shaper to HarfRust's owned `Font`, short-lived

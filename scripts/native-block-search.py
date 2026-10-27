@@ -272,7 +272,7 @@ class SearchSmoke(native.Smoke):
             # Status text wraps with retained-range/progress chrome. Verify its
             # exact owned public label instead of joining unrelated OCR lines;
             # final navigation still requires independent target/neighbor pixels.
-            self.public.raw_result('complete', 'raw-complete')
+            self.public.complete_raw_search('raw-complete')
             self.navigate('E03EARLYHIT', 16, pointer=True, raw=True)
         else:
             for record in range(64):
@@ -307,7 +307,7 @@ def main():
     result = dict(binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                   backend=args.backend, scenario=args.scenario,
                   exclusions=['input p95 and presentation latency', 'complete memory accounting',
-                              'natural-limit Continue', 'continuous PTY contention',
+                              'guaranteed natural-limit Continue on every runner', 'continuous PTY contention',
                               'pane/query/reset/eviction/alternate-screen race matrix',
                               'keyboard final navigation', 'Wayland'])
     # The ambiguous numeric OCR observer is superseded, not character-repaired.

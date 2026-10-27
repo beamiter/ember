@@ -102,7 +102,7 @@ class Tests(unittest.TestCase):
   source=Path(p.__file__).read_text();self.assertNotIn('SetText(',source);self.assertNotIn('refresh_block_search_hits',source)
  def test_search_identity_controls_and_budget_remain(self):
   source=Path(p.__file__).with_name('native-block-search.py').read_text()
-  for text in ['active_hit_claim(rows, token)',"stopped['claim'] == claim", "self.wait_active_hit('E03EARLYHIT', 'loading-return-rejected')", "self.public.raw_result('complete', 'raw-complete')", "f'ROW{row + 1:06d}'", "'input p95 and presentation latency'",'self.memory_stop.wait(0.01)','for record in range(64)']:
+  for text in ['active_hit_claim(rows, token)',"stopped['claim'] == claim", "self.wait_active_hit('E03EARLYHIT', 'loading-return-rejected')", "self.public.complete_raw_search('raw-complete')", "f'ROW{row + 1:06d}'", "'input p95 and presentation latency'",'self.memory_stop.wait(0.01)','for record in range(64)']:
    self.assertIn(text,source)
   self.assertNotIn('self.query_point',source);self.assertEqual(source.count('self.key(*BLOCK_SEARCH_CHORD)'),1)
 
@@ -266,5 +266,100 @@ class RawEvidenceTests(unittest.TestCase):
    after['nodes'][-2]['name']=after['nodes'][-2]['name'].replace('#18','#19')
    driver.read=Mock(side_effect=[(tree,{}),(after,{})])
    with self.assertRaisesRegex(RuntimeError,'changed'):driver.evidence(lambda t:p.raw_hit(t,driver.expected,'active'),'raw')
+
+class ContinueTests(unittest.TestCase):
+ button_tree=Tests.button_tree
+ tree=Tests.tree
+ driver=Tests.driver
+ result_tree=EvidenceTests.result_tree
+ raw_tree=RawEvidenceTests.raw_tree
+ def partial_tree(self):
+  tree=self.raw_tree();tree['nodes'][-1]['name']='Continue this output'
+  status=copy.deepcopy(tree['nodes'][-1]);status.update(path=status['path']+'-status',role=29,
+   name='Retained blocks #1–#7 · Partial output: operation time limit; 87 windows, 89088 row decodes, 14521344 charged cells, 9.6s; Continue this output')
+  status['interfaces'].append(p.public.TEXT);status['text']=status['name']
+  tree['nodes'][2]['children'].append(status['path']);tree['nodes'].append(status)
+  return tree
+ def complete_tree(self):
+  tree=self.raw_tree();node=tree['nodes'][-1]
+  node.update(name='Retained blocks #1–#7 · Block #2: Complete for this retained output only; 11 chunks this window; 11 windows, 10913 row decodes, 1778819 charged cells, 1.2s',role=29)
+  node['interfaces'].append(p.public.TEXT);node['text']=node['name'];return tree
+ def test_partial_requires_exact_reason_positive_work_and_unique_owned_control(self):
+  tree=self.partial_tree();result=p.raw_hit(tree,'E03DISCOVERY','partial')
+  self.assertEqual(result['progress']['rows'],89088)
+  for case in ['reason','zero-work','no-control','duplicate-status','stop','complete','foreign']:
+   bad=copy.deepcopy(tree);status=bad['nodes'][-1];button=bad['nodes'][-2]
+   if case=='reason':status['name']=status['name'].replace('operation time limit','cancelled');status['text']=status['name']
+   elif case=='zero-work':status['name']=status['name'].replace('89088 row','0 row');status['text']=status['name']
+   elif case=='no-control':button['name']='Unknown'
+   elif case=='duplicate-status':bad['nodes'].append(copy.deepcopy(status))
+   elif case=='foreign':button['owner']=':9.9'
+   else:
+    extra=copy.deepcopy(button);extra['path']+='-mixed';extra['name']='Stop search' if case=='stop' else 'Complete for this retained output only';bad['nodes'].append(extra)
+   with self.subTest(case=case),self.assertRaises(RuntimeError):p.raw_hit(bad,'E03DISCOVERY','partial')
+ def test_continue_is_single_real_action_and_final_complete_preserves_hit(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory);clock=[0];calls=[];partial=self.partial_tree();active=self.raw_tree();complete=self.complete_tree()
+   phases=[partial,complete]
+   def wait(select,label,timeout):
+    calls.append(timeout);clock[0]+=1
+    if len(calls)==2:
+     with self.assertRaises(p.MissingTarget):select(partial)
+     with self.assertRaises(p.MissingTarget):select(active)
+    tree=phases.pop(0);return tree,select(tree)
+   driver.wait_evidence=wait
+   with patch.object(p.time,'monotonic',side_effect=lambda:clock[0]),patch.object(p.time,'sleep'),patch.object(p,'invoke_button',return_value={'returned':True}) as invoke:
+    result=driver.complete_raw_search('finish')
+   self.assertEqual(result['claim']['retained_row'],18);self.assertEqual(calls,[30,29])
+   invoke.assert_called_once();self.assertEqual(invoke.call_args.args[-1],'Continue this output')
+ def test_stale_partial_cannot_trigger_duplicate_continue(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory);partial=self.partial_tree();calls=[0]
+   def wait(select,label,timeout):
+    calls[0]+=1
+    if calls[0]==1:return partial,select(partial)
+    with self.assertRaises(p.MissingTarget):select(partial)
+    raise RuntimeError('Exact public target deadline exhausted')
+   driver.wait_evidence=wait
+   with patch.object(p,'invoke_button',return_value={}) as invoke,self.assertRaisesRegex(RuntimeError,'deadline exhausted'):
+    driver.complete_raw_search('finish')
+   invoke.assert_called_once()
+ def test_continuation_rejects_changed_hit_identity(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory);partial=self.partial_tree();complete=self.complete_tree()
+   complete['nodes'][-2]['name']=complete['nodes'][-2]['name'].replace('#18','#19')
+   phases=[partial,complete]
+   def wait(select,label,timeout):
+    tree=phases.pop(0);return tree,select(tree)
+   driver.wait_evidence=wait
+   with patch.object(p,'invoke_button',return_value={}),self.assertRaisesRegex(RuntimeError,'hit identity'):
+    driver.complete_raw_search('finish')
+
+ def test_continuation_rejects_changed_completion_range(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory);partial=self.partial_tree();complete=self.complete_tree()
+   complete['nodes'][-1]['name']=complete['nodes'][-1]['name'].replace('#1–#7','#1–#8')
+   complete['nodes'][-1]['text']=complete['nodes'][-1]['name'];phases=[partial,complete]
+   def wait(select,label,timeout):
+    tree=phases.pop(0);return tree,select(tree)
+   driver.wait_evidence=wait
+   with patch.object(p,'invoke_button',return_value={}),self.assertRaisesRegex(RuntimeError,'retained range'):
+    driver.complete_raw_search('finish')
+
+ def test_real_evidence_skips_active_capture_before_partial_or_completion(self):
+  for continued in [False,True]:
+   with self.subTest(continued=continued),tempfile.TemporaryDirectory() as directory:
+    driver=self.driver(directory);driver.smoke.run.return_value.stdout='1280 900'
+    driver.smoke.screenshot.side_effect=lambda label:(driver.smoke.out/(label+'.png')).write_bytes(b'fresh fixture')
+    active=self.raw_tree();partial=self.partial_tree();complete=self.complete_tree()
+    trees=iter([active,partial,partial,active,complete,complete] if continued else [active,complete,complete])
+    def read(label):
+     driver.serial+=1;tree=next(trees);return tree,p.public.controls(tree,driver.expected)
+    driver.read=read
+    with patch.object(p.time,'sleep'),patch.object(p,'invoke_button',return_value={}) as invoke:
+     result=driver.complete_raw_search('real-bracket')
+    self.assertEqual(result['claim']['retained_row'],18)
+    self.assertEqual(driver.smoke.screenshot.call_count,2 if continued else 1)
+    self.assertEqual(invoke.call_count,1 if continued else 0)
 
 if __name__=='__main__':unittest.main()

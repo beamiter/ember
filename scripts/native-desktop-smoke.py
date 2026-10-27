@@ -32,6 +32,13 @@ def wait_for(test, label, timeout=30):
     raise RuntimeError('Timed out: ' + label)
 
 
+def sentinel_command(sentinel):
+    # The displayed command must not depend on the artifact directory length:
+    # an extra wrapped row moves the native pixel/OCR fixture's live baseline.
+    # The destination is inherited by the real shell, not injected into the app.
+    return "printf '%s:%s:%s\\n' " + shlex.quote(sentinel) + ' "$$" "$(tty)" >> "$EMBER_SMOKE_SENTINELS"'
+
+
 class Smoke:
     def __init__(self, binary, backend, out):
         self.binary, self.backend, self.out = binary, backend, out
@@ -72,6 +79,7 @@ PS0=$'\e]133;C\a'
 PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
 """)
         self.transcript = out / 'shell-sentinels.txt'
+        self.env['EMBER_SMOKE_SENTINELS'] = str(self.transcript)
 
     def run(self, args, **kwargs):
         return subprocess.run(args, env=self.env, check=True, timeout=30, **kwargs)
@@ -166,7 +174,7 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             self.run(['grim', target])
 
     def command(self, sentinel, paste=False):
-        command = "printf '%s:%s:%s\\n' " + shlex.quote(sentinel) + ' "$$" "$(tty)" >> ' + shlex.quote(str(self.transcript))
+        command = sentinel_command(sentinel)
         if paste:
             if self.backend == 'x11':
                 # Keep the owner as a tracked child instead of daemonizing.

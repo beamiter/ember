@@ -1586,6 +1586,13 @@ fn app_mouse_frame_route(
 
 const LINK_ACTIVATION_DRAG_THRESHOLD: f32 = 4.0;
 
+// A hover popup must not cover the text currently being composed. Only its
+// presentation is suppressed; hover detection and Ctrl-link activation remain
+// unchanged, and the popup is eligible again after commit/cancel.
+fn link_tooltip_visible(link_eligible: bool, has_preedit: bool) -> bool {
+    link_eligible && !has_preedit
+}
+
 fn link_activation_press(input: &egui::InputState) -> Option<(bool, bool, egui::Pos2)> {
     input.events.iter().find_map(|event| {
         let egui::Event::PointerButton {
@@ -7943,6 +7950,9 @@ impl eframe::App for TerminalApp {
                     .unwrap_or(&self.renderer);
                 renderer.pointer_link_eligible_projected(&terminal, &mouse_projection_viewport, pos)
             });
+            // Sample the rendered session after any same-frame pane focus
+            // change, rather than reusing the frame-start keyboard owner.
+            let link_has_preedit = !terminal.preedit_text.is_empty();
             drop(terminal);
             if self.hovered_link.is_some() && hovered_link_eligible {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -7951,7 +7961,11 @@ impl eframe::App for TerminalApp {
             // 链接悬停提示:在指针右下方画一个浮层显示完整 URL 和 Ctrl+Click 操作提示。
             // OSC8 等链接显示的"文本"可能与真实目标不同(例如 "click here"),
             // 鼠标悬停透出真实跳转目标,避免用户被诱导点击未知链接。
-            if let Some(link) = self.hovered_link.as_ref().filter(|_| hovered_link_eligible) {
+            if let Some(link) = self
+                .hovered_link
+                .as_ref()
+                .filter(|_| link_tooltip_visible(hovered_link_eligible, link_has_preedit))
+            {
                 if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                     egui::Area::new(egui::Id::new("link_hover_tooltip"))
                         .order(egui::Order::Tooltip)
@@ -8310,6 +8324,15 @@ impl Drop for TerminalApp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn link_tooltip_yields_to_preedit_and_returns_after_composition() {
+        assert!(super::link_tooltip_visible(true, false));
+        assert!(!super::link_tooltip_visible(true, true));
+        assert!(super::link_tooltip_visible(true, false));
+        assert!(!super::link_tooltip_visible(false, false));
+        assert!(!super::link_tooltip_visible(false, true));
+    }
+
     use super::{
         alternate_scroll_cursor_bytes, app_mouse_frame_route,
         app_mouse_press_reports_from_snapshot, application_cell_at_pointer,

@@ -143,6 +143,11 @@ class Tests(unittest.TestCase):
                 elif mode == 'flush' and index == p.base.fixture.PILOT_LIVE_ROW:
                     self.assertEqual(new.index(p.base.fixture.PILOT_LIVE_MARKER.encode()),36)
                     self.assertTrue(new.rstrip(b' \n').endswith(p.base.fixture.PILOT_LIVE_MARKER.encode()))
+                elif mode == 'flush' and abs(index - p.base.fixture.PILOT_LIVE_ROW) == 1:
+                    # Quiet neighbors isolate the live positive control without
+                    # changing source row identity, width, or byte budgets.
+                    self.assertEqual(new.rstrip(b' \n'), f'E03FLUSH ROW{index:06d}'.encode())
+                    self.assertNotIn(p.base.fixture.PILOT_LIVE_MARKER.encode(), new)
                 else:self.assertEqual(old,new)
         for record in range(1,64):
             for index in [16,17]:self.assertEqual(p.base.fixture.line('snapshot',index,record),p.base.fixture.line('snapshot',index,record,True))

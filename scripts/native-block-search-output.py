@@ -41,7 +41,9 @@ def line(mode, index, record=0, observer_pilot=False):
         prefix = prefix.ljust(PILOT_COLUMN) + PILOT_LIVE_MARKER + '    '
     # Quiet padding keeps sparse-text OCR from joining these independent
     # control words to a dense dot leader. Width and source budgets stay fixed.
-    padding = ' ' if marker_row else '.'
+    quiet_live_neighbor = (observer_pilot and mode == 'flush' and record == 0
+                           and abs(index - PILOT_LIVE_ROW) <= 1)
+    padding = ' ' if marker_row or quiet_live_neighbor else '.'
     return (prefix + padding * (WIDTH - len(prefix)) + '\n').encode('ascii')
 
 
