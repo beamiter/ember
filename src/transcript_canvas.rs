@@ -76,21 +76,24 @@ impl TranscriptCanvas {
     ) -> CanvasPresentation {
         let height = f64::from(line_height.max(1.0));
         let max = document_rows.saturating_sub(visible_rows) as f64 * height;
-        self.motion.set_reduced_motion(reduced_motion);
         let geometry_changed = self.columns != columns
             || self.visible_rows != visible_rows
             || self.line_height != height;
+        // Capture the presented anchor before reduced-motion can snap an old
+        // wheel target. That destination belongs to the old layout, not to
+        // the fractional row the projection has just reflowed.
+        let remainder =
+            if self.initialized && !self.follows_live && follows_live == self.expected_follow {
+                self.motion.position() / self.line_height - self.expected_offset as f64
+            } else {
+                0.0
+            };
+        self.motion.set_reduced_motion(reduced_motion);
         if !self.initialized || geometry_changed {
             // The projection supplies a reflowed whole-row anchor. Preserve
             // the reader's position within that row across resize/font zoom,
             // but never carry an obsolete wheel destination into new geometry.
             // Ember projects ceil(position), so this remainder is non-positive.
-            let remainder =
-                if self.initialized && !self.follows_live && follows_live == self.expected_follow {
-                    self.motion.position() / self.line_height - self.expected_offset as f64
-                } else {
-                    0.0
-                };
             let position = if self.initialized && self.follows_live && follows_live {
                 0.0
             } else {
@@ -272,6 +275,34 @@ mod tests {
         assert_eq!(resized.translation, 0.0);
         assert!(resized.follows_live);
         assert!(!resized.animating);
+    }
+
+    #[test]
+    fn resize_with_reduced_motion_uses_presented_anchor_not_old_destination() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 10, 200, false, 0.0);
+        canvas.scroll(-5.0, true);
+        let old = present(&mut canvas, 10, 200, false, 0.016);
+        assert_eq!(old.translation, 5.0);
+        canvas.scroll(120.0, false);
+        let resized = canvas.present(16, 220, 2, 30, 100, false, 24.0, 0.032, true);
+        assert_eq!(resized.offset_rows, 16);
+        assert_eq!(resized.translation, 6.0);
+        assert!(!resized.animating);
+        assert!(!resized.follows_live);
+        let idle = canvas.present(16, 220, 2, 30, 100, false, 24.0, 0.048, true);
+        assert_eq!(idle, resized);
+    }
+
+    #[test]
+    fn reduced_motion_without_reflow_still_completes_requested_wheel_motion() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 10, 200, false, 0.0);
+        canvas.scroll(120.0, false);
+        let frame = canvas.present(10, 200, 200, 20, 80, false, 20.0, 0.016, true);
+        assert_eq!(frame.offset_rows, 16);
+        assert!(!frame.animating);
+        assert!(!frame.follows_live);
     }
 
     #[test]

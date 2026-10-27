@@ -35,6 +35,9 @@ switching tabs or splitting a tab does not transfer another pane's momentum.
 - Resizing a pane or changing font size keeps a reader's position within the
   anchored row, rather than snapping to a text-row boundary. A layout change
   retires obsolete wheel motion; a live-following pane stays at the live edge.
+  If reduced motion is enabled in the same frame as reflow, the presented
+  reading anchor wins over the obsolete wheel destination. Without reflow,
+  reduced motion still completes the requested destination immediately.
 - Explicit navigation and scrollbar dragging replace the old destination.
   Selecting history stops pending motion and holds the reading position as
   more output arrives; typing or returning to live restores following. A
