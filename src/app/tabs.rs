@@ -457,7 +457,19 @@ impl TerminalApp {
     fn tab_real_title(&self, tab_idx: usize) -> String {
         self.tab_display_session(tab_idx)
             .and_then(|idx| self.session_manager.sessions().get(idx))
-            .map(Self::session_cwd_title)
+            .map(|session| {
+                let fallback = Self::session_cwd_title(session);
+                if session
+                    .metadata
+                    .custom_name
+                    .as_ref()
+                    .is_some_and(|name| !name.is_empty())
+                {
+                    return fallback;
+                }
+                let terminal = session.terminal.lock();
+                jterm_core::title_bar::tab_label(&terminal.window_title, &fallback)
+            })
             .unwrap_or_default()
     }
 
@@ -672,12 +684,16 @@ impl TerminalApp {
             }
         }
         let pid = session.get_shell_pid();
-        jterm_core::process::process_cwd(pid)
+        let reported_cwd = session.terminal.lock().current_working_dir.clone();
+        reported_cwd
+            .or_else(|| jterm_core::process::process_cwd(pid))
             .map(|cwd| {
                 if let Ok(home) = std::env::var("HOME") {
                     if cwd == home {
                         "~".to_string()
-                    } else if let Some(rest) = cwd.strip_prefix(&home) {
+                    } else if let Some(rest) =
+                        cwd.strip_prefix(&home).filter(|rest| rest.starts_with('/'))
+                    {
                         format!("~{}", rest)
                     } else {
                         cwd
@@ -840,7 +856,11 @@ impl TerminalApp {
                                         ui.add_sized([ui.available_width(), row_h], btn)
                                     })
                                     .inner
-                                    .on_hover_text(Self::sidebar_tab_tooltip(*flags));
+                                    .on_hover_text(format!(
+                                        "{}\n{}",
+                                        title,
+                                        Self::sidebar_tab_tooltip(*flags)
+                                    ));
 
                                 // 拖拽开始:仅在按下且尚未跟踪时记录起点
                                 if resp.drag_started() {
@@ -1483,20 +1503,59 @@ impl TerminalApp {
             font_size,
         );
 
-        if ui
-            .put(
-                egui::Rect::from_min_size(
-                    egui::pos2(tab_rect.right() - 30.0, tab_rect.top() + 5.0),
-                    egui::vec2(25.0, tab_height - 10.0),
-                ),
-                egui::Button::new("+").frame(false),
-            )
-            .on_hover_text("New tab (Ctrl+Shift+T)")
-            .clicked()
-            && !workspace_drag_in_flight
-        {
-            self.new_tab();
+        // 关闭窗口按钮（最右侧，与顶部 tab 模式保持一致）
+        let close_win_size = 25.0;
+        let close_win_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                tab_rect.right() - close_win_size - 5.0,
+                tab_rect.top() + 5.0,
+            ),
+            egui::vec2(close_win_size, tab_height - 10.0),
+        );
+        let close_win_hovered = hover_pos
+            .map(|p| close_win_rect.contains(p))
+            .unwrap_or(false);
+        let close_win_bg = if close_win_hovered {
+            egui::Color32::from_rgb(200, 60, 55)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        painter.rect_filled(close_win_rect, 6.0, close_win_bg);
+
+        let cw_cross = 5.0;
+        let cw_center = close_win_rect.center();
+        let cw_x_color = if close_win_hovered {
+            egui::Color32::WHITE
+        } else {
+            tb_inactive_text
+        };
+        painter.line_segment(
+            [
+                egui::pos2(cw_center.x - cw_cross, cw_center.y - cw_cross),
+                egui::pos2(cw_center.x + cw_cross, cw_center.y + cw_cross),
+            ],
+            egui::Stroke::new(1.5, cw_x_color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(cw_center.x + cw_cross, cw_center.y - cw_cross),
+                egui::pos2(cw_center.x - cw_cross, cw_center.y + cw_cross),
+            ],
+            egui::Stroke::new(1.5, cw_x_color),
+        );
+        if close_win_hovered {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            if mouse_released {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
+        ui.interact(
+            close_win_rect,
+            egui::Id::new("sidebar_mode_close_window"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text("Close window");
+
         if !workspace_drag_in_flight {
             self.render_blocks_nav_toggle(
                 ui,
@@ -1607,7 +1666,7 @@ impl TerminalApp {
                 ("", title)
             };
             let parts: Vec<&str> = path_part.split('/').collect();
-            if parts.len() <= 1 {
+            if prefix.is_empty() || parts.len() <= 1 {
                 let ellipsis = "...";
                 let mut truncated = String::new();
                 for ch in title.chars() {
@@ -2123,11 +2182,13 @@ impl TerminalApp {
             // menu as sidebar tabs.
             let hit_rect = tab_rect_item.intersect(tab_clip_rect);
             if hit_rect.is_positive() && menu_rows_current {
-                let response = ui.interact(
-                    hit_rect,
-                    egui::Id::new(("top_tab_context_menu", i)),
-                    egui::Sense::click(),
-                );
+                let response = ui
+                    .interact(
+                        hit_rect,
+                        egui::Id::new(("top_tab_context_menu", i)),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_text(self.tab_title(i));
                 let info = SidebarTabInfo {
                     index: i,
                     title: self.tab_title(i),
@@ -2435,12 +2496,78 @@ impl TerminalApp {
             }
         }
 
+        // 关闭窗口按钮（最右侧）
+        let close_win_size = 25.0;
+        let close_win_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                tab_rect.right() - close_win_size - 5.0,
+                tab_rect.top() + 5.0,
+            ),
+            egui::vec2(close_win_size, tab_height - 10.0),
+        );
+
+        let close_win_hovered = if let Some(hover_pos) = hover_pos {
+            close_win_rect.contains(hover_pos)
+        } else {
+            false
+        };
+
+        let close_win_bg = if close_win_hovered {
+            egui::Color32::from_rgb(200, 60, 55)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+
+        painter.rect_filled(close_win_rect, 6.0, close_win_bg);
+
+        // 绘制 X 符号
+        let cw_cross = 5.0;
+        let cw_center = close_win_rect.center();
+        let cw_x_color = if close_win_hovered {
+            egui::Color32::WHITE
+        } else {
+            tb_inactive_text
+        };
+        painter.line_segment(
+            [
+                egui::pos2(cw_center.x - cw_cross, cw_center.y - cw_cross),
+                egui::pos2(cw_center.x + cw_cross, cw_center.y + cw_cross),
+            ],
+            egui::Stroke::new(1.5, cw_x_color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(cw_center.x + cw_cross, cw_center.y - cw_cross),
+                egui::pos2(cw_center.x - cw_cross, cw_center.y + cw_cross),
+            ],
+            egui::Stroke::new(1.5, cw_x_color),
+        );
+
+        // 检测关闭窗口按钮点击
+        if mouse_released
+            && !is_actually_dragging
+            && !any_tab_drag_in_flight
+            && !pane_drag_in_flight
+        {
+            if let Some(click_pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                if close_win_rect.contains(click_pos) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
         ui.interact(
             plus_btn_rect,
             egui::Id::new("top_new_tab_btn"),
             egui::Sense::hover(),
         )
-        .on_hover_text("New tab (Ctrl+Shift+T)");
+        .on_hover_text("New tab");
+        ui.interact(
+            close_win_rect,
+            egui::Id::new("top_close_window_btn"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text("Close window");
 
         // 向下移动光标
         ui.allocate_exact_size(

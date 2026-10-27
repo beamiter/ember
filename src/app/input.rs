@@ -3053,7 +3053,11 @@ impl TerminalApp {
             !terminal.preedit_text.is_empty()
         };
 
-        let window_title = self.title_bar_content().window_title;
+        let title = self.tab_title(self.tabs.active_index());
+        let window_title = format!(
+            "Ember · {}",
+            super::window::safe_window_title(&title, "Ember")
+        );
         if window_title != self.last_window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title.clone()));
             self.last_window_title = window_title;

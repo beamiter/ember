@@ -9,7 +9,6 @@ pub mod rendering;
 pub mod state;
 pub mod tabs;
 pub mod tasks;
-mod title_bar;
 pub mod window;
 
 #[cfg(test)]

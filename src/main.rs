@@ -5591,7 +5591,6 @@ impl TerminalApp {
             .resizable(false)
             .show(root_ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                self.render_window_title_bar(ui, ctx);
                 // Top 模式：完整水平标签栏(含 ☰ 与位置切换控件)。
                 // Sidebar 模式：精简顶栏(仅 ☰ 与位置切换控件)，标签在侧边栏内。
                 if self.show_top_tab_bar() {
