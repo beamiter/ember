@@ -58,6 +58,7 @@ def main():
         module.wait_for(smoke.app_window, 'installed Ember IME window')
         time.sleep(2)
         identity = smoke.command('ime-ready')
+        smoke.park_pointer()
         capture = smoke.raw_start('ime-return-' + args.mode)
         assert (capture / 'live.bin').read_bytes() == b'', 'Bytes before keyboard readiness'
         keyboard = keyboard_module.CompositionKeyboard(smoke)

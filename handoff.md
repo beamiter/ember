@@ -1,5 +1,34 @@
 # Engineering handoff
 
+## 2026-10-27 — park the real pointer before IME visual baselines
+
+- External descendant `d2357c5` removed an extra title row while retaining all
+  repair files. Its full hosted run passed live mode switching (including the
+  corrected collector boundary), but the first active Normal preedit failed.
+  Artifact `12712113500` SHA-256 is
+  `2c52a956da84418487fd17836fbdad0e8f73906290611eed064df6f81878c620`.
+- The unmodified PNG shows the real white pointer tail overlapping yellow
+  token pixels at y119–120. This is actual occlusion, not a tolerable OCR
+  mismatch: both layouts split the obscured word. No ROI heuristic, text
+  repair, image masking, font change or visual threshold relaxation was used.
+- The public virtual-pointer helper now supports a strict motion-only command:
+  absolute motion, frame and compositor roundtrip acknowledgment, with no
+  button events. Before each initial IME baseline, the driver verifies its
+  single scale-one output and focused app, then parks at the output origin
+  only if that point lies outside the client rectangle. Bad coordinates,
+  overflowing values, malformed commands or failed acknowledgment fail closed.
+- The pointer stays put through each composition's visual lifecycle. Settings
+  clicks still occur normally when explicitly testing a mode transition; the
+  next fresh composition parks before its own baseline. Raw byte, ownership,
+  exact token and exact pixel-restoration assertions remain intact.
+- New local tests compile the real C command loop against a recording protocol
+  shim: move emits no button, click keeps press/release ordering, and invalid
+  commands produce no motion/action acknowledgment. Driver tests cover actual
+  geometry bounds, owner/focus/exit checks and acknowledgment failure before
+  a live-cycle helper or collector starts. In the standalone fixture the IME
+  helper is already connected but composition and capture have not started. Hosted real-compositor verification and actual
+  screenshot inspection of the new head remain required.
+
 ## 2026-10-27 — end input capture before passive post-commit OCR
 
 - On `0329e05`, general Wayland selection passed; remaining native failures

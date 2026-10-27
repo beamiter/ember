@@ -25,7 +25,7 @@ class Tests(unittest.TestCase):
                 if cleanup_fail:raise RuntimeError('cleanup failed')
         process=Process()
         def artifact(smoke,label):
-            (out/'segment').mkdir();return SimpleNamespace(out=out/'segment',spawn=spawn)
+            (out/'segment').mkdir();return SimpleNamespace(out=out/'segment',spawn=spawn,park_pointer=lambda:events.append('park-pointer'))
         def spawn(*args):events.append('spawn');(control/'connected').touch();return process
         def wait(test,label):
             if (control/'start').exists():(control/'preedit').touch()
@@ -66,6 +66,8 @@ class Tests(unittest.TestCase):
                 args,events,result=self.fixture(d,outcome=outcome)
                 got=m.transition(*args)
                 self.assertEqual(got['native_outcome'],outcome)
+                self.assertEqual(events.count('park-pointer'),1)
+                self.assertLess(events.index('park-pointer'),events.index('before'))
                 order=['active-preedit','switch','cancelled-preedit','challenge','after-challenge','wait','finish']
                 self.assertEqual([x for x in events if x in order],order)
                 self.assertEqual(json.loads(result.read_text())['status'],'pass')

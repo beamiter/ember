@@ -38,6 +38,7 @@ def composition_cycle(smoke, module, keyboard_module, visual, helper, identity, 
     result = {'status': 'running', 'identity': identity, 'label': label}
     try:
         assert seat.poll() is None, 'Persistent seat keyboard exited'
+        view.park_pointer()
         ime = view.spawn([str(helper), str(control)], 'ime-client')
         def marker(name):
             def ready():

@@ -143,6 +143,7 @@ def transition(smoke, module, live, visual, helper, identity, old, new, seat):
     result = {'status': 'running', 'from': old, 'to': new, 'identity': identity}
     try:
         assert smoke.app.poll() is None and seat.poll() is None
+        view.park_pointer()
         capture = smoke.raw_start(label)
         zero(capture, 'collector ready')
         ime = view.spawn([str(helper), str(control)], 'ime-client')

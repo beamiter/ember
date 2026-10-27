@@ -134,7 +134,7 @@ class LiveTests(unittest.TestCase):
                     with self.assertRaisesRegex(AssertionError,'Exact sentinel transcript mismatch'):
                         live.exercise(smoke,None,None,None,None,SimpleNamespace(poll=lambda:None))
 
-    def cycle_fixture(self,directory,fail_preedit=False,wrong_identity=False,fail_after=False,helper_wait=None):
+    def cycle_fixture(self,directory,fail_preedit=False,wrong_identity=False,fail_after=False,helper_wait=None,fail_park=False):
         out=Path(directory);events=[];capture=out/'raw';capture.mkdir();(capture/'live.bin').write_bytes(b'')
         state={'status':None};seat=SimpleNamespace(poll=lambda:None)
         class Process:
@@ -151,6 +151,9 @@ class LiveTests(unittest.TestCase):
             def __init__(self):self.out=out;self.logs=[];self.processes=[];self.env={};self.app=object()
             def spawn(self,args,label):
                 events.append('helper-spawn');self.control=Path(args[1]);(self.control/'connected').touch();return helper
+            def park_pointer(self):
+                events.append('park-pointer')
+                if fail_park:raise RuntimeError('pointer ack failed')
             def raw_start(self,label):events.append('raw-start');return capture
             def raw_finish(self,path,identity,expected):
                 events.append('raw-finish');self.asserted_identity=identity;assert path==capture and expected=='你'.encode()
@@ -187,6 +190,8 @@ class LiveTests(unittest.TestCase):
             result=live.composition_cycle(smoke,module,keyboard,visual,Path('/synthetic/helper'),'42:/dev/pts/0','segment',seat)
             self.assertEqual(result['status'],'pass');self.assertEqual(result['committed_hex'],'e4bda0')
             self.assertEqual(events.count('release-return'),1);self.assertEqual(events.count('submit'),1)
+            self.assertEqual(events.count('park-pointer'),1)
+            self.assertLess(events.index('park-pointer'),events.index('raw-start'))
             self.assertLess(events.index('ime-preedit-zero-bytes'),events.index('release-return'))
             self.assertLess(events.index('helper-wait'),events.index('raw-finish'))
             self.assertLess(events.index('raw-finish'),events.index('post-commit-ocr'))
@@ -211,6 +216,13 @@ class LiveTests(unittest.TestCase):
                     live.composition_cycle(smoke,module,keyboard,visual,Path('/synthetic/helper'),'42:/dev/pts/0','segment',seat)
                 for event in ['raw-finish','post-commit-ocr','submit']:self.assertNotIn(event,events)
                 self.assertEqual(json.loads((Path(directory)/'segment/result.json').read_text())['status'],'fail')
+
+    def test_pointer_ack_failure_prevents_capture_helper_and_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            smoke,module,keyboard,visual,seat,events=self.cycle_fixture(directory,fail_park=True)
+            with self.assertRaisesRegex(RuntimeError,'pointer ack failed'):
+                live.composition_cycle(smoke,module,keyboard,visual,Path('/synthetic/helper'),'42:/dev/pts/0','segment',seat)
+            self.assertEqual(events,['park-pointer'])
 
     def test_preedit_failure_never_releases_return_or_submits(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(live.time,'sleep'):

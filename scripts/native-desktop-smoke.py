@@ -284,6 +284,35 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         response = self.pointer.stdout.readline().strip()
         assert response == expected, ('Pointer helper failed', response)
 
+    def park_pointer(self):
+        """Move without clicking into the verified output's non-client corner."""
+        if self.backend != 'wayland':
+            raise RuntimeError('IME pointer parking requires its Wayland fixture')
+        if self.app.poll() is not None:
+            raise RuntimeError('Ember exited before pointer parking')
+        spec = importlib.util.spec_from_file_location('pointer_visual', Path(__file__).with_name('native-ime-visual.py'))
+        visual = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(visual)
+        outputs = json.loads(self.run(['swaymsg', '-t', 'get_outputs', '-r'],
+                                      capture_output=True, text=True).stdout)
+        active = [item for item in outputs if item.get('active')]
+        if (len(active) != 1 or active[0].get('rect') != visual.OUTPUT_RECT
+                or active[0].get('scale') != 1 or active[0].get('transform') != 'normal'):
+            raise RuntimeError('Pointer parking requires the verified scale-one output')
+        tree = json.loads(self.run(['swaymsg', '-t', 'get_tree', '-r'],
+                                   capture_output=True, text=True).stdout)
+        owned = visual.owned_rectangle(tree, self.app.pid)
+        output = active[0]['rect']; rect = owned['rect']
+        x, y = output['x'], output['y']
+        if rect['x'] <= x < rect['x'] + rect['width'] and rect['y'] <= y < rect['y'] + rect['height']:
+            raise RuntimeError('No verified non-client pointer parking corner')
+        self.pointer.stdin.write(f"move {x} {y} {output['width']} {output['height']}\n")
+        self.pointer.stdin.flush()
+        self.pointer_ack('done')
+        (self.out / 'ime-pointer-park.json').write_text(json.dumps(
+            {'position': {'x': x, 'y': y}, 'output': output, 'owned': owned,
+             'motion_only': True, 'roundtrip_acknowledged': True}, indent=2))
+
     def click(self, x, y):
         if self.backend == 'x11':
             self.run(['xdotool', 'mousemove', '--sync', str(x), str(y), 'click', '1'])
