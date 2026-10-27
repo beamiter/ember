@@ -36,7 +36,7 @@ class SettingsModeTargetTests(unittest.TestCase):
     def rows(self):
         def word(text, x, y, w, h=12):
             return dict(text=text, left=str(x), top=str(y), width=str(w), height=str(h))
-        return [word('Appearance', 416, 196, 85), word('Remote', 633, 196, 56),
+        return [word('Advanced', 363, 226, 60), word('Settings', 428, 227, 50),
                 word('Terminal', 363, 552, 69), word('mode', 437, 552, 32),
                 word('Chat', 483, 552, 32), word('Chat', 1067, 35, 32)]
 
@@ -45,7 +45,7 @@ class SettingsModeTargetTests(unittest.TestCase):
 
     def test_missing_label_ambiguous_value_and_wrong_geometry_fail(self):
         import copy
-        for case in ['title-only', 'duplicate', 'label-missing', 'wrong-word', 'far', 'wrong-row', 'tabs']:
+        for case in ['title-only', 'duplicate', 'label-missing', 'wrong-word', 'far', 'wrong-row', 'heading-row', 'heading-duplicate', 'heading-word', 'heading-gap', 'label-column', 'label-above', 'label-below', 'duplicate-label', 'heading-reverse', 'heading-title', 'two-dialogs']:
             with self.subTest(case=case):
                 rows = copy.deepcopy(self.rows())
                 if case == 'title-only': rows.pop(4)
@@ -54,8 +54,36 @@ class SettingsModeTargetTests(unittest.TestCase):
                 elif case == 'wrong-word': rows[4]['text'] = 'Chatty'
                 elif case == 'far': rows[4]['left'] = '800'
                 elif case == 'wrong-row': rows[4]['top'] = '580'
-                else: rows[1]['top'] = '250'
+                elif case == 'heading-row': rows[1]['top'] = '250'
+                elif case == 'heading-duplicate': rows.extend(copy.deepcopy(rows[:2]))
+                elif case == 'heading-word': rows[0]['text'] = 'Advance'
+                elif case == 'heading-gap': rows[1]['left'] = '500'
+                elif case == 'label-column':
+                    for row in rows[2:5]:row['left']=str(int(row['left'])+100)
+                elif case == 'label-above': rows[2]['top'] = rows[3]['top'] = rows[4]['top'] = '210'
+                elif case == 'label-below': rows[2]['top'] = rows[3]['top'] = rows[4]['top'] = '1000'
+                elif case == 'duplicate-label': rows.extend(copy.deepcopy(rows[2:4]))
+                elif case == 'heading-reverse': rows[0]['text'],rows[1]['text']='Settings','Advanced'
+                elif case == 'heading-title': rows[1]['top']='150'
+                elif case == 'two-dialogs':
+                    other=copy.deepcopy(rows[:5])
+                    for row in other:row['left']=str(int(row['left'])+400)
+                    rows.extend(other)
                 with self.assertRaises(RuntimeError): desktop.settings_mode_selector(rows, 'Chat')
+
+    def test_unrelated_tabs_are_not_mode_field_anchors(self):
+        rows=self.rows()
+        rows.extend([dict(text='Advanced',left='500',top='193',width='60',height='11'),
+                     dict(text='poearance',left='412',top='193',width='74',height='13'),
+                     dict(text='Remote',left='609',top='193',width='48',height='10')])
+        self.assertEqual(desktop.settings_mode_selector(rows,'Chat')['left'],'483')
+
+    def test_exact_failed_artifact_geometry_selects_normal_not_title(self):
+        rows=[dict(text=t,left=str(x),top=str(y),width=str(w),height=str(h)) for t,x,y,w,h in [
+            ('Advanced',363,226,60,11),('Settings',428,227,50,13),
+            ('Terminal',363,522,54,11),('mode',421,522,35,11),('Normal',469,522,45,11),
+            ('Terminal',1060,35,54,11),('Normal',1140,35,45,11)]]
+        self.assertEqual(desktop.settings_mode_selector(rows,'Normal')['top'],'522')
 
 
 class LiveTests(unittest.TestCase):

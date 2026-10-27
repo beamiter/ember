@@ -50,18 +50,22 @@ def settings_mode_selector(rows, current):
         _, ay, _, ah = bounds(a)
         _, by, _, bh = bounds(b)
         return max(ay, by) < min(ay + ah, by + bh) and abs((2*ay + ah) - (2*by + bh)) <= 10
-    tabs = []
-    for name in ('Appearance', 'Remote'):
-        matches = [r for r in rows if r['text'] == name]
-        if len(matches) != 1:
-            raise RuntimeError('Missing or ambiguous Settings tab anchor')
-        tabs.append(matches[0])
-    if not same_row(*tabs):
-        raise RuntimeError('Settings tab anchors are on different rows')
-    tab_bottom = max(bounds(r)[1] + bounds(r)[3] for r in tabs)
+    # This observation is made after selecting Advanced. Its own section
+    # heading scopes the mode field; unrelated tabs are not field anchors.
+    headings = [(a, b) for a in rows for b in rows
+                if a['text'] == 'Advanced' and b['text'] == 'Settings'
+                and same_row(a, b)
+                and 0 <= bounds(b)[0] - (bounds(a)[0] + bounds(a)[2]) <= min(bounds(a)[3], bounds(b)[3])]
+    if len(headings) != 1:
+        raise RuntimeError('Missing or ambiguous Advanced Settings section heading')
+    heading, suffix = headings[0]
+    hx, hy, _, hh = bounds(heading)
+    heading_bottom = max(hy + hh, bounds(suffix)[1] + bounds(suffix)[3])
     labels = [(a, b) for a in rows for b in rows
               if a['text'] == 'Terminal' and b['text'] == 'mode'
-              and bounds(a)[1] > tab_bottom and same_row(a, b)
+              and heading_bottom < bounds(a)[1] <= heading_bottom + 32 * max(hh, bounds(suffix)[3])
+              and abs(bounds(a)[0] - hx) <= max(hh, bounds(a)[3])
+              and same_row(a, b)
               and 0 <= bounds(b)[0] - (bounds(a)[0] + bounds(a)[2]) <= min(bounds(a)[3], bounds(b)[3])]
     if len(labels) != 1:
         raise RuntimeError('Missing or ambiguous Settings Terminal mode label')

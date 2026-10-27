@@ -1,5 +1,25 @@
 # Engineering handoff
 
+## 2026-10-27 — scope mode selection to its Advanced section
+
+- Exact-head `8fabb86` passed the complete active-preedit cancellation/challenge
+  and fresh-composition gate, plus every other native gate except general
+  Wayland mode selection. Its binary SHA matches the previous run: no new
+  product or clipboard failure was observed.
+- Artifact `12709081846` (SHA-256
+  `24ebe803baad9cfc778e125b078620bf5a3211356f0f71cda126e5f411fd0604`)
+  shows a healthy Advanced Settings page. The field and current value were
+  exact, but an unrelated Appearance tab was misrecognized. Mode selection
+  now requires its own exact, unique `Advanced Settings` heading and an
+  aligned, bounded lower `Terminal mode` label, with the same unique adjacent
+  current value. It does not require unrelated tab text to locate the field.
+- No alternate OCR retry, fuzzy spelling, arbitrary first match, product change
+  or initial Advanced-tab targeting change. Negative controls cover separate
+  dialogs, missing/duplicate/reversed headings, wrong columns and vertical
+  bounds, duplicate field/value, and title-only values. All 28 original
+  mode-selector TSVs across `86dbbdf`, `352bc2b` and `8fabb86` locate the intended
+  field with this rule. Fresh hosted validation still remains required.
+
 ## 2026-10-27 — finish active-preedit source-mode observation
 
 - Exact-head `352bc2b` hosted CI passed all five non-release jobs and every
