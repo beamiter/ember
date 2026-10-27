@@ -16,6 +16,7 @@
 //! 5. **Strict correlation.** An OSC 133 completion only becomes an
 //!    observation when its reported command text matches the approved one.
 
+use jterm_core::agent::ModelRequestToken;
 use crate::config::Config;
 use crate::terminal::CompletedCommandEvent;
 #[cfg(test)]
@@ -178,10 +179,10 @@ fn proposal_command(session: &AgentSession, proposal_id: ProposalId) -> Option<&
 /// The pinned jagent parser mutates the transcript before returning its
 /// proposal. Keep a safe checkpoint so a command rejected only by the newer
 /// visual-spoof contract never survives long enough to reach the next frame.
-fn accept_model_reply_compat(session: &mut AgentSession, raw: &str) -> Result<(), String> {
+fn accept_model_reply_for(session: &mut AgentSession, request: &ModelRequestToken, raw: &str) -> Result<(), String> {
     let checkpoint = session.snapshot();
     let outcome = session
-        .accept_model_reply(raw)
+        .accept_model_reply_for(request, raw)
         .map_err(|error| error.to_string())?;
     let ModelOutcome::Proposal { command, .. } = outcome else {
         return Ok(());
@@ -406,6 +407,7 @@ pub struct AgentPanel {
     /// lands after New Task, a restore, or a session replacement belongs to a
     /// transcript that no longer exists and must not be accepted.
     request_epoch: Option<jterm_core::agent::AgentSessionEpoch>,
+ model_token: Option<ModelRequestToken>,
     cancel: Option<AiCancellationToken>,
     execution_generation: u64,
 }
@@ -428,6 +430,7 @@ impl AgentPanel {
             provider_label: String::new(),
             result_rx: None,
             request_epoch: None,
+ model_token: None,
             cancel: None,
             execution_generation: 0,
         }
@@ -578,6 +581,7 @@ impl AgentPanel {
         self.background_context_attached = background;
         self.input.clear();
         self.request_epoch = None;
+ self.model_token = None;
         self.status.clear();
 
         self.provider_label = provider_label;
@@ -678,6 +682,7 @@ impl AgentPanel {
         self.awaiting = None;
         self.result_rx = None;
         self.request_epoch = None;
+ self.model_token = None;
         self.loading = false;
         self.edit = None;
         self.status =
@@ -791,6 +796,7 @@ impl AgentPanel {
                     self.awaiting = None;
                     self.result_rx = None;
                     self.request_epoch = None;
+ self.model_token = None;
                     self.loading = false;
                     self.edit = None;
                     self.status = "Agent task stopped because the source terminal's recorded working directory no longer matches an independently verified local shell cwd".to_string();
@@ -805,23 +811,25 @@ impl AgentPanel {
                     self.cancel = None;
                     self.loading = false;
                     let expected_epoch = self.request_epoch.take();
+ let request = self.model_token.take();
                     if let Some(session) = self
                         .session
                         .as_mut()
-                        .filter(|session| expected_epoch == Some(session.epoch()))
+                        .filter(|session| expected_epoch == Some(session.epoch()) && request.as_ref().is_some_and(ModelRequestToken::is_active))
                     {
-                        let outcome = match result {
+                        let request = request.expect("checked request");
+ let outcome = match result {
                             Ok(raw) if raw.len() <= MAX_AGENT_MODEL_REPLY_BYTES => {
-                                accept_model_reply_compat(session, &raw)
+                                accept_model_reply_for(session, &request, &raw)
                             }
                             Ok(_) => session
-                                .model_failed(format!(
+                                .model_failed_for(&request, format!(
                                     "AI reply exceeded the {MAX_AGENT_MODEL_REPLY_BYTES}-byte limit"
                                 ))
                                 .map(|_| ())
                                 .map_err(|error| error.to_string()),
                             Err(error) => session
-                                .model_failed(error)
+                                .model_failed_for(&request, error)
                                 .map(|_| ())
                                 .map_err(|error| error.to_string()),
                         };
@@ -835,8 +843,8 @@ impl AgentPanel {
                     self.result_rx = None;
                     self.cancel = None;
                     self.loading = false;
-                    if let Some(session) = self.session.as_mut() {
-                        let _ = session.model_failed("AI worker thread exited unexpectedly");
+                    if let (Some(session), Some(request)) = (self.session.as_mut(), self.model_token.take()) {
+                        let _ = session.model_failed_for(&request, "AI worker thread exited unexpectedly");
                     }
                 }
             }
@@ -942,6 +950,7 @@ impl AgentPanel {
             git.as_ref(),
             shared_context,
         );
+        self.model_token = session.model_request_token();
         let token = AiCancellationToken::new();
         let worker_token = token.clone();
         let (tx, rx) = mpsc::channel();
@@ -970,6 +979,7 @@ impl AgentPanel {
         token: AiCancellationToken,
         rx: mpsc::Receiver<Result<String, String>>,
     ) {
+        if self.model_token.is_none() { self.model_token = self.session.as_ref().and_then(AgentSession::model_request_token); }
         if let Err(error) = spawned {
             // No worker owns this already-started model turn. Close its
             // receiver and fail the turn once, leaving the ordinary retry
@@ -979,6 +989,7 @@ impl AgentPanel {
             self.cancel = None;
             self.result_rx = None;
             self.request_epoch = None;
+ self.model_token = None;
             self.loading = false;
             let message = format!("could not start AI worker: {error}");
             if let Some(session) = self.session.as_mut() {
@@ -1498,6 +1509,7 @@ impl AgentPanel {
             self.awaiting = None;
             self.result_rx = None;
             self.request_epoch = None;
+ self.model_token = None;
             self.loading = false;
             self.edit = None;
             self.status = "Agent task stopped".to_string();
@@ -3294,4 +3306,10 @@ mod tests {
         panel.open(&Config::default(), "session-zero".into());
         assert!(panel.status.contains("disabled"));
     }
+}
+
+#[cfg(test)]
+fn accept_model_reply_compat(session: &mut AgentSession, raw: &str) -> Result<(), String> {
+ let request = session.model_request_token().expect("test request");
+ accept_model_reply_for(session, &request, raw)
 }
