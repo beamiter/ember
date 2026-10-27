@@ -1,5 +1,28 @@
 # Engineering handoff
 
+## 2026-10-27 — HarfRust 0.14 compatibility and clipboard lock repair
+
+- Migrated the GPU font shaper to HarfRust's owned `Font`, short-lived
+  `ShaperFont` and in-place `Buffer` API. Immutable font tables remain cached;
+  buffer allocations are reused while segment properties are cleared between
+  runs. Shaping errors reset the buffer and use the existing character
+  rasterization fallback rather than panic or expose partially shaped data.
+- Extended the bundled-font regression across LTR, RTL, multibyte UTF-8,
+  empty text and repeated reuse, preserving byte-index cluster assertions.
+- Updated the yanked `clipboard-win` 5.4.1 lock entry to compatible 5.4.3.
+  No advisory ignores or accessibility features were changed.
+- Validation: `cargo check --locked --tests`, `cargo clippy --locked
+  --all-targets -- -D warnings`, formatting and all five font-backend tests
+  passed. The complete library runner had 1343 passes, three ignored tests
+  and three failures: the existing trusted-system-Git tests reject this
+  container's non-system-owned `/`. Their security guards remain intact.
+- `scripts/security-check.sh --audit` reports zero vulnerabilities and three
+  denied maintenance warnings (zvariant, zvariant_derive, zbus_names).
+  Upstream Mundy/AccessKit/AT-SPI still require zbus 5; migrating that runtime
+  chain to zbus 6 is separate work, not hidden behind an audit exception.
+  Native compositor acceptance requires the hosted CI run of this repair;
+  the preceding head failed compilation before those gates could execute.
+
 ## 2026-10-26 — continuous Block and Chat transcript canvas
 
 - Each shell session now owns a pixel viewport over the existing projected

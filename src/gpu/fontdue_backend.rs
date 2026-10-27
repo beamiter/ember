@@ -156,45 +156,29 @@ fn lcd_filter_expand(src: &[u8], width: usize, height: usize, weight_boost: f32)
 /// Owned shaping output kept after releasing the immutable font-face borrow.
 type ShapedGlyphData = (u16, u32, f32, f32, f32);
 
-/// Parsed HarfRust shaping data backed by immutable owned font bytes.
+/// Owned immutable font data and its cached HarfRust layout tables.
 ///
-/// `ShaperData` caches the expensive font-derived tables without borrowing the
-/// source. A lightweight `FontRef` is recreated for each shape call, avoiding
-/// the self-referential forged `'static` lifetime the old RustyBuzz wrapper
-/// required.
+/// HarfRust 0.14's `Font` owns its source and caches derived tables. A short-lived
+/// `ShaperFont` borrows that cache, without self-referential or forged lifetimes.
 struct ShapingFont {
-    data: Arc<Vec<u8>>,
-    shaper_data: harfrust::ShaperData,
+    font: harfrust::Font,
     has_gsub: bool,
 }
 
 impl ShapingFont {
     fn new(data: Arc<Vec<u8>>) -> Option<Self> {
-        let font = harfrust::FontRef::from_index(data.as_slice(), 0).ok()?;
-        let has_gsub = font.table_data(harfrust::Tag::new(b"GSUB")).is_some();
-        let shaper_data = harfrust::ShaperData::new(&font);
-        Some(Self {
-            data,
-            shaper_data,
-            has_gsub,
-        })
+        let font = harfrust::Font::new(harfrust::font::Blob::Shared(data), 0)?;
+        let has_gsub = font.tables().gsub_data().is_some();
+        Some(Self { font, has_gsub })
     }
 
-    fn shape(&self, mut buffer: harfrust::UnicodeBuffer) -> (harfrust::GlyphBuffer, f32) {
-        // `new` parsed these same immutable bytes successfully. Rebuilding the
-        // borrowed view cannot fail unless that invariant is broken.
-        let font = harfrust::FontRef::from_index(self.data.as_slice(), 0)
-            .expect("validated immutable shaping font");
-        let shaper = self.shaper_data.shaper(&font).build();
-        let units_per_em = shaper.units_per_em() as f32;
-        // RustyBuzz's free `shape` function guessed direction/script/language
-        // internally. HarfRust exposes shaping as a method and requires the
-        // caller to establish those segment properties before plan creation.
+    fn shape(&self, buffer: &mut harfrust::Buffer) -> Result<f32, harfrust::ShapeError> {
+        let shaper = harfrust::ShaperFont::new(&self.font);
+        // Segment properties must be inferred afresh after clearing a reused
+        // buffer, especially when switching between left- and right-to-left text.
         buffer.guess_segment_properties();
-        (
-            shaper.shape(buffer, harfrust::ShapeOptions::new()),
-            units_per_em,
-        )
+        harfrust::shape(&shaper, buffer, harfrust::ShapeOptions::new())?;
+        Ok(self.font.units_per_em() as f32)
     }
 }
 
@@ -234,14 +218,12 @@ pub struct FontdueAtlas {
     cached_ascent: f32,
     cached_descent: f32,
     cached_advance_width: f32,
-    /// HarfRust's cached shaping tables. The borrowed `FontRef` itself is cheap
-    /// to reconstruct; the expensive derived state lives in [`ShapingFont`].
+    /// Owned font source and cached shaping tables, reused across shape misses.
     shape_regular: Option<ShapingFont>,
     shape_bold: Option<ShapingFont>,
     shaping_enabled: bool,
-    /// Reusable HarfRust buffer to avoid allocating one per shape miss. Held
-    /// in an Option so we can `take` it across the consume-by-shape boundary.
-    shape_buffer: Option<harfrust::UnicodeBuffer>,
+    /// Reusable in-place HarfRust buffer; cleared after both success and failure.
+    shape_buffer: harfrust::Buffer,
     // Subpixel rendering
     subpixel_rendering: bool,
 }
@@ -295,7 +277,7 @@ impl FontdueAtlas {
         let mut atlas = FontdueAtlas {
             shape_regular,
             shape_bold,
-            shape_buffer: Some(harfrust::UnicodeBuffer::new()),
+            shape_buffer: harfrust::Buffer::new(),
             font_regular,
             font_bold,
             fallback_fonts,
@@ -913,15 +895,21 @@ impl FontBackend for FontdueAtlas {
         };
 
         // 收集本次整形得到的字形信息为自有数据，随后即可释放对字体（&self）的借用，
-        // 以便调用需要 &mut self 的 rasterize_gid。复用 UnicodeBuffer 避免每次
+        // 以便调用需要 &mut self 的 rasterize_gid。复用 Buffer 避免每次
         // 缓存未命中都新分配一个。
-        let shaped: Option<Vec<ShapedGlyphData>> = shaping_font.map(|font| {
-            let mut buffer = self.shape_buffer.take().unwrap_or_default();
+        let shaped: Option<Vec<ShapedGlyphData>> = shaping_font.and_then(|font| {
+            let buffer = &mut self.shape_buffer;
             buffer.push_str(text);
-
-            let (glyph_buffer, units_per_em) = font.shape(buffer);
-            let infos = glyph_buffer.glyph_infos();
-            let positions = glyph_buffer.glyph_positions();
+            let units_per_em = match font.shape(buffer) {
+                Ok(units) => units,
+                Err(error) => {
+                    log::warn!("font shaping failed; using character rasterization: {error}");
+                    buffer.clear();
+                    return None;
+                }
+            };
+            let infos = buffer.glyph_infos();
+            let positions = buffer.glyph_positions();
 
             let scale = self.font_size_px / units_per_em;
 
@@ -938,9 +926,9 @@ impl FontBackend for FontdueAtlas {
                     )
                 })
                 .collect();
-            // Return the buffer to the pool for the next miss.
-            self.shape_buffer = Some(glyph_buffer.clear());
-            collected
+            // Retain allocations but reset text and segment properties.
+            buffer.clear();
+            Some(collected)
         });
 
         let shaped = match shaped {
@@ -1044,14 +1032,22 @@ mod tests {
             ShapingFont::new(Arc::new(hack.font.to_vec())).expect("parse bundled Hack font");
         assert!(shaping_font.has_gsub);
 
-        let mut input = harfrust::UnicodeBuffer::new();
-        input.push_str("a->b");
-        let (glyphs, units_per_em) = shaping_font.shape(input);
-
-        assert!(units_per_em.is_finite() && units_per_em > 0.0);
-        assert!(!glyphs.is_empty());
-        assert!(glyphs.glyph_infos().iter().all(|glyph| glyph.cluster < 4));
-        assert!(glyphs.clear().is_empty());
+        let mut buffer = harfrust::Buffer::new();
+        // Reuse the allocation across different scripts and UTF-8 byte lengths.
+        for text in ["a->b", "שלום", "éa", "", "a->b"] {
+            buffer.push_str(text);
+            let units_per_em = shaping_font.shape(&mut buffer).expect("shape text");
+            assert!(units_per_em.is_finite() && units_per_em > 0.0);
+            assert_eq!(buffer.is_empty(), text.is_empty());
+            assert_eq!(buffer.glyph_infos().len(), buffer.glyph_positions().len());
+            assert!(buffer.glyph_infos().iter().all(|glyph| {
+                text.is_char_boundary(glyph.cluster as usize)
+                    && (glyph.cluster as usize) < text.len()
+            }));
+            buffer.clear();
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.direction(), harfrust::Direction::Invalid);
+        }
     }
 
     #[test]
