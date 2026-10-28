@@ -52,4 +52,45 @@ class PopupTests(unittest.TestCase):
   for text in ['block','Bloc!','(Block','Block.']:
    with self.assertRaisesRegex(RuntimeError,'popup item'):d.settings_mode_popup([word(text)],self.selector,'block')
 
+ def authoritative(self,rows,region=None):
+  return d.registered_settings_popup_rows(rows,region or dict(x=489,y=584,width=100,height=65))
+ def test_registered_pass_is_authoritative_without_cross_pass_box_tolerance(self):
+  # The exact CI image produced these two boxes for one physical Chat item.
+  # The original union remains a failure; the predeclared one-pass observer
+  # receives neither a competing whole-image vote nor any repaired word box.
+  selector=word('Block',479,522,37,11)
+  whole=word('Chat',486,590,32,11);tight=word('Chat',485,590,33,11)
+  with self.assertRaisesRegex(RuntimeError,'popup item'):
+   d.settings_mode_popup(d.merge_settings_ocr_rows([whole],[tight]),selector,'chat')
+  observed=d.registered_settings_popup_rows([tight],dict(x=474,y=548,width=100,height=62))
+  self.assertIs(d.settings_mode_popup(observed,selector,'chat'),tight)
+ def test_authoritative_pass_rejects_same_pass_duplicate(self):
+  with self.assertRaisesRegex(RuntimeError,'Duplicate'):
+   self.authoritative([word('Block'),word('Block')])
+ def test_authoritative_pass_keeps_one_pixel_different_same_pass_boxes_ambiguous(self):
+  rows=self.authoritative([word('Block'),word('Block',501,592)])
+  with self.assertRaisesRegex(RuntimeError,'popup item'):
+   d.settings_mode_popup(rows,self.selector,'block')
+ def test_authoritative_pass_keeps_two_actual_same_named_items_ambiguous(self):
+  rows=self.authoritative([word('Block'),word('Block',500,615)])
+  with self.assertRaisesRegex(RuntimeError,'popup item'):
+   d.settings_mode_popup(rows,self.selector,'block')
+ def test_authoritative_two_different_items_select_only_exact_requested_name(self):
+  first,second=word('Block'),word('Chat',500,615)
+  observed=self.authoritative([first,second])
+  self.assertIs(d.settings_mode_popup(observed,self.selector,'block'),first)
+  self.assertIs(d.settings_mode_popup(observed,self.selector,'chat'),second)
+ def test_authoritative_pass_cannot_use_words_outside_registered_popup(self):
+  for row in [word('Block',488,592),word('Block',500,583),word('Block',570,592),word('Block',500,645)]:
+   with self.assertRaisesRegex(RuntimeError,'registered crop'):
+    self.authoritative([row])
+ def test_authoritative_pass_requires_registered_nonzero_geometry(self):
+  for region in [None,dict(x=489,y=584,width=0,height=65),dict(x=-1,y=584,width=100,height=65)]:
+   with self.assertRaisesRegex(RuntimeError,'registered native'):
+    d.registered_settings_popup_rows([word('Block')],region)
+ def test_empty_or_fuzzy_registered_pass_cannot_select_a_mode(self):
+  for rows in [[],[word('block')],[word('Block.')]]:
+   with self.assertRaisesRegex(RuntimeError,'popup item'):
+    d.settings_mode_popup(self.authoritative(rows),self.selector,'block')
+
 if __name__=='__main__':unittest.main()

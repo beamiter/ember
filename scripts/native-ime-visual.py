@@ -9,7 +9,7 @@ import re
 PREEDIT_TOKEN = 'EMBERPREEDITMARKER'
 HEALTH_ANCHOR = 'master'
 REFERENCE_SHELL_HEALTH = False
-# Opted into only by the existing 16pt, scale-one Return/live-switch fixtures.
+# Opted into only by registered scale-one14/16pt reference fixtures.
 # The original132f private geometry probe measured a23px native caret line.
 # sync_font_metrics takes the maximum of native-atlas metrics and the control
 # galley+4px inset. A separate locked-egui16pt measurement gives18+4=22px;
@@ -17,6 +17,10 @@ REFERENCE_SHELL_HEALTH = False
 REFERENCE_INLINE_BODY = False
 INLINE_FIXTURE_FONT_SIZE = 16.0
 INLINE_FIXTURE_LINE_HEIGHT = 23
+INLINE_FIXTURE_REGISTRATIONS = {
+    16.0: (16, 23, 'native132f actual caret height23 at configured16pt/line_spacing1/scale1; locked-egui control18+4=22 is a lower bound'),
+    14.0: (14, 20, 'native d6 fourteen-point active-switch frame:20px outer input row,18px exact dark plane after rounded border; source sync_font_metrics reserves control galley plus4'),
+}
 OUTPUT_RECT = {'x': 0, 'y': 0, 'width': 1280, 'height': 900}
 FOOTER_RECT = {'x': 0, 'y': 876, 'width': 1280, 'height': 24}
 
@@ -183,7 +187,8 @@ def reference_token_rows(smoke, label, image, rectangle, psm):
     return mapped,{'rectangle':region,'image':str(target),'image_sha256':digest,'ocr_psm':psm}
 
 
-def native_body_registration(pixels, width, height, *, single_line=True):
+def native_body_registration(pixels, width, height, *, single_line=True,
+                             min_height=16, max_height=23):
     """Register every substantial single-line dark plane without reading text.
 
     The reference terminal surface is RGB9,12,23. Connected components are
@@ -192,6 +197,9 @@ def native_body_registration(pixels, width, height, *, single_line=True):
     """
     if len(pixels) != width * height * 3:
         raise RuntimeError('Wrong native canvas RGB byte count')
+    if (type(min_height) is not int or type(max_height) is not int or
+            min_height <= 0 or max_height < min_height):
+        raise RuntimeError('Unregistered native body height contract')
     mask = bytearray(pixels[i:i+3] == bytes((9, 12, 23))
                      for i in range(0, len(pixels), 3))
     groups = {}
@@ -226,18 +234,18 @@ def native_body_registration(pixels, width, height, *, single_line=True):
     for (y, h), components in groups.items():
         x = min(c['x'] for c in components)
         w = max(c['x']+c['width'] for c in components)-x
-        if (w >= 250 and math.ceil(INLINE_FIXTURE_FONT_SIZE) <= h and
-                (not single_line or h <= INLINE_FIXTURE_LINE_HEIGHT)):
+        if (w >= 250 and min_height <= h and
+                (not single_line or h <= max_height)):
             registration.append(dict(rectangle=dict(x=x, y=y, width=w, height=h),
                                      components=sorted(components, key=lambda c: c['x'])))
     return sorted(registration, key=lambda r: (r['rectangle']['y'], r['rectangle']['x']))
 
 
-def native_body_rectangles(pixels, width, height):
-    return [record['rectangle'] for record in native_body_registration(pixels, width, height)]
+def native_body_rectangles(pixels, width, height, **bounds):
+    return [record['rectangle'] for record in native_body_registration(pixels, width, height, **bounds)]
 
 
-def reference_body_observations(smoke, label, image, rectangle):
+def reference_body_observations(smoke, label, image, rectangle, contract):
     """Additional OCR passes over all registered bodies in the same PNG.
 
     Whole-canvas passes remain in use. This resolves their segmentation loss
@@ -254,7 +262,8 @@ def reference_body_observations(smoke, label, image, rectangle):
                      f"{canvas['width']}x{canvas['height']}+{canvas['x']}+{canvas['y']}",
                      '+repage', '-colorspace', 'sRGB', '-alpha', 'off', '-depth', '8', 'RGB:-'],
                     capture_output=True).stdout
-    regions = native_body_registration(raw, canvas['width'], canvas['height'])
+    regions = native_body_registration(raw, canvas['width'], canvas['height'],
+        min_height=contract['min_height'], max_height=contract['line_height'])
     observations, evidence = [], []
     for index, registration in enumerate(regions):
         local = registration['rectangle']
@@ -313,7 +322,7 @@ def require_native_plane_witness(word, rectangle, canvas, planes):
     return matches[0]
 
 
-def reference_native_plane_witnesses(smoke, image, rectangle):
+def reference_native_plane_witnesses(smoke, image, rectangle, contract):
     """Geometry only for multi-line planes; do not add a tighter OCR pass."""
     owned = rectangle['rect']
     canvas = dict(x=owned['x']+292, y=owned['y']+91,
@@ -325,7 +334,8 @@ def reference_native_plane_witnesses(smoke, image, rectangle):
                     '+repage','-colorspace','sRGB','-alpha','off','-depth','8','RGB:-'],
                     capture_output=True).stdout
     planes=[]
-    for registration in native_body_registration(raw, canvas['width'], canvas['height'], single_line=False):
+    for registration in native_body_registration(raw, canvas['width'], canvas['height'], single_line=False,
+            min_height=contract['min_height'], max_height=contract['line_height']):
         local = registration['rectangle']
         planes.append(dict(rectangle=dict(local,x=local['x']+canvas['x'],y=local['y']+canvas['y']),
                            components=[dict(c,x=c['x']+canvas['x'],y=c['y']+canvas['y'])
@@ -337,15 +347,14 @@ def inline_body_fixture_contract(config_path):
     import tomllib
     config_bytes = config_path.read_bytes()
     config = tomllib.loads(config_bytes.decode('utf-8'))
-    if (config.get('font_size') != INLINE_FIXTURE_FONT_SIZE or
-            config.get('ui_font_size') != INLINE_FIXTURE_FONT_SIZE or
-            config.get('line_spacing') != 1.0):
+    font = config.get('font_size')
+    if (type(font) not in (int, float) or font not in INLINE_FIXTURE_REGISTRATIONS or config.get('ui_font_size') != font or
+            type(config.get('line_spacing')) not in (int, float) or config.get('line_spacing') != 1.0):
         raise RuntimeError('Unregistered font/line spacing for inline-body fixture')
+    minimum, maximum, source = INLINE_FIXTURE_REGISTRATIONS[font]
     return dict(config=str(config_path), config_sha256=hashlib.sha256(config_bytes).hexdigest(),
-                font_size=INLINE_FIXTURE_FONT_SIZE, ui_font_size=INLINE_FIXTURE_FONT_SIZE,
-                line_height=INLINE_FIXTURE_LINE_HEIGHT,
-                min_height=math.ceil(INLINE_FIXTURE_FONT_SIZE), scale=1, line_spacing=1.0,
-                line_source='native132f actual caret height23 at configured16pt/line_spacing1/scale1; locked-egui control18+4=22 is a lower bound')
+                font_size=font, ui_font_size=font, line_height=maximum,
+                min_height=minimum, scale=1, line_spacing=1.0, line_source=source)
 
 
 def merge_exact_token_observations(observations, rectangle):
@@ -483,7 +492,7 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
     native_plane_evidence = None
     if REFERENCE_SHELL_HEALTH and REFERENCE_INLINE_BODY:
         body_contract = inline_body_fixture_contract(smoke.config)
-        body_observations, body_evidence = reference_body_observations(smoke, label, image, rectangle)
+        body_observations, body_evidence = reference_body_observations(smoke, label, image, rectangle, body_contract)
         if legacy_token_pair is not None:
             require_legacy_token_geometry(*legacy_token_pair, rectangle, body_observations)
         token_observations.extend(body_observations)
@@ -493,7 +502,7 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
         for match in matches:
             if not any(box(word) == box(match) for word in registered):
                 if native_plane_evidence is None:
-                    canvas, planes, pixels_digest = reference_native_plane_witnesses(smoke, image, rectangle)
+                    canvas, planes, pixels_digest = reference_native_plane_witnesses(smoke, image, rectangle, body_contract)
                     native_plane_evidence = dict(canvas=canvas, planes=planes, canvas_rgb_sha256=pixels_digest,
                                                  scope='independent geometry witness only; no extra multi-line OCR')
                 plane = require_native_plane_witness(match, rectangle, native_plane_evidence['canvas'],

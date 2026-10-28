@@ -250,6 +250,7 @@ def main():
         global REFERENCE_SHELL_LAYOUT
         REFERENCE_SHELL_LAYOUT = True
         visual.REFERENCE_SHELL_HEALTH = True
+        visual.REFERENCE_INLINE_BODY = True
         live.MODES = ('block', 'chat', 'block')
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -265,7 +266,7 @@ def main():
         seat = smoke.spawn(['wtype', '-s', '600000', '-k', 'F24'], 'ime-seat-keyboard')
         time.sleep(0.5)
         initial_mode = 'block' if args.reference_shell else 'normal'
-        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + initial_mode + '"\nrestore_session = false\nfont_size = 14.0\nui_font_size = 14.0\n')
+        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + initial_mode + '"\nrestore_session = false\nfont_size = 14.0\nui_font_size = 14.0\nline_spacing = 1.0\n')
         with smoke.config.open('a') as config_file:
             config_file.write('app_renderer = "' + args.renderer + '"\n')
         smoke.app = smoke.spawn([str(smoke.binary)], 'ember')

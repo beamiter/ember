@@ -125,6 +125,47 @@ class BodyObserverTests(unittest.TestCase):
             with self.subTest(bodies=bodies), self.assertRaisesRegex(RuntimeError, 'geometry'):
                 visual.require_legacy_token_geometry([word()], [], self.rectangle, bodies)
 
+    def test_fourteen_point_contract_requires_its_exact_registered_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'config.toml'
+            path.write_text('font_size=14.0\nui_font_size=14.0\nline_spacing=1.0\n')
+            contract = visual.inline_body_fixture_contract(path)
+            self.assertEqual((contract['font_size'], contract['min_height'], contract['line_height']), (14, 14, 20))
+            for config in ['font_size=14\nui_font_size=16\nline_spacing=1\n',
+                           'font_size=15\nui_font_size=15\nline_spacing=1\n',
+                           'font_size=14\nui_font_size=14\nline_spacing=1.25\n',
+                           'font_size=14\nui_font_size=14\nline_spacing=true\n']:
+                path.write_text(config)
+                with self.subTest(config=config), self.assertRaisesRegex(RuntimeError, 'Unregistered'):
+                    visual.inline_body_fixture_contract(path)
+
+    def test_fourteen_point_body_bounds_do_not_expand_sixteen_point_contract(self):
+        for height, count in [(13, 0), (14, 1), (18, 1), (20, 1), (21, 0), (23, 0)]:
+            with self.subTest(height=height):
+                self.assertEqual(len(visual.native_body_rectangles(
+                    self.pixels([(0, 0, 300, height)]), 600, 100, min_height=14, max_height=20)), count)
+        self.assertEqual(visual.INLINE_FIXTURE_REGISTRATIONS[16.0][:2], (16, 23))
+
+    def test_fourteen_point_components_still_require_exact_collinearity(self):
+        for right in [(210, 5, 200, 17), (210, 6, 200, 18)]:
+            with self.subTest(right=right):
+                self.assertEqual(visual.native_body_rectangles(
+                    self.pixels([(0, 5, 200, 18), right]), 600, 100, min_height=14, max_height=20), [])
+
+    def test_fourteen_point_two_bodies_do_not_reduce_to_one_occurrence(self):
+        regions = visual.native_body_rectangles(self.pixels([(0, 5, 300, 18), (0, 45, 300, 18)]),
+                                               600, 100, min_height=14, max_height=20)
+        self.assertEqual(len(regions), 2)
+        self.assertEqual(len(self.merge([('body0', [word(y=5)]), ('body1', [word(y=45)])])), 2)
+
+    def test_fourteen_point_wrong_palette_and_invalid_height_contract_fail_closed(self):
+        pixels = self.pixels([(0, 5, 300, 18)])
+        self.assertEqual(visual.native_body_rectangles(pixels.replace(bytes((9, 12, 23)), bytes((10, 12, 23))),
+                                                     600, 100, min_height=14, max_height=20), [])
+        for minimum, maximum in [(0, 20), (14, 13), (True, 20), (14, 20.0)]:
+            with self.subTest(bounds=(minimum, maximum)), self.assertRaisesRegex(RuntimeError, 'height contract'):
+                visual.native_body_rectangles(pixels, 600, 100, min_height=minimum, max_height=maximum)
+
     def test_nonempty_layout_disagreement_never_gets_the_thin_exemption(self):
         with self.assertRaisesRegex(RuntimeError, 'geometry'):
             visual.require_legacy_token_geometry([word()], [word(x=21)], self.rectangle,

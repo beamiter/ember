@@ -121,7 +121,7 @@ def settings_mode_popup_region(selector, owned):
 
 
 def merge_settings_ocr_rows(primary, additional):
-    """Retain all observed words; only exact text/box equality deduplicates."""
+    """Legacy comparison: exact boxes only, never a production popup vote."""
     result = list(primary)
     seen = {(r['text'],) + tuple(int(r[k]) for k in ('left','top','width','height')) for r in primary}
     additional_seen = set()
@@ -133,6 +133,37 @@ def merge_settings_ocr_rows(primary, additional):
         if key not in seen:
             result.append(row)
             seen.add(key)
+    return result
+
+
+def registered_settings_popup_rows(rows, region):
+    """One preselected native popup/PSM owns the action observation.
+
+    Whole-image OCR remains a separate diagnostic. It must not duplicate a
+    physical item merely because segmentation moves its word box. Every word
+    from the one authoritative pass must remain inside its independently
+    registered native border; duplicate rows are never silently collapsed.
+    """
+    if (region is None or any(type(region.get(key)) is not int for key in ('x', 'y', 'width', 'height'))
+            or min(region['x'], region['y']) < 0 or min(region['width'], region['height']) <= 0):
+        raise RuntimeError('Missing or invalid registered native Settings popup')
+    result, seen = [], set()
+    for row in rows:
+        try:
+            text = row['text']
+            x, y, width, height = (int(row[key]) for key in ('left', 'top', 'width', 'height'))
+            if (not isinstance(text, str) or not text.strip() or min(width, height) <= 0
+                    or x < region['x'] or y < region['y']
+                    or x + width > region['x'] + region['width']
+                    or y + height > region['y'] + region['height']):
+                raise ValueError('word crosses registered popup')
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError('Settings popup OCR crosses registered crop or is malformed') from error
+        key = (text, x, y, width, height)
+        if key in seen:
+            raise RuntimeError('Duplicate native Settings popup OCR row')
+        seen.add(key)
+        result.append(row)
     return result
 
 
@@ -498,15 +529,15 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
                        f"{admissible['width']}x{admissible['height']}+{admissible['x']}+{admissible['y']}",
                        '+repage','-colorspace','sRGB','-alpha','off','-depth','8','RGB:-'],capture_output=True).stdout
             region = settings_mode_popup_plane(pixels, admissible, popup_selector)
-            # No registered plane cannot justify an additional OCR pass. The
-            # unchanged exact popup-name/uniqueness predicate still decides.
+            # Geometry chooses the authoritative observation before reading
+            # any popup words. An unregistered surface cannot justify a click.
             if region is None:
                 metadata['popup']={'admissible':admissible,'registered':False}
                 if (owned()!=before or hashlib.sha256(source.read_bytes()).hexdigest()!=digest or
                         hashlib.sha256(analysis.read_bytes()).hexdigest()!=metadata['analysis_sha256']):
                     raise RuntimeError('Settings popup ownership or immutable pixels changed')
                 (self.out/(label+'-settings-analysis.json')).write_text(json.dumps(metadata,indent=2))
-                return rows
+                raise RuntimeError('Missing registered native Settings popup')
             target = self.out / (label + '-settings-popup-gray-inverted.png')
             self.run(['convert', str(analysis), '-crop',
                       f"{region['width']}x{region['height']}+{region['x']}+{region['y']}", '+repage', str(target)])
@@ -520,13 +551,17 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
                 if min(w,h)<=0 or min(x,y)<0 or x+w>region['width'] or y+h>region['height']:
                     raise RuntimeError('Settings popup OCR crosses registered crop')
                 additional.append(dict(word,left=str(x+region['x']),top=str(y+region['y'])))
-            rows=merge_settings_ocr_rows(rows,additional)
+            primary_word_count = len(rows)
+            rows=registered_settings_popup_rows(additional,region)
             if (owned()!=before or hashlib.sha256(source.read_bytes()).hexdigest()!=digest or
                     hashlib.sha256(analysis.read_bytes()).hexdigest()!=metadata['analysis_sha256'] or
                     hashlib.sha256(target.read_bytes()).hexdigest()!=crop_digest):
                 raise RuntimeError('Settings popup ownership or immutable pixels changed')
             metadata['popup']={'rectangle':region,'admissible':admissible,'selector':popup_selector,'image':str(target),
                                'image_sha256':crop_digest,'ocr_psm':11,'source':'same Gray-inverted immutable full capture'}
+            metadata['popup']['action_observer']='single fixed-PSM pass in independently registered native popup'
+            metadata['popup']['whole_image_role']='retained diagnostic, not an additional action observation'
+            metadata['popup']['whole_image_word_count']=primary_word_count
         (self.out / (label + '-settings-analysis.json')).write_text(json.dumps(metadata,indent=2))
         return rows
 
