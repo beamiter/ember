@@ -121,6 +121,108 @@ fn cursor_rect(
     egui::Rect::from_min_size(egui::pos2(x, y), Vec2::new(width, height))
 }
 
+struct PreeditPaint {
+    galley: std::sync::Arc<egui::Galley>,
+    origin: egui::Pos2,
+    chip: egui::Rect,
+    clip: egui::Rect,
+    candidate: egui::Rect,
+}
+
+impl PreeditPaint {
+    fn paint(self, painter: &egui::Painter) {
+        let painter = painter.with_clip_rect(self.clip);
+        painter.rect_filled(self.chip, 3, Color32::from_rgb(231, 237, 253));
+        painter.galley(self.origin, self.galley, Color32::WHITE);
+    }
+}
+
+/// Consume the integration's Unicode-character range before painting the same
+/// composition. winit byte offsets have already been converted by egui-winit.
+/// A range has no direction, so its trailing edge is the candidate caret.
+/// Missing or malformed ranges retain the previous end-of-text fallback.
+pub fn apply_terminal_preedit_event(
+    terminal: &mut crate::terminal::TerminalState,
+    event: &egui::ImeEvent,
+) {
+    let egui::ImeEvent::Preedit {
+        text,
+        active_range_chars,
+    } = event
+    else {
+        return;
+    };
+    if text.is_empty() {
+        terminal.ime_enabled = false;
+        terminal.clear_preedit();
+    } else {
+        let count = text.chars().count();
+        let cursor = active_range_chars
+            .as_ref()
+            .filter(|range| range.start <= range.end && range.end <= count)
+            .map_or(count, |range| range.end);
+        terminal.ime_enabled = true;
+        terminal.set_preedit(text.clone(), cursor);
+    }
+}
+
+/// Place the real composition beside its projected caret without acquiring any
+/// layout space. A one-line input body must use its caret line, never a nearby
+/// command header or the shared toolbar.
+fn preedit_paint(
+    ui: &Ui,
+    caret: egui::Rect,
+    clip: egui::Rect,
+    text: &str,
+    preedit_cursor: usize,
+    font_size: f32,
+) -> Option<PreeditPaint> {
+    if !caret.is_finite() || !clip.is_finite() || !caret.intersects(clip) || !clip.is_positive() {
+        return None;
+    }
+    let galley = ui.painter().layout_no_wrap(
+        format!("➜ {text}"),
+        FontId::monospace(font_size),
+        Color32::from_rgb(40, 52, 76),
+    );
+    let size = galley.size();
+    if size.y > clip.height() || clip.width() <= 4.0 {
+        return None;
+    }
+    let padding_y = ((clip.height() - size.y) * 0.5).min(1.0);
+    let height = size.y + 2.0 * padding_y;
+    let width = (size.x + 16.0).min(clip.width());
+    let x = (caret.left() - 2.0).clamp(clip.left(), (clip.right() - width).max(clip.left()));
+    let y = if caret.bottom() + height <= clip.bottom() {
+        caret.bottom()
+    } else if caret.top() - height >= clip.top() {
+        caret.top() - height
+    } else {
+        caret
+            .top()
+            .clamp(clip.top(), (clip.bottom() - height).max(clip.top()))
+    };
+    let chip = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height));
+    let composition_cursor = galley.pos_from_cursor(egui::text::CCursor::new(
+        2 + preedit_cursor.min(text.chars().count()),
+    ));
+    // Long compositions scroll their model caret into this same body. The
+    // model text and the terminal's native caret are never changed.
+    let text_width = (width - 4.0).max(0.0);
+    let scroll_x = (composition_cursor.left() - text_width).max(0.0);
+    let origin = chip.min + egui::vec2(2.0 - scroll_x, padding_y);
+    let candidate_x = (origin.x + composition_cursor.left()).clamp(clip.left(), clip.right() - 1.0);
+    let candidate =
+        egui::Rect::from_min_size(egui::pos2(candidate_x, origin.y), egui::vec2(1.0, size.y));
+    Some(PreeditPaint {
+        galley,
+        origin,
+        chip,
+        clip,
+        candidate,
+    })
+}
+
 pub(crate) fn grid_position_from_content(
     pos: egui::Pos2,
     content_rect: egui::Rect,
@@ -4686,6 +4788,38 @@ impl TerminalRenderer {
                 )
             });
 
+        let preedit = if focus_enabled && terminal.ime_enabled && !terminal.preedit_text.is_empty()
+        {
+            ime_rect.and_then(|caret| {
+                let visible = self
+                    .canvas_row_painter(&painter, content_rect, cursor_pos.0)
+                    .clip_rect();
+                let clip = if self.chat_mode {
+                    self.chat_preedit_clip(
+                        terminal,
+                        &viewport,
+                        block_chrome.as_deref().unwrap_or_default(),
+                        content_rect,
+                        visible,
+                        caret,
+                    )
+                } else {
+                    Some(visible)
+                }?;
+                preedit_paint(
+                    ui,
+                    caret,
+                    clip,
+                    &terminal.preedit_text,
+                    terminal.preedit_cursor,
+                    self.font_size,
+                )
+            })
+        } else {
+            None
+        };
+        let ime_rect = preedit.as_ref().map(|paint| paint.candidate).or(ime_rect);
+
         let ctx = ui.ctx();
         if focus_enabled
             && (response.clicked()
@@ -5580,33 +5714,8 @@ impl TerminalRenderer {
             }
         }
 
-        // Render IME preedit text below cursor
-        if !terminal.preedit_text.is_empty() && terminal.ime_enabled {
-            let preedit_display = format!("➜ {}", terminal.preedit_text);
-
-            // 在光标下方显示预编辑文本
-            let preedit_x = content_rect.left() + cursor_pos.1 as f32 * char_width;
-            let preedit_y = self.canvas_row_content(content_rect, cursor_pos.0).top()
-                + cursor_pos.0 as f32 * line_height
-                + line_height;
-
-            // 确保不超出屏幕范围
-            if preedit_y + line_height <= content_rect.bottom() {
-                let font_id = FontId::monospace(self.font_size);
-                let galley = ui.painter().layout_no_wrap(
-                    preedit_display,
-                    font_id,
-                    Color32::from_rgb(40, 52, 76),
-                );
-
-                let origin = egui::pos2(preedit_x, preedit_y);
-                let chip = egui::Rect::from_min_size(
-                    origin - egui::vec2(2.0, 1.0),
-                    galley.size() + egui::vec2(16.0, 2.0),
-                );
-                painter.rect_filled(chip, 3, Color32::from_rgb(231, 237, 253));
-                painter.galley(origin, galley, Color32::WHITE);
-            }
+        if let Some(preedit) = preedit {
+            preedit.paint(&painter);
         }
 
         // Draw scrollbar background and thumb
@@ -9249,6 +9358,393 @@ mod tests {
         assert!(KittyImageLayer::BelowText.contains(-1));
         assert!(KittyImageLayer::AboveText.contains(0));
         assert!(KittyImageLayer::AboveText.contains(i32::MAX));
+    }
+
+    #[test]
+    fn actual_preedit_paint_and_candidate_stay_with_the_caret_owner() {
+        const TOKEN: &str = "NATIVEPREEDITTOKEN";
+        for dpi in [1.0, 1.25, 1.5] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(dpi);
+            ctx.run_ui(Default::default(), |_| {})
+                .drop_without_applying_deltas();
+            for font in [10.0, 18.0, 32.0] {
+                let line = font * 1.4;
+                for placement in ["below", "above", "inline", "outside", "narrow"] {
+                    for right_edge in [false, true] {
+                        let height = if placement == "inline" || placement == "narrow" {
+                            line
+                        } else {
+                            line * 4.0
+                        };
+                        let width = if placement == "narrow" { 64.0 } else { 640.0 };
+                        let clip = egui::Rect::from_min_size(
+                            egui::pos2(100.0, 100.0),
+                            egui::vec2(width, height),
+                        );
+                        let y = match placement {
+                            "above" => clip.bottom() - line,
+                            "outside" => clip.bottom() + line,
+                            _ => clip.top(),
+                        };
+                        let x = if right_edge {
+                            clip.right() - 10.0
+                        } else {
+                            clip.left()
+                        };
+                        let caret =
+                            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(10.0, line));
+                        let mut measured = None;
+                        let mut output = ctx.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(1000.0, 800.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ui| {
+                                if let Some(paint) = preedit_paint(
+                                    ui,
+                                    caret,
+                                    clip,
+                                    TOKEN,
+                                    TOKEN.chars().count(),
+                                    font,
+                                ) {
+                                    measured = Some((
+                                        paint.chip,
+                                        paint.candidate,
+                                        paint.origin,
+                                        paint.galley.size(),
+                                    ));
+                                    paint.paint(ui.painter());
+                                }
+                            },
+                        );
+                        let texts: Vec<_> = output
+                            .shapes
+                            .iter()
+                            .filter_map(|shape| {
+                                if let egui::Shape::Text(text) = &shape.shape {
+                                    Some((text.galley.text().to_owned(), shape.clip_rect))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        output.textures_delta.clear();
+                        if placement == "outside" {
+                            assert!(measured.is_none());
+                            assert!(
+                                texts.is_empty(),
+                                "an offscreen owner must not acquire a detached composition"
+                            );
+                            continue;
+                        }
+                        let (chip, candidate, origin, size) = measured.unwrap();
+                        assert!(
+                            clip.contains_rect(chip),
+                            "{dpi}/{font}/{placement}: {chip:?} outside {clip:?}"
+                        );
+                        assert!(
+                            chip.contains_rect(candidate),
+                            "candidate must belong to the painted composition"
+                        );
+                        assert_eq!(
+                            texts.len(),
+                            1,
+                            "paint one real composition, not a duplicate token"
+                        );
+                        assert_eq!(texts[0].0, format!("➜ {TOKEN}"));
+                        assert_eq!(texts[0].1, clip);
+                        if placement == "below" {
+                            assert!(chip.top() >= caret.bottom());
+                        }
+                        if placement == "above" {
+                            assert!(chip.bottom() <= caret.top());
+                        }
+                        if placement == "inline" || placement == "narrow" {
+                            assert!(chip.intersects(caret));
+                        }
+                        if placement != "narrow" {
+                            assert!(clip.contains_rect(egui::Rect::from_min_size(origin, size)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_single_line_preedit_fits_the_observed_chat_owner() {
+        let ctx = egui::Context::default();
+        let owner = egui::Rect::from_min_max(egui::pos2(330.0, 749.0), egui::pos2(932.0, 772.0));
+        let caret = egui::Rect::from_min_max(egui::pos2(330.0, 749.0), egui::pos2(340.0, 772.0));
+        let mut rects = None;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            if let Some(paint) = preedit_paint(
+                ui,
+                caret,
+                owner,
+                "NATIVEPREEDITTOKEN",
+                "NATIVEPREEDITTOKEN".chars().count(),
+                18.0,
+            ) {
+                rects = Some((paint.chip, paint.candidate));
+                paint.paint(ui.painter());
+            }
+        });
+        output.textures_delta.clear();
+        let (chip, candidate) = rects.unwrap();
+        assert!(owner.contains_rect(chip));
+        assert!(owner.contains_rect(candidate));
+        assert!(chip.intersects(caret));
+    }
+
+    #[test]
+    fn preedit_candidate_uses_the_existing_model_character_cursor() {
+        let ctx = egui::Context::default();
+        let clip = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(740.0, 123.0));
+        let caret = egui::Rect::from_min_size(clip.min, egui::vec2(10.0, 23.0));
+        let text = "你好x";
+        let mut positions = Vec::new();
+        for cursor in [0, 1, 2, 3, usize::MAX] {
+            let mut measured = None;
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                if let Some(paint) = preedit_paint(ui, caret, clip, text, cursor, 18.0) {
+                    let expected = paint.galley.pos_from_cursor(egui::text::CCursor::new(
+                        2 + cursor.min(text.chars().count()),
+                    ));
+                    measured = Some((paint.candidate, paint.origin.x + expected.left()));
+                    paint.paint(ui.painter());
+                }
+            });
+            output.textures_delta.clear();
+            let (candidate, expected_x) = measured.unwrap();
+            assert_eq!(candidate.left(), expected_x);
+            assert!(clip.contains_rect(candidate));
+            positions.push(candidate.left());
+        }
+        assert!(
+            positions.windows(2).take(3).all(|pair| pair[0] < pair[1]),
+            "middle CJK character cursors must not be replaced with the galley end"
+        );
+        assert_eq!(
+            positions[3], positions[4],
+            "a stale out-of-range cursor is clamped to the real text"
+        );
+    }
+
+    #[test]
+    fn integration_preedit_range_reaches_model_and_painted_candidate() {
+        let ctx = egui::Context::default();
+        let clip = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(740.0, 123.0));
+        let caret = egui::Rect::from_min_size(clip.min, egui::vec2(10.0, 23.0));
+        let mut terminal = TerminalState::new(80, 24);
+        let version = terminal.get_grid_version();
+        let mut positions = Vec::new();
+        for (range, expected_cursor) in [
+            (Some(0..0), 0),
+            (Some(1..1), 1),
+            (Some(1..2), 2),
+            (None, 3),
+            (Some(0..4), 3),
+            (Some(std::ops::Range { start: 2, end: 1 }), 3),
+        ] {
+            apply_terminal_preedit_event(
+                &mut terminal,
+                &egui::ImeEvent::Preedit {
+                    text: "你好x".to_owned(),
+                    active_range_chars: range,
+                },
+            );
+            assert!(terminal.ime_enabled);
+            assert_eq!(terminal.preedit_text, "你好x");
+            assert_eq!(terminal.preedit_cursor, expected_cursor);
+            let mut observed = None;
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                let paint = preedit_paint(
+                    ui,
+                    caret,
+                    clip,
+                    &terminal.preedit_text,
+                    terminal.preedit_cursor,
+                    18.0,
+                )
+                .expect("actual composition fits its owner");
+                let cursor = paint
+                    .galley
+                    .pos_from_cursor(egui::text::CCursor::new(2 + expected_cursor));
+                assert_eq!(paint.candidate.left(), paint.origin.x + cursor.left());
+                assert!(paint.clip.contains_rect(paint.candidate));
+                observed = Some(paint.candidate.left());
+                paint.paint(ui.painter());
+            });
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "➜ 你好x")));
+            output.textures_delta.clear();
+            positions.push(observed.unwrap());
+        }
+        assert!(
+            positions[0] < positions[1]
+                && positions[1] < positions[2]
+                && positions[2] < positions[3]
+        );
+        assert_eq!(&positions[3..], &[positions[3]; 3]);
+        apply_terminal_preedit_event(
+            &mut terminal,
+            &egui::ImeEvent::Preedit {
+                text: String::new(),
+                active_range_chars: Some(0..0),
+            },
+        );
+        assert!(!terminal.ime_enabled);
+        assert!(terminal.preedit_text.is_empty());
+        assert_eq!(terminal.preedit_cursor, 0);
+        assert_eq!(terminal.get_grid_version(), version);
+    }
+
+    #[test]
+    fn renderer_candidate_anchors_the_actual_painted_composition() {
+        let ctx = egui::Context::default();
+        let mut renderer = TerminalRenderer::new(
+            18.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        renderer.gpu_rendering = false;
+        let mut terminal = TerminalState::new(64, 8);
+        let mut baseline_rect = None;
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                baseline_rect = Some(
+                    renderer
+                        .render(
+                            ui,
+                            &mut terminal,
+                            true,
+                            true,
+                            &crate::search::SearchState::default(),
+                            &[],
+                            &None,
+                        )
+                        .rect,
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+        let baseline_caret = renderer.last_ime_rect;
+        terminal.set_preedit(
+            "NATIVEPREEDITTOKEN".to_owned(),
+            "NATIVEPREEDITTOKEN".chars().count(),
+        );
+        terminal.ime_enabled = true;
+        let grid_version = terminal.get_grid_version();
+        let mut composing_rect = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                composing_rect = Some(
+                    renderer
+                        .render(
+                            ui,
+                            &mut terminal,
+                            true,
+                            true,
+                            &crate::search::SearchState::default(),
+                            &[],
+                            &None,
+                        )
+                        .rect,
+                );
+            },
+        );
+        let mut chips = Vec::new();
+        let mut tokens = Vec::new();
+        for shape in &output.shapes {
+            match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == Color32::from_rgb(231, 237, 253) => {
+                    chips.push(rect.rect)
+                }
+                egui::Shape::Text(text) if text.galley.text() == "➜ NATIVEPREEDITTOKEN" => {
+                    tokens.push(shape.clip_rect)
+                }
+                _ => {}
+            }
+        }
+        let candidates: Vec<_> = output
+            .viewport_output
+            .values()
+            .flat_map(|viewport| &viewport.commands)
+            .filter_map(|command| {
+                if let egui::ViewportCommand::IMERect(rect) = command {
+                    Some(*rect)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        output.textures_delta.clear();
+        assert_eq!(chips.len(), 1);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(candidates, vec![renderer.last_ime_rect.unwrap()]);
+        assert!(chips[0].contains_rect(candidates[0]));
+        assert!(tokens[0].contains_rect(chips[0]));
+        assert_eq!(terminal.preedit_text, "NATIVEPREEDITTOKEN");
+        assert_eq!(
+            composing_rect, baseline_rect,
+            "preedit must not allocate canvas space"
+        );
+        assert_eq!(
+            terminal.get_grid_version(),
+            grid_version,
+            "painting cannot mutate PTY cells"
+        );
+        terminal.preedit_text.clear();
+        let mut restored_rect = None;
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                restored_rect = Some(
+                    renderer
+                        .render(
+                            ui,
+                            &mut terminal,
+                            true,
+                            true,
+                            &crate::search::SearchState::default(),
+                            &[],
+                            &None,
+                        )
+                        .rect,
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(restored_rect, baseline_rect);
+        assert_eq!(renderer.last_ime_rect, baseline_caret);
     }
 
     #[test]

@@ -52,7 +52,16 @@ fn state_icon(ui: &egui::Ui, rect: egui::Rect, state: model::StepState) {
     icon(ui, rect, kind, tint);
 }
 
+/// Rich message roles inherit the text size of their owning surface. The
+/// central transcript owns Main; a floating AI Chats window owns UI. Reference
+/// roles retain their reference hierarchy at the existing Config default.
+/// BODY is the default role size, not the font setting's normalization value.
+fn content_scale(ui: &egui::Ui) -> f32 {
+    crate::theme::workspace_font_size(ui) / crate::config::DEFAULT_FONT_SIZE
+}
+
 fn pill(ui: &mut egui::Ui, text: &str, key: &str, complete: bool) {
+    let scale = content_scale(ui);
     egui::Frame::NONE
         .fill(if complete {
             Color32::from_rgb(229, 244, 235)
@@ -62,22 +71,25 @@ fn pill(ui: &mut egui::Ui, text: &str, key: &str, complete: bool) {
         .corner_radius(5)
         .inner_margin(egui::Margin::symmetric(6, 0))
         .show(ui, |ui| {
-            ui.spacing_mut().interact_size.y = shell::METADATA_PILL_HEIGHT;
+            ui.spacing_mut().interact_size.y = shell::METADATA_PILL_HEIGHT * scale;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(12.0, shell::METADATA_PILL_HEIGHT),
+                    egui::vec2(12.0 * scale, shell::METADATA_PILL_HEIGHT * scale),
                     egui::Sense::hover(),
                 );
                 icon(
                     ui,
-                    egui::Rect::from_center_size(rect.center(), egui::vec2(12.0, 12.0)),
+                    egui::Rect::from_center_size(
+                        rect.center(),
+                        egui::vec2(12.0 * scale, 12.0 * scale),
+                    ),
                     Icon::from_key(key),
                     rgb(color::CANVAS_MUTED),
                 );
                 ui.label(
                     RichText::new(text)
-                        .size(9.0)
+                        .size(9.0 * scale)
                         .color(rgb(color::CANVAS_MUTED)),
                 );
             });
@@ -85,6 +97,7 @@ fn pill(ui: &mut egui::Ui, text: &str, key: &str, complete: bool) {
 }
 
 fn draw_steps(ui: &mut egui::Ui, steps: &[model::Step]) {
+    let scale = content_scale(ui);
     egui::Frame::NONE
         .fill(Color32::from_rgb(239, 244, 253))
         .corner_radius(8)
@@ -92,18 +105,18 @@ fn draw_steps(ui: &mut egui::Ui, steps: &[model::Step]) {
         .inner_margin(egui::Margin::symmetric(8, 0))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
-            ui.spacing_mut().interact_size.y = shell::TASK_ROW_HEIGHT;
+            ui.spacing_mut().interact_size.y = shell::TASK_ROW_HEIGHT * scale;
             for (index, step) in steps.iter().enumerate() {
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(16.0, shell::TASK_ROW_HEIGHT),
+                        egui::vec2(16.0 * scale, shell::TASK_ROW_HEIGHT * scale),
                         egui::Sense::hover(),
                     );
                     state_icon(ui, rect.shrink(1.0), step.state);
                     ui.add(
                         egui::Label::new(
                             RichText::new(&step.title)
-                                .size(11.0)
+                                .size(11.0 * scale)
                                 .color(rgb(color::CANVAS_TEXT)),
                         )
                         .truncate(),
@@ -113,7 +126,7 @@ fn draw_steps(ui: &mut egui::Ui, steps: &[model::Step]) {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
                                 RichText::new(elapsed)
-                                    .size(9.0)
+                                    .size(9.0 * scale)
                                     .color(rgb(color::CANVAS_MUTED)),
                             );
                         });
@@ -133,12 +146,36 @@ fn draw_steps(ui: &mut egui::Ui, steps: &[model::Step]) {
         });
 }
 
+fn diff_gutter_width(ui: &egui::Ui, diff: &model::CodeDiff, scale: f32) -> f32 {
+    let widest = diff
+        .lines
+        .iter()
+        .flat_map(|line| [line.old_line, line.new_line])
+        .flatten()
+        .map(|number| {
+            ui.painter()
+                .layout_no_wrap(
+                    number.to_string(),
+                    egui::FontId::monospace(9.0 * scale),
+                    rgb(color::CANVAS_MUTED),
+                )
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    (shell::DIFF_GUTTER_COLUMN_WIDTH * scale).max(widest + 8.0 * scale)
+}
+
 fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
+    let scale = content_scale(ui);
+    let gutter_width = diff_gutter_width(ui, diff, scale);
     egui::Frame::NONE
         .fill(Color32::WHITE)
         .corner_radius(10)
         .stroke(Stroke::new(1.0, rgb(color::LIGHT_BORDER)))
         .show(ui, |ui| {
+            ui.spacing_mut().interact_size.y =
+                crate::theme::workspace_control_height(shell::type_size::BODY * scale);
             egui::Frame::NONE
                 .fill(Color32::from_rgb(243, 246, 253))
                 .inner_margin(egui::Margin::symmetric(8, 1))
@@ -147,24 +184,27 @@ fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
                         // The message renderer uses zero-width spacing for its
                         // outer row; diff header groups keep their own fixed gap.
                         ui.spacing_mut().item_spacing.x = shell::METADATA_GAP;
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(16.0 * scale, 16.0 * scale),
+                            egui::Sense::hover(),
+                        );
                         icon(ui, rect, Icon::Code, rgb(color::CANVAS_MUTED));
                         let natural = ui
                             .painter()
                             .layout_no_wrap(
                                 diff.path.clone(),
-                                egui::FontId::proportional(10.0),
+                                egui::FontId::proportional(10.0 * scale),
                                 rgb(color::CANVAS_TEXT),
                             )
                             .size()
                             .x;
-                        let width = natural.min((ui.available_width() - 210.0).max(24.0));
+                        let width =
+                            natural.min((ui.available_width() - 210.0 * scale).max(24.0 * scale));
                         ui.add_sized(
-                            [width, 28.0],
+                            [width, 28.0 * scale],
                             egui::Label::new(
                                 RichText::new(&diff.path)
-                                    .size(10.0)
+                                    .size(10.0 * scale)
                                     .color(rgb(color::CANVAS_TEXT)),
                             )
                             .truncate(),
@@ -172,7 +212,7 @@ fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
                         .on_hover_text(&diff.path);
                         ui.label(
                             RichText::new(format!("+{} −{}", diff.added, diff.removed))
-                                .size(9.0)
+                                .size(9.0 * scale)
                                 .color(Color32::from_rgb(69, 145, 111)),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -180,20 +220,20 @@ fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
                                 false,
                                 egui::Button::new(
                                     RichText::new("Apply")
-                                        .size(9.0)
+                                        .size(9.0 * scale)
                                         .color(rgb(color::DISABLED_TEXT)),
                                 )
-                                .min_size(egui::vec2(43.0, 24.0))
+                                .min_size(egui::vec2(43.0 * scale, 24.0 * scale))
                                 .fill(rgb(color::CONTROL_SURFACE))
                                 .stroke(Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
                                 .corner_radius(6),
                             )
                             .on_disabled_hover_text("No authorized edit target is connected");
                             let copy = ui.add_sized(
-                                [55.0, 24.0],
+                                [55.0 * scale, 24.0 * scale],
                                 egui::Button::new(
                                     RichText::new("Copy")
-                                        .size(9.0)
+                                        .size(9.0 * scale)
                                         .color(rgb(color::CANVAS_MUTED)),
                                 )
                                 .fill(rgb(color::CONTROL_SURFACE))
@@ -212,17 +252,17 @@ fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
                             }
                             ui.label(
                                 RichText::new(&diff.language)
-                                    .size(9.0)
+                                    .size(9.0 * scale)
                                     .color(rgb(color::CANVAS_MUTED)),
                             );
                         });
                     });
                 });
             ui.spacing_mut().item_spacing.y = 0.0;
-            ui.add_space(shell::DIFF_BODY_VERTICAL_PADDING);
+            ui.add_space(shell::DIFF_BODY_VERTICAL_PADDING * scale);
             for line in &diff.lines {
                 let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), shell::DIFF_LINE_HEIGHT),
+                    egui::vec2(ui.available_width(), shell::DIFF_LINE_HEIGHT * scale),
                     egui::Sense::hover(),
                 );
                 let fill = match line.kind {
@@ -234,13 +274,12 @@ fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
                 for (index, number) in [line.old_line, line.new_line].into_iter().enumerate() {
                     ui.painter().text(
                         egui::pos2(
-                            rect.left() + (index + 1) as f32 * shell::DIFF_GUTTER_COLUMN_WIDTH
-                                - 4.0,
+                            rect.left() + (index + 1) as f32 * gutter_width - 4.0 * scale,
                             rect.center().y,
                         ),
                         egui::Align2::RIGHT_CENTER,
                         number.map(|n| n.to_string()).unwrap_or_default(),
-                        egui::FontId::monospace(9.0),
+                        egui::FontId::monospace(9.0 * scale),
                         rgb(color::CANVAS_MUTED),
                     );
                 }
@@ -249,39 +288,42 @@ fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
                     model::DiffKind::Removed => "−",
                     _ => " ",
                 };
-                let x = rect.left() + 2.0 * shell::DIFF_GUTTER_COLUMN_WIDTH;
+                let x = rect.left() + 2.0 * gutter_width;
                 ui.painter().text(
-                    egui::pos2(x + shell::DIFF_SIGN_WIDTH * 0.5, rect.center().y),
+                    egui::pos2(x + shell::DIFF_SIGN_WIDTH * scale * 0.5, rect.center().y),
                     egui::Align2::CENTER_CENTER,
                     sign,
-                    egui::FontId::monospace(10.0),
+                    egui::FontId::monospace(10.0 * scale),
                     rgb(color::CANVAS_TEXT),
                 );
                 ui.painter().with_clip_rect(rect).text(
-                    egui::pos2(x + shell::DIFF_SIGN_WIDTH, rect.center().y),
+                    egui::pos2(x + shell::DIFF_SIGN_WIDTH * scale, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     &line.text,
-                    egui::FontId::monospace(10.0),
+                    egui::FontId::monospace(10.0 * scale),
                     rgb(color::CANVAS_TEXT),
                 );
             }
-            ui.add_space(shell::DIFF_BODY_VERTICAL_PADDING);
+            ui.add_space(shell::DIFF_BODY_VERTICAL_PADDING * scale);
         });
 }
 
 fn draw_terminal(ui: &mut egui::Ui, title: &str, text: &str, max_height: f32) {
+    let scale = content_scale(ui);
     egui::Frame::NONE
         .fill(rgb(color::TERMINAL))
         .corner_radius(9)
         .inner_margin(10.0)
         .show(ui, |ui| {
+            ui.spacing_mut().interact_size.y =
+                crate::theme::workspace_control_height(shell::type_size::BODY * scale);
             ui.horizontal(|ui| {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                 icon(ui, rect, Icon::Terminal, rgb(color::CHROME_MUTED));
                 ui.label(
                     RichText::new(title)
-                        .size(9.0)
+                        .size(9.0 * scale)
                         .color(rgb(color::CHROME_MUTED)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -298,7 +340,7 @@ fn draw_terminal(ui: &mut egui::Ui, title: &str, text: &str, max_height: f32) {
                         egui::Label::new(
                             RichText::new(text)
                                 .monospace()
-                                .size(10.0)
+                                .size(10.0 * scale)
                                 .color(rgb(color::CHROME_TEXT)),
                         )
                         .selectable(true),
@@ -308,8 +350,11 @@ fn draw_terminal(ui: &mut egui::Ui, title: &str, text: &str, max_height: f32) {
 }
 
 pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
+    let scale = content_scale(ui);
     if message.role == model::Role::User {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            ui.spacing_mut().interact_size.y =
+                crate::theme::workspace_control_height(shell::type_size::BODY * scale);
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.add_space(9.0);
             let (avatar, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
@@ -319,7 +364,7 @@ pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
                 avatar.center(),
                 egui::Align2::CENTER_CENTER,
                 &message.avatar,
-                egui::FontId::proportional(10.0),
+                egui::FontId::proportional(10.0 * scale),
                 rgb(color::ACCENT),
             );
             ui.add_space(10.0);
@@ -329,13 +374,13 @@ pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
                 .inner_margin(10.0)
                 .show(ui, |ui| {
                     ui.set_width((shell::USER_BUBBLE_WIDTH - 20.0).min(ui.available_width()));
-                    ui.set_min_height(shell::USER_BUBBLE_HEIGHT - 20.0);
+                    ui.set_min_height((shell::USER_BUBBLE_HEIGHT - 20.0) * scale);
                     for part in &message.parts {
                         if let model::Part::Paragraph(text) = part {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(text)
-                                        .size(12.0)
+                                        .size(12.0 * scale)
                                         .color(rgb(color::CANVAS_TEXT)),
                                 )
                                 .halign(egui::Align::Min)
@@ -349,6 +394,8 @@ pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
         return;
     }
     ui.horizontal_top(|ui| {
+        ui.spacing_mut().interact_size.y =
+            crate::theme::workspace_control_height(shell::type_size::BODY * scale);
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(8.0);
         let (avatar, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
@@ -370,14 +417,14 @@ pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(&message.author)
-                        .size(shell::type_size::ROLE)
+                        .size(shell::type_size::ROLE * scale)
                         .strong()
                         .color(rgb(color::CANVAS_TEXT)),
                 );
                 if let Some(timing) = &message.timing {
                     ui.label(
                         RichText::new(format!("· {timing}"))
-                            .size(9.0)
+                            .size(9.0 * scale)
                             .color(rgb(color::CANVAS_MUTED)),
                     );
                 }
@@ -389,7 +436,7 @@ pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(text)
-                                    .size(shell::type_size::HEADLINE)
+                                    .size(shell::type_size::HEADLINE * scale)
                                     .family(egui::FontFamily::Name("reference-chrome-bold".into()))
                                     .strong()
                                     .color(rgb(color::CANVAS_TEXT)),
@@ -401,7 +448,7 @@ pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(text)
-                                    .size(12.0)
+                                    .size(12.0 * scale)
                                     .color(rgb(color::CANVAS_TEXT)),
                             )
                             .wrap()
@@ -743,7 +790,7 @@ impl TerminalApp {
                         separator.center(),
                         egui::Align2::CENTER_CENTER,
                         model::FIXTURE_DATE_SEPARATOR,
-                        egui::FontId::proportional(8.0),
+                        egui::FontId::proportional(8.0 * content_scale(ui)),
                         rgb(color::CANVAS_MUTED),
                     );
                     ui.spacing_mut().item_spacing.y = 0.0;
@@ -823,6 +870,206 @@ mod reference_font_tests {
                     initial_zoom,
                     "UI zoom must not scale viewport"
                 );
+            }
+        }
+    }
+
+    fn content_test_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let regular = fonts.families[&egui::FontFamily::Proportional].clone();
+        fonts.families.insert(
+            egui::FontFamily::Name("reference-chrome-bold".into()),
+            regular,
+        );
+        ctx.set_fonts(fonts);
+        ctx
+    }
+
+    #[test]
+    fn painted_content_roles_follow_the_owning_body_without_global_zoom() {
+        for dpi in [1.0, 1.25, 1.5] {
+            let ctx = content_test_context();
+            ctx.set_pixels_per_point(dpi);
+            ctx.run_ui(Default::default(), |_| {})
+                .drop_without_applying_deltas();
+            let fixture = model::acceptance_fixture();
+            let initial_zoom = ctx.zoom_factor();
+            let mut previous_widths = std::collections::HashMap::new();
+            // Default 14 preserves the shared 20/12/10 role hierarchy. The old
+            // explicitly configured fixture12 remains a nondefault case.
+            for owner_size in [8.0, 12.0, 13.0, 14.0, 15.0, 24.0] {
+                let mut output = ctx.run_ui(Default::default(), |ui| {
+                    crate::theme::configure_workspace_text(ui.style_mut(), owner_size);
+                    ui.set_width(1200.0);
+                    for message in &fixture.messages {
+                        draw_message(ui, message);
+                    }
+                });
+                let mut roles = Vec::new();
+                for shape in &output.shapes {
+                    text_roles(&shape.shape, &mut roles);
+                }
+                output.textures_delta.clear();
+                let scale = owner_size / crate::config::DEFAULT_FONT_SIZE;
+                let mut selected = Vec::new();
+                for (name, reference_size) in [
+                    ("One continuous canvas, a stable reading position", 20.0),
+                    ("Read files", 9.0),
+                    ("Inspect the current renderer", 11.0),
+                    ("src/canvas.rs", 10.0),
+                    ("38", 9.0),
+                    ("fn viewport_offset(row: f64) -> f64 {", 10.0),
+                ] {
+                    let role = roles.iter().find(|role| role.0 == name).unwrap();
+                    assert_eq!(role.1, reference_size * scale, "painted role {name}");
+                    if let Some(previous) = previous_widths.insert(name, role.2.x) {
+                        assert!(role.2.x > previous, "actual galley must grow: {name}");
+                    }
+                    selected.push(serde_json::json!({"text":role.0,"font":role.1,"extent":[role.2.x,role.2.y]}));
+                }
+                let body = roles
+                    .iter()
+                    .find(|role| role.0.starts_with("The message surface keeps"))
+                    .unwrap();
+                assert_eq!(body.1, 12.0 * scale);
+                selected.push(
+                    serde_json::json!({"text":body.0,"font":body.1,"extent":[body.2.x,body.2.y]}),
+                );
+                assert_eq!(ctx.zoom_factor(), initial_zoom);
+                eprintln!(
+                    "CONTENT_ROLE_MEASURE {}",
+                    serde_json::json!({"owner":owner_size,"dpi":dpi,"roles":selected})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sibling_content_uses_its_ui_owner_instead_of_the_central_main_group() {
+        let ctx = content_test_context();
+        for main_size in [12.0, 16.0] {
+            for ui_size in [14.0, 15.0] {
+                let mut measured = [0.0; 2];
+                let mut output = ctx.run_ui(Default::default(), |ui| {
+                    crate::theme::configure_workspace_text(ui.style_mut(), ui_size);
+                    ui.scope(|ui| {
+                        crate::theme::configure_workspace_text(ui.style_mut(), main_size);
+                        measured[0] = content_scale(ui);
+                        pill(ui, "Central content", "files", false);
+                    });
+                    // Like AI Chats' Window, this sibling does not inherit the
+                    // central transcript's local Main style.
+                    measured[1] = content_scale(ui);
+                    pill(ui, "Floating content", "files", false);
+                });
+                let mut roles = Vec::new();
+                for shape in &output.shapes {
+                    text_roles(&shape.shape, &mut roles);
+                }
+                output.textures_delta.clear();
+                assert_eq!(
+                    measured,
+                    [
+                        main_size / crate::config::DEFAULT_FONT_SIZE,
+                        ui_size / crate::config::DEFAULT_FONT_SIZE
+                    ]
+                );
+                for (label, owner) in [
+                    ("Central content", main_size),
+                    ("Floating content", ui_size),
+                ] {
+                    let painted = roles.iter().find(|role| role.0 == label).unwrap();
+                    assert_eq!(
+                        painted.1,
+                        9.0 * (owner / crate::config::DEFAULT_FONT_SIZE),
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zoomed_diff_gutters_and_rows_fit_their_actual_text() {
+        let ctx = content_test_context();
+        let fixture = model::acceptance_fixture();
+        let mut diff = fixture
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| {
+                if let model::Part::Diff(diff) = part {
+                    Some(diff.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let mut reference_gutter = 0.0;
+        ctx.run_ui(Default::default(), |ui| {
+            crate::theme::configure_workspace_text(
+                ui.style_mut(),
+                crate::config::DEFAULT_FONT_SIZE,
+            );
+            reference_gutter = diff_gutter_width(ui, &diff, content_scale(ui));
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(
+            reference_gutter,
+            shell::DIFF_GUTTER_COLUMN_WIDTH,
+            "the accepted two-digit reference gutter must not grow"
+        );
+        for (index, line) in diff.lines.iter_mut().enumerate() {
+            line.old_line = Some(999990 + index as u32);
+            line.new_line = Some(999990 + index as u32);
+        }
+        for owner_size in [8.0, 12.0, 24.0, 32.0] {
+            let mut gutter = 0.0;
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                crate::theme::configure_workspace_text(ui.style_mut(), owner_size);
+                ui.set_width(1200.0);
+                gutter = diff_gutter_width(ui, &diff, content_scale(ui));
+                draw_diff(ui, &diff);
+            });
+            let mut text_shapes = Vec::new();
+            fn collect<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::epaint::TextShape>) {
+                match shape {
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            collect(shape, out);
+                        }
+                    }
+                    egui::Shape::Text(text) => out.push(text),
+                    _ => {}
+                }
+            }
+            for shape in &output.shapes {
+                collect(&shape.shape, &mut text_shapes);
+            }
+            // Clone measurements before clearing the output's texture delta.
+            let measured: Vec<_> = text_shapes
+                .iter()
+                .map(|text| (text.galley.text().to_owned(), text.galley.size(), text.pos))
+                .collect();
+            output.textures_delta.clear();
+            let scale = owner_size / crate::config::DEFAULT_FONT_SIZE;
+            for (_, extent, _) in measured
+                .iter()
+                .filter(|(text, _, _)| text.starts_with("99999"))
+            {
+                assert!(extent.x + 8.0 * scale <= gutter + 0.01);
+                assert!(extent.y <= shell::DIFF_LINE_HEIGHT * scale);
+            }
+            let code: Vec<_> = measured
+                .iter()
+                .filter(|(text, _, _)| {
+                    text.contains("row: f64") || text.contains("let anchor = row;")
+                })
+                .collect();
+            assert_eq!(code.len(), 2);
+            for (_, extent, _) in code {
+                assert!(extent.y <= shell::DIFF_LINE_HEIGHT * scale);
             }
         }
     }

@@ -49,6 +49,7 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
             .max_rect(rect),
         |ui| {
             ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+            ui.spacing_mut().interact_size.y = shell::CONTROL_HEIGHT;
             *ui.visuals_mut() = egui::Visuals::light();
             ui.visuals_mut().disabled_alpha = 1.0;
             let model_width = if rect.width() > 540.0 {
@@ -79,10 +80,12 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                         ui.add_enabled_ui(enabled, |ui| {
                             ui.put(
                                 bounds,
-                                egui::Button::new("")
-                                    .fill(rgb(color::CONTROL_SURFACE))
-                                    .stroke(egui::Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
-                                    .corner_radius(7),
+                                egui::Button::new(
+                                    egui::RichText::new("").size(shell::type_size::CONTROL),
+                                )
+                                .fill(rgb(color::CONTROL_SURFACE))
+                                .stroke(egui::Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
+                                .corner_radius(7),
                             )
                         })
                         .inner
@@ -258,10 +261,12 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                     ui.add_enabled_ui(false, |ui| {
                         ui.put(
                             bounds,
-                            egui::Button::new("")
-                                .fill(rgb(color::CONTROL_SURFACE))
-                                .stroke(egui::Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
-                                .corner_radius(7),
+                            egui::Button::new(
+                                egui::RichText::new("").size(shell::type_size::CONTROL),
+                            )
+                            .fill(rgb(color::CONTROL_SURFACE))
+                            .stroke(egui::Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
+                            .corner_radius(7),
                         )
                     })
                     .inner
@@ -554,6 +559,50 @@ impl TerminalRenderer {
             }
         }
         cards
+    }
+
+    pub(super) fn chat_preedit_clip(
+        &self,
+        terminal: &TerminalState,
+        viewport: &ProjectedViewport,
+        entries: &[BlockChromeEntry],
+        content: egui::Rect,
+        visible: egui::Rect,
+        caret: egui::Rect,
+    ) -> Option<egui::Rect> {
+        if let Some(rows) = viewport.chat_composer_rows() {
+            let frame = self.shared_composer_rect(content, rows.clone());
+            if frame.contains(caret.center()) {
+                let mut clip = frame.intersect(visible);
+                clip.max.y = clip
+                    .max
+                    .y
+                    .min(self.composer_footer_rect(content, rows).top());
+                return (clip.is_positive() && clip.intersects(caret)).then_some(clip);
+            }
+        }
+        let mut has_cards = false;
+        for entry in entries {
+            for card in self.chat_cards(terminal, viewport, entry, content) {
+                has_cards = true;
+                if card.command || !card.rect.contains(caret.center()) {
+                    continue;
+                }
+                let mut clip = card.rect.intersect(visible);
+                if card.composer {
+                    if let Some(rows) = viewport.chat_composer_rows() {
+                        clip.max.y = clip
+                            .max
+                            .y
+                            .min(self.composer_footer_rect(content, rows).top());
+                    }
+                }
+                return (clip.is_positive() && clip.intersects(caret)).then_some(clip);
+            }
+        }
+        // A native surface without shell markers still owns its actual caret.
+        // A known command/header card is never a substitute for an input body.
+        (!has_cards && visible.intersects(caret)).then_some(visible)
     }
 
     fn chat_card_fill(&self, entry: &BlockChromeEntry, card: ChatCard) -> Color32 {
@@ -1110,6 +1159,60 @@ mod tests {
     use super::*;
     use crate::terminal::{ChatInputAction, ProjectionPolicy, ProjectionViewState};
 
+    #[test]
+    fn reference_tools_keep_their_actual_painted_height_across_main_font_sizes() {
+        use jterm_core::reference_shell::{self as shell, color};
+        let ctx = egui::Context::default();
+        for main_size in [8.0, 12.0, 14.0, 18.0, 28.0, 72.0] {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                crate::theme::configure_workspace_text(ui.style_mut(), main_size);
+                draw_reference_composer_tools(
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(333.0, 657.0),
+                        egui::vec2(643.0, shell::CONTROL_HEIGHT),
+                    ),
+                    true,
+                    0,
+                );
+            });
+            fn collect(shape: &egui::Shape, rects: &mut Vec<egui::Rect>) {
+                match shape {
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            collect(shape, rects);
+                        }
+                    }
+                    egui::Shape::Rect(rect)
+                        if rect.fill
+                            == Color32::from_rgb(
+                                color::CONTROL_SURFACE[0],
+                                color::CONTROL_SURFACE[1],
+                                color::CONTROL_SURFACE[2],
+                            ) =>
+                    {
+                        rects.push(rect.rect)
+                    }
+                    _ => {}
+                }
+            }
+            let mut rects = Vec::new();
+            for shape in &output.shapes {
+                collect(&shape.shape, &mut rects);
+            }
+            output.textures_delta.clear();
+            assert_eq!(rects.len(), 7, "six tool buttons and one model slot");
+            for rect in rects {
+                assert_eq!(rect.top(), 657.0);
+                assert_eq!(
+                    rect.height(),
+                    shell::CONTROL_HEIGHT,
+                    "actual Button paint must respect its reference slot at Main{main_size}"
+                );
+            }
+        }
+    }
+
     fn renderer() -> TerminalRenderer {
         let mut renderer = TerminalRenderer::new(
             16.0,
@@ -1407,6 +1510,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn chat_preedit_uses_the_real_body_and_excludes_commands_and_tools() {
+        let renderer = renderer();
+        let mut terminal = TerminalState::new(80, 16);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cat\r\n\x1b]133;C\x07");
+        let mut policy = ProjectionPolicy::new();
+        policy.set_chat_mode(true);
+        policy.set_block_chrome(true, 0);
+        policy.set_block_spacing(true);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 440.0));
+        let content = renderer.layout_rects(screen).0;
+        let view = renderer.projected_viewport_with_state(
+            &mut terminal,
+            &policy,
+            &mut ProjectionViewState::new(),
+        );
+        let entries = renderer
+            .block_chrome_snapshot(&terminal, &view, view.rows())
+            .unwrap();
+        let cards: Vec<_> = entries
+            .iter()
+            .flat_map(|entry| renderer.chat_cards(&terminal, &view, entry, content))
+            .collect();
+        let body = cards
+            .iter()
+            .find(|card| !card.command && !card.composer)
+            .unwrap();
+        let caret = egui::Rect::from_min_size(
+            body.rect.min + egui::vec2(8.0, 0.0),
+            egui::vec2(renderer.char_width, renderer.line_height),
+        );
+        let clip = renderer
+            .chat_preedit_clip(&terminal, &view, &entries, content, content, caret)
+            .unwrap();
+        assert_eq!(clip, body.rect.intersect(content));
+        let command = cards.iter().find(|card| card.command).unwrap();
+        let command_caret =
+            egui::Rect::from_center_size(command.rect.center(), egui::vec2(2.0, 2.0));
+        assert!(renderer
+            .chat_preedit_clip(&terminal, &view, &entries, content, content, command_caret)
+            .is_none());
+
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        prompt(&mut terminal);
+        let view = renderer.projected_viewport_with_state(
+            &mut terminal,
+            &policy,
+            &mut ProjectionViewState::new(),
+        );
+        let entries = renderer
+            .block_chrome_snapshot(&terminal, &view, view.rows())
+            .unwrap();
+        let composer = entries
+            .iter()
+            .flat_map(|entry| renderer.chat_cards(&terminal, &view, entry, content))
+            .find(|card| card.composer)
+            .unwrap();
+        let rows = view.chat_composer_rows().unwrap();
+        let footer = renderer.composer_footer_rect(content, rows);
+        let caret = egui::Rect::from_min_size(
+            composer.rect.min + egui::vec2(16.0, 4.0),
+            egui::vec2(renderer.char_width, renderer.line_height),
+        );
+        let clip = renderer
+            .chat_preedit_clip(&terminal, &view, &entries, content, content, caret)
+            .unwrap();
+        assert!(clip.bottom() <= footer.top());
+        let toolbar_caret = egui::Rect::from_center_size(footer.center(), egui::vec2(2.0, 2.0));
+        assert!(renderer
+            .chat_preedit_clip(&terminal, &view, &entries, content, content, toolbar_caret)
+            .is_none());
     }
 
     #[test]

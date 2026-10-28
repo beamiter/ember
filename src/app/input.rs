@@ -3014,15 +3014,8 @@ impl TerminalApp {
                         crate::debug_log!("[IME] Preedit: {:?}", text);
                         // egui 0.35 起 Enabled/Disabled 不再触发,改由 Preedit 的 text 是否为空来表达
                         // IME 活跃状态:非空 = 输入中,空 = 已退出。
-                        if text.is_empty() {
-                            terminal.ime_enabled = false;
-                            terminal.clear_preedit();
-                        } else {
-                            terminal.ime_enabled = true;
-                            // 光标位置用字符数而非字节数:CJK 预编辑文本每字符多字节,
-                            // 用 byte len 会让光标落到错误(过大)的位置。
-                            let cursor = text.chars().count();
-                            terminal.set_preedit(text.clone(), cursor);
+                        crate::ui::apply_terminal_preedit_event(&mut terminal, ime_event);
+                        if !text.is_empty() {
                             self.organism.accepted_input(&session.metadata.session_id);
                         }
                     }

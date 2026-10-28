@@ -13,6 +13,24 @@ import time
 ACCESSIBLE = 'org.a11y.atspi.Accessible'
 ROOT = '/org/a11y/atspi/accessible/root'
 LIMIT = 512
+SOFTWARE_VULKAN_ICD = '/usr/share/vulkan/icd.d/lvp_icd.x86_64.json'
+
+
+def task_software_vulkan_environment(generated):
+    """An explicit, hash-verified installed software ICD, never host routes."""
+    path = generated.get('EMBER_SMOKE_VULKAN_ICD')
+    expected = generated.get('EMBER_SMOKE_VULKAN_ICD_SHA256')
+    if path is None and expected is None:
+        return {}
+    if (path != SOFTWARE_VULKAN_ICD or not isinstance(expected, str) or
+            len(expected) != 64 or any(c not in '0123456789abcdef' for c in expected)):
+        raise RuntimeError('Software-only probe requires its registered ICD and SHA256')
+    source = Path(path)
+    if source.resolve(strict=True) != source or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+        raise RuntimeError('Installed software Vulkan ICD identity changed')
+    # Both names are explicit so newer and older Vulkan loaders agree. The
+    # ordinary sanitizer still discards all ambient VK/WGPU adapter variables.
+    return dict(VK_DRIVER_FILES=path, VK_ICD_FILENAMES=path)
 
 
 def child_environment(generated):
@@ -20,11 +38,13 @@ def child_environment(generated):
     keys = ('HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
             'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR', 'EMBER_SMOKE_SHELL_TRACE',
             'EMBER_SMOKE_CAPTURE', 'EMBER_SMOKE_RAW_ROOT', 'EMBER_SMOKE_SENTINELS')
-    return dict({k: generated[k] for k in keys}, PATH='/usr/bin:/bin',
+    child = dict({k: generated[k] for k in keys}, PATH='/usr/bin:/bin',
                 LANG='C.UTF-8', LC_ALL='C.UTF-8', SHELL='/bin/bash',
                 XDG_DATA_DIRS='/usr/local/share:/usr/share',
                 LIBGL_ALWAYS_SOFTWARE='1', WGPU_BACKEND='vulkan',
                 RUST_LOG='info', NO_AT_BRIDGE='0')
+    child.update(task_software_vulkan_environment(generated))
+    return child
 
 
 def validate_address(address, expected_bus):

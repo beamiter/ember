@@ -102,6 +102,68 @@ def settings_mode_popup(rows, selector, mode):
     return matches[0]
 
 
+def settings_mode_popup_region(selector, owned):
+    """Crop the existing admissible popup area from its observed selector.
+
+    The original target predicate remains authoritative. A symmetric100px
+    horizontal allowance comes from that predicate, and two selector-word
+    widths preserve full option words after their admissible left edge.
+    """
+    x, y, width, height = (int(selector[k]) for k in ('left', 'top', 'width', 'height'))
+    if min(width, height) <= 0:
+        raise RuntimeError('Invalid native Settings selector bounds')
+    region = dict(x=x-100, y=y+height, width=200+2*width, height=7*height)
+    if (region['x'] < owned['x'] or region['y'] < owned['y'] or
+            region['x']+region['width'] > owned['x']+owned['width'] or
+            region['y']+region['height'] > owned['y']+owned['height']):
+        raise RuntimeError('Settings popup region outside owned surface')
+    return region
+
+
+def merge_settings_ocr_rows(primary, additional):
+    """Retain all observed words; only exact text/box equality deduplicates."""
+    result = list(primary)
+    seen = {(r['text'],) + tuple(int(r[k]) for k in ('left','top','width','height')) for r in primary}
+    additional_seen = set()
+    for row in additional:
+        key = (row['text'],) + tuple(int(row[k]) for k in ('left','top','width','height'))
+        if key in additional_seen:
+            raise RuntimeError('Duplicate native Settings popup OCR row')
+        additional_seen.add(key)
+        if key not in seen:
+            result.append(row)
+            seen.add(key)
+    return result
+
+
+def settings_mode_popup_plane(pixels, region, selector):
+    """Measure the native popup's two vertical border runs, never its words."""
+    width, height = region['width'], region['height']
+    if len(pixels) != width*height*3:
+        raise RuntimeError('Invalid Settings popup RGB size')
+    minimum = 2*int(selector['height'])
+    center = int(selector['left'])+int(selector['width'])/2
+    runs=[]
+    for x in range(width):
+        start=None
+        for y in range(height+1):
+            border = y<height and pixels[(y*width+x)*3:(y*width+x)*3+3]==bytes((60,60,60))
+            if border and start is None:start=y
+            if not border and start is not None:
+                if y-start>=minimum:runs.append((x,start,y))
+                start=None
+    planes=[]
+    for left in runs:
+        for right in runs:
+            top=max(left[1],right[1]);bottom=min(left[2],right[2])
+            if (region['x']+left[0]<center<region['x']+right[0] and
+                    right[0]-left[0]+1>=int(selector['width']) and bottom-top>=minimum):
+                planes.append(dict(x=region['x']+left[0],y=region['y']+top,
+                                   width=right[0]-left[0]+1,height=bottom-top))
+    if len(planes)>1:raise RuntimeError('Ambiguous native Settings popup border plane')
+    return planes[0] if planes else None
+
+
 class Smoke:
     def __init__(self, binary, backend, out):
         self.binary, self.backend, self.out = binary, backend, out
@@ -384,7 +446,7 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         self.click(int(row['left']) + int(row['width']) // 2,
                    int(row['top']) + int(row['height']) // 2)
 
-    def reference_settings_words(self, label):
+    def reference_settings_words(self, label, *, popup_selector=None):
         # Use the existing Settings Save oracle's deterministic grayscale
         # inversion for dark dialog text. Original native pixels stay immutable;
         # exact spelling, uniqueness, geometry and real input still gate actions.
@@ -426,8 +488,46 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         rows=[word for word in rows if int(word['left'])>=r['x'] and int(word['top'])>=r['y']
               and int(word['left'])+int(word['width'])<=r['x']+r['width']
               and int(word['top'])+int(word['height'])<=r['y']+r['height']]
-        (self.out / (label + '-settings-analysis.json')).write_text(json.dumps({'owned':before,'source_sha256':digest,
-            'analysis_sha256':hashlib.sha256(analysis.read_bytes()).hexdigest(),'algorithm':'ImageMagick -colorspace Gray -negate','ocr_psm':11},indent=2))
+        metadata={'owned':before,'source_sha256':digest,
+            'analysis_sha256':hashlib.sha256(analysis.read_bytes()).hexdigest(),'algorithm':'ImageMagick -colorspace Gray -negate','ocr_psm':11}
+        if popup_selector is not None:
+            if not label.endswith('-mode-menu'):
+                raise RuntimeError('Popup ROI is limited to an observed Settings mode menu')
+            admissible = settings_mode_popup_region(popup_selector, r)
+            pixels = self.run(['convert',str(source),'-crop',
+                       f"{admissible['width']}x{admissible['height']}+{admissible['x']}+{admissible['y']}",
+                       '+repage','-colorspace','sRGB','-alpha','off','-depth','8','RGB:-'],capture_output=True).stdout
+            region = settings_mode_popup_plane(pixels, admissible, popup_selector)
+            # No registered plane cannot justify an additional OCR pass. The
+            # unchanged exact popup-name/uniqueness predicate still decides.
+            if region is None:
+                metadata['popup']={'admissible':admissible,'registered':False}
+                if (owned()!=before or hashlib.sha256(source.read_bytes()).hexdigest()!=digest or
+                        hashlib.sha256(analysis.read_bytes()).hexdigest()!=metadata['analysis_sha256']):
+                    raise RuntimeError('Settings popup ownership or immutable pixels changed')
+                (self.out/(label+'-settings-analysis.json')).write_text(json.dumps(metadata,indent=2))
+                return rows
+            target = self.out / (label + '-settings-popup-gray-inverted.png')
+            self.run(['convert', str(analysis), '-crop',
+                      f"{region['width']}x{region['height']}+{region['x']}+{region['y']}", '+repage', str(target)])
+            crop_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            reply = self.run(['tesseract',str(target),'stdout','--psm','11','tsv'], capture_output=True,text=True)
+            (self.out / (label + '-settings-popup-gray-inverted.tsv')).write_text(reply.stdout)
+            additional=[]
+            for word in csv.DictReader(io.StringIO(reply.stdout),delimiter='\t',quoting=csv.QUOTE_NONE):
+                if not word['text'].strip():continue
+                x,y,w,h=(int(word[k]) for k in ('left','top','width','height'))
+                if min(w,h)<=0 or min(x,y)<0 or x+w>region['width'] or y+h>region['height']:
+                    raise RuntimeError('Settings popup OCR crosses registered crop')
+                additional.append(dict(word,left=str(x+region['x']),top=str(y+region['y'])))
+            rows=merge_settings_ocr_rows(rows,additional)
+            if (owned()!=before or hashlib.sha256(source.read_bytes()).hexdigest()!=digest or
+                    hashlib.sha256(analysis.read_bytes()).hexdigest()!=metadata['analysis_sha256'] or
+                    hashlib.sha256(target.read_bytes()).hexdigest()!=crop_digest):
+                raise RuntimeError('Settings popup ownership or immutable pixels changed')
+            metadata['popup']={'rectangle':region,'admissible':admissible,'selector':popup_selector,'image':str(target),
+                               'image_sha256':crop_digest,'ocr_psm':11,'source':'same Gray-inverted immutable full capture'}
+        (self.out / (label + '-settings-analysis.json')).write_text(json.dumps(metadata,indent=2))
         return rows
 
     def switch_mode(self, old, new):
@@ -472,7 +572,7 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         if getattr(self, 'reference_shell_fixture', False):
             # The same mode names also exist in the shared toolbar. Scope this
             # exact target to the popup immediately below its observed field.
-            item = settings_mode_popup(observe(new + '-mode-menu'), row, new)
+            item = settings_mode_popup(self.reference_settings_words(new + '-mode-menu', popup_selector=row), row, new)
             self.click(int(item['left'])+int(item['width'])//2,int(item['top'])+int(item['height'])//2)
         else:
             self.click_word(new.title(), new + '-mode-menu')

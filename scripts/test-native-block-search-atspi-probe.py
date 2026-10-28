@@ -5,6 +5,7 @@ from pathlib import Path
 import unittest
 import copy
 import json
+import hashlib
 import tempfile
 import subprocess
 from unittest.mock import Mock, patch
@@ -18,13 +19,38 @@ class Tests(unittest.TestCase):
         src={k:'/synthetic/'+k for k in keys}
         src.update(DISPLAY=':0',WAYLAND_DISPLAY='host',DBUS_SESSION_BUS_ADDRESS='host',
                    AT_SPI_BUS_ADDRESS='host',LD_PRELOAD='host',PYTHONPATH='host',
-                   WGPU_BACKEND='host',GITHUB_TOKEN='host',XAUTHORITY='host',GTK_MODULES='host')
+                   WGPU_BACKEND='host',GITHUB_TOKEN='host',XAUTHORITY='host',GTK_MODULES='host',
+                   VK_ICD_FILENAMES='host',VK_DRIVER_FILES='host',WGPU_ADAPTER_NAME='host')
         out=p.child_environment(src)
         for k in ('DISPLAY','WAYLAND_DISPLAY','DBUS_SESSION_BUS_ADDRESS','AT_SPI_BUS_ADDRESS',
-                  'LD_PRELOAD','PYTHONPATH','GITHUB_TOKEN','XAUTHORITY','GTK_MODULES'):
+                  'LD_PRELOAD','PYTHONPATH','GITHUB_TOKEN','XAUTHORITY','GTK_MODULES',
+                  'VK_ICD_FILENAMES','VK_DRIVER_FILES','WGPU_ADAPTER_NAME'):
             self.assertNotIn(k,out)
         self.assertEqual(out['WGPU_BACKEND'],'vulkan')
         self.assertEqual(out['PATH'],'/usr/bin:/bin')
+
+    def test_only_explicit_verified_installed_software_icd_is_retained(self):
+        payload = b'unit fixture, never loaded as a driver'
+        request = dict(EMBER_SMOKE_VULKAN_ICD=p.SOFTWARE_VULKAN_ICD,
+                       EMBER_SMOKE_VULKAN_ICD_SHA256=hashlib.sha256(payload).hexdigest())
+        with patch.object(p.Path, 'resolve', return_value=Path(p.SOFTWARE_VULKAN_ICD)), \
+                patch.object(p.Path, 'read_bytes', return_value=payload):
+            self.assertEqual(p.task_software_vulkan_environment(request),
+                dict(VK_DRIVER_FILES=p.SOFTWARE_VULKAN_ICD, VK_ICD_FILENAMES=p.SOFTWARE_VULKAN_ICD))
+            bad = dict(request, EMBER_SMOKE_VULKAN_ICD_SHA256='0' * 64)
+            with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+                p.task_software_vulkan_environment(bad)
+
+    def test_foreign_unpaired_or_malformed_icd_stops_before_file_read(self):
+        for request in [dict(EMBER_SMOKE_VULKAN_ICD='/tmp/foreign.json',
+                             EMBER_SMOKE_VULKAN_ICD_SHA256='0' * 64),
+                        dict(EMBER_SMOKE_VULKAN_ICD=p.SOFTWARE_VULKAN_ICD),
+                        dict(EMBER_SMOKE_VULKAN_ICD_SHA256='0' * 64),
+                        dict(EMBER_SMOKE_VULKAN_ICD=p.SOFTWARE_VULKAN_ICD,
+                             EMBER_SMOKE_VULKAN_ICD_SHA256='not-a-digest')]:
+            with self.subTest(request=request), patch.object(p.Path, 'read_bytes') as read:
+                with self.assertRaises(RuntimeError): p.task_software_vulkan_environment(request)
+                read.assert_not_called()
 
     def test_generated_sentinel_survives_isolation_and_shell_writes_owned_file(self):
         spec=importlib.util.spec_from_file_location('isolated_desktop',Path(__file__).with_name('native-desktop-smoke.py'))

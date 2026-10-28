@@ -31,6 +31,7 @@ def main():
     visual = importlib.util.module_from_spec(visual_spec)
     visual_spec.loader.exec_module(visual)
     visual.REFERENCE_SHELL_HEALTH = args.reference_shell
+    visual.REFERENCE_INLINE_BODY = args.reference_shell
     smoke.reference_shell_fixture = args.reference_shell
     smoke.reference_readiness_marker = 'ime-ready'
     keyboard = None
@@ -58,7 +59,7 @@ def main():
         wait_ime_marker('connected', 'IME protocol connected')
         # Use readable native glyphs in the visual fixture. At the 14px default,
         # the yellow Chat preedit is only 10px high and OCR invents punctuation.
-        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + args.mode + '"\nrestore_session = false\nfont_size = 16.0\nui_font_size = 16.0\n')
+        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + args.mode + '"\nrestore_session = false\nfont_size = 16.0\nui_font_size = 16.0\nline_spacing = 1.0\n')
         smoke.app = smoke.spawn([str(smoke.binary)], 'ember')
         module.wait_for(smoke.app_window, 'installed Ember IME window')
         time.sleep(2)

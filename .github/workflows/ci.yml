@@ -424,6 +424,7 @@ jobs:
         run: |
           python3 scripts/test-native-ime-keyboard.py
           python3 scripts/test-native-ime-visual.py
+          python3 scripts/test-native-ime-body-observer.py
           mkdir -p "$RUNNER_TEMP/ember-ime"
           wayland-scanner client-header scripts/protocols/input-method-unstable-v2.xml "$RUNNER_TEMP/ember-ime/input-method-unstable-v2-client-protocol.h"
           wayland-scanner private-code scripts/protocols/input-method-unstable-v2.xml "$RUNNER_TEMP/ember-ime/protocol.c"
@@ -452,6 +453,7 @@ jobs:
         shell: bash
         run: |
           python3 scripts/test-native-settings-save-ocr.py
+          python3 scripts/test-native-settings-popup-observer.py
           python3 scripts/test-native-workspace-desktop.py
           python3 scripts/test-native-ime-live-switch.py
           python3 scripts/native-ime-live-switch.py \

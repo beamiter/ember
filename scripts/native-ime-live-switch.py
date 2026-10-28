@@ -159,6 +159,7 @@ def main():
         global MODES
         MODES = ('block', 'chat', 'block')
         visual.REFERENCE_SHELL_HEALTH = True
+        visual.REFERENCE_INLINE_BODY = True
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     helper = args.ime_client.resolve(strict=True)
@@ -177,7 +178,7 @@ def main():
         # Keep the same readable visual-fixture fonts through every Settings
         # switch; the tiny default Chat preedit makes OCR invent punctuation.
         initial = MODES[0]
-        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + initial + '"\nrestore_session = false\nfont_size = 16.0\nui_font_size = 16.0\n')
+        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + initial + '"\nrestore_session = false\nfont_size = 16.0\nui_font_size = 16.0\nline_spacing = 1.0\n')
         smoke.app = smoke.spawn([str(smoke.binary)], 'ember')
         module.wait_for(smoke.app_window, 'live IME Ember window')
         time.sleep(2)
