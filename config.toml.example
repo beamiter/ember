@@ -1,8 +1,9 @@
 # ember configuration
 # Omitted values use the defaults of the installed binary, so upgrades pick
 # up the current defaults without duplicating them in this template.
-# The installer keeps existing values when configuration fields are unchanged.
-# Changed fields trigger a config.toml.backup.* copy before replacement.
+# The installer tracks template fields in .config.toml.installed-defaults.
+# Only changes to the installed template fields trigger config.toml.backup.*.
+# Existing configurations without an installation record are adopted unchanged.
 # Restore selected custom settings from that private backup as needed.
 # Use scripts/install.sh --no-config to always keep your existing configuration.
 # Example customizations:
