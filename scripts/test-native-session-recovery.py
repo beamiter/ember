@@ -17,6 +17,39 @@ def word(text, x, y, w, h, line='1'):
 
 
 class RecoveryPhraseTests(unittest.TestCase):
+    def test_recovery_region_uses_attached_card_surfaces_not_warning_words(self):
+        from PIL import Image, ImageDraw
+        image = Image.new('RGB', (1280, 900), (0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((107, 67, 554, 95), fill=(45, 45, 45))
+        draw.rectangle((107, 96, 554, 484), fill=(29, 29, 29))
+        owned = dict(x=90, y=50, width=1100, height=800)
+        self.assertEqual(recovery.recovery_rectangle(image, owned), (107, 67, 555, 485))
+        draw.text((120, 200), 'unrelated warning text', fill=(220, 220, 220))
+        self.assertEqual(recovery.recovery_rectangle(image, owned), (107, 67, 555, 485))
+
+    def test_absent_duplicate_foreign_or_headerless_card_is_not_evidence(self):
+        from PIL import Image, ImageDraw
+        for case in ['absent', 'duplicate', 'foreign', 'headerless']:
+            with self.subTest(case=case):
+                image = Image.new('RGB', (1280, 900), (0, 0, 0))
+                draw = ImageDraw.Draw(image)
+                owned = dict(x=90, y=50, width=1100, height=800)
+                if case != 'absent': draw.rectangle((107, 96, 554, 484), fill=(29, 29, 29))
+                if case not in ['absent', 'headerless']:
+                    draw.rectangle((107, 67, 554, 95), fill=(45, 45, 45))
+                if case == 'duplicate':
+                    draw.rectangle((607, 96, 1054, 484), fill=(29, 29, 29))
+                    draw.rectangle((607, 67, 1054, 95), fill=(45, 45, 45))
+                if case == 'foreign': owned = dict(x=600, y=50, width=600, height=800)
+                with self.assertRaises(RuntimeError): recovery.recovery_rectangle(image, owned)
+
+    def test_exact_warning_missing_wrong_or_duplicate_remains_a_failure(self):
+        phrase = 'Saved pane layout adjusted: invalid or oversized layout references.'
+        for text in ['', phrase.replace('invalid', 'valid'), phrase + ' ' + phrase]:
+            with self.subTest(text=text), self.assertRaises(AssertionError):
+                recovery.require_phrases(None, 'fixture', [phrase], text)
+
     def rows(self, y=203):
         return [word('Recheck', 30, y, 51, 11), word('original', 85, y-10, 46, 31),
                 word('metadata', 139, y-10, 58, 31)]

@@ -1185,8 +1185,8 @@ fn active_companion_region(
     (region.is_positive() && content.contains_rect(region)).then_some(region)
 }
 
-/// The foreground footer is presentation-only. The app passes the SAME native
-/// rectangle to grid sizing, PTY resize, projection and this renderer.
+/// Foreground content paints above the shared footer. The native allocation
+/// is owned by `reference_terminal_rects` and stays stable at the Prompt too.
 pub fn reference_foreground_rects(
     outer: egui::Rect,
     foreground: bool,
@@ -1200,6 +1200,18 @@ pub fn reference_foreground_rects(
         egui::Rect::from_min_max(outer.min, egui::pos2(outer.right(), top)),
         (height > 0.0).then(|| egui::Rect::from_min_max(egui::pos2(outer.left(), top), outer.max)),
     )
+}
+
+/// One native budget is shared by Prompt and foreground/TUI. Only the
+/// presentation may use additional virtual rows for the docked composer.
+pub fn reference_terminal_rects(
+    outer: egui::Rect,
+    retained: bool,
+    foreground: bool,
+) -> (egui::Rect, egui::Rect, Option<egui::Rect>) {
+    let native = reference_foreground_rects(outer, retained).0;
+    let (presentation, footer) = reference_foreground_rects(outer, foreground);
+    (native, presentation, footer)
 }
 
 /// Offer only structural canvas padding, never a raw terminal row, to the
@@ -1406,6 +1418,8 @@ pub struct TerminalRenderer {
     pub chat_control_rect: Option<egui::Rect>,
     /// Non-editable chrome outside the already reduced foreground PTY viewport.
     pub foreground_footer_rect: Option<egui::Rect>,
+    /// Canvas-only rows; never resize the native PTY for a prompt dock.
+    pub projection_view_rows: Option<usize>,
     /// Same-frame explicit input action; target identity must be revalidated by the app.
     pub chat_input_action: Option<(usize, crate::terminal::ChatInputAction, i32)>,
     /// Native shell/foreground identity supplied by the owning session.
@@ -1566,6 +1580,7 @@ impl TerminalRenderer {
             chat_controls_enabled: false,
             chat_control_rect: None,
             foreground_footer_rect: None,
+            projection_view_rows: None,
             chat_input_action: None,
             chat_native_owner: None,
             chat_pressed_action: None,
@@ -1645,11 +1660,12 @@ impl TerminalRenderer {
             policy.set_chat_command_bubbles(self.chat_command_bubbles);
             policy.set_block_spacing(true);
             policy.set_block_chrome(true, 0);
-            terminal.projected_viewport_with_state(
+            terminal.projected_viewport_with_rows(
                 self.history_projection,
                 self.block_mode,
                 &policy,
                 &mut crate::terminal::ProjectionViewState::new(),
+                self.projection_view_rows,
             )
         } else {
             terminal.projected_viewport(self.history_projection, self.block_mode)
@@ -1662,11 +1678,12 @@ impl TerminalRenderer {
         policy: &crate::terminal::ProjectionPolicy,
         view_state: &mut crate::terminal::ProjectionViewState,
     ) -> ProjectedViewport {
-        terminal.projected_viewport_with_state(
+        terminal.projected_viewport_with_rows(
             self.history_projection,
             self.block_mode,
             policy,
             view_state,
+            self.projection_view_rows,
         )
     }
 
@@ -1779,7 +1796,7 @@ impl TerminalRenderer {
             viewport.scroll_offset(),
             viewport.document_rows(),
             viewport.plan_revision().unwrap_or(0),
-            terminal.grid.rows(),
+            viewport.visible_rows(),
             viewport.columns(),
             state.follows_bottom(),
             self.line_height,
@@ -7096,6 +7113,42 @@ mod tests {
             !block_action_has_focus(&ctx),
             "explicitly closing the last active owner releases future native input"
         );
+    }
+
+    #[test]
+    fn prompt_and_foreground_share_native_budget_but_not_virtual_canvas_rows() {
+        let renderer = TerminalRenderer::new(
+            12.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        for outer in [
+            egui::Rect::from_min_size(egui::pos2(320.0, 103.0), egui::vec2(702.0, 590.0)),
+            egui::Rect::from_min_size(egui::pos2(700.0, 130.0), egui::vec2(330.0, 560.0)),
+        ] {
+            let (native, prompt, footer) = reference_terminal_rects(outer, true, false);
+            assert_eq!(prompt, outer);
+            assert!(
+                footer.is_none(),
+                "Prompt owns its single projected composer"
+            );
+            let size = renderer.grid_dimensions(native.size());
+            for foreground in [true, false, true, false] {
+                let (next_native, presentation, footer) =
+                    reference_terminal_rects(outer, true, foreground);
+                assert_eq!(next_native, native);
+                assert_eq!(renderer.grid_dimensions(next_native.size()), size);
+                assert_eq!(presentation, if foreground { native } else { outer });
+                assert_eq!(footer.is_some(), foreground);
+            }
+            assert!(renderer.grid_dimensions(prompt.size()).1 > size.1);
+            assert_eq!(
+                reference_terminal_rects(outer, false, false),
+                (outer, outer, None)
+            );
+        }
     }
 
     #[test]

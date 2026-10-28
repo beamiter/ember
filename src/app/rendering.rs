@@ -5,6 +5,46 @@ use crate::theme::ThemeExt as _;
 use crate::{command_palette, config, config_panel, layout, search_replace_panel, theme};
 use eframe::egui;
 
+/// Progress metadata must not move the result the user is about to activate.
+/// Paint one dedicated line; preserve the complete status for hover and AT.
+fn block_search_history_status(ui: &mut egui::Ui, status: &str) -> egui::Response {
+    let response = ui.add_sized(
+        [
+            ui.available_width(),
+            ui.text_style_height(&egui::TextStyle::Small),
+        ],
+        egui::Label::new(egui::RichText::new(status).small())
+            .truncate()
+            .show_tooltip_when_elided(false)
+            .halign(egui::Align::Min),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), status)
+    });
+    // Selectable labels export their painted (elided) galley as TextRuns.
+    // Keep visual ellipsis separate from the complete read-only status text.
+    let full = ui.painter().layout_no_wrap(
+        status.to_owned(),
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
+    let global_from_layer = ui
+        .ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .unwrap_or_default();
+    let global_from_galley =
+        global_from_layer * egui::emath::TSTransform::from_translation(response.rect.min.to_vec2());
+    egui::text_selection::accesskit_text::update_accesskit_for_text_widget(
+        ui.ctx(),
+        response.id,
+        None,
+        egui::accesskit::Role::Label,
+        global_from_galley,
+        &full,
+    );
+    response.on_hover_text(status)
+}
+
 // Find owns Enter/Shift+Enter for match navigation, not text submission.
 fn find_query_edit(ui: &mut egui::Ui, query: &mut String) -> egui::Response {
     let output = egui::TextEdit::singleline(query)
@@ -2634,10 +2674,22 @@ impl TerminalApp {
                 .lock()
                 .chat_surface()
                 .composer_docked();
-        let (single_native_rect, single_footer) =
-            crate::ui::reference_foreground_rects(available_rect, foreground);
+        let (single_pty_rect, single_presentation_rect, single_footer) =
+            crate::ui::reference_terminal_rects(
+                available_rect,
+                self.renderer.chat_mode,
+                foreground,
+            );
         self.renderer.foreground_footer_rect = single_footer;
-        let (cols, rows) = self.renderer.grid_dimensions(single_native_rect.size());
+        // Prompt's virtual dock and foreground's footer have the same native
+        // budget. Presentation rows can grow; the PTY must not resize merely
+        // because OSC C/D changed the shell's surface state.
+        self.renderer.projection_view_rows = self.renderer.chat_mode.then(|| {
+            self.renderer
+                .grid_dimensions(single_presentation_rect.size())
+                .1
+        });
+        let (cols, rows) = self.renderer.grid_dimensions(single_pty_rect.size());
         crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
 
         // 单窗格才按整窗口尺寸 resize 活跃会话;多窗格时各窗格在下方
@@ -2695,8 +2747,11 @@ impl TerminalApp {
                         .is_some_and(|session| {
                             !session.terminal.lock().chat_surface().composer_docked()
                         });
-                let (content_rect, footer) =
-                    crate::ui::reference_foreground_rects(pane_outer_rect, foreground);
+                let (pty_rect, content_rect, footer) = crate::ui::reference_terminal_rects(
+                    pane_outer_rect,
+                    self.pane_renderers[pane_idx].chat_mode,
+                    foreground,
+                );
                 self.pane_renderers[pane_idx].foreground_footer_rect = footer;
                 let native_editor = self
                     .session_manager
@@ -2724,8 +2779,14 @@ impl TerminalApp {
                 renderer.sync_font_metrics(ctx);
                 // 按本窗格 rect 的尺寸 resize 该窗格会话的 shell + 终端 grid,
                 // 否则窗格内的 shell 仍以为自己拥有整窗口宽高,导致换行/清屏错乱。
+                self.pane_renderers[pane_idx].projection_view_rows =
+                    self.pane_renderers[pane_idx].chat_mode.then(|| {
+                        self.pane_renderers[pane_idx]
+                            .grid_dimensions(content_rect.size())
+                            .1
+                    });
                 let (pane_cols, pane_rows) =
-                    self.pane_renderers[pane_idx].grid_dimensions(content_rect.size());
+                    self.pane_renderers[pane_idx].grid_dimensions(pty_rect.size());
                 if let Some(session) = self.session_manager.get_session_mut(session_idx) {
                     let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                     let terminal_arc = std::sync::Arc::clone(&session.terminal);
@@ -3083,7 +3144,7 @@ impl TerminalApp {
                     &self.search_state,
                     &self.cached_links,
                     &self.hovered_link,
-                    single_native_rect,
+                    single_presentation_rect,
                 );
                 companion_surface = self
                     .renderer
@@ -3972,8 +4033,8 @@ impl TerminalApp {
                         if latest.clicked() && self.block_search.request_latest_history() {
                             self.refresh_block_search_hits();
                         }
-                        ui.label(egui::RichText::new(self.block_search.history_label()).small());
                     });
+                    block_search_history_status(ui, &self.block_search.history_label());
                     ui.separator();
                     let query_error = self.block_search.query_error.clone();
                     if let Some(error) = &query_error {
@@ -5172,6 +5233,75 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_search_progress_and_error_metadata_keep_result_geometry_stable() {
+        let statuses = [
+            "Retained blocks #1–#6 · Searching this retained output; 39 windows, 39936 rows; partial coverage",
+            "Retained blocks #1–#6 · Searching retained output: 52 windows; current window 224 row decodes, 28672 cells; partial coverage",
+            "Retained blocks #1–#6 · Output unavailable or invalidated (Unavailable); retained coverage incomplete",
+            "Retained blocks #1–#6 · Stopped explicitly; partial coverage only",
+        ];
+        for width in [320.0, 620.0, 900.0] {
+            for size in [12.0, 14.0, 18.0] {
+                let ctx = egui::Context::default();
+                let mut expected = None;
+                for status in statuses {
+                    let mut observed = None;
+                    let output = run_frame(&ctx, Default::default(), |ui| {
+                        crate::theme::configure_workspace_text(ui.style_mut(), size);
+                        ui.set_width(width);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.button("Searching this output")
+                                .on_hover_text("Current output");
+                            ui.button("Stop search")
+                                .on_hover_text("Stop the search worker");
+                            ui.button("Latest").on_hover_text("Latest retained window");
+                        });
+                        let metadata = block_search_history_status(ui, status);
+                        ui.separator();
+                        let result = ui.button("Retained row #21 · literal match: E03EARLYHIT");
+                        observed = Some((metadata.rect, result.rect));
+                    });
+                    output.drop_without_applying_deltas();
+                    let observed = observed.unwrap();
+                    assert!(observed.0.width() > 0.0);
+                    assert!(observed.0.height() <= size * 1.5);
+                    if let Some(expected) = expected {
+                        assert_eq!(observed, expected, "live metadata moved the hit control");
+                    } else {
+                        expected = Some(observed);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_search_status_accessible_text_retains_complete_progress_and_errors() {
+        for status in [
+            "Retained blocks #1–#6 · Output unavailable or invalidated (Unavailable); retained coverage incomplete".to_owned(),
+            "Retained blocks #1–#6 · Complete for this retained output only; 98 windows, 100352 row decodes; partial session coverage".repeat(3),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut widget = None;
+            let output = run_frame(&ctx, Default::default(), |ui| {
+                ui.set_width(320.0);
+                widget = Some(block_search_history_status(ui, &status).id);
+            });
+            let update = output.platform_output.accesskit_update.as_ref().unwrap();
+            let nodes: std::collections::HashMap<_, _> = update.nodes.iter()
+                .map(|(id, node)| (*id, node)).collect();
+            let node = nodes[&widget.unwrap().accesskit_id()];
+            assert_eq!(node.value(), Some(status.as_str()));
+            let text: String = node.children().iter().filter_map(|id| nodes.get(id))
+                .filter(|child| child.role() == egui::accesskit::Role::TextRun)
+                .map(|child| child.value().unwrap_or("")).collect();
+            assert_eq!(text, status, "AT Text must not inherit visual ellipsis");
+            output.drop_without_applying_deltas();
+        }
+    }
 
     // egui 0.36 debug-asserts when a TexturesDelta with unapplied deltas is
     // dropped. These tests own no texture atlas, so clear it explicitly.

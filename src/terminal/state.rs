@@ -5720,6 +5720,20 @@ impl super::TerminalState {
         policy: &ProjectionPolicy,
         view_state: &mut ProjectionViewState,
     ) -> ProjectedViewport {
+        self.projected_viewport_with_rows(projection, block_mode, policy, view_state, None)
+    }
+
+    /// The native grid remains PTY-owned. A retained Prompt may present extra
+    /// structural canvas rows for its shared composer without sending SIGWINCH
+    /// or changing raw row identity. Identity/TUI bypasses keep native rows.
+    pub fn projected_viewport_with_rows(
+        &mut self,
+        projection: HistoryProjection,
+        block_mode: bool,
+        policy: &ProjectionPolicy,
+        view_state: &mut ProjectionViewState,
+        presentation_rows: Option<usize>,
+    ) -> ProjectedViewport {
         view_state.active_transformed = false;
         self.observe_chat_native_takeover();
         if !block_mode || self.use_alt_buffer || policy.chat_mode() && self.chat_native_takeover() {
@@ -5752,12 +5766,17 @@ impl super::TerminalState {
             return self.projected_viewport(projection, true);
         };
         self.enter_transformed_selection_space(&plan);
-        let visible_rows = self.grid.rows();
+        let visible_rows = presentation_rows
+            .unwrap_or(self.grid.rows())
+            .clamp(1, super::MAX_TERMINAL_ROWS);
+        let view_rows_changed = view_state.last_viewport_rows != Some(visible_rows);
         let max_offset = plan.document_rows().saturating_sub(visible_rows);
-        if view_state.last_plan_key.as_ref() != Some(&plan_key) {
+        if view_state.last_plan_key.as_ref() != Some(&plan_key) || view_rows_changed {
             if view_state.follow_bottom {
                 view_state.offset_from_bottom = 0;
-            } else if plan.incremental_from.as_ref() == view_state.last_plan_key.as_ref() {
+            } else if !view_rows_changed
+                && plan.incremental_from.as_ref() == view_state.last_plan_key.as_ref()
+            {
                 view_state.offset_from_bottom = view_state
                     .offset_from_bottom
                     .saturating_add(plan.incremental_appended_rows)
@@ -5813,6 +5832,7 @@ impl super::TerminalState {
             .then(|| self.projected_top_anchor(&viewport))
             .flatten();
         view_state.last_plan_key = Some(plan_key);
+        view_state.last_viewport_rows = Some(visible_rows);
         view_state.active_transformed = true;
         viewport
     }

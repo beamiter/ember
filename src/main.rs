@@ -5581,6 +5581,7 @@ impl TerminalApp {
         }
         theme::configure_workspace_text(root_ui.style_mut(), self.config.effective_ui_font_size());
         self.font_zoom.begin_layout();
+        let workspace_rect = root_ui.max_rect();
 
         // Bars register their pane-promotion targets before CentralPanel runs.
         // They are frame-local geometry and must never survive a resize or a
@@ -5650,6 +5651,7 @@ impl TerminalApp {
                     self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);
                     self.render_reference_rich_canvas(ui);
                 });
+                content
             });
 
         if let Some(intent) =
@@ -5667,11 +5669,8 @@ impl TerminalApp {
                 _ => {}
             }
         }
-        self.font_zoom.register(
-            main_panel.response.rect,
-            root_ui.layer_id(),
-            font_zoom::FontGroup::Main,
-        );
+        self.font_zoom
+            .register_workspace(workspace_rect, main_panel.inner, root_ui.layer_id());
         self.render_floating_panels(ctx);
         self.render_vim9_dialog(ctx);
         self.handle_font_zoom(ctx);

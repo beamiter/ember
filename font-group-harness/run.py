@@ -15,10 +15,19 @@ main = (ROOT / "src/main.rs").read_text()
 tabs = (ROOT / "src/app/tabs.rs").read_text()
 input_source = (ROOT / "src/app/input.rs").read_text()
 state = (ROOT / "src/app/state.rs").read_text()
+workspace = (ROOT / "src/reference_workspace.rs").read_text()
 assert "self.font_zoom\n            .collect(&mut raw_input.events, raw_input.focused);" in main
 assert "self.font_zoom.begin_layout();" in main
-assert "top_bar.response.rect," in main
-assert "main_panel.response.rect," in main
+# The native reference shell replaces the former top_bar widget. Its measured
+# content excludes the local header, while the full current-frame workspace
+# keeps the top/rail/navigation/inspector in the UI font group. The production
+# router's real-egui tests exercise this registration and responsive geometry.
+assert "let workspace_rect = root_ui.max_rect();" in main
+assert ".register_workspace(workspace_rect, main_panel.inner, root_ui.layer_id());" in main
+assert "self.render_reference_canvas_header(ui);" in main
+assert "ui.advance_cursor_after_rect(rect);" in workspace
+assert "                    self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);" in main
+assert re.search(r"self\.render_reference_rich_canvas\(ui\);\s*}\);\s*content\s*}\);", main)
 assert ".register(panel_rect, root_ui.layer_id(), font_zoom::FontGroup::Ui);" in main
 assert "theme::configure_workspace_text(ui.style_mut(), self.config.font_size);" in main
 assert "theme::configure_workspace_text(root_ui.style_mut(), self.config.effective_ui_font_size());" in main

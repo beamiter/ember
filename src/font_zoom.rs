@@ -78,6 +78,15 @@ impl FontZoom {
         self.regions.push(Region { rect, layer, group });
     }
 
+    /// The unified shell includes more than its former top/sidebar panels.
+    /// Use this frame's measured terminal content, excluding its local header,
+    /// so every remaining shell surface keeps UI font ownership. Floating
+    /// surfaces still establish their own topmost layer before draining input.
+    pub fn register_workspace(&mut self, workspace: Rect, main: Rect, layer: LayerId) {
+        self.register(workspace, layer, FontGroup::Ui);
+        self.register(main.intersect(workspace), layer, FontGroup::Main);
+    }
+
     /// Half-open bounds give shared edges a single owner. Topmost-layer checking
     /// prevents a popup/window from zooming a pane hidden underneath it.
     #[cfg(test)]
@@ -520,5 +529,114 @@ mod tests {
             [0.0, 0.0]
         );
         assert_eq!(ctx.zoom_factor(), 1.0);
+    }
+
+    #[test]
+    fn reference_shell_measures_ui_chrome_separately_from_terminal_content() {
+        let ctx = egui::Context::default();
+        let mut router = FontZoom::default();
+        let mut measured = [Rect::NOTHING; 3];
+        for width in [1356.0, 700.0] {
+            let mut run = |events: Vec<Event>| {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 704.0))),
+                    events,
+                    ..Default::default()
+                };
+                router.collect(&mut input.events, input.focused);
+                let mut delta = [0.0; 2];
+                let mut output = ctx.run_ui(input, |ui| {
+                    router.begin_layout();
+                    let workspace = ui.max_rect();
+                    egui::Panel::top("reference-titlebar")
+                        .exact_size(42.0)
+                        .show_separator_line(false)
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |_| {});
+                    egui::Panel::left("reference-rail")
+                        .exact_size(55.0)
+                        .show_separator_line(false)
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |_| {});
+                    if width > 1000.0 {
+                        egui::Panel::left("reference-navigation")
+                            .exact_size(237.0)
+                            .show_separator_line(false)
+                            .frame(egui::Frame::NONE)
+                            .show(ui, |_| {});
+                        egui::Panel::right("reference-inspector")
+                            .exact_size(306.0)
+                            .show_separator_line(false)
+                            .frame(egui::Frame::NONE)
+                            .show(ui, |_| {});
+                    }
+                    let main =
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ui, |ui| {
+                                let (header, _) = ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), 49.0),
+                                    egui::Sense::hover(),
+                                );
+                                // Header controls paint into its already allocated
+                                // rectangle. A compact child must not shrink that
+                                // reservation and move the native terminal grid.
+                                ui.scope_builder(
+                                    egui::UiBuilder::new()
+                                        .max_rect(header.shrink2(Vec2::new(28.0, 7.0))),
+                                    |ui| {
+                                        ui.allocate_exact_size(
+                                            Vec2::splat(24.0),
+                                            egui::Sense::hover(),
+                                        );
+                                    },
+                                );
+                                ui.advance_cursor_after_rect(header);
+                                let bounds = ui.available_rect_before_wrap();
+                                let content = Rect::from_min_max(
+                                    bounds.min + Vec2::new(28.0, 12.0),
+                                    bounds.max - Vec2::new(28.0, 11.0),
+                                );
+                                measured = [workspace, header, content];
+                                content
+                            });
+                    // This is the same production registration used after the
+                    // actual reference shell and its measured content render.
+                    router.register_workspace(workspace, main.inner, ui.layer_id());
+                    delta = router.drain(|p| workspace_layer_at(&ctx, p));
+                    ctx.input(|input| {
+                        assert_eq!(input.zoom_delta(), 1.0);
+                        assert_eq!(input.smooth_scroll_delta, Vec2::ZERO);
+                    });
+                });
+                output.textures_delta.clear();
+                delta
+            };
+            for _ in 0..2 {
+                assert_eq!(run(vec![]), [0.0, 0.0]);
+            }
+            // Measure once through a separate frame, then use real output
+            // geometry rather than reconstructing the old top-bar variable.
+            assert_eq!(
+                run(vec![
+                    Event::PointerMoved(Pos2::new(20.0, 20.0)),
+                    wheel(MouseWheelUnit::Line, 1.0),
+                    Event::PointerMoved(Pos2::new(20.0, 200.0)),
+                    wheel(MouseWheelUnit::Line, 2.0),
+                    Event::PointerMoved(Pos2::new(width * 0.5, 60.0)),
+                    wheel(MouseWheelUnit::Line, 3.0),
+                    Event::PointerMoved(Pos2::new(width * 0.5, 200.0)),
+                    wheel(MouseWheelUnit::Line, 4.0),
+                    Event::PointerMoved(Pos2::new(width - 10.0, 200.0)),
+                    wheel(MouseWheelUnit::Line, 5.0),
+                    Event::PointerMoved(Pos2::new(width + 10.0, 200.0)),
+                    wheel(MouseWheelUnit::Line, 6.0),
+                ]),
+                [11.0, 4.0]
+            );
+            assert_eq!(measured[0].width(), width);
+            assert_eq!(measured[1].height(), 49.0);
+            assert!(measured[2].min.y >= measured[1].max.y + 12.0);
+        }
     }
 }

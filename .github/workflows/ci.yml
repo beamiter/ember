@@ -435,12 +435,12 @@ jobs:
         shell: bash
         run: |
           status=0
-          for mode in normal block chat; do
+          for mode in block chat; do
             if ! python3 scripts/native-ime-return-smoke.py \
               --runner scripts/native-desktop-smoke.py \
               --ime-client "$RUNNER_TEMP/ember-ime/native-ime-return" \
               --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
-              --mode "$mode" --output "native-smoke-artifacts/ime-return-$mode"; then
+              --mode "$mode" --reference-shell --output "native-smoke-artifacts/ime-return-$mode"; then
               status=1
             fi
           done
@@ -452,10 +452,12 @@ jobs:
         shell: bash
         run: |
           python3 scripts/test-native-settings-save-ocr.py
+          python3 scripts/test-native-workspace-desktop.py
           python3 scripts/test-native-ime-live-switch.py
           python3 scripts/native-ime-live-switch.py \
             --ime-client "$RUNNER_TEMP/ember-ime/native-ime-return" \
             --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
+            --reference-shell \
             --output native-smoke-artifacts/ime-live-switch
 
       - name: Gate Settings switches during active IME preedit
@@ -469,6 +471,7 @@ jobs:
             --ime-client "$RUNNER_TEMP/ember-ime/native-ime-return" \
             --preedit-client "$RUNNER_TEMP/ember-ime/native-ime-preedit-switch" \
             --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
+            --reference-shell \
             --output native-smoke-artifacts/ime-preedit-switch
 
       - name: Gate measured Wayland scales and narrow geometry

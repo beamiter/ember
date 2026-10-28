@@ -879,8 +879,8 @@ impl TerminalRenderer {
                 "↑",
                 "Send Enter immediately when the shell and writer are ready. If unavailable, use the native keyboard; enhanced multi-byte button encodings are unsupported.",
             ))
-        } else if surface == jterm_core::chat_mode::ChatSurface::Running
-            && self.foreground_footer_rect.is_some()
+        } else if let (jterm_core::chat_mode::ChatSurface::Running, Some(footer)) =
+            (surface, self.foreground_footer_rect)
         {
             if !(ChatInputAction::Interrupt {
                 sequence: record.sequence,
@@ -890,7 +890,6 @@ impl TerminalRenderer {
                 self.chat_pressed_action = None;
                 return false;
             }
-            let footer = self.foreground_footer_rect.unwrap();
             Some((ChatInputAction::Interrupt { sequence:record.sequence },egui::Rect::from_min_size(egui::pos2(footer.right()-36.0,footer.bottom()-36.0),egui::vec2(28.0,28.0)),"Stop","Send Ctrl+C to the current foreground command. Native ownership and IME guards are revalidated before writing."))
         } else if surface == jterm_core::chat_mode::ChatSurface::Running {
             viewport.chat_command_spans().iter().find(|command| command.sequence == record.sequence)

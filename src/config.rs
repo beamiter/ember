@@ -2465,9 +2465,8 @@ mod chat_mode_config_tests {
                     config.block_mode, legacy,
                     "never rewrite the user's legacy preference"
                 );
-                assert_eq!(
+                assert!(
                     config.command_cards_enabled(),
-                    true,
                     "legacy raw modes must retain the canvas after migration"
                 );
                 let saved = toml::to_string(&config).unwrap();

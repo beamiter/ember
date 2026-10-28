@@ -19,6 +19,7 @@ from pathlib import Path
 import shlex
 import select
 import subprocess
+import tempfile
 import time
 
 
@@ -37,6 +38,15 @@ def sentinel_command(sentinel):
     # an extra wrapped row moves the native pixel/OCR fixture's live baseline.
     # The destination is inherited by the real shell, not injected into the app.
     return "printf '%s:%s:%s\\n' " + shlex.quote(sentinel) + ' "$$" "$(tty)" >> "$EMBER_SMOKE_SENTINELS"'
+
+
+def presentation_mode(value):
+    """Current public presentation, including the persisted legacy alias."""
+    if value == 'normal':
+        return 'block'
+    if value in ('block', 'chat'):
+        return value
+    raise RuntimeError('Unknown terminal presentation: ' + str(value))
 
 
 def settings_mode_selector(rows, current):
@@ -78,17 +88,40 @@ def settings_mode_selector(rows, current):
     return values[0]
 
 
+def settings_mode_popup(rows, selector, mode):
+    """Exact current presentation in the popup below its observed field."""
+    name = presentation_mode(mode).title()
+    x, y, width, height = (int(selector[k]) for k in ('left', 'top', 'width', 'height'))
+    if min(width, height) <= 0:
+        raise RuntimeError('Invalid native Settings selector bounds')
+    matches = [r for r in rows if r['text'] == name
+               and abs(int(r['left']) - x) <= 100
+               and y + height <= int(r['top']) <= y + 8 * height]
+    if len(matches) != 1:
+        raise RuntimeError('Missing or ambiguous native mode popup item')
+    return matches[0]
+
+
 class Smoke:
     def __init__(self, binary, backend, out):
         self.binary, self.backend, self.out = binary, backend, out
         self.processes = []
         self.logs = []
+        # The unified native workspace is now the product UI, not an opt-in
+        # screenshot fixture. Historical observer functions remain separately
+        # testable, but real Settings input uses its owned current surface.
+        self.reference_shell_fixture = True
         self.env = os.environ.copy()
-        for name in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK'):
+        for name in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK', 'DBUS_SESSION_BUS_ADDRESS'):
             self.env.pop(name, None)
         home = out / 'home'
-        runtime = out / 'runtime'
-        runtime.mkdir(mode=0o700)
+        # Artifact paths may exceed the Unix-domain socket limit. The actual
+        # compositor/Vim transport stays short, private, and owned by this run.
+        self._runtime = tempfile.TemporaryDirectory(prefix='ember-native-', dir='/tmp')
+        runtime = Path(self._runtime.name)
+        (out / 'native-runtime.json').write_text(json.dumps({
+            'path': str(runtime), 'path_bytes': len(os.fsencode(runtime)),
+            'removed_after_cleanup': False}, indent=2))
         home.mkdir()
         for key, suffix in [('HOME', ''), ('XDG_CONFIG_HOME', '.config'),
                             ('XDG_DATA_HOME', '.local/share'), ('XDG_STATE_HOME', '.local/state'),
@@ -135,7 +168,8 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             spec = importlib.util.spec_from_file_location('native_x11', Path(__file__).with_name('native-x11-display.py'))
             display = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(display)
-            display.start_xvfb(self.spawn, self.env, self.out, '1280x900x24')
+            display.start_xvfb(self.spawn, self.env, self.out,
+                               getattr(self, 'x11_screen', '1280x900x24'))
             # Stock Openbox grabs Ctrl+Alt+Left/Right for desktop switching.
             # Keep the real Ember pane shortcuts; remove only those conflicting
             # test-WM bindings, with the original and effective config recorded.
@@ -166,7 +200,9 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             cfg = self.out / 'sway.conf'
             cfg.write_text('xwayland disable\noutput * resolution 1280x900\nseat seat0 fallback true\nfocus_follows_mouse no\n')
             self.env.update(WLR_BACKENDS='headless', WLR_RENDERER='pixman', WLR_LIBINPUT_NO_DEVICES='1', WLR_HEADLESS_OUTPUTS='1')
-            server = self.spawn(['sway', '-d', '-c', str(cfg)], 'sway')
+            # This is a disposable Pixman/headless compositor, independent of
+            # any installed host GPU driver or the user's desktop session.
+            server = self.spawn(['sway', '--unsupported-gpu', '-d', '-c', str(cfg)], 'sway')
             runtime = Path(self.env['XDG_RUNTIME_DIR'])
             sock = wait_for(lambda: next((p for p in runtime.glob('wayland-*') if p.is_socket()), None), 'Wayland socket')
             self.env['WAYLAND_DISPLAY'] = sock.name.removesuffix('.lock')
@@ -355,6 +391,25 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         spec = importlib.util.spec_from_file_location('settings_geometry', Path(__file__).with_name('native-settings-save-ocr.py'))
         geometry = importlib.util.module_from_spec(spec); spec.loader.exec_module(geometry)
         def owned():
+            if self.backend == 'x11':
+                reply = self.run(['xdotool', 'search', '--onlyvisible', '--pid', str(self.app.pid)], capture_output=True, text=True)
+                windows = reply.stdout.splitlines()
+                if len(windows) != 1:
+                    raise RuntimeError('Settings native window absent or ambiguous')
+                window = windows[0]
+                focus = self.run(['xdotool', 'getwindowfocus'], capture_output=True, text=True).stdout.strip()
+                if focus != window:
+                    raise RuntimeError('Settings native window lost focus')
+                pid = self.run(['xdotool', 'getwindowpid', window], capture_output=True, text=True).stdout.strip()
+                if pid != str(self.app.pid):
+                    raise RuntimeError('Settings native window PID changed')
+                reply = self.run(['xdotool', 'getwindowgeometry', '--shell', window], capture_output=True, text=True).stdout
+                values = dict(line.split('=', 1) for line in reply.splitlines() if '=' in line)
+                rect = {name: int(values[key]) for name, key in
+                        [('x', 'X'), ('y', 'Y'), ('width', 'WIDTH'), ('height', 'HEIGHT')]}
+                if min(rect['x'], rect['y']) < 0 or min(rect['width'], rect['height']) <= 0:
+                    raise RuntimeError('Invalid Settings native rectangle')
+                return {'id': window, 'pid': self.app.pid, 'rect': rect}
             return geometry.owned_rect(json.loads(self.run(['swaymsg','-t','get_tree','-r'],capture_output=True,text=True).stdout),self.app.pid)
         before = owned()
         self.screenshot(label)
@@ -376,6 +431,7 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         return rows
 
     def switch_mode(self, old, new):
+        old, new = presentation_mode(old), presentation_mode(new)
         self.key('o', ('ctrl', 'shift'))
         time.sleep(0.4)
         # Disambiguate the Advanced tab from the Advanced Settings heading
@@ -416,11 +472,8 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         if getattr(self, 'reference_shell_fixture', False):
             # The same mode names also exist in the shared toolbar. Scope this
             # exact target to the popup immediately below its observed field.
-            menu = [r for r in observe(new + '-mode-menu') if r['text'] == new.title()
-                    and abs(int(r['left']) - int(row['left'])) <= 100
-                    and int(row['top']) + int(row['height']) <= int(r['top']) <= int(row['top']) + 8 * int(row['height'])]
-            assert len(menu) == 1, ('missing or ambiguous native mode popup item',menu)
-            self.click(int(menu[0]['left'])+int(menu[0]['width'])//2,int(menu[0]['top'])+int(menu[0]['height'])//2)
+            item = settings_mode_popup(observe(new + '-mode-menu'), row, new)
+            self.click(int(item['left'])+int(item['width'])//2,int(item['top'])+int(item['height'])//2)
         else:
             self.click_word(new.title(), new + '-mode-menu')
         if self.backend == 'wayland':
@@ -429,7 +482,13 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             spec.loader.exec_module(settings_save)
             settings_save.click_save(self, new + '-mode-save')
         else:
-            self.click_word('Save', new + '-mode-save')
+            rows = observe(new + '-mode-save')
+            save = [r for r in rows if r['text'] == 'Save']
+            if len(save) != 1:
+                raise RuntimeError('Missing or ambiguous native Settings Save')
+            row = save[0]
+            self.click(int(row['left']) + int(row['width']) // 2,
+                       int(row['top']) + int(row['height']) // 2)
         wait_for(lambda: tomllib.loads(self.config.read_text()).get('terminal_mode') == new,
                  'Settings persisted mode ' + new)
         self.key('o', ('ctrl', 'shift'))
@@ -525,8 +584,11 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         time.sleep(0.3)
 
     def exercise(self):
-        self.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\n'
-                               'initial_width = 1100\ninitial_height = 800\nrestore_session = false\n')
+        config = ('shell = "/bin/bash"\nterminal_mode = "normal"\n'
+                  'initial_width = 1100\ninitial_height = 800\nrestore_session = false\n')
+        if getattr(self, 'renderer', None) is not None:
+            config += f'app_renderer = "{self.renderer}"\n'
+        self.config.write_text(config)
         app = self.app = self.spawn([str(self.binary)], 'ember')
         wait_for(self.app_window, 'Ember window')
         time.sleep(2)
@@ -536,8 +598,11 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         self.raw_punctuation_oracle(identity, 'normal')
         self.find_clipboard_ownership(identity, 'initial-normal')
         assert self.command('normal-paste', paste=True) == identity
-        old = 'normal'
-        for mode in ('block', 'chat', 'normal'):
+        # Legacy Normal is still a startup configuration positive control; its
+        # visible presentation is Block. Only the two current public choices
+        # are selected through the actual Settings popup.
+        old = presentation_mode('normal')
+        for mode in ('chat', 'block'):
             self.switch_mode(old, mode)
             self.raw_punctuation_oracle(identity, mode + 'switch')
             self.find_clipboard_ownership(identity, 'switched-' + mode)
@@ -554,15 +619,16 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         assert self.command('split-right-return') == second
         self.screenshot('panes-completed')
         lines = self.transcript.read_text().splitlines()
-        expected = ['normal-typed', 'normal-paste', 'block-switched', 'block-switched-paste',
-                    'chat-switched', 'chat-switched-paste', 'normal-switched', 'normal-switched-paste',
+        expected = ['normal-typed', 'normal-paste', 'chat-switched', 'chat-switched-paste',
+                    'block-switched', 'block-switched-paste',
                     'split-right', 'split-left-return', 'split-right-return']
         assert len(lines) == len(expected), lines
         assert [line.split(':', 1)[0] for line in lines] == expected
         assert app.poll() is None, 'Application exited unexpectedly'
         return {'sentinels': len(lines), 'primary_identity': identity, 'split_identity': second,
-                'live_modes': ['normal', 'block', 'chat', 'normal'],
-                'find_clipboard_zero_byte_cases': 8, 'clipboard_positive_controls': 4}
+                'initial_config_mode': 'normal', 'initial_presentation': 'block',
+                'live_modes': ['block', 'chat', 'block'],
+                'find_clipboard_zero_byte_cases': 6, 'clipboard_positive_controls': 3}
 
     def close(self):
         for proc in reversed(self.processes):
@@ -575,6 +641,11 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
                     proc.wait()
         for log in self.logs:
             log.close()
+        runtime = Path(self._runtime.name)
+        self._runtime.cleanup()
+        (self.out / 'native-runtime.json').write_text(json.dumps({
+            'path': str(runtime), 'path_bytes': len(os.fsencode(runtime)),
+            'removed_after_cleanup': not runtime.exists()}, indent=2))
 
 
 def main():
@@ -582,14 +653,18 @@ def main():
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--backend', required=True, choices=['x11', 'wayland'])
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--renderer', choices=['wgpu', 'glow'],
+                        help='Select a supported native renderer; default uses the product default')
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
-    result = {'backend': args.backend, 'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
+    result = {'backend': args.backend, 'renderer': args.renderer or 'product-default',
+              'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
               'excluded': ['IME composition', 'physical GPU', 'fractional scale and narrow window',
               'selection/copy geometry', 'task/settings UI clipboard ownership and adversarial clipboard scenarios', 'clipboard latency']}
     smoke = Smoke(args.binary, args.backend, args.output)
+    smoke.renderer = args.renderer
     try:
         smoke.start_desktop()
         result.update(smoke.exercise())

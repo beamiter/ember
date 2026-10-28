@@ -74,7 +74,7 @@
     {
       "source": "src/config.rs",
       "included_whole": true,
-      "sha256": "3d6ff4fdf2dae06b732d445e00ea7b440a46f66dac025c918ec7ac252e96e489"
+      "sha256": "04412c030989eb9d1e6ded70a7bcddfc954f2b212650f21d8f5b053164b2128f"
     },
     {
       "source": "src/persistence_file.rs",

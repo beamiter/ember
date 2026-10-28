@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import tempfile
 import time
 
 from PIL import Image, ImageChops, ImageGrab
@@ -90,12 +91,19 @@ def main():
         "call timer_start(60, function('NativeFixtureState'), {'repeat': -1})\n",
         encoding="utf-8",
     )
+    # A test artifact directory may be longer than the Unix socket path limit.
+    # Keep the real Vim transport in a private short runtime, not the user home.
+    private_runtime = tempfile.TemporaryDirectory(prefix=args.app + '-vim-', dir='/tmp')
+    runtime_path = Path(private_runtime.name)
+    runtime_record = dict(path=str(runtime_path), path_bytes=len(os.fsencode(runtime_path)),
+                          reason='private short native Vim Unix-domain socket directory')
+    (out / 'native-runtime.json').write_text(json.dumps(runtime_record, indent=2) + '\n')
     env = os.environ.copy()
     env.pop("WAYLAND_DISPLAY", None)
     env.update({
         "XDG_CONFIG_HOME": str(out / "config"), "XDG_STATE_HOME": str(out / "state"),
         "XDG_DATA_HOME": str(out / "data"), "XDG_CACHE_HOME": str(out / "cache"),
-        "XDG_RUNTIME_DIR": str(out / "runtime"),
+        "XDG_RUNTIME_DIR": str(runtime_path),
         "VIMINIT": "execute 'source ' . fnameescape(" + quoted(vimrc) + ")",
         "WGPU_BACKEND": "gl", "LIBGL_ALWAYS_SOFTWARE": "1", "WINIT_UNIX_BACKEND": "x11",
     })
@@ -126,23 +134,29 @@ def main():
         pixels = image.get_flattened_data() if hasattr(image, "get_flattened_data") else image.getdata()
         spots = [(i % image.width, i // image.width) for i, color in enumerate(pixels)
                  if color == (0x19, 0xc3, 0xa7)]
-        def groups(axis):
+        def groups(axis, gap):
             values = sorted({point[axis] for point in spots})
             result = []
             for value in values:
-                if not result or value - result[-1][1] > 35:
+                if not result or value - result[-1][1] > gap:
                     result.append([value, value])
                 else:
                     result[-1][1] = value
             return result
-        xs, ys = groups(0), groups(1)
+        ys = groups(1, 35)
+        # Narrow native panes can put adjacent source-label ink less than35px
+        # apart. One measured glyph-height separates the actual pane gutter
+        # without splitting the fixed ASCII label's within-character gaps.
+        glyph_height = max((hi - lo + 1 for lo, hi in ys), default=0)
+        xs = groups(0, max(1, glyph_height))
         panes = {}
         for x, y in spots:
             xi = next(i for i, (lo, hi) in enumerate(xs) if lo <= x <= hi)
             yi = next(i for i, (lo, hi) in enumerate(ys) if lo <= y <= hi)
             key = f"{xi},{yi}"
             panes[key] = panes.get(key, 0) + 1
-        return {"pixels": len(spots), "x_regions": xs, "y_regions": ys, "panes": panes}
+        return {"pixels": len(spots), "x_regions": xs, "y_regions": ys, "panes": panes,
+                "horizontal_group_gap": glyph_height}
     def native_splits(name, horizontal_regions, vertical_regions):
         regions = color_regions(name)
         expected_panes = horizontal_regions + vertical_regions - 1
@@ -241,7 +255,7 @@ def main():
         box = (int(geometry["X"]), int(geometry["Y"]),
                int(geometry["X"]) + int(geometry["WIDTH"]), int(geometry["Y"]) + int(geometry["HEIGHT"]))
         wheel_images = []
-        def wheel_y(name):
+        def wheel_bounds(name):
             # XCB memory capture avoids ImageMagick process/PNG latency inside
             # the 100 ms gesture. Encode artifacts after sampling has finished.
             image = ImageGrab.grab(bbox=box, xdisplay=env["DISPLAY"]).convert("RGB")
@@ -251,9 +265,18 @@ def main():
                 part = channel.point([255 if v == value else 0 for v in range(256)])
                 mask = part if mask is None else ImageChops.multiply(mask, part)
             bounds = mask.getbbox()
+            return bounds
+        def wheel_y(name):
+            bounds = wheel_bounds(name)
             return bounds[1] if bounds is not None else None
         def trace_notch(prefix, mode):
-            xdo("mousemove", "--window", window, "200", "200")
+            # The workspace navigation now occupies x0..292. Use the actual
+            # painted fixture line, never a stale whole-window coordinate.
+            source_bounds = wait_for(lambda: wheel_bounds(prefix + "-pointer-source"),
+                                     "native wheel pointer source pixels", app)
+            pointer = [(source_bounds[0] + source_bounds[2]) // 2,
+                       (source_bounds[1] + source_bounds[3]) // 2]
+            xdo("mousemove", "--window", window, *pointer)
             start_y = wait_for(lambda: wheel_y(prefix + "-before"), "painted wheel source highlight", app)
             before_ack = state().get("render", {}).get("scroll_ack", 0)
             started = time.monotonic()
@@ -263,6 +286,7 @@ def main():
                 trace.append([round(time.monotonic() - started, 4), wheel_y(prefix + "-step-" + str(index))])
                 time.sleep(0.008)
             report["wheel_attempt_" + mode] = {"start_y": start_y, "trace": trace,
+                                               "source_rgb_bounds": list(source_bounds), "pointer": pointer,
                                                "before_ack": before_ack, "after_state": state()}
             for name, image in wheel_images:
                 image.save(out / (name + ".png"))
@@ -429,9 +453,23 @@ def main():
             regions = color_regions("focused-buffer-defaults")
             return regions if regions["x_regions"] and regions["y_regions"] else None
         focused = wait_for(focused_native, "native buffer repainted after cursor fixture", app)
-        assert focused["x_regions"][0][0] < 80, focused
+        # The native workspace adds a navigation column, not a Vim project
+        # tree. Observe its independent light header before checking the same
+        # small source inset; a second IDE/tree inside the canvas still fails.
+        image = capture("focused-workspace-header")
+        header_y = 42 + 49 - 3
+        light = [x for x in range(image.width)
+                 if min(image.getpixel((x, header_y))) > 200]
+        assert light and light == list(range(light[0], light[-1] + 1)), light
+        canvas_left, canvas_right = light[0], light[-1] + 1
+        assert canvas_left == 55 + 237, canvas_left
+        # Native panel-stroke ownership may consume up to two raster pixels.
+        # This does not alter the 80px source-inset bound being tested.
+        assert abs(canvas_right - (image.width - 306)) <= 2, canvas_right
+        assert canvas_left <= focused["x_regions"][0][0] < canvas_left + 80, focused
         assert focused["y_regions"][0][0] < 120, focused
-        report["focused_buffer_defaults"] = focused
+        report["focused_buffer_defaults"] = dict(focused, canvas_header_span=[canvas_left, canvas_right],
+                                                   header_observation_y=header_y)
         xdo("key", "Escape")
         xdo("type", "--clearmodifiers", "--delay", "20", "ggIsaved_native_")
         wait_for(lambda: state().get("text", "").startswith("saved_native_"), "Vim received insert text", app)
@@ -570,6 +608,9 @@ def main():
                 app.kill()
                 app.wait(timeout=5)
         log.close()
+        private_runtime.cleanup()
+        runtime_record['removed_after_cleanup'] = not runtime_path.exists()
+        (out / 'native-runtime.json').write_text(json.dumps(runtime_record, indent=2) + '\n')
 
 
 if __name__ == "__main__":

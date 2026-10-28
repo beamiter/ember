@@ -1652,6 +1652,7 @@ pub struct ProjectionViewState {
     pub(super) follow_bottom: bool,
     pub(super) top_anchor: Option<ProjectedTopAnchor>,
     pub(super) last_plan_key: Option<ProjectionPlanCacheKey>,
+    pub(super) last_viewport_rows: Option<usize>,
     pub(super) canvas_margin: bool,
     pub(super) canvas_managed: bool,
 }
@@ -1664,6 +1665,7 @@ impl Default for ProjectionViewState {
             follow_bottom: true,
             top_anchor: None,
             last_plan_key: None,
+            last_viewport_rows: None,
             canvas_margin: false,
             canvas_managed: false,
         }

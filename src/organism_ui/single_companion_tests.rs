@@ -1,17 +1,48 @@
 use super::*;
 
+/// Every headless frame must consume its texture changes even when a later
+/// assertion fails. Otherwise epaint's debug Drop check aborts during unwind
+/// and obscures the original single-owner failure.
+#[derive(Default)]
+struct ObservedFrame(egui::FullOutput);
+
+impl std::ops::Deref for ObservedFrame {
+    type Target = egui::FullOutput;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ObservedFrame {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl ObservedFrame {
+    fn take(mut self) -> egui::FullOutput {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for ObservedFrame {
+    fn drop(&mut self) {
+        self.0.textures_delta.clear();
+    }
+}
+
 fn render_companion(
     host: &mut OrganismHost,
     ctx: &egui::Context,
     config: &Config,
     surface_session: &str,
     region: egui::Rect,
-) -> egui::FullOutput {
+) -> ObservedFrame {
     let mut terminal = crate::terminal::TerminalState::new(80, 24);
     let key = terminal
         .projected_viewport(crate::terminal::HistoryProjection::identity(), true)
         .key();
-    ctx.run_ui(
+    ObservedFrame(ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -33,23 +64,80 @@ fn render_companion(
                 true,
             );
         },
-    )
+    ))
 }
 
 fn organism_shapes(output: &egui::FullOutput) -> usize {
-    output
-        .shapes
-        .iter()
-        .filter(|shape| match &shape.shape {
-            egui::Shape::Text(text) => {
-                let text = text.galley.text();
-                // Full bodies are one three-line galley; compact bodies keep
-                // the shared glyph. Labels/details contain neither.
-                text.lines().count() == 3 || text.contains("^-^") || text.contains("o.o")
-            }
-            _ => false,
-        })
-        .count()
+    // Observe the actual vector paint, not the retired three-line ASCII galley.
+    // Each shared creature has one opaque navy body mesh and two pale eye
+    // meshes. Check clipping and eye containment as well as body cardinality:
+    // an invisible/no-op painter or a duplicated split body must still fail.
+    let meshes = |color: egui::Color32| {
+        output
+            .shapes
+            .iter()
+            .filter_map(move |shape| match &shape.shape {
+                egui::Shape::Mesh(mesh)
+                    if !mesh.indices.is_empty()
+                        && !mesh.vertices.is_empty()
+                        && mesh.vertices.iter().all(|vertex| vertex.color == color) =>
+                {
+                    let bounds =
+                        mesh.vertices
+                            .iter()
+                            .fold(egui::Rect::NOTHING, |bounds, vertex| {
+                                bounds.union(egui::Rect::from_min_max(vertex.pos, vertex.pos))
+                            });
+                    assert!(bounds.is_positive(), "the creature has real painted area");
+                    assert!(
+                        shape.clip_rect.contains_rect(bounds),
+                        "the creature is not clipped"
+                    );
+                    Some(bounds)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let bodies = meshes(egui::Color32::from_rgb(19, 36, 66));
+    let eyes = meshes(egui::Color32::from_rgb(223, 241, 255));
+    assert_eq!(
+        eyes.len(),
+        2 * bodies.len(),
+        "two rendered eyes per creature"
+    );
+    for body in &bodies {
+        assert_eq!(
+            eyes.iter().filter(|eye| body.contains_rect(**eye)).count(),
+            2
+        );
+    }
+    bodies.len()
+}
+
+#[test]
+fn vector_observer_distinguishes_missing_and_duplicate_bodies() {
+    let ctx = egui::Context::default();
+    let mut host = OrganismHost::default();
+    host.acquire(Some("local"), None, false);
+    let config = Config {
+        ascii_organism_enabled: true,
+        ascii_organism_motion: Some(OrganismMotion::Static),
+        ..Config::default()
+    };
+    let region = egui::Rect::from_min_max(egui::pos2(200.0, 100.0), egui::pos2(600.0, 220.0));
+    let mut output = render_companion(&mut host, &ctx, &config, "local", region);
+    assert_eq!(organism_shapes(&output), 1);
+    let mut duplicate = output.shapes.clone();
+    for shape in &mut duplicate {
+        let offset = egui::vec2(0.0, 200.0);
+        shape.shape.translate(offset);
+        shape.clip_rect = shape.clip_rect.translate(offset);
+    }
+    output.shapes.extend(duplicate);
+    assert_eq!(organism_shapes(&output), 2, "duplicate paint is observable");
+    output.shapes.clear();
+    assert_eq!(organism_shapes(&output), 0, "missing paint is observable");
 }
 
 #[test]
@@ -147,6 +235,7 @@ fn a_small_safe_region_uses_one_compact_body_without_allocating_rows() {
         .native_surface_rect
         .expect("compact body fits this safe region");
     assert!(region.contains_rect(body));
+    assert_eq!(organism_shapes(&output), 1);
     assert_eq!(
         output
             .shapes
@@ -330,14 +419,14 @@ fn actual_split_renderers_offer_only_the_active_panes_single_body() {
         crate::terminal::ProjectionViewState::new(),
     ];
     let mut host = OrganismHost::default();
-    let mut accumulated = egui::FullOutput::default();
+    let mut accumulated = ObservedFrame::default();
     for active in [0, 1, 0, 1] {
         host.acquire(
             Some(if active == 0 { "left" } else { "right" }),
             None,
             false,
         );
-        let output = ctx.run_ui(
+        let output = ObservedFrame(ctx.run_ui(
             egui::RawInput { screen_rect: Some(screen), ..Default::default() },
             |ui| {
                 host.set_available_geometry(ui.available_rect_before_wrap(), ui.clip_rect());
@@ -383,15 +472,15 @@ fn actual_split_renderers_offer_only_the_active_panes_single_body() {
                 host.draw_native_body(ui, &config, chosen, true);
                 assert!(host.native_surface_rect.is_some());
             },
-        );
+        ));
         assert_eq!(organism_shapes(&output), 1, "focused pane {active}");
-        accumulated.append(output);
+        accumulated.append(output.take());
     }
     if let Ok(path) = std::env::var("EMBER_COMPANION_RENDER_DUMP") {
         crate::ui::chat::export_native_frame(
             std::path::Path::new(&path),
             &ctx,
-            accumulated,
+            accumulated.take(),
             [1000, 600],
         );
     } else {

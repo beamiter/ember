@@ -69,6 +69,27 @@ class VisualTests(unittest.TestCase):
     def capture(self, present=False, baseline=None, label='test'):
         return visual.snapshot(self.smoke, label, baseline, present)
 
+    def test_reference_health_rejects_wrong_duplicate_or_unregistered_pty_marker(self):
+        transcript = self.smoke.out / 'sentinels.txt'
+        cases = [
+            ('ime-ready', b'preedit-switch-ready:42:/dev/pts/1\n'),
+            ('ime-ready', b'ime-ready:42:/dev/pts/1\nime-ready:42:/dev/pts/1\n'),
+            ('ime-ready', b'prefix-ime-ready:42:/dev/pts/1\n'),
+            ('unknown', b'unknown:42:/dev/pts/1\n'),
+        ]
+        for marker, content in cases:
+            with self.subTest(marker=marker, content=content):
+                transcript.write_bytes(content)
+                calls = []
+                smoke = SimpleNamespace(
+                    app=SimpleNamespace(poll=lambda: None),
+                    transcript=transcript, reference_readiness_marker=marker,
+                    run=lambda *args, **kwargs: calls.append(args))
+                rectangle = {'rect': {'x': 0, 'y': 0, 'width': 1280, 'height': 900}}
+                with self.assertRaises(RuntimeError):
+                    visual.reference_header_health(smoke, 'health', None, rectangle)
+                self.assertEqual(calls, [], 'Invalid identity must fail before pixel processing')
+
     def test_same_image_single_capture_and_explicit_ocr(self):
         result = self.capture()
         self.assertEqual(result['observed_token_count'], 0)

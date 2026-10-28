@@ -120,7 +120,7 @@ def composition_cycle(smoke, module, keyboard_module, visual, helper, identity, 
 def exercise(smoke, module, keyboard_module, visual, helper, seat):
     identity = smoke.command('live-ime-ready')
     segments = []
-    old = 'normal'
+    old = MODES[0]
     for index, mode in enumerate(MODES):
         label = f'live-{index}-{mode}'
         if index:
@@ -141,7 +141,7 @@ def exercise(smoke, module, keyboard_module, visual, helper, seat):
     actual_bytes = smoke.transcript.read_bytes()
     assert actual_bytes == expected_bytes, ('Exact sentinel transcript mismatch', actual_bytes.hex(), expected_bytes.hex())
     return {'identity': identity, 'segments': segments, 'sentinels': len(expected),
-            'find_zero_byte_cases': 8, 'clipboard_positive_controls': 4}
+            'find_zero_byte_cases': 2 * len(MODES), 'clipboard_positive_controls': len(MODES)}
 
 
 def main():
@@ -149,15 +149,22 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--ime-client', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--reference-shell', action='store_true')
     args = parser.parse_args()
     scripts = Path(__file__).parent
     module = load('smoke', scripts / 'native-desktop-smoke.py')
     keyboard = load('keyboard', scripts / 'native-ime-keyboard.py')
     visual = load('visual', scripts / 'native-ime-visual.py')
+    if args.reference_shell:
+        global MODES
+        MODES = ('block', 'chat', 'block')
+        visual.REFERENCE_SHELL_HEALTH = True
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     helper = args.ime_client.resolve(strict=True)
     smoke = module.Smoke(args.binary.resolve(strict=True), 'wayland', out)
+    smoke.reference_shell_fixture = args.reference_shell
+    smoke.reference_readiness_marker = 'live-ime-ready'
     smoke.env['EMBER_SMOKE_CAPTURE'] = str((scripts / 'native-ime-pty-capture.py').resolve())
     result = {'status': 'running', 'live_modes': list(MODES), 'scale': 1,
               'binary_sha256': hashlib.sha256(smoke.binary.read_bytes()).hexdigest(),
@@ -169,7 +176,8 @@ def main():
         time.sleep(0.5)
         # Keep the same readable visual-fixture fonts through every Settings
         # switch; the tiny default Chat preedit makes OCR invent punctuation.
-        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = false\nfont_size = 16.0\nui_font_size = 16.0\n')
+        initial = MODES[0]
+        smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + initial + '"\nrestore_session = false\nfont_size = 16.0\nui_font_size = 16.0\n')
         smoke.app = smoke.spawn([str(smoke.binary)], 'ember')
         module.wait_for(smoke.app_window, 'live IME Ember window')
         time.sleep(2)

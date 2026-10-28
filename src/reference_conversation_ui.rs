@@ -441,7 +441,12 @@ pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
     });
 }
 
-pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fixture: bool) {
+pub(crate) fn draw_inspector(
+    ui: &mut egui::Ui,
+    inspector: &model::Inspector,
+    fixture: bool,
+    scale: f32,
+) {
     egui::Frame::NONE
         .fill(rgb(color::INSPECTOR_CARD))
         .corner_radius(12)
@@ -457,7 +462,7 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
                     ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
                 icon(ui, rect, Icon::Agent, rgb(color::ACCENT));
                 ui.add(
-                    egui::Label::new(RichText::new(&inspector.title).strong().size(11.0))
+                    egui::Label::new(RichText::new(&inspector.title).strong().size(11.0 * scale))
                         .truncate(),
                 );
                 egui::Frame::NONE
@@ -465,18 +470,18 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
                     .corner_radius(5)
                     .inner_margin(egui::Margin::symmetric(5, 2))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(&inspector.badge).size(8.0));
+                        ui.label(RichText::new(&inspector.badge).size(8.0 * scale));
                     });
             });
             ui.label(
                 RichText::new(&inspector.subtitle)
-                    .size(9.0)
+                    .size(9.0 * scale)
                     .color(rgb(color::CHROME_MUTED)),
             );
             if fixture {
                 ui.label(
                     RichText::new("Visual acceptance fixture")
-                        .size(8.0)
+                        .size(8.0 * scale)
                         .color(rgb(color::CHROME_MUTED)),
                 );
             }
@@ -502,7 +507,7 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
                 egui::pos2(progress_row.right(), track.center().y),
                 egui::Align2::RIGHT_CENTER,
                 format!("{} / {} steps", inspector.completed, inspector.total),
-                egui::FontId::proportional(8.0),
+                egui::FontId::proportional(8.0 * scale),
                 rgb(color::CHROME_MUTED),
             );
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -516,14 +521,14 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
                     rect.left_center(),
                     egui::Align2::LEFT_CENTER,
                     label,
-                    egui::FontId::proportional(9.0),
+                    egui::FontId::proportional(9.0 * scale),
                     rgb(color::CHROME_MUTED),
                 );
                 let value_rect =
                     egui::Rect::from_min_max(rect.min + egui::vec2(70.0, 0.0), rect.max);
                 ui.put(
                     value_rect,
-                    egui::Label::new(RichText::new(value).size(9.0))
+                    egui::Label::new(RichText::new(value).size(9.0 * scale))
                         .halign(egui::Align::Max)
                         .truncate(),
                 )
@@ -532,7 +537,7 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
             ui.add_space(10.0);
             ui.label(
                 RichText::new("CURRENT STEP")
-                    .size(8.0)
+                    .size(8.0 * scale)
                     .color(rgb(color::CHROME_MUTED)),
             );
             ui.add_space((shell::INSPECTOR_CURRENT_TARGET_Y - ui.cursor().top()).max(0.0));
@@ -548,17 +553,17 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
                             let (rect, _) = ui
                                 .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                             state_icon(ui, rect, step.state);
-                            ui.label(RichText::new(&step.title).size(9.0));
+                            ui.label(RichText::new(&step.title).size(9.0 * scale));
                         });
                         ui.label(
                             RichText::new(&step.detail)
-                                .size(8.0)
+                                .size(8.0 * scale)
                                 .color(rgb(color::CHROME_MUTED)),
                         );
                     } else {
                         ui.label(
                             RichText::new("No current step")
-                                .size(9.0)
+                                .size(9.0 * scale)
                                 .color(rgb(color::CHROME_MUTED)),
                         );
                     }
@@ -566,14 +571,14 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
             ui.add_space(13.0);
             ui.label(
                 RichText::new("TASK QUEUE")
-                    .size(8.0)
+                    .size(8.0 * scale)
                     .color(rgb(color::CHROME_MUTED)),
             );
             ui.add_space(shell::METADATA_GAP);
             if inspector.queue.is_empty() {
                 ui.label(
                     RichText::new("No queued tasks")
-                        .size(9.0)
+                        .size(9.0 * scale)
                         .color(rgb(color::CHROME_MUTED)),
                 );
             }
@@ -603,7 +608,7 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
                 if let Some(elapsed) = &step.elapsed {
                     let elapsed_galley = ui.painter().layout_no_wrap(
                         elapsed.clone(),
-                        egui::FontId::proportional(8.0),
+                        egui::FontId::proportional(8.0 * scale),
                         rgb(color::CHROME_MUTED),
                     );
                     title_rect.max.x =
@@ -622,7 +627,7 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
                 // Keep the full detail available without changing row/grid height.
                 let mut title_job = egui::text::LayoutJob::simple(
                     step.title.clone(),
-                    egui::FontId::proportional(9.0),
+                    egui::FontId::proportional(9.0 * scale),
                     rgb(color::CHROME_TEXT),
                     title_rect.width(),
                 );
@@ -655,7 +660,7 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
             }
             let target = ui.min_rect().top() + 425.0;
             ui.add_space((target - ui.cursor().top()).max(8.0));
-            ui.label(RichText::new(&inspector.output_title).size(9.0));
+            ui.label(RichText::new(&inspector.output_title).size(9.0 * scale));
             egui::Frame::NONE
                 .fill(rgb(color::TERMINAL))
                 .corner_radius(8)
@@ -671,7 +676,7 @@ pub(crate) fn draw_inspector(ui: &mut egui::Ui, inspector: &model::Inspector, fi
                                 egui::Label::new(
                                     RichText::new(&inspector.output)
                                         .monospace()
-                                        .size(9.0)
+                                        .size(9.0 * scale)
                                         .color(rgb(color::CHROME_MUTED)),
                                 )
                                 .selectable(true),
@@ -748,5 +753,77 @@ impl TerminalApp {
                     }
                 });
         });
+    }
+}
+
+#[cfg(test)]
+mod reference_font_tests {
+    use super::*;
+
+    fn text_roles(shape: &egui::Shape, roles: &mut Vec<(String, f32, egui::Vec2)>) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    text_roles(shape, roles);
+                }
+            }
+            egui::Shape::Text(text) => {
+                for section in &text.galley.job.sections {
+                    roles.push((
+                        text.galley.text().to_owned(),
+                        section.format.font_id.size,
+                        text.galley.size(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn inspector_painted_roles_follow_ui_font_without_global_zoom() {
+        for dpi in [1.0, 1.5] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(dpi);
+            // egui applies the requested display scale at the next frame.
+            ctx.run_ui(Default::default(), |_| {})
+                .drop_without_applying_deltas();
+            let initial_zoom = ctx.zoom_factor();
+            let mut previous_width = 0.0;
+            for ui_size in [12.0, 14.0, 15.0, 18.0] {
+                let scale = ui_size / crate::config::DEFAULT_FONT_SIZE;
+                let fixture = model::acceptance_fixture().inspector;
+                let mut output = ctx.run_ui(Default::default(), |ui| {
+                    crate::reference_workspace::chrome_style(ui, scale);
+                    ui.set_width(277.0);
+                    draw_inspector(ui, &fixture, true, scale);
+                });
+                let mut roles = Vec::new();
+                for shape in &output.shapes {
+                    text_roles(&shape.shape, &mut roles);
+                }
+                // Consume the atlas delta before assertions so their original
+                // failure remains readable even in debug/unwind builds.
+                output.textures_delta.clear();
+                for (name, reference_size) in [
+                    ("Canvas renderer", 11.0),
+                    ("Visual acceptance fixture", 8.0),
+                    ("Model", 9.0),
+                    ("CURRENT STEP", 8.0),
+                    ("TASK QUEUE", 8.0),
+                ] {
+                    let role = roles.iter().find(|role| role.0 == name).unwrap();
+                    assert_eq!(role.1, reference_size * scale, "painted role: {name}");
+                }
+                let heading = roles.iter().find(|role| role.0 == "TASK QUEUE").unwrap();
+                assert!(heading.2.x > previous_width, "actual galley must grow");
+                previous_width = heading.2.x;
+                assert_eq!(
+                    ctx.zoom_factor(),
+                    initial_zoom,
+                    "UI zoom must not scale viewport"
+                );
+            }
+        }
     }
 }

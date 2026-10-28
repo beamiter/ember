@@ -114,7 +114,10 @@ def reference_header_health(smoke, label, image, rectangle):
     if not contained(region, owned) or smoke.app.poll() is not None:
         raise RuntimeError('Reference header lies outside live owned surface')
     transcript = smoke.transcript.read_bytes()
-    matches = re.findall(rb'^preedit-switch-ready:([0-9]+):(/dev/pts/[0-9]+)$', transcript, re.M)
+    marker = getattr(smoke, 'reference_readiness_marker', 'preedit-switch-ready')
+    if marker not in ('preedit-switch-ready', 'ime-ready', 'live-ime-ready'):
+        raise RuntimeError('Unregistered reference readiness marker')
+    matches = re.findall(rb'^' + re.escape(marker.encode('ascii')) + rb':([0-9]+):(/dev/pts/[0-9]+)$', transcript, re.M)
     if len(matches) != 1:
         raise RuntimeError('Missing exact real-PTY readiness identity')
     shell_pid, terminal = matches[0]

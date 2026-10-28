@@ -22,6 +22,51 @@ def tree():
         name='Ember',role=23,children=[],states=[0,0],interfaces=[])])
 
 class Tests(unittest.TestCase):
+    def test_terminal_region_uses_native_surface_not_sidebar_or_marker_text(self):
+        from PIL import Image, ImageDraw
+        image = Image.new('RGB', (1800, 1000), (0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((130, 150, 350, 850), fill=(9, 12, 23))  # Sidebar decoy.
+        draw.rectangle((1422, 592, 1680, 730), fill=(9, 12, 23))  # Inspector decoy.
+        draw.rectangle((422, 155, 1355, 858), fill=(9, 12, 23))
+        self.assertEqual(p.terminal_rectangle(image, (100, 50, 1600, 900)),
+                         (422, 155, 1356, 859))
+        # A marker-looking label cannot move the ROI; only the fixed surface
+        # boundary is observed and no expected target word is passed to it.
+        draw.text((700, 300), 'TARGET PAPAYA', fill=(240, 240, 240))
+        self.assertEqual(p.terminal_rectangle(image, (100, 50, 1600, 900)),
+                         (422, 155, 1356, 859))
+
+    def test_black_foreign_tiny_or_offscreen_surface_fails_closed(self):
+        from PIL import Image, ImageDraw
+        for case in ('black', 'foreign-only', 'tiny', 'offscreen'):
+            with self.subTest(case=case):
+                image = Image.new('RGB', (1800, 1000), (0, 0, 0))
+                draw = ImageDraw.Draw(image)
+                owned = (100, 50, 1600, 900)
+                if case == 'foreign-only': draw.rectangle((1422, 592, 1680, 730), fill=(9, 12, 23))
+                if case == 'tiny': draw.rectangle((450, 200, 500, 250), fill=(9, 12, 23))
+                if case == 'offscreen': owned = (300, 50, 1600, 900)
+                with self.assertRaises(RuntimeError): p.terminal_rectangle(image, owned)
+
+    def test_same_observer_locates_pre_redesign_full_width_terminal(self):
+        from PIL import Image, ImageDraw
+        for palette in ((29, 29, 29), (39, 39, 39)):
+            with self.subTest(palette=palette):
+                image = Image.new('RGB', (1800, 1000), (0, 0, 0))
+                ImageDraw.Draw(image).rectangle((108, 100, 1680, 905), fill=palette)
+                self.assertEqual(p.terminal_rectangle(image, (100, 50, 1600, 900)),
+                                 (108, 100, 1681, 906))
+
+    def test_two_equal_wide_surfaces_are_not_a_unique_terminal(self):
+        from PIL import Image, ImageDraw
+        image = Image.new('RGB', (1800, 1000), (0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((422, 155, 1355, 400), fill=(9, 12, 23))
+        draw.rectangle((422, 500, 1355, 745), fill=(9, 12, 23))
+        with self.assertRaisesRegex(RuntimeError, 'ambiguous'):
+            p.terminal_rectangle(image, (100, 50, 1600, 900))
+
     def test_live_baseline_waits_for_painted_output_before_single_search_action(self):
         smoke=object.__new__(p.PilotSmoke)
         smoke.app=SimpleNamespace(pid=42)

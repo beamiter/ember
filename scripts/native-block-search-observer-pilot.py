@@ -6,12 +6,58 @@ fixture produced false negatives. Historical failed verdicts remain unchanged.
 """
 import hashlib
 import importlib.util
+import csv
+import io
 import json
 from pathlib import Path
+import re
 import time
 
 spec = importlib.util.spec_from_file_location('e03_legacy_pilot_base', Path(__file__).with_name('native-block-search.py'))
 base = importlib.util.module_from_spec(spec); spec.loader.exec_module(base)
+
+
+def terminal_rectangle(image, owned):
+    """Locate the painted terminal by its non-text surface, never marker words.
+
+    Within the actual owned client, require the major wide, predominantly
+    dark terminal surface. Registered palettes come from the actual
+    pre-redesign builtin dark theme/card hover and current terminal surface.
+    No target/query/neighbor text participates in choosing this ROI.
+    """
+    from PIL import Image, ImageChops, ImageDraw
+    x, y, width, height = owned
+    if (min(x, y) < 0 or width <= 598 or height <= 182 or
+            x + width > image.width or y + height > image.height):
+        raise RuntimeError('Invalid owned terminal client bounds')
+    surface = image.convert('RGB').crop((x, y, x + width, y + height))
+    candidates = []
+    # Legacy completed-card hover composites foreground220@13/255 over29,
+    # yielding39. Keep that real native state visible to the same observer.
+    for palette in ((9, 12, 23), (29, 29, 29), (39, 39, 39)):
+        channels = ImageChops.difference(surface, Image.new('RGB', surface.size, palette)).split()
+        distance = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]), channels[2])
+        mask = distance.point([255] + [0] * 255)
+        pixels = mask.tobytes()
+        for row in range(height):
+            for run in re.finditer(b'\xff{300,}', pixels[row*width:(row+1)*width]):
+                seed = (run.start(), row)
+                if mask.getpixel(seed) != 255:
+                    continue
+                ImageDraw.floodfill(mask, seed, 128, thresh=0)
+                component = mask.point([255 if value == 128 else 0 for value in range(256)])
+                left, top, right, bottom = component.getbbox()
+                area = (right-left) * (bottom-top)
+                if (right-left >= width * 0.5 and bottom-top >= 80 and
+                        component.histogram()[255] >= area * 0.5):
+                    candidates.append((area, (left+x, top+y, right+x, bottom+y)))
+                mask.paste(0, mask=component)
+    if not candidates:
+        raise RuntimeError('Native terminal surface is absent or too small')
+    candidates.sort(reverse=True)
+    if len(candidates) > 1 and candidates[0][0] < candidates[1][0] * 2:
+        raise RuntimeError('Native terminal surface is ambiguous')
+    return candidates[0][1]
 
 
 def bbox(words):
@@ -84,6 +130,45 @@ def closed_picker(tree, owner, pid):
 
 
 class PilotSmoke(base.SearchSmoke):
+    def terminal_words(self, label):
+        from PIL import Image, ImageOps
+        source = self.out / (label + '.png')
+        original = hashlib.sha256(source.read_bytes()).hexdigest()
+        geometry = self.run(['xdotool', 'getwindowgeometry', '--shell', self.public.window],
+                            capture_output=True, text=True).stdout
+        values = dict(line.split('=', 1) for line in geometry.splitlines() if '=' in line)
+        owned = [int(values[key]) for key in ('X', 'Y', 'WIDTH', 'HEIGHT')]
+        with Image.open(source) as image:
+            region = terminal_rectangle(image, owned)
+            crop = image.convert('RGB').crop(region)
+        raw = self.out / (label + '-terminal.png')
+        analysis = self.out / (label + '-terminal-gray-negate.png')
+        crop.save(raw)
+        # Fixed, pixel-preserving analysis of the same immutable native image.
+        # PSM11, exact words, unique occurrences and adjacency remain unchanged.
+        ImageOps.invert(ImageOps.grayscale(crop)).save(analysis)
+        reply = self.run(['tesseract', str(analysis), 'stdout', '--psm', '11', 'tsv'],
+                         capture_output=True, text=True)
+        tsv = self.out / (label + '-terminal.tsv')
+        tsv.write_text(reply.stdout)
+        rows = []
+        for row in csv.DictReader(io.StringIO(reply.stdout), delimiter='\t', quoting=csv.QUOTE_NONE):
+            if not row['text'].strip():
+                continue
+            box = [int(row[key]) for key in ('left', 'top', 'width', 'height')]
+            if (min(box[:2]) < 0 or min(box[2:]) <= 0 or
+                    box[0] + box[2] > crop.width or box[1] + box[3] > crop.height):
+                raise RuntimeError('Terminal OCR word crosses its native surface')
+            rows.append(dict(row, left=str(box[0] + region[0]), top=str(box[1] + region[1])))
+        if hashlib.sha256(source.read_bytes()).hexdigest() != original:
+            raise RuntimeError('Native source image changed during terminal analysis')
+        (self.out / (label + '-terminal-region.json')).write_text(json.dumps(dict(
+            owned_client=owned, region=region, native_source=source.name, source_sha256=original,
+            region_sha256=hashlib.sha256(raw.read_bytes()).hexdigest(),
+            analysis=analysis.name, analysis_sha256=hashlib.sha256(analysis.read_bytes()).hexdigest(),
+            tsv=tsv.name, tsv_sha256=hashlib.sha256(tsv.read_bytes()).hexdigest()), indent=2))
+        return rows, tsv
+
     def emit(self, mode, record=0):
         path = self.fixture_dir / f'{mode}-{record:02d}.json'
         assert not path.exists()
@@ -101,14 +186,16 @@ class PilotSmoke(base.SearchSmoke):
         if self.app.poll() is not None or self.app_window() != self.public.window:
             raise RuntimeError('Owned application/window changed before fresh capture')
         started = time.monotonic_ns()
-        words = self.observe(name)
+        self.observe(name)  # Retain the original whole-frame OCR as evidence.
+        words, terminal_tsv = self.terminal_words(label)
         if self.last_observation_label != label or not png.is_file() or not tsv.is_file():
             raise RuntimeError('Pilot capture identity changed')
         if self.app.poll() is not None or self.app_window() != self.public.window:
             raise RuntimeError('Owned application/window changed during fresh capture')
         return words, dict(pid=self.app.pid, window=self.public.window, started_ns=started, finished_ns=time.monotonic_ns(),
             exclusive_fresh_path=True, label=label, png_sha256=hashlib.sha256(png.read_bytes()).hexdigest(),
-            tsv_sha256=hashlib.sha256(tsv.read_bytes()).hexdigest())
+            tsv_sha256=hashlib.sha256(terminal_tsv.read_bytes()).hexdigest(),
+            terminal_tsv=terminal_tsv.name)
 
     def open_find(self, query):
         # A completed generator/sentinel proves PTY execution, not that the UI

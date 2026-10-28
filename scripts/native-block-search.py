@@ -102,6 +102,10 @@ def validate_manifest(result, mode, record, identity, observer_pilot=False):
 class SearchSmoke(native.Smoke):
     def __init__(self, binary, backend, out):
         super().__init__(binary, backend, out)
+        # The native workspace reserves 598px for its sidebars. A 1200px
+        # client leaves only 72 real PTY columns at this fixture font; the
+        # unchanged 97-byte generator correctly refuses to wrap below 100.
+        self.x11_screen = '1800x1000x24'
         self.env = public.probe.child_environment(self.env)
         self.bus_daemon = None
         self.public = None
@@ -234,8 +238,11 @@ class SearchSmoke(native.Smoke):
         self.memory_thread.start()
 
     def exercise_search(self, scenario):
-        self.config.write_text('shell = "/bin/bash"\nterminal_mode = "block"\n'
-                               'initial_width = 1200\ninitial_height = 800\nfont_size = 12.0\n'
+        initial_mode = getattr(self, 'fixture_initial_mode', 'block')
+        if initial_mode not in ('normal', 'block'):
+            raise RuntimeError('Unknown native fixture configuration mode')
+        self.config.write_text(f'shell = "/bin/bash"\nterminal_mode = "{initial_mode}"\n'
+                               'initial_width = 1600\ninitial_height = 900\nfont_size = 12.0\n'
                                'scrollback_lines = 160000\ncommand_history_max_entries = 1000\n'
                                'restore_session = false\n')
         self.app = self.spawn([str(self.binary)], 'ember')
@@ -281,7 +288,7 @@ class SearchSmoke(native.Smoke):
             self.open_find('E03SNAPSHOT00')
             self.click_phrase('Earlier history', 'snapshot-earlier')
             self.navigate('E03SNAPSHOT00', 16, pointer=True)
-        return dict(scenario=scenario, shell_identity=self.identity,
+        return dict(scenario=scenario, shell_identity=self.identity, initial_config_mode=initial_mode,
                     correctness='first-stage matrix only; see exclusions')
 
     def close(self):
@@ -297,6 +304,8 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--backend', choices=['x11'], default='x11')
     parser.add_argument('--scenario', choices=['raw', 'snapshot'], required=True)
+    parser.add_argument('--initial-mode', choices=['normal', 'block'], default='block',
+                        help='Exact persisted config value for pre-redesign compatibility comparisons')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--observer-pilot', action='store_true',
                         help='Compatibility entry point for the former independent pixel observer pilot')
@@ -305,7 +314,7 @@ def main():
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     result = dict(binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
-                  backend=args.backend, scenario=args.scenario,
+                  backend=args.backend, scenario=args.scenario, initial_config_mode=args.initial_mode,
                   exclusions=['input p95 and presentation latency', 'complete memory accounting',
                               'guaranteed natural-limit Continue on every runner', 'continuous PTY contention',
                               'pane/query/reset/eviction/alternate-screen race matrix',
@@ -314,7 +323,9 @@ def main():
     # Keep both CI entry points on the same strict positive/negative pixel proof.
     smoke_class = load('e03_observer_pilot', 'native-block-search-observer-pilot.py').PilotSmoke
     result['fixture_version'] = 'bounded-pixel-v2'
+    result['pixel_observer'] = 'owned-native-terminal-surface-gray-negate-v1'
     smoke = smoke_class(binary, args.backend, out)
+    smoke.fixture_initial_mode = args.initial_mode
     if args.observer_pilot:
         result['observer_pilot'] = 'compatibility entry point; bounded-pixel-v2 oracle'
     try:

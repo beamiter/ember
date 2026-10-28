@@ -9463,3 +9463,120 @@ fn finalized_preview_cache_is_replaced_and_evicted_with_its_capture() {
     assert!(terminal.command_records()[index].captured_output.is_none());
     assert!(terminal.command_records()[index].output_preview.is_empty());
 }
+
+#[test]
+fn chat_presentation_rows_do_not_resize_native_cells_or_duplicate_prompt_origins() {
+    let mut terminal = TerminalState::new(80, 12);
+    chat_pair(&mut terminal, "echo retained", "retained output");
+    chat_prompt(&mut terminal, "pending café");
+    let policy = chat_policy();
+    let native_version = terminal.grid_version;
+    let records = format!("{:?}", terminal.command_records());
+    let mut state = ProjectionViewState::new();
+    let expanded = terminal.projected_viewport_with_rows(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+        Some(18),
+    );
+    assert!(expanded.is_transformed());
+    assert_eq!(expanded.visible_rows(), 18);
+    assert_eq!(terminal.grid.rows(), 12);
+    assert_eq!(terminal.grid_version, native_version);
+    let cursor_anchor = expanded.raw_anchor_at(expanded.cursor()).unwrap();
+    let again = terminal.projected_viewport_with_rows(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+        Some(18),
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &expanded.cells_arc(),
+        &again.cells_arc()
+    ));
+    let reduced = terminal.projected_viewport_with_rows(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+        Some(12),
+    );
+    assert_eq!(reduced.visible_rows(), 12);
+    assert_eq!(reduced.raw_anchor_at(reduced.cursor()), Some(cursor_anchor));
+    assert_eq!(terminal.grid.rows(), 12);
+    assert_eq!(terminal.grid_version, native_version);
+    assert_eq!(format!("{:?}", terminal.command_records()), records);
+    terminal.process_input(b"\x1b[?1049h");
+    let alternate = terminal.projected_viewport_with_rows(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+        Some(18),
+    );
+    assert!(alternate.key().is_bypass());
+    assert_eq!(
+        alternate.visible_rows(),
+        12,
+        "TUI rows stay native, without clipping"
+    );
+}
+
+#[test]
+fn chat_presentation_row_changes_preserve_history_anchor_and_follow_intent() {
+    let mut terminal = TerminalState::new(80, 12);
+    for index in 0..50 {
+        chat_pair(
+            &mut terminal,
+            &format!("echo line{index}"),
+            &format!("line{index}"),
+        );
+    }
+    chat_prompt(&mut terminal, "pending");
+    let policy = chat_policy();
+    let mut state = ProjectionViewState::new();
+    let initial = terminal.projected_viewport_with_rows(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+        Some(18),
+    );
+    state.set_offset(50, &initial);
+    let history = terminal.projected_viewport_with_rows(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+        Some(18),
+    );
+    let first_raw = |viewport: &super::ProjectedViewport| {
+        (0..viewport.visible_rows())
+            .find_map(|row| viewport.raw_anchor_at(DisplayPoint::new(row, 0)))
+    };
+    let anchor = first_raw(&history).unwrap();
+    for rows in [12, 18, 14, 18] {
+        let changed = terminal.projected_viewport_with_rows(
+            HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut state,
+            Some(rows),
+        );
+        assert_eq!(first_raw(&changed), Some(anchor));
+        assert!(!state.follows_bottom(), "reading intent must not be stolen");
+        assert_eq!(terminal.grid.rows(), 12);
+    }
+    state.scroll_to_bottom();
+    let latest = terminal.projected_viewport_with_rows(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+        Some(18),
+    );
+    assert!(state.follows_bottom());
+    assert_eq!(latest.scroll_offset(), 0);
+}

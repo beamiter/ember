@@ -15,6 +15,7 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--mode', choices=['normal', 'block', 'chat'], required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--reference-shell', action='store_true')
     args = parser.parse_args()
     spec = importlib.util.spec_from_file_location('native_smoke', args.runner)
     module = importlib.util.module_from_spec(spec)
@@ -29,8 +30,12 @@ def main():
     visual_spec = importlib.util.spec_from_file_location('ime_visual', Path(__file__).with_name('native-ime-visual.py'))
     visual = importlib.util.module_from_spec(visual_spec)
     visual_spec.loader.exec_module(visual)
+    visual.REFERENCE_SHELL_HEALTH = args.reference_shell
+    smoke.reference_shell_fixture = args.reference_shell
+    smoke.reference_readiness_marker = 'ime-ready'
     keyboard = None
-    result = {'status': 'running', 'mode': args.mode,
+    result = {'status': 'running', 'mode': module.presentation_mode(args.mode) if args.reference_shell else args.mode,
+              'initial_config_mode': args.mode, 'reference_shell': args.reference_shell,
               'binary_sha256': hashlib.sha256(smoke.binary.read_bytes()).hexdigest(),
               'helper_sha256': hashlib.sha256(args.ime_client.resolve(strict=True).read_bytes()).hexdigest(),
               'mechanism': 'input-method-v2 keyboard grab and compositor preedit/commit requests',
