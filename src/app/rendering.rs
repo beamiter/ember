@@ -1873,6 +1873,8 @@ impl TerminalApp {
             renderer.font_ligatures = self.renderer.font_ligatures;
             renderer.click_moves_cursor = self.renderer.click_moves_cursor;
             renderer.block_mode = self.renderer.block_mode;
+            renderer.continuous_block = self.renderer.continuous_block;
+            renderer.glass_chat_requested = self.renderer.glass_chat_requested;
             renderer.chat_mode = self.renderer.chat_mode;
             renderer.chat_command_bubbles = self.renderer.chat_command_bubbles;
             renderer.block_compact = self.renderer.block_compact;
@@ -2645,7 +2647,11 @@ impl TerminalApp {
             self.prompt_fill_enter_latch,
         );
         self.renderer.chat_controls_enabled = chat_controls_enabled;
-        let available_rect = ui.available_rect_before_wrap();
+        let outer = ui.available_rect_before_wrap();
+        let available_rect = egui::Rect::from_min_max(
+            outer.min + egui::vec2(16.0, 0.0),
+            outer.max - egui::vec2(17.0, 0.0),
+        );
         // Keep the focused pane's geometry current even in single-pane mode,
         // so split commands can validate the resulting child sizes before
         // creating another shell session.
@@ -2666,6 +2672,14 @@ impl TerminalApp {
                 .collect()
         };
         self.ensure_pane_renderer_capacity(ctx);
+        if self.layout().panes().len() == 1 {
+            let session = self.session_manager.get_active_session_mut();
+            self.renderer.configure_glass_presentation(
+                self.config.chat_mode_enabled(),
+                &session.terminal.lock(),
+                available_rect.height(),
+            );
+        }
         let foreground = self.renderer.chat_mode
             && !self
                 .session_manager
@@ -2677,8 +2691,8 @@ impl TerminalApp {
         let (single_pty_rect, single_presentation_rect, single_footer) =
             crate::ui::reference_terminal_rects(
                 available_rect,
-                self.renderer.chat_mode,
-                foreground,
+                true,
+                !self.renderer.chat_mode || foreground,
             );
         self.renderer.foreground_footer_rect = single_footer;
         // Prompt's virtual dock and foreground's footer have the same native
@@ -2739,20 +2753,6 @@ impl TerminalApp {
 
                 let pane_outer_rect = pane_chrome[pane_idx].1;
                 let session_idx = pane.session_idx;
-                let foreground = self.pane_renderers[pane_idx].chat_mode
-                    && self
-                        .session_manager
-                        .sessions()
-                        .get(session_idx)
-                        .is_some_and(|session| {
-                            !session.terminal.lock().chat_surface().composer_docked()
-                        });
-                let (pty_rect, content_rect, footer) = crate::ui::reference_terminal_rects(
-                    pane_outer_rect,
-                    self.pane_renderers[pane_idx].chat_mode,
-                    foreground,
-                );
-                self.pane_renderers[pane_idx].foreground_footer_rect = footer;
                 let native_editor = self
                     .session_manager
                     .sessions()
@@ -2776,7 +2776,30 @@ impl TerminalApp {
                 renderer.font_size = renderer
                     .native_vim9_font_size
                     .unwrap_or(self.config.font_size);
-                renderer.sync_font_metrics(ctx);
+                if let Some(session) = self.session_manager.sessions().get(session_idx) {
+                    renderer.sync_glass_presentation(
+                        ctx,
+                        self.config.chat_mode_enabled(),
+                        &session.terminal.lock(),
+                        pane_outer_rect.height(),
+                    );
+                } else {
+                    renderer.sync_font_metrics(ctx);
+                }
+                let foreground = self.pane_renderers[pane_idx].chat_mode
+                    && self
+                        .session_manager
+                        .sessions()
+                        .get(session_idx)
+                        .is_some_and(|session| {
+                            !session.terminal.lock().chat_surface().composer_docked()
+                        });
+                let (pty_rect, content_rect, footer) = crate::ui::reference_terminal_rects(
+                    pane_outer_rect,
+                    true,
+                    !self.pane_renderers[pane_idx].chat_mode || foreground,
+                );
+                self.pane_renderers[pane_idx].foreground_footer_rect = footer;
                 // 按本窗格 rect 的尺寸 resize 该窗格会话的 shell + 终端 grid,
                 // 否则窗格内的 shell 仍以为自己拥有整窗口宽高,导致换行/清屏错乱。
                 self.pane_renderers[pane_idx].projection_view_rows =
@@ -2805,15 +2828,20 @@ impl TerminalApp {
                     session
                         .projection_policy
                         .set_block_spacing(self.pane_renderers[pane_idx].block_spacer_rows());
+                    session.projection_policy.set_block_chrome(
+                        self.pane_renderers[pane_idx].block_mode
+                            && !self.pane_renderers[pane_idx].continuous_block,
+                        0,
+                    );
                     session
                         .projection_policy
-                        .set_block_chrome(self.pane_renderers[pane_idx].block_mode, 0);
+                        .set_retain_identity_canvas(self.pane_renderers[pane_idx].continuous_block);
                     session
                         .projection_policy
                         .set_chat_mode(self.pane_renderers[pane_idx].chat_mode);
-                    session.projection_policy.set_chat_footer_rows(
-                        (28.0 / self.pane_renderers[pane_idx].line_height).ceil() as usize,
-                    );
+                    session
+                        .projection_policy
+                        .set_chat_footer_rows(self.pane_renderers[pane_idx].chat_footer_rows());
                     session.projection_policy.set_chat_command_bubbles(
                         self.pane_renderers[pane_idx].chat_command_bubbles,
                     );
@@ -3089,15 +3117,19 @@ impl TerminalApp {
                 session
                     .projection_policy
                     .set_block_spacing(self.renderer.block_spacer_rows());
+                session.projection_policy.set_block_chrome(
+                    self.renderer.block_mode && !self.renderer.continuous_block,
+                    0,
+                );
                 session
                     .projection_policy
-                    .set_block_chrome(self.renderer.block_mode, 0);
+                    .set_retain_identity_canvas(self.renderer.continuous_block);
                 session
                     .projection_policy
                     .set_chat_mode(self.renderer.chat_mode);
                 session
                     .projection_policy
-                    .set_chat_footer_rows((28.0 / self.renderer.line_height).ceil() as usize);
+                    .set_chat_footer_rows(self.renderer.chat_footer_rows());
                 session
                     .projection_policy
                     .set_chat_command_bubbles(self.renderer.chat_command_bubbles);

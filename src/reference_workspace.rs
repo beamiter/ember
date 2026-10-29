@@ -2,17 +2,17 @@
 //!
 //! This module owns chrome only. The live PTY, projection, IME and reading
 //! anchors continue to belong to the existing terminal renderer and session.
-use crate::reference_conversation_ui::{icon, icon_button};
+use crate::glass_shell::{self as shell, color};
+use crate::reference_conversation_ui::icon;
 use crate::{
     app::state::{ReferenceInspectorRequest, ReferenceInspectorTab, TerminalApp},
     config, sidebar, theme,
 };
 use egui::{Color32, FontId, RichText, Stroke};
-use jterm_core::reference_shell::{self as shell, color};
 use jterm_core::{reference_conversation as conversation, reference_icons::Icon};
 
 pub(crate) fn rgb(value: [u8; 3]) -> Color32 {
-    Color32::from_rgb(value[0], value[1], value[2])
+    shell::paint_color(value)
 }
 
 /// Reuse the shipped native identities, decoded once per egui context.
@@ -46,18 +46,7 @@ fn product_identity(ui: &egui::Ui, rect: egui::Rect, product: &str) {
 /// A small native mesh keeps the light canvas continuous without adding layers
 /// over text or moving any terminal cells.
 pub(crate) fn paint_canvas_background(painter: &egui::Painter, rect: egui::Rect) {
-    let mut mesh = egui::Mesh::default();
-    for (pos, tint) in [
-        (rect.left_top(), color::CANVAS),
-        (rect.right_top(), color::CANVAS),
-        (rect.left_bottom(), color::CANVAS_COOL),
-        (rect.right_bottom(), color::CANVAS_COOL),
-    ] {
-        mesh.colored_vertex(pos, rgb(tint));
-    }
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(1, 3, 2);
-    painter.add(egui::Shape::mesh(mesh));
+    shell::paint_panel(painter, rect, shell::token::CENTER);
 }
 
 /// A compact inspector occupies a bounded overlay surface, never another
@@ -87,7 +76,7 @@ pub(crate) fn show_inspector_drawer<R>(
             ui.set_min_size(rect.size());
             ui.set_max_size(rect.size());
             ui.set_clip_rect(rect.intersect(ui.clip_rect()));
-            ui.painter().rect_filled(rect, 0, frame.fill);
+            shell::paint_panel(ui.painter(), rect, shell::token::INSPECTOR);
             frame
                 .show(ui, |ui| {
                     ui.set_min_height(ui.available_height());
@@ -117,18 +106,19 @@ fn header_action(ui: &mut egui::Ui, kind: Icon, label: &str) -> egui::Response {
             ui.spacing_mut().interact_size = egui::Vec2::splat(shell::HEADER_ACTION_SIZE);
             ui.spacing_mut().button_padding = egui::Vec2::ZERO;
             let visuals = ui.visuals_mut();
-            visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
-            visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-            visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-            visuals.widgets.hovered.bg_fill = rgb(color::CONTROL_SURFACE);
-            visuals.widgets.hovered.weak_bg_fill = rgb(color::CONTROL_SURFACE);
-            visuals.widgets.hovered.bg_stroke = Stroke::NONE;
-            visuals.widgets.active.bg_fill = rgb(color::ACCENT_PALE);
-            visuals.widgets.active.weak_bg_fill = rgb(color::ACCENT_PALE);
+            visuals.widgets.inactive.bg_fill = shell::rgba(shell::token::BUTTON);
+            visuals.widgets.inactive.weak_bg_fill = shell::rgba(shell::token::BUTTON);
+            visuals.widgets.inactive.bg_stroke =
+                Stroke::new(1.0, shell::rgba(shell::token::BORDER));
+            visuals.widgets.hovered.bg_fill = shell::rgba(shell::token::BUTTON_HOVER);
+            visuals.widgets.hovered.weak_bg_fill = shell::rgba(shell::token::BUTTON_HOVER);
+            visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, shell::rgba(shell::token::BORDER));
+            visuals.widgets.active.bg_fill = shell::rgba(shell::token::ACCENT_TOP);
+            visuals.widgets.active.weak_bg_fill = shell::rgba(shell::token::ACCENT_TOP);
             visuals.widgets.active.bg_stroke = Stroke::new(1.0, rgb(color::ACCENT));
             ui.add_sized(
                 [shell::HEADER_ACTION_SIZE, shell::HEADER_ACTION_SIZE],
-                egui::Button::new("").corner_radius(6),
+                egui::Button::new("").corner_radius(shell::CONTROL_RADIUS),
             )
         })
         .inner;
@@ -141,7 +131,7 @@ fn header_action(ui: &mut egui::Ui, kind: Icon, label: &str) -> egui::Response {
     if response.has_focus() {
         ui.painter().rect_stroke(
             response.rect,
-            6,
+            shell::CONTROL_RADIUS,
             Stroke::new(1.0, rgb(color::ACCENT)),
             egui::StrokeKind::Inside,
         );
@@ -152,70 +142,22 @@ fn header_action(ui: &mut egui::Ui, kind: Icon, label: &str) -> egui::Response {
     response.on_hover_text(label)
 }
 
-fn mode_control(ui: &mut egui::Ui, label: &str, selected: bool, scale: f32) -> egui::Response {
-    ui.push_id(("reference-mode", label), |ui| {
-        let font = egui::TextStyle::Button.resolve(ui.style());
-        let text = ui
-            .painter()
-            .layout_no_wrap(label.into(), font, Color32::WHITE);
-        let size = egui::vec2(
-            (text.size().x + 2.0 * ui.spacing().button_padding.x)
-                .max(shell::MODE_CONTROL_MIN_WIDTH * scale.max(1.0)),
-            shell::CONTROL_HEIGHT,
-        );
-        let (slot, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        // Keep the existing horizontal slots; vertical placement belongs to
-        // the 42px toolbar, not the row's text/interaction minimum height.
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(
-                slot.left(),
-                (shell::TITLEBAR_HEIGHT - shell::CONTROL_HEIGHT) * 0.5,
-            ),
-            size,
-        );
-        let visuals = ui.visuals_mut();
-        visuals.selection.bg_fill = rgb(color::ACCENT);
-        visuals.selection.stroke = Stroke::new(1.0, rgb(color::ACCENT));
-        visuals.widgets.inactive.weak_bg_fill = rgb(color::INSPECTOR_CARD);
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, rgb(color::DARK_BORDER));
-        if selected {
-            ui.painter().rect_stroke(
-                rect.expand(1.0),
-                8,
-                Stroke::new(1.0, rgb(color::ACCENT).gamma_multiply(0.2)),
-                egui::StrokeKind::Inside,
-            );
-        }
-        ui.put(
-            rect,
-            egui::Button::new(RichText::new(label).color(if selected {
-                Color32::WHITE
-            } else {
-                rgb(color::CHROME_MUTED)
-            }))
-            .selected(selected)
-            .min_size(size)
-            .corner_radius(7),
-        )
-    })
-    .inner
-}
-
 pub(crate) fn chrome_style(ui: &mut egui::Ui, scale: f32) {
     let style = ui.style_mut();
     style.visuals = egui::Visuals::dark();
     style.visuals.override_text_color = Some(rgb(color::CHROME_TEXT));
-    style.visuals.panel_fill = rgb(color::NAVIGATION);
+    style.visuals.panel_fill = Color32::TRANSPARENT;
+    style.visuals.disabled_alpha = 1.0;
     style.visuals.window_fill = rgb(color::INSPECTOR_CARD);
     style.visuals.selection.bg_fill = rgb(color::NAVIGATION_SELECTED);
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, rgb(color::DARK_BORDER));
     style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
     style.visuals.widgets.hovered.weak_bg_fill = rgb(color::NAVIGATION_SELECTED);
     style.spacing.item_spacing = egui::vec2(shell::METADATA_GAP, 4.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
-    style.spacing.interact_size.y = shell::CONTROL_HEIGHT;
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.interact_size.y = 28.0;
     for font in style.text_styles.values_mut() {
-        *font = FontId::proportional(10.0 * scale);
+        *font = FontId::proportional(16.0 * scale);
     }
 }
 
@@ -343,10 +285,13 @@ impl TerminalApp {
         let width = shell::INSPECTOR_WIDTH.min((screen.width() - layout.rail.width).max(0.0));
         let rect = egui::Rect::from_min_max(
             egui::pos2(
-                screen.right() - width,
-                screen.top() + layout.titlebar.height,
+                screen.right() - shell::token::OUTER_RIGHT - width,
+                screen.top() + shell::token::MAIN_TOP,
             ),
-            screen.right_bottom(),
+            egui::pos2(
+                screen.right() - shell::token::OUTER_RIGHT,
+                screen.bottom() - shell::token::SHORT_BOTTOM_GAP,
+            ),
         );
         rect.is_positive().then_some(rect)
     }
@@ -449,14 +394,14 @@ impl TerminalApp {
                             Color32::TRANSPARENT
                         })
                         .stroke(Stroke::new(1.0, rgb(color::DARK_BORDER)))
-                        .corner_radius(7),
+                        .corner_radius(12),
                 )
             })
             .inner
             .on_hover_text(label);
         icon(
             ui,
-            rect.shrink(6.0),
+            rect.shrink2(egui::vec2(15.0, 10.0)),
             Icon::PanelRight,
             rgb(if shown {
                 color::CHROME_TEXT
@@ -486,13 +431,10 @@ impl TerminalApp {
     /// the light document and white PTY-owned composer.
     pub(crate) fn reference_terminal_theme(&self) -> theme::Theme {
         let mut theme = self.current_theme.clone();
-        {
-            theme.terminal = theme::Theme::builtin_light().terminal;
-            theme.terminal.background = color::CANVAS;
-            theme.terminal.foreground = color::CANVAS_TEXT;
-            theme.terminal.cursor = color::ACCENT;
-            theme.tabbar.active_border = color::ACCENT;
-        }
+        theme.terminal.background = [4, 10, 21];
+        theme.terminal.foreground = [239, 245, 255];
+        theme.terminal.cursor = color::ACCENT;
+        theme.tabbar.active_border = color::ACCENT;
         theme
     }
 
@@ -519,147 +461,175 @@ impl TerminalApp {
             }
         }
         let scale = self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE;
+        let layout = self.reference_layout(root.ctx());
+        for (rect, fill) in [
+            (Some(layout.rail), shell::token::RAIL),
+            (layout.navigation, shell::token::NAVIGATION),
+            (Some(layout.center), shell::token::CENTER),
+            (layout.inspector, shell::token::INSPECTOR),
+        ] {
+            if let Some(r) = rect {
+                shell::paint_panel(
+                    root.painter(),
+                    egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.width, r.height)),
+                    fill,
+                );
+            }
+        }
         egui::Panel::top("reference-titlebar")
             .exact_size(shell::TITLEBAR_HEIGHT)
             .resizable(false)
             .show_separator_line(false)
             .frame(
                 egui::Frame::NONE
-                    .fill(rgb(color::TITLEBAR))
-                    .inner_margin(7.0),
+                    .fill(shell::rgba(shell::token::TOP))
+                    .inner_margin(0.0),
             )
             .show(root, |ui| {
                 chrome_style(ui, scale);
-                let blank = ui.max_rect();
-                let drag = ui.interact(blank, ui.id().with("window-drag"), egui::Sense::drag());
+                let bounds = ui.max_rect();
+                let drag = ui.interact(bounds, ui.id().with("window-drag"), egui::Sense::drag());
                 if drag.drag_started() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
-                let toggle = egui::Rect::from_min_size(
-                    egui::pos2(blank.right() - shell::CONTROL_HEIGHT, blank.top()),
-                    egui::Vec2::splat(shell::CONTROL_HEIGHT),
-                );
-                let content = egui::Rect::from_min_max(
-                    blank.min,
-                    egui::pos2(toggle.left() - shell::METADATA_GAP, blank.bottom()),
-                );
-                ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
-                    // The application toggle keeps a fixed reachable slot even
-                    // when the compact titlebar's optional identity text hides.
-                    ui.set_clip_rect(content.intersect(ui.clip_rect()));
-                    ui.horizontal_centered(|ui| {
-                        for (glyph, tip, command) in [
-                            ("×", "Close window", egui::ViewportCommand::Close),
-                            (
-                                "−",
-                                "Minimize window",
-                                egui::ViewportCommand::Minimized(true),
-                            ),
-                        ] {
-                            if ui
-                                .add_sized(
-                                    [24.0, 24.0],
-                                    egui::Button::new(RichText::new(glyph).size(12.0 * scale))
-                                        .fill(Color32::TRANSPARENT)
-                                        .stroke(Stroke::NONE)
-                                        .corner_radius(5),
-                                )
-                                .on_hover_text(tip)
-                                .clicked()
-                            {
-                                ui.ctx().send_viewport_cmd(command);
-                            }
-                        }
-                        if ui
-                            .add_sized(
-                                [24.0, 24.0],
-                                egui::Button::new(RichText::new("□").size(12.0 * scale))
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE)
-                                    .corner_radius(5),
-                            )
-                            .on_hover_text("Maximize or restore window")
-                            .clicked()
-                        {
-                            let maximized =
-                                ui.input(|input| input.viewport().maximized.unwrap_or(false));
-                            ui.ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                        }
-                        ui.add_space(8.0);
-                        let (brand, _) = ui.allocate_exact_size(
-                            egui::Vec2::splat(jterm_core::reference_identity::PRODUCT_ICON_SIZE),
-                            egui::Sense::hover(),
-                        );
-                        product_identity(ui, brand, "ember");
-                        if blank.width() >= 500.0 {
-                            ui.label(RichText::new("Ember").strong().size(12.0 * scale));
-                            ui.label(
-                                RichText::new(if self.config.chat_mode_enabled() {
-                                    "Chat"
-                                } else {
-                                    "Block"
-                                })
-                                .size(9.0 * scale)
-                                .color(rgb(color::CHROME_MUTED)),
-                            );
-                        }
-                        let width = ui.available_width();
-                        if width > 780.0 {
-                            ui.add_space(18.0);
-                            let path = self.reference_workspace_path();
-                            ui.add_sized(
-                                [160.0, 22.0],
-                                egui::Label::new(
-                                    RichText::new(path.as_str()).color(rgb(color::CHROME_MUTED)),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(path);
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if icon_button(ui, Icon::Settings, "Settings").clicked() {
-                                self.config_panel.open(&self.config);
-                            }
-                            for (mode, label) in [
-                                (config::TerminalMode::Chat, "Chat"),
-                                (config::TerminalMode::Block, "Block"),
-                            ] {
-                                let selected = (mode == config::TerminalMode::Chat)
-                                    == self.config.chat_mode_enabled();
-                                if mode_control(ui, label, selected, scale)
-                                    .on_hover_text("Change presentation of the same live shell")
-                                    .clicked()
-                                    && !selected
-                                {
-                                    self.config.terminal_mode = Some(mode);
-                                    self.apply_runtime_config(ui.ctx());
-                                    self.force_resize_session = true;
-                                    self.return_focus_to_terminal(ui.ctx());
-                                    self.config_panel.sync_from_config(&self.config);
-                                    self.schedule_config_save();
-                                }
-                            }
-                        });
-                    });
-                });
-                self.render_reference_inspector_toggle(ui, toggle);
-                if ui.max_rect().width() > 900.0 {
-                    let width = shell::SEARCH_WIDTH;
-                    let global_width = ui.ctx().viewport_rect().width();
-                    let search = egui::Rect::from_min_size(
-                        egui::pos2(
-                            (global_width - width) * 0.5 + shell::SEARCH_CENTER_OFFSET,
-                            shell::SEARCH_TOP,
-                        ),
-                        egui::vec2(width, shell::SEARCH_HEIGHT),
+                for (i, glyph, tip) in [
+                    (0, "×", "Close window"),
+                    (1, "−", "Minimize window"),
+                    (2, "□", "Maximize or restore window"),
+                ] {
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(14.0 + i as f32 * 31.0, 19.0),
+                        egui::vec2(28.0, 30.0),
                     );
                     if ui
                         .put(
-                            search,
+                            r,
+                            egui::Button::new(RichText::new(glyph).size(19.0 * scale))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
+                        )
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        match i {
+                            0 => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                            1 => ui
+                                .ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                            _ => {
+                                let v = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                                ui.ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!v));
+                            }
+                        }
+                    }
+                }
+                let brand =
+                    egui::Rect::from_min_size(egui::pos2(128.0, 19.0), egui::vec2(33.0, 33.0));
+                if bounds.width() > 470.0 {
+                    product_identity(ui, brand, "ember");
+                }
+                if bounds.width() > 700.0 {
+                    ui.painter().text(
+                        egui::pos2(176.0, 35.0),
+                        egui::Align2::LEFT_CENTER,
+                        "Ember",
+                        FontId::proportional(24.0 * scale),
+                        shell::rgba(shell::token::TEXT),
+                    );
+                    ui.painter().text(
+                        egui::pos2(262.0, 38.0),
+                        egui::Align2::LEFT_CENTER,
+                        if self.config.chat_mode_enabled() {
+                            "Chat"
+                        } else {
+                            "Block"
+                        },
+                        FontId::proportional(14.0 * scale),
+                        shell::rgba(shell::token::MUTED_TEXT),
+                    );
+                }
+                let button_h = 42.0;
+                let toggle_w = if bounds.width() > 1000.0 { 54.0 } else { 42.0 };
+                let toggle = egui::Rect::from_min_size(
+                    egui::pos2(bounds.right() - 12.0 - toggle_w, 16.0),
+                    egui::vec2(toggle_w, button_h),
+                );
+                self.render_reference_inspector_toggle(ui, toggle);
+                let settings = toggle.translate(egui::vec2(-toggle_w - 10.0, 0.0));
+                let response = ui.put(
+                    settings,
+                    egui::Button::new("")
+                        .fill(shell::rgba(shell::token::BUTTON))
+                        .stroke(Stroke::new(1.0, shell::rgba(shell::token::BORDER)))
+                        .corner_radius(12),
+                );
+                icon(
+                    ui,
+                    settings.shrink2(egui::vec2(15.0, 10.0)),
+                    Icon::Settings,
+                    shell::rgba(shell::token::TEXT),
+                );
+                if response.on_hover_text("Settings").clicked() {
+                    self.config_panel.open(&self.config);
+                }
+                let mode_width = if bounds.width() > 1000.0 { 90.0 } else { 64.0 };
+                let mode_padding = ui.spacing().button_padding;
+                if bounds.width() <= 1000.0 {
+                    ui.spacing_mut().button_padding.x = 6.0;
+                }
+                for (i, mode, label) in [
+                    (0, config::TerminalMode::Chat, "Chat"),
+                    (1, config::TerminalMode::Block, "Block"),
+                ] {
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(
+                            settings.left() - 18.0 - mode_width - i as f32 * (mode_width + 10.0),
+                            16.0,
+                        ),
+                        egui::vec2(mode_width, button_h),
+                    );
+                    let selected =
+                        (mode == config::TerminalMode::Chat) == self.config.chat_mode_enabled();
+                    let response = ui.put(
+                        r,
+                        egui::Button::new(
+                            RichText::new(label)
+                                .size(16.0 * scale)
+                                .color(shell::rgba(shell::token::TEXT)),
+                        )
+                        .truncate()
+                        .fill(shell::rgba(if selected {
+                            shell::token::ACCENT_TOP
+                        } else {
+                            shell::token::BUTTON
+                        }))
+                        .stroke(Stroke::new(1.0, shell::rgba(shell::token::BORDER)))
+                        .corner_radius(12),
+                    );
+                    if response.clicked() && !selected {
+                        self.config.terminal_mode = Some(mode);
+                        self.apply_runtime_config(ui.ctx());
+                        self.force_resize_session = true;
+                        self.return_focus_to_terminal(ui.ctx());
+                        self.config_panel.sync_from_config(&self.config);
+                        self.schedule_config_save();
+                    }
+                }
+                ui.spacing_mut().button_padding = mode_padding;
+                if bounds.width() >= 1250.0 {
+                    let width = (bounds.width() * 0.337).min(543.0);
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2((bounds.width() - width) * 0.5, 16.0),
+                        egui::vec2(width, 42.0),
+                    );
+                    if ui
+                        .put(
+                            r,
                             egui::Button::new("")
-                                .fill(rgb(color::INSPECTOR_CARD))
-                                .corner_radius(6),
+                                .fill(shell::rgba(shell::token::BUTTON))
+                                .stroke(Stroke::new(1.0, shell::rgba(shell::token::BORDER)))
+                                .corner_radius(12),
                         )
                         .on_hover_text("Open command launcher")
                         .clicked()
@@ -668,30 +638,30 @@ impl TerminalApp {
                     }
                     icon(
                         ui,
-                        egui::Rect::from_min_size(
-                            search.min + egui::vec2(9.0, 6.0),
-                            egui::vec2(16.0, 16.0),
+                        egui::Rect::from_center_size(
+                            r.left_center() + egui::vec2(24.0, 0.0),
+                            egui::vec2(20.0, 20.0),
                         ),
                         Icon::Search,
-                        rgb(color::CHROME_MUTED),
+                        shell::rgba(shell::token::TEXT),
                     );
                     ui.painter().text(
-                        search.left_center() + egui::vec2(34.0, 0.0),
+                        r.left_center() + egui::vec2(50.0, 0.0),
                         egui::Align2::LEFT_CENTER,
-                        "Search commands…",
-                        egui::FontId::proportional(10.0 * scale),
-                        rgb(color::CHROME_MUTED),
+                        "Search commands, files, tools…",
+                        FontId::proportional(14.0 * scale),
+                        shell::rgba(shell::token::MUTED_TEXT),
                     );
                     ui.painter().text(
-                        search.right_center() - egui::vec2(10.0, 0.0),
+                        r.right_center() - egui::vec2(12.0, 0.0),
                         egui::Align2::RIGHT_CENTER,
                         self.keybindings
                             .pretty_bindings_for("command_palette:toggle")
                             .first()
                             .map(String::as_str)
                             .unwrap_or("Unbound"),
-                        egui::FontId::proportional(9.0 * scale),
-                        rgb(color::CHROME_TEXT),
+                        FontId::proportional(13.0 * scale),
+                        shell::rgba(shell::token::TEXT),
                     );
                 }
             });
@@ -730,14 +700,20 @@ impl TerminalApp {
 
     pub(crate) fn render_reference_rail(&mut self, root: &mut egui::Ui) {
         let scale = self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE;
+        let layout = self.reference_layout(root.ctx());
+        let short = root.ctx().viewport_rect().height() < shell::token::SHORT_HEIGHT;
         egui::Panel::left("reference-rail")
-            .exact_size(shell::RAIL_WIDTH)
+            .exact_size(layout.rail.width + shell::token::OUTER_LEFT)
             .resizable(false)
             .show_separator_line(false)
-            .frame(egui::Frame::NONE.fill(rgb(color::RAIL)).inner_margin(10.0))
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                left: 17,
+                right: 12,
+                top: 8,
+                bottom: if short { 24 } else { 50 },
+            }))
             .show(root, |ui| {
                 chrome_style(ui, scale);
-                ui.add_space(2.0);
                 for (key, hint) in conversation::RAIL_NAVIGATION {
                     let kind = if key == "workspace" {
                         Icon::Grid
@@ -749,20 +725,26 @@ impl TerminalApp {
                         "agent" => sidebar::SidebarView::Tasks,
                         _ => sidebar::SidebarView::Sessions,
                     };
-                    let selected = kind == Icon::Grid;
+                    let size = (layout.rail.width - 24.0).min(49.0);
                     let response = ui.add_sized(
-                        [34.0, 34.0],
-                        egui::Button::new("").selected(selected).corner_radius(8),
+                        [size, size],
+                        egui::Button::new("")
+                            .fill(if key == "workspace" {
+                                shell::rgba(shell::token::ACCENT_TOP)
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(Stroke::NONE)
+                            .corner_radius(12),
                     );
                     icon(
                         ui,
-                        response.rect.shrink(8.0),
+                        egui::Rect::from_center_size(
+                            response.rect.center(),
+                            egui::Vec2::splat(if size < 40.0 { 20.0 } else { 24.0 }),
+                        ),
                         kind,
-                        if selected {
-                            rgb(color::CHROME_TEXT)
-                        } else {
-                            rgb(color::CHROME_MUTED)
-                        },
+                        shell::rgba(shell::token::TEXT),
                     );
                     if response.on_hover_text(hint).clicked() {
                         if key == "search" {
@@ -771,26 +753,23 @@ impl TerminalApp {
                             self.reference_request_sidebar_view(view, ui.ctx());
                         }
                     }
-                    ui.add_space(7.0);
+                    ui.add_space(8.0);
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     let initial = std::env::var("USER")
                         .ok()
-                        .and_then(|name| name.chars().next())
+                        .and_then(|s| s.chars().next())
                         .unwrap_or('U')
                         .to_uppercase()
                         .to_string();
-                    let profile = ui.add_sized(
-                        [shell::PROFILE_DIAMETER, shell::PROFILE_DIAMETER],
-                        egui::Button::new(initial)
-                            .fill(rgb(color::PROFILE_BACKGROUND))
-                            .stroke(Stroke::new(1.0, rgb(color::PROFILE_BORDER)))
-                            .corner_radius(14),
-                    );
-                    profile.on_hover_text("Local profile");
-                    if icon_button(ui, Icon::Settings, "Settings").clicked() {
-                        self.config_panel.open(&self.config);
-                    }
+                    ui.add_sized(
+                        [48.0, 48.0],
+                        egui::Button::new(RichText::new(initial).size(20.0 * scale))
+                            .fill(shell::rgba(shell::token::BUTTON))
+                            .stroke(Stroke::new(1.0, shell::rgba(shell::token::BORDER)))
+                            .corner_radius(24),
+                    )
+                    .on_hover_text("Local profile");
                 });
             });
     }
@@ -804,7 +783,7 @@ impl TerminalApp {
         ui.spacing_mut().item_spacing.y = shell::NAVIGATION_ROW_GAP;
         ui.label(
             RichText::new("WORKSPACE")
-                .size(8.0 * scale)
+                .size(13.0 * scale)
                 .color(rgb(color::CHROME_MUTED)),
         );
         let full_path = self.reference_workspace_path();
@@ -817,7 +796,7 @@ impl TerminalApp {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| full_path.clone())
         };
-        ui.add_space((shell::WORKSPACE_SELECTOR_TOP - ui.cursor().top()).max(0.0));
+        ui.add_space(8.0);
         let selector = ui
             .add_enabled_ui(false, |ui| {
                 ui.add_sized(
@@ -845,7 +824,7 @@ impl TerminalApp {
             name_rect.left_center(),
             egui::Align2::LEFT_CENTER,
             workspace,
-            egui::FontId::proportional(10.0 * scale),
+            egui::FontId::proportional(16.0 * scale),
             rgb(color::CHROME_TEXT),
         );
         ui.painter().text(
@@ -867,7 +846,7 @@ impl TerminalApp {
         selector.on_disabled_hover_text(format!(
             "Workspace switching is unavailable\n{full_path}\nBranch not reported"
         ));
-        ui.add_space((shell::NAVIGATION_ITEMS_TOP - ui.cursor().top()).max(0.0));
+        ui.add_space(8.0);
         for (key, label) in conversation::NAVIGATION {
             let label = if key == "conversation" {
                 if self.config.chat_mode_enabled() {
@@ -916,11 +895,10 @@ impl TerminalApp {
                 }
             }
         }
-        let target = shell::REFERENCE_RECENT_TOP;
-        ui.add_space((target - ui.cursor().top()).max(0.0));
+        ui.add_space(18.0);
         let heading = ui.label(
-            RichText::new("RECENT")
-                .size(8.0 * scale)
+            RichText::new("TABS")
+                .size(13.0 * scale)
                 .color(rgb(color::CHROME_MUTED)),
         );
         ui.add_space((heading.rect.bottom() + shell::METADATA_GAP - ui.cursor().top()).max(0.0));
@@ -964,7 +942,7 @@ impl TerminalApp {
                         .painter()
                         .layout_no_wrap(
                             entry.time.clone(),
-                            egui::FontId::proportional(8.0 * scale),
+                            egui::FontId::proportional(12.0 * scale),
                             rgb(color::CHROME_MUTED),
                         )
                         .size()
@@ -977,7 +955,7 @@ impl TerminalApp {
                     );
                     let mut title_job = egui::text::LayoutJob::simple(
                         entry.title.clone(),
-                        egui::FontId::proportional(10.0 * scale),
+                        egui::FontId::proportional(16.0 * scale),
                         rgb(color::CHROME_TEXT),
                         title_rect.width(),
                     );
@@ -991,14 +969,14 @@ impl TerminalApp {
                         egui::pos2(left, rect.top() + 19.0),
                         egui::Align2::LEFT_TOP,
                         &entry.detail,
-                        egui::FontId::proportional(8.0 * scale),
+                        egui::FontId::proportional(12.0 * scale),
                         rgb(color::CHROME_MUTED),
                     );
                     ui.painter().text(
                         egui::pos2(rect.right() - 7.0, rect.top() + 6.0),
                         egui::Align2::RIGHT_TOP,
                         &entry.time,
-                        egui::FontId::proportional(8.0 * scale),
+                        egui::FontId::proportional(12.0 * scale),
                         rgb(color::CHROME_MUTED),
                     );
                     response.on_hover_text(format!("{}\n{}", entry.title, entry.detail));
@@ -1008,12 +986,10 @@ impl TerminalApp {
 
     pub(crate) fn render_reference_spaces(&mut self, ui: &mut egui::Ui) {
         let scale = self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE;
-        let status_top = ui.ctx().viewport_rect().bottom() - shell::NAVIGATION_STATUS_HEIGHT;
-        let spaces_top = shell::REFERENCE_SPACES_TOP.min(status_top - 136.0);
-        ui.add_space((spaces_top - ui.cursor().top()).max(0.0));
+        ui.add_space(20.0);
         let heading = ui.label(
             RichText::new("SPACES")
-                .size(8.0 * scale)
+                .size(13.0 * scale)
                 .color(rgb(color::CHROME_MUTED)),
         );
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -1028,9 +1004,21 @@ impl TerminalApp {
                 egui::vec2(ui.available_width(), shell::SPACES_ROW_HEIGHT),
                 egui::Sense::hover(),
             );
+            if name.eq_ignore_ascii_case("Ember") {
+                ui.painter()
+                    .rect_filled(row, 8, shell::rgba(shell::token::BUTTON));
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(
+                        row.min + egui::vec2(-5.0, 4.0),
+                        egui::vec2(4.0, row.height() - 8.0),
+                    ),
+                    2,
+                    Color32::from_rgb(255, 157, 66),
+                );
+            }
             let badge = egui::Rect::from_center_size(
-                egui::pos2(row.left() + 11.0, row.center().y),
-                egui::vec2(22.0, 22.0),
+                egui::pos2(row.left() + 16.0, row.center().y),
+                egui::vec2(32.0, 32.0),
             );
             ui.painter().rect_filled(
                 badge,
@@ -1039,52 +1027,66 @@ impl TerminalApp {
             );
             product_identity(ui, badge, name);
             ui.painter().text(
-                egui::pos2(row.left() + 28.0, row.top() + 3.0),
-                egui::Align2::LEFT_TOP,
+                egui::pos2(row.left() + 46.0, row.center().y),
+                egui::Align2::LEFT_CENTER,
                 name,
-                egui::FontId::proportional(10.0 * scale),
+                egui::FontId::proportional(16.0 * scale),
                 rgb(color::CHROME_TEXT),
             );
-            ui.painter().text(
-                egui::pos2(row.left() + 28.0, row.top() + 17.0),
-                egui::Align2::LEFT_TOP,
-                detail,
-                egui::FontId::proportional(8.0 * scale),
-                rgb(color::CHROME_MUTED),
-            );
+            ui.painter()
+                .with_clip_rect(egui::Rect::from_min_max(
+                    row.min + egui::vec2(101.0, 0.0),
+                    row.max,
+                ))
+                .text(
+                    egui::pos2(row.left() + 101.0, row.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    detail,
+                    egui::FontId::proportional(12.0 * scale),
+                    rgb(color::CHROME_MUTED),
+                );
             response.on_hover_text("Opening sibling applications is unavailable");
         }
-        ui.add_space((status_top - ui.cursor().top()).max(0.0));
-        let bounds = ui.available_rect_before_wrap();
-        let text_y = ui.ctx().viewport_rect().bottom() - shell::NAVIGATION_STATUS_TEXT_BOTTOM;
-        ui.painter().line_segment(
-            [
-                egui::pos2(bounds.left(), status_top),
-                egui::pos2(bounds.right(), status_top),
-            ],
-            Stroke::new(1.0, rgb(color::DARK_BORDER)),
+    }
+
+    pub(crate) fn render_reference_status(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let scale = self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE;
+        ui.painter().hline(
+            rect.x_range(),
+            rect.top(),
+            Stroke::new(1.0, shell::rgba(shell::token::BORDER)),
         );
         ui.painter().circle_filled(
-            egui::pos2(bounds.left() + 3.0, text_y + 5.0),
-            2.0,
-            rgb(color::CHROME_MUTED),
+            rect.left_center() + egui::vec2(8.0, 0.0),
+            4.0,
+            shell::rgba(shell::token::MUTED_TEXT),
         );
         ui.painter().text(
-            egui::pos2(bounds.left() + 12.0, text_y),
-            egui::Align2::LEFT_TOP,
+            rect.left_center() + egui::vec2(26.0, 0.0),
+            egui::Align2::LEFT_CENTER,
             "Local session",
-            egui::FontId::proportional(8.0 * scale),
-            rgb(color::CHROME_MUTED),
+            FontId::proportional(13.0 * scale),
+            shell::rgba(shell::token::MUTED_TEXT),
         );
-        ui.interact(
-            egui::Rect::from_min_max(egui::pos2(bounds.left(), status_top), bounds.max),
-            ui.id().with("reference-local-status"),
-            egui::Sense::hover(),
-        )
-        .on_hover_text(format!(
-            "{} sessions · local workspace",
-            self.session_manager.len()
-        ));
+        let settings = egui::Rect::from_center_size(
+            rect.right_center() - egui::vec2(12.0, 0.0),
+            egui::vec2(24.0, 28.0),
+        );
+        let response = ui.put(
+            settings,
+            egui::Button::new("")
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::NONE),
+        );
+        icon(
+            ui,
+            settings.shrink(3.0),
+            Icon::Settings,
+            shell::rgba(shell::token::TEXT),
+        );
+        if response.on_hover_text("Settings").clicked() {
+            self.config_panel.open(&self.config);
+        }
     }
 
     pub(crate) fn render_reference_files_navigation(&mut self, root: &mut egui::Ui) {
@@ -1095,25 +1097,52 @@ impl TerminalApp {
             return;
         }
         egui::Panel::left("reference-files-navigation")
-            .exact_size(shell::NAVIGATION_WIDTH)
+            .exact_size(
+                self.reference_layout(root.ctx())
+                    .navigation
+                    .map_or(0.0, |r| r.width),
+            )
             .resizable(false)
             .show_separator_line(false)
-            .frame(
-                egui::Frame::NONE
-                    .fill(rgb(color::NAVIGATION))
-                    .inner_margin(shell::NAVIGATION_PADDING),
-            )
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                left: 17,
+                right: 16,
+                top: 17,
+                bottom: if root.ctx().viewport_rect().height() < shell::token::SHORT_HEIGHT {
+                    12
+                } else {
+                    30
+                },
+            }))
             .show(root, |ui| {
-                self.render_reference_navigation(ui);
-                let tabs: Vec<_> = (0..self.tabs.len())
-                    .map(|i| (i, self.tab_title(i)))
-                    .collect();
-                for (index, title) in tabs {
-                    if nav_row(ui, &title, self.tabs.active_index() == index).clicked() {
-                        self.activate_tab(index);
-                    }
-                }
-                self.render_reference_spaces(ui);
+                let bounds = ui.available_rect_before_wrap();
+                let status = egui::Rect::from_min_max(
+                    egui::pos2(bounds.left(), (bounds.bottom() - 60.0).max(bounds.top())),
+                    bounds.max,
+                );
+                let body =
+                    egui::Rect::from_min_max(bounds.min, egui::pos2(bounds.right(), status.top()));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("glass-files-navigation-body")
+                        .min_scrolled_height(0.0)
+                        .max_height(body.height())
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.render_reference_navigation(ui);
+                            let tabs: Vec<_> = (0..self.tabs.len())
+                                .map(|i| (i, self.tab_title(i)))
+                                .collect();
+                            for (index, title) in tabs {
+                                if nav_row(ui, &title, self.tabs.active_index() == index).clicked()
+                                {
+                                    self.activate_tab(index);
+                                }
+                            }
+                            self.render_reference_spaces(ui);
+                        });
+                });
+                self.render_reference_status(ui, status);
             });
     }
 
@@ -1123,12 +1152,13 @@ impl TerminalApp {
         {
             return;
         }
-        let frame = egui::Frame::NONE
-            .fill(rgb(color::INSPECTOR))
-            .inner_margin(egui::Margin {
-                top: 11,
-                ..egui::Margin::same(shell::INSPECTOR_INSET as i8)
-            });
+        let short = root.ctx().viewport_rect().height() < shell::token::SHORT_HEIGHT;
+        let frame = egui::Frame::NONE.inner_margin(egui::Margin {
+            left: 20,
+            right: 18,
+            top: 15,
+            bottom: if short { 12 } else { 46 },
+        });
         if let Some(rect) = self.reference_inspector_drawer_rect(root.ctx()) {
             let response =
                 show_inspector_drawer(root, rect, "reference-inspector-drawer", frame, |ui| {
@@ -1143,7 +1173,11 @@ impl TerminalApp {
                 .identify_inspector_drawer(response.response.layer_id);
         } else {
             egui::Panel::right("reference-inspector")
-                .exact_size(shell::INSPECTOR_WIDTH)
+                .exact_size(
+                    shell::INSPECTOR_WIDTH
+                        + shell::token::INSPECTOR_GAP
+                        + shell::token::OUTER_RIGHT,
+                )
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(frame)
@@ -1163,14 +1197,18 @@ impl TerminalApp {
                 );
                 let tab = self.reference_selected_inspector_tab();
                 ui.horizontal(|ui| {
+                    ui.visuals_mut().selection.bg_fill = shell::rgba(shell::token::ACCENT_TOP);
+                    ui.visuals_mut().selection.stroke =
+                        Stroke::new(1.0, shell::rgba(shell::token::BORDER));
                     for (candidate, label) in [
                         (ReferenceInspectorTab::Agent, "Agent"),
                         (ReferenceInspectorTab::Context, "Context"),
                         (ReferenceInspectorTab::Files, "Files"),
                     ] {
                         let response = ui.add_sized(
-                            [shell::INSPECTOR_TAB_WIDTH, shell::CONTROL_HEIGHT],
-                            egui::Button::selectable(tab == candidate, label),
+                            [shell::INSPECTOR_TAB_WIDTH, 42.0],
+                            egui::Button::selectable(tab == candidate, label)
+                                .corner_radius(shell::CONTROL_RADIUS),
                         );
                         remember_inspector_control(ui, &response);
                         if response.clicked() {
@@ -1178,7 +1216,7 @@ impl TerminalApp {
                         }
                     }
                 });
-                ui.add_space(6.0);
+                ui.add_space(16.0);
                 egui::ScrollArea::vertical()
                     .id_salt(("reference-inspector-scroll", tab))
                     .show(ui, |ui| {
@@ -1221,7 +1259,7 @@ impl TerminalApp {
         ] {
             ui.label(
                 RichText::new(label)
-                    .size(8.0 * scale)
+                    .size(13.0 * scale)
                     .color(rgb(color::CHROME_MUTED)),
             );
             ui.add(egui::Label::new(RichText::new(value.clone()).size(10.0 * scale)).wrap())
@@ -1339,25 +1377,41 @@ impl TerminalApp {
             format!("Workspace / {}", self.tab_title(self.tabs.active_index()))
         };
         let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), shell::CANVAS_HEADER_HEIGHT),
+            egui::vec2(
+                ui.available_width(),
+                self.reference_layout(ui.ctx()).header.height,
+            ),
             egui::Sense::hover(),
         );
-        ui.painter().rect_filled(rect, 0, rgb(color::CANVAS));
+
         ui.painter().line_segment(
             [rect.left_bottom(), rect.right_bottom()],
             Stroke::new(1.0, rgb(color::LIGHT_BORDER)),
         );
         ui.scope_builder(
-            egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(28.0, 7.0))),
+            egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(
+                24.0,
+                if rect.height() < 88.0 { 12.0 } else { 19.0 },
+            ))),
             |ui| {
-                *ui.visuals_mut() = egui::Visuals::light();
+                *ui.visuals_mut() = egui::Visuals::dark();
                 ui.visuals_mut().override_text_color = Some(rgb(color::CANVAS_TEXT));
                 ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
                 ui.visuals_mut().widgets.inactive.bg_fill = Color32::TRANSPARENT;
                 ui.visuals_mut().widgets.inactive.bg_stroke =
                     Stroke::new(1.0, rgb(color::LIGHT_BORDER));
-                let title_width = (ui.available_width() - 90.0).max(1.0);
-                let origin = ui.max_rect().min;
+                let icon_space = if rect.width() > 500.0 { 68.0 } else { 0.0 };
+                if icon_space > 0.0 {
+                    let tile = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(18.0, 19.0),
+                        egui::vec2(54.0, 54.0),
+                    );
+                    ui.painter()
+                        .rect_filled(tile, 12, shell::rgba(shell::token::BUTTON));
+                    product_identity(ui, tile.shrink(8.0), "ember");
+                }
+                let title_width = (ui.available_width() - 160.0 - icon_space).max(1.0);
+                let origin = ui.max_rect().min + egui::vec2(icon_space, 0.0);
                 let display_title = if title.trim().is_empty() {
                     "Terminal session"
                 } else {
@@ -1367,7 +1421,7 @@ impl TerminalApp {
                     egui::UiBuilder::new()
                         .max_rect(egui::Rect::from_min_size(
                             origin,
-                            egui::vec2(title_width, 36.0),
+                            egui::vec2(title_width, 56.0),
                         ))
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                     |ui| {
@@ -1389,7 +1443,7 @@ impl TerminalApp {
                             } else {
                                 "Block · live terminal"
                             })
-                            .size(9.0 * scale)
+                            .size(14.0 * scale)
                             .color(rgb(color::CANVAS_MUTED)),
                         );
                     },

@@ -1,3 +1,6 @@
+fn shell_control_reserve() -> f32 {
+    crate::glass_shell::COMPOSER_CONTROL_BOTTOM + crate::glass_shell::CONTROL_HEIGHT
+}
 use super::*;
 
 /// A command bubble and a result surface are separate geometry, even though
@@ -45,11 +48,9 @@ fn reference_chrome_width_scale(ui: &Ui) -> f32 {
 }
 
 fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: bool, owner: usize) {
-    use jterm_core::{
-        reference_icons::Icon,
-        reference_shell::{self as shell, color},
-    };
-    let rgb = |[r, g, b]: [u8; 3]| Color32::from_rgb(r, g, b);
+    use crate::glass_shell::{self as shell, color};
+    use jterm_core::reference_icons::Icon;
+    let rgb = crate::glass_shell::paint_color;
     let popup_color = |[r, g, b, a]: [u8; 4]| Color32::from_rgba_unmultiplied(r, g, b, a);
     let width_scale = reference_chrome_width_scale(ui);
     let composer_width = rect.width()
@@ -65,7 +66,7 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
         |ui| {
             ui.set_clip_rect(rect.intersect(ui.clip_rect()));
             ui.spacing_mut().interact_size.y = shell::CONTROL_HEIGHT;
-            *ui.visuals_mut() = egui::Visuals::light();
+            *ui.visuals_mut() = egui::Visuals::dark();
             ui.visuals_mut().disabled_alpha = 1.0;
             let widgets = &mut ui.visuals_mut().widgets;
             for visuals in [&mut widgets.inactive, &mut widgets.noninteractive] {
@@ -128,8 +129,15 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                                 egui::Button::new(
                                     egui::RichText::new("").size(shell::type_size::CONTROL),
                                 )
+                                .fill(if label == "Terminal" {
+                                    crate::glass_shell::rgba(
+                                        crate::glass_shell::token::ACCENT_BOTTOM,
+                                    )
+                                } else {
+                                    rgb(color::CONTROL_SURFACE)
+                                })
                                 .stroke(egui::Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
-                                .corner_radius(7),
+                                .corner_radius(12),
                             )
                         })
                         .inner
@@ -155,18 +163,18 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                             if label.is_empty() {
                                 bounds.center().x
                             } else {
-                                x + 12.0
+                                x + 18.0
                             },
                             bounds.center().y,
                         ),
-                        egui::vec2(12.0, 12.0),
+                        egui::vec2(20.0, 20.0),
                     ),
                     kind,
                     tint,
                 );
                 if !label.is_empty() {
                     ui.painter().text(
-                        egui::pos2(x + 22.0, bounds.center().y),
+                        egui::pos2(x + 36.0, bounds.center().y),
                         egui::Align2::LEFT_CENTER,
                         label,
                         FontId::proportional(shell::type_size::CONTROL),
@@ -177,8 +185,8 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                     paint_reference_icon(
                         ui.painter(),
                         egui::Rect::from_center_size(
-                            egui::pos2(bounds.right() - 12.0, bounds.center().y),
-                            egui::vec2(12.0, 12.0),
+                            egui::pos2(bounds.right() - 16.0, bounds.center().y),
+                            egui::vec2(20.0, 20.0),
                         ),
                         Icon::ChevronDown,
                         tint,
@@ -330,7 +338,7 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                             )
                             .fill(rgb(color::CONTROL_SURFACE))
                             .stroke(egui::Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
-                            .corner_radius(7),
+                            .corner_radius(12),
                         )
                     })
                     .inner
@@ -348,7 +356,7 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                     ui.painter(),
                     egui::Rect::from_center_size(
                         bounds.right_center() - egui::vec2(12.0, 0.0),
-                        egui::vec2(12.0, 12.0),
+                        egui::vec2(20.0, 20.0),
                     ),
                     Icon::ChevronDown,
                     rgb(color::DISABLED_TEXT),
@@ -398,9 +406,9 @@ fn draw_chat_footer_hint(
 // text or alter projected rows to make a capsule fit. Both paint passes use it.
 fn chat_card_rounding(card: ChatCard) -> egui::CornerRadius {
     let radius: f32 = if card.composer {
-        jterm_core::reference_shell::COMPOSER_RADIUS
+        crate::glass_shell::COMPOSER_RADIUS
     } else {
-        jterm_core::reference_shell::CARD_RADIUS
+        crate::glass_shell::CARD_RADIUS
     };
     let limit = (card.rect.width().min(card.rect.height()) * 0.5).max(0.0);
     let rounded = radius.min(limit) as u8;
@@ -508,10 +516,11 @@ impl TerminalRenderer {
                     ),
             )
         });
-        let top = (outer.bottom() - jterm_core::reference_shell::COMPOSER_HEIGHT)
-            .min(native.top() - 6.0)
-            .max(outer.top());
-        egui::Rect::from_min_max(egui::pos2(outer.left(), top), outer.max)
+        let outer = egui::Rect::from_min_max(
+            outer.min - egui::vec2(16.0, 0.0),
+            outer.max + egui::vec2(17.0, 0.0),
+        );
+        crate::glass_shell::editor_dock(outer, native.top()).frame
     }
 
     fn composer_footer_rect(
@@ -519,23 +528,8 @@ impl TerminalRenderer {
         content: egui::Rect,
         rows: std::ops::Range<usize>,
     ) -> egui::Rect {
-        let first_footer = rows
-            .end
-            .saturating_sub((28.0 / self.line_height).ceil() as usize)
-            .max(rows.start);
-        let native_footer = self.canvas_chat_row_rect(content, first_footer..rows.end);
         let frame = self.shared_composer_rect(content, rows);
-        egui::Rect::from_min_max(
-            egui::pos2(
-                frame.left() + jterm_core::reference_shell::COMPOSER_CONTROL_LEFT,
-                (frame.bottom() - 36.0).max(native_footer.top()),
-            ),
-            frame.max
-                - egui::vec2(
-                    jterm_core::reference_shell::COMPOSER_CONTROL_RIGHT,
-                    jterm_core::reference_shell::COMPOSER_CONTROL_BOTTOM,
-                ),
-        )
+        crate::glass_shell::editor_dock(frame, frame.top() + 6.0).controls
     }
 
     fn chat_cards(
@@ -671,22 +665,14 @@ impl TerminalRenderer {
 
     fn chat_card_fill(&self, entry: &BlockChromeEntry, card: ChatCard) -> Color32 {
         if card.composer {
-            let [r, g, b] = jterm_core::reference_shell::color::COMPOSER;
-            return Color32::from_rgba_unmultiplied(
-                r,
-                g,
-                b,
-                (255.0 * self.opacity.clamp(0.0, 1.0)) as u8,
-            );
+            let mut surface = crate::glass_shell::token::COMPOSER;
+            surface[3] = (surface[3] as f32 * self.opacity.clamp(0.0, 1.0)) as u8;
+            return crate::glass_shell::rgba(surface);
         }
-        if !card.command && !card.composer && !entry.selected && !entry.active {
-            let [r, g, b] = jterm_core::reference_shell::color::TERMINAL;
-            return Color32::from_rgba_unmultiplied(
-                r,
-                g,
-                b,
-                (255.0 * self.opacity.clamp(0.0, 1.0)) as u8,
-            );
+        if !card.command && !entry.selected && !entry.active {
+            let mut surface = crate::glass_shell::token::TERMINAL;
+            surface[3] = (surface[3] as f32 * self.opacity.clamp(0.0, 1.0)) as u8;
+            return crate::glass_shell::rgba(surface);
         }
         if chat_output_is_quiet(
             card.command,
@@ -860,26 +846,9 @@ impl TerminalRenderer {
         let Some(rect) = self.foreground_footer_rect else {
             return;
         };
-        use jterm_core::{
-            reference_icons::Icon,
-            reference_shell::{self as shell, color},
-        };
-        let rgb = |[r, g, b]: [u8; 3]| Color32::from_rgb(r, g, b);
-        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-        painter.rect_filled(rect, shell::COMPOSER_RADIUS, rgb(color::COMPOSER));
-        painter.rect_stroke(
-            rect,
-            shell::COMPOSER_RADIUS,
-            egui::Stroke::new(1.0, rgb(color::LIGHT_BORDER)),
-            egui::StrokeKind::Inside,
-        );
-        painter.text(
-            rect.min + egui::vec2(12.0, 18.0),
-            egui::Align2::LEFT_CENTER,
-            "Input goes to the foreground program",
-            FontId::proportional(10.0),
-            rgb(color::CANVAS_MUTED),
-        );
+        use crate::glass_shell::{self as shell};
+        use jterm_core::reference_icons::Icon;
+        shell::paint_panel(ui.painter(), rect, shell::token::COMPOSER);
         let y = rect.bottom() - shell::COMPOSER_CONTROL_BOTTOM - shell::CONTROL_HEIGHT;
         let controls = egui::Rect::from_min_max(
             egui::pos2(rect.left() + shell::COMPOSER_CONTROL_LEFT, y),
@@ -891,40 +860,35 @@ impl TerminalRenderer {
                 rect.bottom() - shell::COMPOSER_CONTROL_BOTTOM,
             ),
         );
+        let interactive =
+            terminal.chat_surface().allows_submit_affordance() && !terminal.chat_native_takeover();
         draw_reference_composer_tools(
             ui,
             controls,
-            false,
+            interactive,
             terminal as *const TerminalState as usize,
         );
-        let can_interrupt = terminal.command_records().back().is_some_and(|record| {
-            crate::terminal::ChatInputAction::Interrupt {
-                sequence: record.sequence,
-            }
-            .is_current(terminal)
-        });
-        if !can_interrupt {
-            let stop = egui::Rect::from_min_size(
-                egui::pos2(
-                    rect.right() - shell::COMPOSER_CONTROL_RIGHT - shell::COMPOSER_SEND_WIDTH,
-                    y,
-                ),
-                egui::vec2(shell::COMPOSER_SEND_WIDTH, shell::CONTROL_HEIGHT),
-            );
-            painter.rect_stroke(
-                stop,
-                7,
-                egui::Stroke::new(1.0, rgb(color::LIGHT_BORDER)),
-                egui::StrokeKind::Inside,
-            );
-            paint_reference_icon(
-                &painter,
-                egui::Rect::from_center_size(stop.center(), egui::vec2(12.0, 12.0)),
-                Icon::Close,
-                rgb(color::CANVAS_MUTED),
-            );
-            ui.interact(stop,ui.id().with("foreground-unavailable-stop"),egui::Sense::hover()).on_hover_text("Stop is unavailable for this input owner; use the foreground program's native keys (Ctrl+C where supported)");
-        }
+        let button = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.right() - shell::COMPOSER_CONTROL_RIGHT - shell::COMPOSER_SEND_WIDTH,
+                y,
+            ),
+            egui::vec2(shell::COMPOSER_SEND_WIDTH, shell::CONTROL_HEIGHT),
+        );
+        ui.painter()
+            .rect_filled(button, 12, shell::rgba(shell::token::BUTTON));
+        ui.painter().rect_stroke(
+            button,
+            12,
+            egui::Stroke::new(1.0, shell::rgba(shell::token::BORDER)),
+            egui::StrokeKind::Inside,
+        );
+        paint_reference_icon(
+            ui.painter(),
+            egui::Rect::from_center_size(button.center(), egui::vec2(22.0, 22.0)),
+            Icon::Send,
+            shell::rgba(shell::token::DISABLED_TEXT),
+        );
     }
 
     pub(super) fn draw_chat_controls(
@@ -956,7 +920,7 @@ impl TerminalRenderer {
                 return false;
             }
             let footer = self.composer_footer_rect(content, composer);
-            let button_width = jterm_core::reference_shell::COMPOSER_SEND_WIDTH.min(footer.width());
+            let button_width = crate::glass_shell::COMPOSER_SEND_WIDTH.min(footer.width());
             let button = egui::Rect::from_min_max(
                 egui::pos2(footer.right() - button_width, footer.top()),
                 footer.max,
@@ -964,13 +928,12 @@ impl TerminalRenderer {
             let label_rect = egui::Rect::from_min_max(
                 footer.min,
                 egui::pos2(
-                    button.left() - jterm_core::reference_shell::METADATA_GAP,
+                    button.left() - crate::glass_shell::METADATA_GAP,
                     footer.bottom(),
                 ),
             );
             if label_rect.width()
-                < jterm_core::reference_shell::COMPOSER_TOOLS_WIDTH
-                    * reference_chrome_width_scale(ui)
+                < crate::glass_shell::COMPOSER_TOOLS_WIDTH * reference_chrome_width_scale(ui)
             {
                 draw_chat_footer_hint(
                     ui,
@@ -995,6 +958,31 @@ impl TerminalRenderer {
                 "↑",
                 "Send Enter immediately when the shell and writer are ready. If unavailable, use the native keyboard; enhanced multi-byte button encodings are unsupported.",
             ))
+        } else if !self.chat_mode
+            && self.foreground_footer_rect.is_some()
+            && surface.allows_submit_affordance()
+        {
+            let footer = self.foreground_footer_rect.unwrap();
+            let r = egui::Rect::from_min_size(
+                egui::pos2(
+                    footer.right()
+                        - crate::glass_shell::COMPOSER_CONTROL_RIGHT
+                        - crate::glass_shell::COMPOSER_SEND_WIDTH,
+                    footer.bottom() - shell_control_reserve(),
+                ),
+                egui::vec2(
+                    crate::glass_shell::COMPOSER_SEND_WIDTH,
+                    crate::glass_shell::CONTROL_HEIGHT,
+                ),
+            );
+            Some((
+                ChatInputAction::Submit {
+                    sequence: record.sequence,
+                },
+                r,
+                "↑",
+                "Send Enter to this terminal using the existing native ownership guards",
+            ))
         } else if let (jterm_core::chat_mode::ChatSurface::Running, Some(footer)) =
             (surface, self.foreground_footer_rect)
         {
@@ -1006,10 +994,10 @@ impl TerminalRenderer {
                 self.chat_pressed_action = None;
                 return false;
             }
-            let chrome = jterm_core::reference_shell::COMPOSER_CONTROL_RIGHT;
-            let width = jterm_core::reference_shell::COMPOSER_SEND_WIDTH;
-            let height = jterm_core::reference_shell::CONTROL_HEIGHT;
-            let bottom = jterm_core::reference_shell::COMPOSER_CONTROL_BOTTOM;
+            let chrome = crate::glass_shell::COMPOSER_CONTROL_RIGHT;
+            let width = crate::glass_shell::COMPOSER_SEND_WIDTH;
+            let height = crate::glass_shell::CONTROL_HEIGHT;
+            let bottom = crate::glass_shell::COMPOSER_CONTROL_BOTTOM;
             Some((ChatInputAction::Interrupt { sequence:record.sequence },egui::Rect::from_min_size(egui::pos2(footer.right()-chrome-width,footer.bottom()-bottom-height),egui::vec2(width,height)),"Stop","Send Ctrl+C to the current foreground command. Native ownership and IME guards are revalidated before writing."))
         } else if surface == jterm_core::chat_mode::ChatSurface::Running {
             viewport.chat_command_spans().iter().find(|command| command.sequence == record.sequence)
@@ -1036,7 +1024,7 @@ impl TerminalRenderer {
         let icon_control = matches!(action, ChatInputAction::Submit { .. })
             || self.foreground_footer_rect.is_some();
         let label_size = if icon_control {
-            egui::vec2(12.0, 12.0)
+            egui::vec2(20.0, 20.0)
         } else {
             ui.painter()
                 .layout_no_wrap(
@@ -1082,10 +1070,10 @@ impl TerminalRenderer {
                             .small()
                             .truncate()
                             .fill(if icon_control {
-                                let [r, g, b] = jterm_core::reference_shell::color::ACCENT;
+                                let [r, g, b] = crate::glass_shell::color::ACCENT;
                                 egui::Color32::from_rgb(r, g, b)
                             } else { self.theme.terminal_background() })
-                            .corner_radius(7),
+                            .corner_radius(12),
                         )
                     })
                     .inner
@@ -1098,7 +1086,7 @@ impl TerminalRenderer {
         if icon_control {
             paint_reference_icon(
                 ui.painter(),
-                egui::Rect::from_center_size(rect.center(), egui::vec2(12.0, 12.0)),
+                egui::Rect::from_center_size(rect.center(), egui::vec2(20.0, 20.0)),
                 if matches!(action, ChatInputAction::Submit { .. }) {
                     jterm_core::reference_icons::Icon::Send
                 } else {
@@ -1232,54 +1220,60 @@ mod tests {
 
     #[test]
     fn reference_tools_keep_their_actual_painted_height_across_main_font_sizes() {
-        use jterm_core::reference_shell::{self as shell, color};
+        use crate::glass_shell as shell;
         let ctx = egui::Context::default();
         for main_size in [8.0, 12.0, 14.0, 18.0, 28.0, 72.0] {
-            let mut output = ctx.run_ui(Default::default(), |ui| {
-                crate::theme::configure_workspace_text(ui.style_mut(), main_size);
-                draw_reference_composer_tools(
-                    ui,
-                    egui::Rect::from_min_size(
-                        egui::pos2(333.0, 657.0),
-                        egui::vec2(643.0, shell::CONTROL_HEIGHT),
-                    ),
-                    true,
-                    0,
-                );
-            });
-            fn collect(shape: &egui::Shape, rects: &mut Vec<egui::Rect>) {
-                match shape {
-                    egui::Shape::Vec(shapes) => {
-                        for shape in shapes {
-                            collect(shape, rects);
+            for (controls_width, expected_controls) in [(643.0, 4), (790.0, 7)] {
+                let mut output = ctx.run_ui(Default::default(), |ui| {
+                    crate::theme::configure_workspace_text(ui.style_mut(), main_size);
+                    draw_reference_composer_tools(
+                        ui,
+                        egui::Rect::from_min_size(
+                            egui::pos2(333.0, 657.0),
+                            egui::vec2(controls_width, shell::CONTROL_HEIGHT),
+                        ),
+                        true,
+                        0,
+                    );
+                });
+                fn collect(shape: &egui::Shape, rects: &mut Vec<egui::Rect>) {
+                    match shape {
+                        egui::Shape::Vec(shapes) => {
+                            for shape in shapes {
+                                collect(shape, rects);
+                            }
                         }
+                        egui::Shape::Rect(rect)
+                            if rect.fill
+                                == crate::glass_shell::rgba(crate::glass_shell::token::BUTTON)
+                                || rect.fill
+                                    == crate::glass_shell::rgba(
+                                        crate::glass_shell::token::ACCENT_BOTTOM,
+                                    ) =>
+                        {
+                            rects.push(rect.rect)
+                        }
+                        _ => {}
                     }
-                    egui::Shape::Rect(rect)
-                        if rect.fill
-                            == Color32::from_rgb(
-                                color::CONTROL_SURFACE[0],
-                                color::CONTROL_SURFACE[1],
-                                color::CONTROL_SURFACE[2],
-                            ) =>
-                    {
-                        rects.push(rect.rect)
-                    }
-                    _ => {}
                 }
-            }
-            let mut rects = Vec::new();
-            for shape in &output.shapes {
-                collect(&shape.shape, &mut rects);
-            }
-            output.textures_delta.clear();
-            assert_eq!(rects.len(), 7, "six tool buttons and one model slot");
-            for rect in rects {
-                assert_eq!(rect.top(), 657.0);
+                let mut rects = Vec::new();
+                for shape in &output.shapes {
+                    collect(&shape.shape, &mut rects);
+                }
+                output.textures_delta.clear();
                 assert_eq!(
-                    rect.height(),
-                    shell::CONTROL_HEIGHT,
-                    "actual Button paint must respect its reference slot at Main{main_size}"
+                    rects.len(),
+                    expected_controls,
+                    "compact keeps3tools+model; reference keeps6tools+model"
                 );
+                for rect in rects {
+                    assert_eq!(rect.top(), 657.0);
+                    assert_eq!(
+                        rect.height(),
+                        shell::CONTROL_HEIGHT,
+                        "actual Button paint must respect its reference slot at Main{main_size}"
+                    );
+                }
             }
         }
     }
@@ -1590,6 +1584,7 @@ mod tests {
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cat\r\n\x1b]133;C\x07");
         let mut policy = ProjectionPolicy::new();
         policy.set_chat_mode(true);
+        policy.set_chat_footer_rows(renderer.chat_footer_rows());
         policy.set_block_chrome(true, 0);
         policy.set_block_spacing(true);
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 440.0));
@@ -1642,10 +1637,30 @@ mod tests {
             .unwrap();
         let rows = view.chat_composer_rows().unwrap();
         let footer = renderer.composer_footer_rect(content, rows);
-        let caret = egui::Rect::from_min_size(
-            composer.rect.min + egui::vec2(16.0, 4.0),
-            egui::vec2(renderer.char_width, renderer.line_height),
+        let cursor = view.cursor();
+        assert_eq!(
+            view.row_kind(cursor.row),
+            Some(crate::terminal::ProjectedRowKind::Raw)
         );
+        assert!(
+            view.raw_anchor_at(cursor).is_some(),
+            "positive caret must have a real native owner"
+        );
+        let caret = cursor_rect(
+            content,
+            cursor.row,
+            cursor.column,
+            renderer.char_width,
+            renderer.line_height,
+        )
+        .translate(egui::vec2(
+            0.0,
+            -renderer
+                .canvas_geometry
+                .row_offset(cursor.row, renderer.line_height),
+        ));
+        assert!(content.contains_rect(caret));
+        assert!(composer.rect.contains(caret.center()));
         let clip = renderer
             .chat_preedit_clip(&terminal, &view, &entries, content, content, caret)
             .unwrap();
@@ -1908,6 +1923,8 @@ mod tests {
     fn chat_run_button_stays_inside_narrow_composer_footer() {
         // Real egui allocation, paint clips, hit regions and pointer events.
         // ui.put's max_rect alone is not a hard bound for a wrapping Button.
+        // Explicit glass contract: 54px action slot containing a 20px vector glyph.
+        assert_eq!(crate::glass_shell::COMPOSER_SEND_WIDTH, 54.0);
         for font in [10.0, 16.0, 32.0] {
             for width in [48.0, 64.0, 80.0, 120.0, 240.0] {
                 for dpi in [1.0, 1.5, 2.0] {
@@ -1932,6 +1949,7 @@ mod tests {
                         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
                         let mut policy = ProjectionPolicy::new();
                         policy.set_chat_mode(true);
+                        policy.set_chat_footer_rows(renderer.chat_footer_rows());
                         policy.set_block_chrome(true, 0);
                         let view = renderer.projected_viewport_with_state(
                             &mut terminal,
@@ -1943,7 +1961,7 @@ mod tests {
                         let footer = renderer
                             .composer_footer_rect(content, view.chat_composer_rows().unwrap());
                         let button = egui::Rect::from_min_max(
-                            egui::pos2(footer.right() - 28.0_f32.min(footer.width()), footer.top()),
+                            egui::pos2(footer.right() - 54.0_f32.min(footer.width()), footer.top()),
                             footer.max,
                         );
                         let pointer = match sample {
@@ -1973,7 +1991,7 @@ mod tests {
                                     ..Default::default()
                                 },
                                 |ui| {
-                                    let text_size = egui::vec2(14.0, 14.0);
+                                    let text_size = egui::vec2(20.0, 20.0);
                                     expected_visible = button.width() >= text_size.x + 12.0
                                         && button.height() >= text_size.y + 2.0;
                                     renderer
@@ -2042,6 +2060,7 @@ mod tests {
                 terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
                 let mut policy = ProjectionPolicy::new();
                 policy.set_chat_mode(true);
+                policy.set_chat_footer_rows(renderer.chat_footer_rows());
                 policy.set_block_chrome(true, 0);
                 let mut state = ProjectionViewState::new();
                 let content = renderer.layout_rects(pane).0;
@@ -2062,6 +2081,11 @@ mod tests {
                     assert_eq!(
                         view.row_kind(footer_row - 1),
                         Some(crate::terminal::ProjectedRowKind::Raw)
+                    );
+                    assert!(
+                        view.raw_anchor_at(DisplayPoint::new(footer_row - 1, 0))
+                            .is_some(),
+                        "the boundary click must target a retained native row"
                     );
                     let pointer = egui::pos2(
                         content.right() - 10.0,
@@ -2215,9 +2239,9 @@ mod capsule_geometry_tests {
         for height in [0.0, 1.0, 8.0, 18.0, 32.0, 64.0] {
             for width in [0.0, 1.0, 8.0, 160.0] {
                 for (command, composer, radius) in [
-                    (true, false, jterm_core::reference_shell::CARD_RADIUS),
-                    (false, false, jterm_core::reference_shell::CARD_RADIUS),
-                    (false, true, jterm_core::reference_shell::COMPOSER_RADIUS),
+                    (true, false, crate::glass_shell::CARD_RADIUS),
+                    (false, false, crate::glass_shell::CARD_RADIUS),
+                    (false, true, crate::glass_shell::COMPOSER_RADIUS),
                 ] {
                     for top_closed in [false, true] {
                         for bottom_closed in [false, true] {

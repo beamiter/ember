@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import native_glass_profile as glass_profile
 
 PREEDIT_TOKEN = 'EMBERPREEDITMARKER'
 HEALTH_ANCHOR = 'master'
@@ -118,12 +119,13 @@ def reference_header_health(smoke, label, image, rectangle):
     """Native-shell readiness without depending on a removed footer word.
 
     The PID-owned/focused surface is verified before and after capture. Require
-    the immutable 42px toolbar's actual palette and a real PTY sentinel from
-    this same live shell. Preedit still uses exact OCR, pixel restoration and
+    the explicitly registered toolbar's actual paint and a real PTY sentinel
+    from this same live shell. Preedit still uses exact OCR, pixel restoration and
     byte assertions; no OCR rows are manufactured from the native proof.
     """
     owned = rectangle['rect']
-    region = dict(x=owned['x'], y=owned['y'], width=owned['width'], height=42)
+    region = (glass_profile.layout(owned)['header'] if glass_profile.selected(smoke)
+              else dict(x=owned['x'], y=owned['y'], width=owned['width'], height=42))
     if not contained(region, owned) or smoke.app.poll() is not None:
         raise RuntimeError('Reference header lies outside live owned surface')
     transcript = smoke.transcript.read_bytes()
@@ -135,6 +137,20 @@ def reference_header_health(smoke, label, image, rectangle):
         raise RuntimeError('Missing exact real-PTY readiness identity')
     shell_pid, terminal = matches[0]
     os.kill(int(shell_pid), 0)
+    if glass_profile.selected(smoke):
+        from PIL import Image
+        digest = hashlib.sha256(image.read_bytes()).hexdigest()
+        with Image.open(image) as pixels:
+            witness = glass_profile.header_paint(pixels, owned, glass_profile.fixture_mode(smoke))
+            r = witness['rectangle']
+            target = smoke.out / (label + '-health-header.png')
+            pixels.crop((r['x'],r['y'],r['x']+r['width'],r['y']+r['height'])).save(target)
+        if hashlib.sha256(image.read_bytes()).hexdigest() != digest:
+            raise RuntimeError('Reference header changed during analysis')
+        return dict(witness, image=str(target),
+                    image_sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
+                    shell_pid=int(shell_pid), tty=terminal.decode(),
+                    sentinel_transcript_sha256=hashlib.sha256(transcript).hexdigest())
     name = label + '-health-header'
     target = smoke.out / (name + '.png')
     crop = f"{region['width']}x{region['height']}+{region['x']}+{region['y']}"
@@ -171,6 +187,8 @@ def reference_token_rows(smoke, label, image, rectangle, psm):
     owned=rectangle['rect']
     region={'x':owned['x']+292,'y':owned['y']+91,
             'width':owned['width']-292-306,'height':owned['height']-91}
+    if glass_profile.selected(smoke):
+        region = glass_profile.layout(owned)['center']
     if not contained(region,owned):raise RuntimeError('Invalid reference native canvas crop')
     name=label+'-native-canvas'
     target=smoke.out/(name+'.png')
@@ -256,14 +274,27 @@ def reference_body_observations(smoke, label, image, rectangle, contract):
     owned = rectangle['rect']
     canvas = dict(x=owned['x']+292, y=owned['y']+91,
                   width=owned['width']-292-306, height=owned['height']-91)
+    glass = glass_profile.layout(owned) if glass_profile.selected(smoke) else None
+    if glass is not None:
+        canvas = glass['center']
     if not contained(canvas, owned):
         raise RuntimeError('Native body canvas outside owned surface')
     raw = smoke.run(['convert', str(image), '-crop',
                      f"{canvas['width']}x{canvas['height']}+{canvas['x']}+{canvas['y']}",
                      '+repage', '-colorspace', 'sRGB', '-alpha', 'off', '-depth', '8', 'RGB:-'],
                     capture_output=True).stdout
-    regions = native_body_registration(raw, canvas['width'], canvas['height'],
-        min_height=contract['min_height'], max_height=contract['line_height'])
+    if glass is None:
+        regions = native_body_registration(raw, canvas['width'], canvas['height'],
+            min_height=contract['min_height'], max_height=contract['line_height'])
+    else:
+        if len(raw) != canvas['width'] * canvas['height'] * 3:
+            raise RuntimeError('Unexpected glass canvas RGB byte count')
+        # A declared complete native output+bounded-input observation domain,
+        # not an inferred dark plane or a target-selected thin crop. The old
+        # exact cross-view token geometry and counts remain authoritative.
+        body = glass['native_body']
+        regions = [dict(rectangle=dict(body, x=body['x']-canvas['x'],
+                                      y=body['y']-canvas['y']), components=[])]
     observations, evidence = [], []
     for index, registration in enumerate(regions):
         local = registration['rectangle']
@@ -289,6 +320,7 @@ def reference_body_observations(smoke, label, image, rectangle, contract):
         observations.append((name, mapped))
         evidence.append(dict(rectangle=region, image=str(target), image_sha256=digest,
                              ocr_psm=6, tsv=str(smoke.out/(name+'-psm6.tsv')),
+                             registration=glass['metadata'] if glass else 'legacy exact dark plane',
                              components=[dict(c, x=c['x']+canvas['x'], y=c['y']+canvas['y'])
                                          for c in registration['components']]))
     return observations, evidence
@@ -327,6 +359,8 @@ def reference_native_plane_witnesses(smoke, image, rectangle, contract):
     owned = rectangle['rect']
     canvas = dict(x=owned['x']+292, y=owned['y']+91,
                   width=owned['width']-292-306, height=owned['height']-91)
+    if glass_profile.selected(smoke):
+        canvas = glass_profile.layout(owned)['center']
     if not contained(canvas, owned):
         raise RuntimeError('Native witness canvas outside owned surface')
     raw = smoke.run(['convert',str(image),'-crop',
@@ -334,6 +368,12 @@ def reference_native_plane_witnesses(smoke, image, rectangle, contract):
                     '+repage','-colorspace','sRGB','-alpha','off','-depth','8','RGB:-'],
                     capture_output=True).stdout
     planes=[]
+    if glass_profile.selected(smoke):
+        if len(raw) != canvas['width'] * canvas['height'] * 3:
+            raise RuntimeError('Unexpected glass canvas RGB byte count')
+        # A full-image-only word without another actual OCR observation must
+        # still fail: a layout rectangle is not a manufactured paint witness.
+        return canvas, planes, hashlib.sha256(raw).hexdigest()
     for registration in native_body_registration(raw, canvas['width'], canvas['height'], single_line=False,
             min_height=contract['min_height'], max_height=contract['line_height']):
         local = registration['rectangle']

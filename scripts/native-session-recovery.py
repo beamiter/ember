@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import re
 import tempfile
+import native_glass_profile as glass_profile
 
 spec = importlib.util.spec_from_file_location('desktop_smoke', Path(__file__).with_name('native-desktop-smoke.py'))
 driver = importlib.util.module_from_spec(spec)
@@ -37,8 +38,27 @@ def wait_startup_surface(smoke):
         assert smoke.app.poll() is None, 'Ember exited before startup paint'
         sequence += 1
         label = f'startup-paint-{sequence:02d}'
+        owned = glass_profile.owned_window(smoke) if glass_profile.selected(smoke) else None
         smoke.screenshot(label)
         image = smoke.out / (label + '.png')
+        if owned is not None:
+            from PIL import Image
+            digest = hashlib.sha256(image.read_bytes()).hexdigest()
+            if glass_profile.owned_window(smoke) != owned:
+                raise RuntimeError('Recovery identity/geometry changed across capture')
+            try:
+                with Image.open(image) as pixels:
+                    witness = glass_profile.header_paint(pixels, owned['rect'],
+                                                         glass_profile.fixture_mode(smoke))
+            except RuntimeError as error:
+                observations.append(dict(image=image.name, sha256=digest,
+                                         owned=owned, profile=glass_profile.NAME, paint_error=str(error)))
+                return False
+            if hashlib.sha256(image.read_bytes()).hexdigest() != digest:
+                raise RuntimeError('Recovery source pixels changed during observation')
+            observations.append(dict(image=image.name, sha256=digest,
+                                     owned=owned, witness=witness))
+            return True
         pixels = smoke.run(['convert', str(image), '-colorspace', 'sRGB',
                             '-alpha', 'off', '-depth', '8', 'RGB:-'], capture_output=True).stdout
         count = sum(pixels[i:i+3] == bytes((15, 23, 38)) for i in range(0, len(pixels), 3))

@@ -5135,6 +5135,23 @@ impl super::TerminalState {
         BlockChromePrompts { headers, status }
     }
 
+    /// Actual prompt extent, including cursor, styled blanks and completion tail.
+    /// No text is copied or trimmed to measure this presentation budget.
+    pub fn native_prompt_input_rows(&self) -> Option<usize> {
+        if !self.chat_surface().composer_docked() {
+            return None;
+        }
+        let prompt = self.command_records.back()?.prompt_start;
+        let (start, _) = self.buffer_anchor_to_absolute(prompt)?;
+        let mut policy = ProjectionPolicy::new();
+        policy.set_chat_mode(true);
+        let end = self
+            .scrollback
+            .len()
+            .checked_add(self.block_chrome_tail_keep(&policy))?;
+        end.checked_sub(start).map(|rows| rows.max(1))
+    }
+
     fn block_chrome_tail_keep(&self, policy: &ProjectionPolicy) -> usize {
         if (!policy.chat_mode() && !policy.block_headers() && policy.companion_status_rows() == 0)
             || !self.kitty_graphics.get_placements().is_empty()
@@ -5204,6 +5221,7 @@ impl super::TerminalState {
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
             block_spacing: policy.block_spacing(),
+            retain_identity_canvas: policy.retain_identity_canvas(),
             block_headers: policy.block_headers(),
             companion_status_rows: policy.companion_status_rows(),
             chrome_tail_keep: self.block_chrome_tail_keep(policy),
@@ -5243,14 +5261,15 @@ impl super::TerminalState {
         let key = self.projection_plan_cache_key(cols, policy);
         if let Some((cached_key, plan)) = &self.projection_plan_cache {
             if self.finished_output_revision != 0 && *cached_key == key {
-                return plan.has_transforms().then(|| std::sync::Arc::clone(plan));
+                return (plan.has_transforms() || policy.retain_identity_canvas())
+                    .then(|| std::sync::Arc::clone(plan));
             }
         }
 
         if let Some((cached_key, mut cached_plan)) = self.projection_plan_cache.take() {
             if let Some(plan) = std::sync::Arc::get_mut(&mut cached_plan) {
                 if self.try_advance_collapsed_projection_plan(&cached_key, &key, plan) {
-                    if !plan.has_transforms() {
+                    if !plan.has_transforms() && !policy.retain_identity_canvas() {
                         self.projection_plan_cache = Some((key, cached_plan));
                         return None;
                     }
@@ -5275,7 +5294,8 @@ impl super::TerminalState {
         }
 
         let resolved = self.resolved_collapses(policy);
-        if !policy.chat_mode()
+        if !policy.retain_identity_canvas()
+            && !policy.chat_mode()
             && resolved.is_empty()
             && !policy.block_spacing()
             && !policy.block_headers()
@@ -5305,7 +5325,7 @@ impl super::TerminalState {
                 policy.chat_footer_rows(),
             );
         }
-        if !plan.has_transforms() {
+        if !plan.has_transforms() && !policy.retain_identity_canvas() {
             self.projection_plan_cache = Some((key, std::sync::Arc::new(plan)));
             return None;
         }
@@ -5354,7 +5374,8 @@ impl super::TerminalState {
                 .chat_commands
                 .iter()
                 .all(|command| command.rows.end <= plan.rows.len().saturating_sub(old_key.rows));
-        if old_key.chat_footer_rows != new_key.chat_footer_rows
+        if old_key.retain_identity_canvas != new_key.retain_identity_canvas
+            || old_key.chat_footer_rows != new_key.chat_footer_rows
             || old_key.chat_command_bubbles != new_key.chat_command_bubbles
             || old_key.chat_mode != new_key.chat_mode
             || new_key.chat_mode && !chat_incremental

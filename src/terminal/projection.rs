@@ -90,6 +90,7 @@ pub struct ProjectionPolicy {
     revision: u64,
     collapsed: BTreeSet<u64>,
     block_spacing: bool,
+    retain_identity_canvas: bool,
     block_headers: bool,
     companion_status_rows: usize,
     chat_mode: bool,
@@ -103,6 +104,7 @@ impl Default for ProjectionPolicy {
             revision: 1,
             collapsed: BTreeSet::new(),
             block_spacing: false,
+            retain_identity_canvas: false,
             block_headers: false,
             companion_status_rows: 0,
             chat_mode: false,
@@ -122,11 +124,29 @@ impl ProjectionPolicy {
     }
 
     pub fn is_identity(&self) -> bool {
-        !self.chat_mode
+        !self.retain_identity_canvas
+            && !self.chat_mode
             && self.collapsed.is_empty()
             && !self.block_spacing
             && !self.block_headers
             && self.companion_status_rows == 0
+    }
+
+    /// Keep the raw identity plan in the existing anchor/fractional canvas.
+    /// No synthetic row or terminal cell is inserted by this presentation flag.
+    pub fn retain_identity_canvas(&self) -> bool {
+        self.retain_identity_canvas
+    }
+    pub fn set_retain_identity_canvas(&mut self, enabled: bool) -> bool {
+        if self.retain_identity_canvas == enabled {
+            return false;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.retain_identity_canvas = enabled;
+        self.revision = revision;
+        true
     }
 
     pub fn chat_mode(&self) -> bool {
@@ -427,6 +447,7 @@ pub(super) struct ProjectionPlanCacheKey {
     pub(super) policy_revision: u64,
     pub(super) policy_ids: SmallVec<[u64; 4]>,
     pub(super) block_spacing: bool,
+    pub(super) retain_identity_canvas: bool,
     pub(super) block_headers: bool,
     pub(super) companion_status_rows: usize,
     pub(super) chrome_tail_keep: usize,

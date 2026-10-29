@@ -12,6 +12,8 @@ pub mod debug;
 mod fold_preview;
 #[cfg(test)]
 mod font_zoom;
+pub mod glass_shell;
+pub mod glass_shell_tokens;
 pub mod gpu;
 pub mod keybindings;
 pub mod kitty_graphics;

@@ -204,6 +204,9 @@ class Smoke:
         # screenshot fixture. Historical observer functions remain separately
         # testable, but real Settings input uses its owned current surface.
         self.reference_shell_fixture = True
+        # Explicit current observation profile. Historical observer unit
+        # fixtures keep their legacy default; no old palette is auto-admitted.
+        self.native_ui_profile = 'glass-v1'
         self.env = os.environ.copy()
         for name in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK', 'DBUS_SESSION_BUS_ADDRESS'):
             self.env.pop(name, None)

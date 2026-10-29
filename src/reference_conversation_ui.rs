@@ -1,11 +1,8 @@
 //! Egui components over the shared conversation model; no HTML or PTY writes.
+use crate::glass_shell::{self as shell, color};
 use crate::{app::state::TerminalApp, reference_workspace::rgb};
 use egui::{Color32, RichText, Stroke};
-use jterm_core::{
-    reference_conversation as model,
-    reference_icons::Icon,
-    reference_shell::{self as shell, color},
-};
+use jterm_core::{reference_conversation as model, reference_icons::Icon};
 
 pub(crate) fn icon(ui: &egui::Ui, rect: egui::Rect, icon: Icon, tint: Color32) {
     let scale = rect.width().min(rect.height()) / 24.0;
@@ -64,7 +61,7 @@ fn pill(ui: &mut egui::Ui, text: &str, key: &str, complete: bool) {
     let scale = content_scale(ui);
     egui::Frame::NONE
         .fill(if complete {
-            Color32::from_rgb(229, 244, 235)
+            shell::rgba([54, 113, 101, 110])
         } else {
             rgb(color::ACCENT_PALE)
         })
@@ -99,7 +96,7 @@ fn pill(ui: &mut egui::Ui, text: &str, key: &str, complete: bool) {
 fn draw_steps(ui: &mut egui::Ui, steps: &[model::Step]) {
     let scale = content_scale(ui);
     egui::Frame::NONE
-        .fill(Color32::from_rgb(239, 244, 253))
+        .fill(shell::rgba(shell::token::INSPECTOR_CARD))
         .corner_radius(8)
         .stroke(Stroke::new(1.0, rgb(color::LIGHT_BORDER)))
         .inner_margin(egui::Margin::symmetric(8, 0))
@@ -170,14 +167,14 @@ fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
     let scale = content_scale(ui);
     let gutter_width = diff_gutter_width(ui, diff, scale);
     egui::Frame::NONE
-        .fill(Color32::WHITE)
+        .fill(shell::rgba(shell::token::TERMINAL))
         .corner_radius(10)
         .stroke(Stroke::new(1.0, rgb(color::LIGHT_BORDER)))
         .show(ui, |ui| {
             ui.spacing_mut().interact_size.y =
                 crate::theme::workspace_control_height(shell::type_size::BODY * scale);
             egui::Frame::NONE
-                .fill(Color32::from_rgb(243, 246, 253))
+                .fill(shell::rgba(shell::token::INSPECTOR_CARD))
                 .inner_margin(egui::Margin::symmetric(8, 1))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -267,9 +264,9 @@ fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
                     egui::Sense::hover(),
                 );
                 let fill = match line.kind {
-                    model::DiffKind::Added => Color32::from_rgb(231, 246, 235),
-                    model::DiffKind::Removed => Color32::from_rgb(253, 239, 240),
-                    _ => Color32::WHITE,
+                    model::DiffKind::Added => shell::rgba([38, 101, 79, 150]),
+                    model::DiffKind::Removed => shell::rgba([116, 50, 74, 150]),
+                    _ => Color32::TRANSPARENT,
                 };
                 ui.painter().rect_filled(rect, 0, fill);
                 for (index, number) in [line.old_line, line.new_line].into_iter().enumerate() {
@@ -496,305 +493,215 @@ pub(crate) fn draw_inspector(
     fixture: bool,
     scale: f32,
 ) {
+    let screen = ui.ctx().viewport_rect();
+    let short = screen.height() < shell::token::SHORT_HEIGHT;
+    let target_height =
+        (screen.height() - if short { 28.0 } else { 80.0 } - ui.cursor().top()).max(0.0);
     egui::Frame::NONE
-        .fill(rgb(color::INSPECTOR_CARD))
-        .corner_radius(12)
-        .stroke(Stroke::new(1.0, rgb(color::DARK_BORDER)))
-        .inner_margin(13.0)
+        .fill(shell::rgba(shell::token::INSPECTOR_CARD))
+        .corner_radius(18)
+        .stroke(Stroke::new(1.0, shell::rgba(shell::token::BORDER)))
+        .inner_margin(16.0)
         .show(ui, |ui| {
-            // The inner width already excludes both panel margins and this
-            // frame's padding/stroke. A larger hard minimum shifts egui's
-            // right-panel clamp and steals two pixels from the inspector.
+            let top = ui.min_rect().top() - 16.0;
+            ui.set_min_height((target_height - 32.0).max(0.0));
             ui.set_min_width(ui.available_width());
-            ui.set_min_height(573.0);
-            ui.spacing_mut().interact_size.y = 18.0;
-            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.spacing_mut().interact_size.y = 24.0;
+            ui.spacing_mut().item_spacing.y = 6.0;
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = shell::METADATA_GAP;
-                let heading_height = shell::INSPECTOR_BADGE_HEIGHT * scale;
-                let icon_size = 18.0 * scale;
-                let badge_font =
-                    egui::FontId::proportional(shell::INSPECTOR_BADGE_FONT_SIZE * scale);
-                let badge_text_width = ui
-                    .painter()
-                    .layout_no_wrap(inspector.badge.clone(), badge_font, rgb(color::CHROME_TEXT))
-                    .size()
-                    .x;
-                let padding_x = shell::INSPECTOR_BADGE_HORIZONTAL_PADDING * scale;
-                let padding_y = shell::INSPECTOR_BADGE_VERTICAL_PADDING * scale;
-                let badge_width = (badge_text_width + 2.0 * padding_x).min(
-                    (ui.available_width() - icon_size - 2.0 * shell::METADATA_GAP - 24.0 * scale)
-                        .max(2.0 * padding_x),
-                );
-                let title_available =
-                    (ui.available_width() - icon_size - 2.0 * shell::METADATA_GAP - badge_width)
-                        .max(0.0);
-                let title_width = ui
-                    .painter()
-                    .layout_no_wrap(
-                        inspector.title.clone(),
-                        egui::FontId::proportional(11.0 * scale),
-                        rgb(color::CHROME_TEXT),
-                    )
-                    .size()
-                    .x
-                    .min(title_available);
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(icon_size, heading_height),
-                    egui::Sense::hover(),
-                );
-                icon(ui, rect, Icon::Agent, rgb(color::ACCENT));
+                let (r, _) = ui.allocate_exact_size(egui::vec2(24.0, 26.0), egui::Sense::hover());
+                icon(ui, r, Icon::Agent, shell::rgba(shell::token::ACCENT_TOP));
+                let badge_width = (inspector.badge.len() as f32 * 6.5 * scale + 16.0)
+                    .min(ui.available_width() * 0.45);
+                let title_width = (ui.available_width() - badge_width - 8.0).max(0.0);
                 ui.add_sized(
-                    [title_width, heading_height],
-                    egui::Label::new(RichText::new(&inspector.title).strong().size(11.0 * scale))
-                        .truncate(),
+                    [title_width, 26.0],
+                    egui::Label::new(
+                        RichText::new(&inspector.title)
+                            .size(14.0 * scale)
+                            .color(shell::rgba(shell::token::TEXT)),
+                    )
+                    .truncate(),
                 )
                 .on_hover_text(&inspector.title);
-                let idle = matches!(
-                    inspector.badge.as_str(),
-                    "No task" | "Unavailable" | "Unsupported"
-                );
                 egui::Frame::NONE
-                    .fill(rgb(if idle {
-                        color::NAVIGATION
-                    } else {
-                        color::NAVIGATION_SELECTED
-                    }))
-                    .corner_radius(shell::INSPECTOR_BADGE_RADIUS * scale)
-                    .inner_margin(egui::Margin::symmetric(
-                        padding_x.round() as i8,
-                        padding_y.round() as i8,
-                    ))
+                    .fill(shell::rgba(shell::token::BUTTON))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(6, 3))
                     .show(ui, |ui| {
                         ui.add_sized(
-                            [
-                                (badge_width - 2.0 * padding_x).max(0.0),
-                                (heading_height - 2.0 * padding_y).max(0.0),
-                            ],
+                            [badge_width - 12.0, 18.0],
                             egui::Label::new(
                                 RichText::new(&inspector.badge)
-                                    .size(shell::INSPECTOR_BADGE_FONT_SIZE * scale)
-                                    .color(rgb(if idle {
-                                        color::CHROME_MUTED
-                                    } else {
-                                        color::CHROME_TEXT
-                                    })),
+                                    .size(11.0 * scale)
+                                    .color(shell::rgba(shell::token::MUTED_TEXT)),
                             )
                             .truncate(),
-                        );
-                    })
-                    .response
-                    .on_hover_text(&inspector.badge);
+                        )
+                        .on_hover_text(&inspector.badge);
+                    });
             });
+            ui.add_space(5.0);
             ui.label(
                 RichText::new(&inspector.subtitle)
-                    .size(9.0 * scale)
-                    .color(rgb(color::CHROME_MUTED)),
+                    .size(14.0 * scale)
+                    .color(shell::rgba(shell::token::MUTED_TEXT)),
             );
             if fixture {
                 ui.label(
                     RichText::new("Visual acceptance fixture")
-                        .size(8.0 * scale)
-                        .color(rgb(color::CHROME_MUTED)),
+                        .size(11.0 * scale)
+                        .color(shell::rgba(shell::token::MUTED_TEXT)),
                 );
             }
-            ui.add_space((shell::INSPECTOR_PROGRESS_TARGET_Y - ui.cursor().top()).max(0.0));
-            let progress = if inspector.total == 0 {
-                0.0
-            } else {
-                inspector.completed as f32 / inspector.total as f32
-            };
-            let (progress_row, _) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
+            ui.add_space((top + 94.0 - ui.cursor().top()).max(8.0));
+            let (progress, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 16.0), egui::Sense::hover());
             let track = egui::Rect::from_min_size(
-                progress_row.min,
-                egui::vec2((progress_row.width() - 62.0).max(0.0), 4.0),
+                progress.min,
+                egui::vec2((progress.width() - 94.0).max(0.0), 7.0),
             );
-            ui.painter().rect_filled(track, 2, rgb(color::NAVIGATION));
-            ui.painter().rect_filled(
-                egui::Rect::from_min_size(track.min, egui::vec2(track.width() * progress, 4.0)),
-                2,
-                rgb(color::ACCENT),
-            );
+            ui.painter()
+                .rect_filled(track, 4, shell::rgba([16, 30, 64, 120]));
+            if inspector.total > 0 {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(
+                        track.min,
+                        egui::vec2(
+                            track.width() * inspector.completed as f32 / inspector.total as f32,
+                            7.0,
+                        ),
+                    ),
+                    4,
+                    shell::rgba(shell::token::ACCENT_TOP),
+                );
+            }
             ui.painter().text(
-                egui::pos2(progress_row.right(), track.center().y),
+                progress.right_top() + egui::vec2(0.0, 3.0),
                 egui::Align2::RIGHT_CENTER,
                 if inspector.total == 0 {
-                    shell::NO_PROGRESS_LABEL.to_owned()
+                    "No progress".into()
                 } else {
                     format!("{} / {} steps", inspector.completed, inspector.total)
                 },
-                egui::FontId::proportional(8.0 * scale),
-                rgb(color::CHROME_MUTED),
+                egui::FontId::proportional(12.0 * scale),
+                shell::rgba(shell::token::MUTED_TEXT),
             );
+            ui.add_space((top + 132.0 - ui.cursor().top()).max(12.0));
             ui.spacing_mut().item_spacing.y = 0.0;
-            ui.add_space((shell::INSPECTOR_METADATA_TARGET_Y - 4.0 - ui.cursor().top()).max(0.0));
             for (label, value) in &inspector.metadata {
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), shell::INSPECTOR_METADATA_ROW_HEIGHT),
+                let (r, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 28.0),
                     egui::Sense::hover(),
                 );
                 ui.painter().text(
-                    rect.left_center(),
+                    r.left_center(),
                     egui::Align2::LEFT_CENTER,
                     label,
-                    egui::FontId::proportional(9.0 * scale),
-                    rgb(color::CHROME_MUTED),
+                    egui::FontId::proportional(14.0 * scale),
+                    shell::rgba(shell::token::MUTED_TEXT),
                 );
-                let value_rect =
-                    egui::Rect::from_min_max(rect.min + egui::vec2(70.0, 0.0), rect.max);
+                let v = egui::Rect::from_min_max(r.min + egui::vec2(110.0, 0.0), r.max);
                 ui.put(
-                    value_rect,
-                    egui::Label::new(RichText::new(value).size(9.0 * scale))
-                        .halign(egui::Align::Max)
-                        .truncate(),
+                    v,
+                    egui::Label::new(
+                        RichText::new(value)
+                            .size(14.0 * scale)
+                            .color(shell::rgba(shell::token::TEXT)),
+                    )
+                    .halign(egui::Align::Min)
+                    .truncate(),
                 )
                 .on_hover_text(value);
             }
-            ui.add_space(10.0);
+            ui.add_space(22.0);
             ui.label(
                 RichText::new("CURRENT STEP")
-                    .size(8.0 * scale)
-                    .color(rgb(color::CHROME_MUTED)),
+                    .size(12.0 * scale)
+                    .color(shell::rgba(shell::token::MUTED_TEXT)),
             );
-            ui.add_space((shell::INSPECTOR_CURRENT_TARGET_Y - ui.cursor().top()).max(0.0));
+            ui.add_space(6.0);
             egui::Frame::NONE
-                .fill(rgb(color::NAVIGATION))
-                .corner_radius(8)
-                .inner_margin(9.0)
+                .fill(shell::rgba([12, 25, 53, 130]))
+                .corner_radius(12)
+                .stroke(Stroke::new(1.0, shell::rgba(shell::token::BORDER)))
+                .inner_margin(14.0)
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.set_min_height(shell::INSPECTOR_CURRENT_HEIGHT - 18.0);
+                    ui.set_min_height(30.0);
                     if let Some(step) = &inspector.current_step {
-                        ui.horizontal(|ui| {
-                            let (rect, _) = ui
-                                .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                            state_icon(ui, rect, step.state);
-                            ui.label(RichText::new(&step.title).size(9.0 * scale));
-                        });
+                        ui.label(
+                            RichText::new(&step.title)
+                                .size(14.0 * scale)
+                                .color(shell::rgba(shell::token::TEXT)),
+                        );
                         ui.label(
                             RichText::new(&step.detail)
-                                .size(8.0 * scale)
-                                .color(rgb(color::CHROME_MUTED)),
+                                .size(12.0 * scale)
+                                .color(shell::rgba(shell::token::MUTED_TEXT)),
                         );
                     } else {
                         ui.label(
                             RichText::new("No current step")
-                                .size(9.0 * scale)
-                                .color(rgb(color::CHROME_MUTED)),
+                                .size(14.0 * scale)
+                                .color(shell::rgba(shell::token::MUTED_TEXT)),
                         );
                     }
                 });
-            ui.add_space(13.0);
+            ui.add_space(25.0);
             ui.label(
                 RichText::new("TASK QUEUE")
-                    .size(8.0 * scale)
-                    .color(rgb(color::CHROME_MUTED)),
+                    .size(12.0 * scale)
+                    .color(shell::rgba(shell::token::MUTED_TEXT)),
             );
-            ui.add_space(shell::METADATA_GAP);
+            ui.add_space(8.0);
             if inspector.queue.is_empty() {
                 ui.label(
                     RichText::new("No queued tasks")
-                        .size(9.0 * scale)
-                        .color(rgb(color::CHROME_MUTED)),
+                        .size(14.0 * scale)
+                        .color(shell::rgba(shell::token::MUTED_TEXT)),
                 );
             }
-            ui.spacing_mut().item_spacing.y = shell::INSPECTOR_QUEUE_GAP;
             for step in &inspector.queue {
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), shell::INSPECTOR_QUEUE_ROW_HEIGHT),
-                    egui::Sense::hover(),
-                );
-                if step.state == model::StepState::Running {
-                    ui.painter()
-                        .rect_filled(rect, 6, rgb(color::NAVIGATION_SELECTED));
-                }
-                state_icon(
-                    ui,
-                    egui::Rect::from_center_size(
-                        egui::pos2(rect.left() + 10.0, rect.center().y),
-                        egui::vec2(13.0, 13.0),
-                    ),
-                    step.state,
-                );
-                let text_rect = egui::Rect::from_min_max(
-                    rect.min + egui::vec2(24.0, 0.0),
-                    rect.max - egui::vec2(4.0, 0.0),
-                );
-                let mut title_rect = text_rect;
-                if let Some(elapsed) = &step.elapsed {
-                    let elapsed_galley = ui.painter().layout_no_wrap(
-                        elapsed.clone(),
-                        egui::FontId::proportional(8.0 * scale),
-                        rgb(color::CHROME_MUTED),
-                    );
-                    title_rect.max.x =
-                        (text_rect.right() - elapsed_galley.size().x - shell::METADATA_GAP)
-                            .max(title_rect.left());
-                    ui.painter().galley(
-                        egui::pos2(
-                            text_rect.right() - elapsed_galley.size().x,
-                            text_rect.center().y - elapsed_galley.size().y * 0.5,
-                        ),
-                        elapsed_galley,
-                        rgb(color::CHROME_MUTED),
-                    );
-                }
-                // A 24px queue row is a single baseline, not a two-line card.
-                // Keep the full detail available without changing row/grid height.
-                let mut title_job = egui::text::LayoutJob::simple(
-                    step.title.clone(),
-                    egui::FontId::proportional(9.0 * scale),
-                    rgb(color::CHROME_TEXT),
-                    title_rect.width(),
-                );
-                title_job.wrap.max_rows = 1;
-                title_job.wrap.break_anywhere = true;
-                title_job.wrap.overflow_character = Some('…');
-                let title_galley = ui.painter().layout_job(title_job);
-                ui.painter().with_clip_rect(title_rect).galley(
-                    egui::pos2(
-                        title_rect.left(),
-                        title_rect.center().y - title_galley.size().y * 0.5,
-                    ),
-                    title_galley,
-                    rgb(color::CHROME_TEXT),
-                );
-                let response = ui.interact(
-                    rect,
-                    ui.id().with(("queue", &step.title)),
-                    egui::Sense::hover(),
-                );
-                response.widget_info(|| {
-                    let mut label = format!("{}\n{}", step.title, step.detail);
-                    if let Some(elapsed) = &step.elapsed {
-                        label.push('\n');
-                        label.push_str(elapsed);
-                    }
-                    egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), label)
+                ui.horizontal(|ui| {
+                    let (r, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 26.0), egui::Sense::hover());
+                    state_icon(ui, r.shrink(2.0), step.state);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&step.title)
+                                .size(13.0 * scale)
+                                .color(shell::rgba(shell::token::TEXT)),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&step.detail);
                 });
-                response.on_hover_text(format!("{}\n{}", step.title, step.detail));
             }
-            let target = ui.min_rect().top() + 425.0;
-            ui.add_space((target - ui.cursor().top()).max(8.0));
-            ui.label(RichText::new(&inspector.output_title).size(9.0 * scale));
+            let terminal_target = top + (target_height - 210.0).max(400.0);
+            ui.add_space((terminal_target - ui.cursor().top()).max(24.0));
+            ui.label(
+                RichText::new(&inspector.output_title)
+                    .size(14.0 * scale)
+                    .color(shell::rgba(shell::token::TEXT)),
+            );
+            ui.add_space(7.0);
             egui::Frame::NONE
-                .fill(rgb(color::TERMINAL))
-                .corner_radius(8)
-                .inner_margin(9.0)
+                .fill(shell::rgba(shell::token::TERMINAL))
+                .corner_radius(12)
+                .inner_margin(14.0)
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.set_min_height(shell::INSPECTOR_OUTPUT_HEIGHT - 18.0);
+                    ui.set_min_height(142.0);
                     egui::ScrollArea::both()
                         .id_salt("inspector-output")
-                        .max_height(shell::INSPECTOR_OUTPUT_HEIGHT - 18.0)
+                        .max_height(142.0)
                         .show(ui, |ui| {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(&inspector.output)
-                                        .monospace()
-                                        .size(9.0 * scale)
-                                        .color(rgb(color::CHROME_MUTED)),
+                                        .size(13.0 * scale)
+                                        .color(shell::rgba(shell::token::MUTED_TEXT)),
                                 )
                                 .selectable(true),
                             );
@@ -849,7 +756,7 @@ impl TerminalApp {
         crate::reference_workspace::paint_canvas_background(ui.painter(), background);
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             ui.set_clip_rect(rect.intersect(ui.clip_rect()));
-            *ui.visuals_mut() = egui::Visuals::light();
+            *ui.visuals_mut() = egui::Visuals::dark();
             ui.visuals_mut().override_text_color = Some(rgb(color::CANVAS_TEXT));
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
 
@@ -1067,6 +974,71 @@ mod reference_font_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn glass_diff_has_dark_context_and_opaque_code_without_losing_semantic_bands() {
+        let ctx = content_test_context();
+        let fixture = model::acceptance_fixture();
+        let diff = fixture
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| {
+                if let model::Part::Diff(diff) = part {
+                    Some(diff)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.set_width(790.0);
+            draw_diff(ui, diff);
+        });
+        fn inspect(shape: &egui::Shape, fills: &mut Vec<Color32>, code: &mut Vec<Color32>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        inspect(shape, fills, code);
+                    }
+                }
+                egui::Shape::Rect(rect) => fills.push(rect.fill),
+                egui::Shape::Text(text) if text.galley.text().contains("Viewport positions") => {
+                    code.extend(
+                        text.galley
+                            .job
+                            .sections
+                            .iter()
+                            .map(|section| section.format.color),
+                    );
+                }
+                _ => {}
+            }
+        }
+        let mut fills = Vec::new();
+        let mut code = Vec::new();
+        for shape in &output.shapes {
+            inspect(&shape.shape, &mut fills, &mut code);
+        }
+        output.textures_delta.clear();
+        assert!(fills.contains(&shell::rgba(shell::token::TERMINAL)));
+        assert!(
+            !fills.contains(&Color32::WHITE),
+            "no legacy white diff card or context row"
+        );
+        assert!(
+            fills.contains(&shell::rgba([38, 101, 79, 150])),
+            "green insert band is retained"
+        );
+        assert!(
+            fills.contains(&shell::rgba([116, 50, 74, 150])),
+            "red removal band is retained"
+        );
+        assert!(!code.is_empty(), "actual context code must be painted");
+        assert!(code
+            .iter()
+            .all(|color| *color == shell::rgba(shell::token::TEXT) && color.a() == 255));
     }
 
     #[test]

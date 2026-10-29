@@ -12,12 +12,13 @@ import json
 from pathlib import Path
 import re
 import time
+import native_glass_profile as glass_profile
 
 spec = importlib.util.spec_from_file_location('e03_legacy_pilot_base', Path(__file__).with_name('native-block-search.py'))
 base = importlib.util.module_from_spec(spec); spec.loader.exec_module(base)
 
 
-def terminal_rectangle(image, owned):
+def terminal_rectangle(image, owned, *, profile='legacy-reference'):
     """Locate the painted terminal by its non-text surface, never marker words.
 
     Within the actual owned client, require the major wide, predominantly
@@ -25,6 +26,13 @@ def terminal_rectangle(image, owned):
     pre-redesign builtin dark theme/card hover and current terminal surface.
     No target/query/neighbor text participates in choosing this ROI.
     """
+    if profile == glass_profile.NAME:
+        rectangle = dict(zip(('x','y','width','height'), owned))
+        glass_profile.header_paint(image, rectangle, 'block')
+        region = glass_profile.layout(rectangle)['terminal']
+        return (region['x'], region['y'], region['x']+region['width'], region['y']+region['height'])
+    if profile != 'legacy-reference':
+        raise RuntimeError('Unregistered terminal-region observation profile')
     from PIL import Image, ImageChops, ImageDraw
     x, y, width, height = owned
     if (min(x, y) < 0 or width <= 598 or height <= 182 or
@@ -139,7 +147,8 @@ class PilotSmoke(base.SearchSmoke):
         values = dict(line.split('=', 1) for line in geometry.splitlines() if '=' in line)
         owned = [int(values[key]) for key in ('X', 'Y', 'WIDTH', 'HEIGHT')]
         with Image.open(source) as image:
-            region = terminal_rectangle(image, owned)
+            profile = getattr(self, 'native_ui_profile', 'legacy-reference')
+            region = terminal_rectangle(image, owned, profile=profile)
             crop = image.convert('RGB').crop(region)
         raw = self.out / (label + '-terminal.png')
         analysis = self.out / (label + '-terminal-gray-negate.png')
@@ -164,6 +173,8 @@ class PilotSmoke(base.SearchSmoke):
             raise RuntimeError('Native source image changed during terminal analysis')
         (self.out / (label + '-terminal-region.json')).write_text(json.dumps(dict(
             owned_client=owned, region=region, native_source=source.name, source_sha256=original,
+            observation_profile=profile,
+            registration=glass_profile.registration()[1] if profile == glass_profile.NAME else None,
             region_sha256=hashlib.sha256(raw.read_bytes()).hexdigest(),
             analysis=analysis.name, analysis_sha256=hashlib.sha256(analysis.read_bytes()).hexdigest(),
             tsv=tsv.name, tsv_sha256=hashlib.sha256(tsv.read_bytes()).hexdigest()), indent=2))

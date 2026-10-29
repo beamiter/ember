@@ -20,6 +20,8 @@ mod execution_journal;
 mod fold_preview;
 mod font_file;
 mod font_zoom;
+pub mod glass_shell;
+pub mod glass_shell_tokens;
 mod gpu;
 mod help;
 mod history_persistence;
@@ -482,7 +484,7 @@ fn configure_fonts_and_gpu(
     let mut loaded_font_paths = HashMap::new();
     // One shared chrome face; terminal fonts and their existing zoom stay independent.
     #[cfg(target_os = "linux")]
-    if let Some(path) = fontconfig_match_family_file(jterm_core::reference_shell::FONT_SANS) {
+    if let Some(path) = fontconfig_match_family_file(crate::glass_shell::FONT_SANS) {
         load_font_from_path(
             &mut fonts,
             &mut loaded_font_paths,
@@ -496,7 +498,7 @@ fn configure_fonts_and_gpu(
     // egui RichText::strong changes color, not font weight. Bind the shared
     // 700 headline face explicitly while keeping normal body text at 400.
     #[cfg(target_os = "linux")]
-    if let Some(path) = fontconfig_match_bold_file(jterm_core::reference_shell::FONT_SANS) {
+    if let Some(path) = fontconfig_match_bold_file(crate::glass_shell::FONT_SANS) {
         load_font_from_path(
             &mut fonts,
             &mut loaded_font_paths,
@@ -1412,7 +1414,10 @@ fn projected_viewport_for_session(
         .set_block_spacing(renderer.block_spacer_rows());
     session
         .projection_policy
-        .set_block_chrome(renderer.block_mode, 0);
+        .set_block_chrome(renderer.block_mode && !renderer.continuous_block, 0);
+    session
+        .projection_policy
+        .set_retain_identity_canvas(renderer.continuous_block);
     session.projection_policy.set_chat_mode(renderer.chat_mode);
     let policy = &session.projection_policy;
     let view_state = &mut session.projection_view_state;
@@ -2751,7 +2756,7 @@ impl TerminalApp {
 
         let mut renderer = TerminalRenderer::new(
             cfg.font_size,
-            cfg.padding,
+            cfg.padding + 12.0,
             cfg.line_spacing,
             cfg.scrollbar_visibility.clone(),
             current_theme.clone(),
@@ -2995,7 +3000,7 @@ impl TerminalApp {
         apply_theme_visuals(ctx, &self.current_theme);
 
         self.renderer.font_size = self.config.font_size;
-        self.renderer.padding = self.config.padding;
+        self.renderer.padding = self.config.padding + 12.0;
         self.renderer.line_spacing = self.config.line_spacing;
         self.renderer.scrollbar_visibility = self.config.scrollbar_visibility.clone();
         self.renderer.theme = self.current_theme.clone();
@@ -3011,7 +3016,7 @@ impl TerminalApp {
 
         for renderer in &mut self.pane_renderers {
             renderer.font_size = self.config.font_size;
-            renderer.padding = self.config.padding;
+            renderer.padding = self.config.padding + 12.0;
             renderer.line_spacing = self.config.line_spacing;
             renderer.scrollbar_visibility = self.config.scrollbar_visibility.clone();
             renderer.theme = self.current_theme.clone();
@@ -3654,16 +3659,34 @@ impl TerminalApp {
         } else {
             egui::Panel::left("file_tree")
         };
-        let width = if files_inspector {
-            jterm_core::reference_shell::INSPECTOR_WIDTH
+        let glass_layout = self.reference_layout(root_ui.ctx());
+        let short =
+            root_ui.ctx().viewport_rect().height() < crate::glass_shell::token::SHORT_HEIGHT;
+        let bottom = if short {
+            crate::glass_shell::token::SHORT_BOTTOM_GAP
         } else {
-            jterm_core::reference_shell::NAVIGATION_WIDTH
+            crate::glass_shell::token::NAVIGATION_BOTTOM_GAP
         };
-        let frame = egui::Frame::NONE
-            .fill(reference_workspace::rgb(
-                jterm_core::reference_shell::color::NAVIGATION,
-            ))
-            .inner_margin(jterm_core::reference_shell::NAVIGATION_PADDING);
+        let width = if files_inspector {
+            crate::glass_shell::INSPECTOR_WIDTH + 18.0
+        } else {
+            glass_layout.navigation.map_or(0.0, |r| r.width)
+        };
+        let frame = egui::Frame::NONE.inner_margin(if files_inspector {
+            egui::Margin {
+                left: 20,
+                right: 18,
+                top: 15,
+                bottom: if short { 12 } else { 46 },
+            }
+        } else {
+            egui::Margin {
+                left: 17,
+                right: 16,
+                top: 17,
+                bottom: bottom as i8,
+            }
+        });
         let mut render_body = |ui: &mut egui::Ui| {
             let mut contents = |ui: &mut egui::Ui| {
                 reference_workspace::chrome_style(
@@ -3947,6 +3970,7 @@ impl TerminalApp {
                         if jterm_core::reference_conversation::fixture_enabled() {
                             self.render_reference_fixture_recent(ui);
                         } else {
+                            ui.spacing_mut().interact_size.y = 42.0;
                             self.render_sidebar_sessions(ui);
                         }
                     }
@@ -4253,7 +4277,22 @@ impl TerminalApp {
                     &mut contents,
                 );
             } else {
-                contents(ui);
+                let bounds = ui.available_rect_before_wrap();
+                let status = egui::Rect::from_min_max(
+                    egui::pos2(bounds.left(), (bounds.bottom() - 60.0).max(bounds.top())),
+                    bounds.max,
+                );
+                let body =
+                    egui::Rect::from_min_max(bounds.min, egui::pos2(bounds.right(), status.top()));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("glass-navigation-body")
+                        .min_scrolled_height(0.0)
+                        .max_height(body.height())
+                        .auto_shrink([false, false])
+                        .show(ui, &mut contents);
+                });
+                self.render_reference_status(ui, status);
             }
         };
         let panel_response = if let Some(rect) = drawer {
@@ -5670,11 +5709,17 @@ impl TerminalApp {
         // The existing terminal renderer still owns every PTY cell and input.
         let terminal_theme = self.reference_terminal_theme();
         self.renderer.theme = terminal_theme.clone();
-        self.renderer.chat_mode = true;
+        self.renderer.chat_mode = self.config.chat_mode_enabled();
+        self.renderer.block_mode = true;
+        self.renderer.continuous_block = !self.config.chat_mode_enabled();
+        self.renderer.glass_chat_requested = self.config.chat_mode_enabled();
         self.renderer.chat_command_bubbles = self.config.chat_mode_enabled();
         for renderer in &mut self.pane_renderers {
             renderer.theme = terminal_theme.clone();
-            renderer.chat_mode = true;
+            renderer.chat_mode = self.config.chat_mode_enabled();
+            renderer.block_mode = true;
+            renderer.continuous_block = !self.config.chat_mode_enabled();
+            renderer.glass_chat_requested = self.config.chat_mode_enabled();
             renderer.chat_command_bubbles = self.config.chat_mode_enabled();
         }
         self.observe_reference_shell(ctx);
@@ -5686,23 +5731,36 @@ impl TerminalApp {
         self.render_sidebar(root_ui);
         self.render_organism(root_ui);
         self.render_vim9_workbench(root_ui);
-        let frame = egui::Frame::NONE
-            .fill(reference_workspace::rgb(
-                jterm_core::reference_shell::color::CANVAS,
-            ))
-            .inner_margin(0.0);
-
+        let layout = self.reference_layout(ctx);
+        let bottom = if ctx.viewport_rect().height() < crate::glass_shell::token::SHORT_HEIGHT {
+            crate::glass_shell::token::SHORT_BOTTOM_GAP
+        } else {
+            crate::glass_shell::token::MAIN_BOTTOM_GAP
+        };
+        let right = if layout.inspector.is_some() {
+            0
+        } else {
+            crate::glass_shell::token::OUTER_RIGHT as i8
+        };
+        let frame = egui::Frame::NONE.inner_margin(egui::Margin {
+            left: crate::glass_shell::token::LEFT_GAP as i8,
+            right,
+            top: 1,
+            bottom: bottom as i8,
+        });
         let main_panel = egui::CentralPanel::default()
             .frame(frame)
             .show(root_ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 self.render_reference_canvas_header(ui);
                 let bounds = ui.available_rect_before_wrap();
-                reference_workspace::paint_canvas_background(ui.painter(), bounds);
-                let inset = jterm_core::reference_shell::COMPOSER_INSET.min(bounds.width() * 0.08);
                 let content = egui::Rect::from_min_max(
-                    bounds.min + egui::vec2(inset, 12.0),
-                    bounds.max - egui::vec2(inset, jterm_core::reference_shell::COMPOSER_BOTTOM),
+                    bounds.min
+                        + egui::vec2(
+                            crate::glass_shell::token::TOOLBAR_INSET_LEFT,
+                            crate::glass_shell::token::TERMINAL_TOP_GAP,
+                        ),
+                    bounds.max - egui::vec2(crate::glass_shell::token::TOOLBAR_INSET_RIGHT, 0.0),
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
                     ui.set_clip_rect(content.intersect(ui.clip_rect()));
@@ -10880,7 +10938,7 @@ mod tests {
     #[test]
     #[ignore = "native font proof requires installed shared reference faces"]
     fn reference_chrome_real_bold_face_is_registered_and_wider_than_regular() {
-        let sans = jterm_core::reference_shell::FONT_SANS;
+        let sans = crate::glass_shell::FONT_SANS;
         let regular_path =
             super::fontconfig_match_family_file(sans).expect("installed shared sans");
         let bold_path = super::fontconfig_match_bold_file(sans).expect("installed shared bold");

@@ -1296,11 +1296,22 @@ pub fn reference_foreground_rects(
     if !foreground {
         return (outer, None);
     }
-    let height = jterm_core::reference_shell::COMPOSER_HEIGHT.min((outer.height() - 24.0).max(0.0));
+    let height = crate::glass_shell::COMPOSER_HEIGHT.min((outer.height() - 24.0).max(0.0));
     let top = outer.bottom() - height;
     (
-        egui::Rect::from_min_max(outer.min, egui::pos2(outer.right(), top)),
-        (height > 0.0).then(|| egui::Rect::from_min_max(egui::pos2(outer.left(), top), outer.max)),
+        egui::Rect::from_min_max(
+            outer.min,
+            egui::pos2(
+                outer.right(),
+                (top - crate::glass_shell::token::TERMINAL_FOOTER_GAP).max(outer.top()),
+            ),
+        ),
+        (height > 0.0).then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(outer.left() - 16.0, top),
+                outer.max + egui::vec2(17.0, 0.0),
+            )
+        }),
     )
 }
 
@@ -1511,6 +1522,10 @@ pub struct TerminalRenderer {
     /// Whether to draw command-block chrome (`block_mode`): gutter stripes,
     /// separators and outcome badges derived from OSC 133 records.
     pub block_mode: bool,
+    /// Raw appearance without discarding the retained identity canvas.
+    pub continuous_block: bool,
+    /// Native column reservation follows requested Chat, including its long-input fallback.
+    pub glass_chat_requested: bool,
     /// Distinct conversation presentation; never changes terminal input ownership.
     pub chat_mode: bool,
     /// Independent from the native composer dock: Block retains left-aligned cells.
@@ -1677,6 +1692,8 @@ impl TerminalRenderer {
             font_ligatures: true,
             click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             block_mode: true,
+            continuous_block: false,
+            glass_chat_requested: false,
             chat_mode: false,
             chat_command_bubbles: true,
             chat_controls_enabled: false,
@@ -1745,8 +1762,44 @@ impl TerminalRenderer {
         }
     }
 
-    /// Native Block cards already have metadata headers and small edge gaps.
-    /// Only Chat keeps full display-row separators between its capsules.
+    /// One projection band includes the toolbar and its actual native-padding gap.
+    /// Select only a presentation. Long real input falls back intact to native rows.
+    pub fn configure_glass_presentation(
+        &mut self,
+        chat: bool,
+        terminal: &TerminalState,
+        outer_height: f32,
+    ) {
+        let limit = crate::glass_shell::editable_input_limit(outer_height, self.line_height);
+        let fallback = chat
+            && terminal.chat_surface().composer_docked()
+            && terminal
+                .native_prompt_input_rows()
+                .is_none_or(|rows| rows as f32 * self.line_height > limit);
+        self.glass_chat_requested = chat;
+        self.chat_mode = chat && !fallback;
+        self.continuous_block = !self.chat_mode;
+        self.block_mode = true;
+    }
+
+    /// The real pane font is resolved before deciding this same frame's dock.
+    pub fn sync_glass_presentation(
+        &mut self,
+        ctx: &egui::Context,
+        chat: bool,
+        terminal: &TerminalState,
+        outer_height: f32,
+    ) {
+        self.chat_mode = chat; // Metrics follow the requested role, never input length.
+        self.sync_font_metrics(ctx);
+        self.configure_glass_presentation(chat, terminal, outer_height);
+    }
+
+    pub fn chat_footer_rows(&self) -> usize {
+        crate::glass_shell::footer_rows(self.padding, self.line_height)
+    }
+
+    /// Only Chat keeps display-row separators between its capsules.
     pub fn block_spacer_rows(&self) -> bool {
         self.chat_mode && self.chat_command_bubbles && !self.block_compact
     }
@@ -1755,10 +1808,20 @@ impl TerminalRenderer {
     /// its link/mouse frontends. Repeated calls with an unchanged key clone
     /// only small `Arc`s; the cells and origin index stay shared.
     pub fn projected_viewport(&self, terminal: &mut TerminalState) -> ProjectedViewport {
-        if self.chat_mode {
+        if self.continuous_block {
+            let mut policy = crate::terminal::ProjectionPolicy::new();
+            policy.set_retain_identity_canvas(true);
+            terminal.projected_viewport_with_rows(
+                self.history_projection,
+                self.block_mode,
+                &policy,
+                &mut crate::terminal::ProjectionViewState::new(),
+                self.projection_view_rows,
+            )
+        } else if self.chat_mode {
             let mut policy = crate::terminal::ProjectionPolicy::new();
             policy.set_chat_mode(true);
-            policy.set_chat_footer_rows((28.0 / self.line_height).ceil() as usize);
+            policy.set_chat_footer_rows(self.chat_footer_rows());
             policy.set_chat_command_bubbles(self.chat_command_bubbles);
             policy.set_block_spacing(true);
             policy.set_block_chrome(true, 0);
@@ -2370,7 +2433,7 @@ impl TerminalRenderer {
     }
 
     fn block_gutter_width(&self) -> f32 {
-        if self.block_mode {
+        if self.block_mode && (!self.continuous_block || self.glass_chat_requested) {
             BLOCK_GUTTER_WIDTH
         } else {
             0.0
@@ -2455,6 +2518,7 @@ impl TerminalRenderer {
         rows: usize,
     ) -> Option<Vec<BlockChromeEntry>> {
         if !self.block_mode
+            || self.continuous_block
             || terminal.is_alt_buffer_active()
             || !terminal.viewport_buffer_mapping_is_exact()
         {
@@ -2716,7 +2780,7 @@ impl TerminalRenderer {
         viewport: &ProjectedViewport,
         rows: usize,
     ) -> Option<Vec<BlockChromeEntry>> {
-        if self.chat_mode && viewport.key().is_bypass() {
+        if self.continuous_block || (self.chat_mode && viewport.key().is_bypass()) {
             return None;
         }
         if viewport.is_transformed() || !terminal.viewport_buffer_mapping_is_exact() {
@@ -2731,7 +2795,7 @@ impl TerminalRenderer {
         terminal: &TerminalState,
         viewport: &ProjectedViewport,
     ) -> Option<Vec<BlockChromeEntry>> {
-        if !self.block_mode || terminal.is_alt_buffer_active() {
+        if !self.block_mode || self.continuous_block || terminal.is_alt_buffer_active() {
             return None;
         }
         let records = terminal.command_records();
@@ -4624,9 +4688,30 @@ impl TerminalRenderer {
             bg.r(),
             bg.g(),
             bg.b(),
-            (self.opacity * 255.0) as u8,
+            (self.opacity * crate::glass_shell::token::TERMINAL[3] as f32) as u8,
         );
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, bg_with_opacity);
+        let mut background_rect = rect;
+        if let Some(composer) = viewport.chat_composer_rows() {
+            let (content, _) = self.layout_rects(rect);
+            background_rect.max.y = self.shared_composer_rect(content, composer).top()
+                - crate::glass_shell::token::TERMINAL_FOOTER_GAP;
+        }
+        if background_rect.is_positive() {
+            painter.rect_filled(
+                background_rect,
+                crate::glass_shell::token::PANEL_RADIUS,
+                bg_with_opacity,
+            );
+            painter.rect_stroke(
+                background_rect,
+                crate::glass_shell::token::PANEL_RADIUS,
+                egui::Stroke::new(
+                    1.0,
+                    crate::glass_shell::rgba(crate::glass_shell::token::BORDER),
+                ),
+                egui::StrokeKind::Inside,
+            );
+        }
 
         let (content_rect, mut scrollbar_rect) = self.layout_rects(rect);
         if let Some(composer) = viewport.chat_composer_rows() {
@@ -5579,7 +5664,7 @@ impl TerminalRenderer {
         }
 
         self.draw_reference_foreground_footer(ui, terminal);
-        if self.chat_mode
+        if (self.chat_mode || self.foreground_footer_rect.is_some())
             && self.draw_chat_controls(
                 ui,
                 terminal,
@@ -7269,14 +7354,20 @@ mod tests {
             crate::config::ScrollbarVisibility::Auto,
             crate::theme::Theme::default(),
         );
-        let outer = egui::Rect::from_min_size(egui::pos2(320.0, 103.0), egui::vec2(702.0, 590.0));
+        // Explicit glass profile: one98px toolbar and13px gap below a real native pane.
+        let outer = egui::Rect::from_min_size(egui::pos2(365.0, 171.0), egui::vec2(859.0, 759.0));
         let (native, footer) = reference_foreground_rects(outer, true);
         let footer = footer.unwrap();
         assert_eq!(native.min, outer.min);
         assert_eq!(native.right(), outer.right());
-        assert_eq!(footer.height(), 80.0);
-        assert_eq!(footer.top(), 613.0);
-        assert_eq!(native.bottom(), footer.top());
+        assert_eq!(footer.height(), 98.0);
+        assert_eq!(footer.top(), 832.0);
+        assert_eq!(native.bottom(), 819.0);
+        assert_eq!(
+            native.bottom() + crate::glass_shell::token::TERMINAL_FOOTER_GAP,
+            footer.top()
+        );
+        assert_eq!((footer.left(), footer.right()), (349.0, 1241.0));
         let full_content = renderer.layout_rects(outer).0;
         let native_content = renderer.layout_rects(native).0;
         assert_eq!(
@@ -11491,6 +11582,39 @@ mod block_spacing_tests {
 #[cfg(test)]
 mod transcript_canvas_tests {
     use super::*;
+
+    fn assert_native_cells_equal(
+        actual: &[Vec<crate::terminal::TerminalCell>],
+        expected: &[Vec<crate::terminal::TerminalCell>],
+    ) {
+        assert_eq!(actual.len(), expected.len(), "native row count");
+        for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "native column count at row {row}"
+            );
+            for (column, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    (
+                        actual.character,
+                        actual.foreground,
+                        actual.background,
+                        actual.flags,
+                        actual.hyperlink_id
+                    ),
+                    (
+                        expected.character,
+                        expected.foreground,
+                        expected.background,
+                        expected.flags,
+                        expected.hyperlink_id
+                    ),
+                    "complete native cell at ({row},{column})"
+                );
+            }
+        }
+    }
     use crate::terminal::{ProjectionPolicy, ProjectionViewState};
     use crate::transcript_canvas::TranscriptCanvas;
 
@@ -11721,6 +11845,217 @@ mod transcript_canvas_tests {
                 "fractional frames reuse the materialized cells instead of rebuilding the transcript");
             assert_eq!(renderer.canvas_geometry.translation, 16.25);
         }
+    }
+
+    #[test]
+    fn long_glass_prompt_uses_actual_pane_font_and_stable_native_grid_budget() {
+        let ctx = egui::Context::default();
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            20.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Always,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        renderer.gpu_rendering = false;
+        let output = ctx.run_ui(Default::default(), |_| {
+            for outer in [
+                egui::Rect::from_min_size(egui::pos2(365.0, 171.0), egui::vec2(859.0, 759.0)),
+                egui::Rect::from_min_size(egui::pos2(310.0, 151.0), egui::vec2(350.0, 477.0)),
+            ] {
+                for font in [14.0, 36.0] {
+                    renderer.font_size = font;
+                    renderer.chat_mode = true;
+                    renderer.sync_font_metrics(&ctx);
+                    let native = reference_terminal_rects(outer, true, false).0;
+                    let size = renderer.grid_dimensions(native.size());
+                    let mut terminal = TerminalState::new(size.0, size.1);
+                    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+                    renderer.sync_glass_presentation(&ctx, true, &terminal, outer.height());
+                    assert!(renderer.chat_mode);
+                    let short_size = renderer.grid_dimensions(native.size());
+                    let limit = crate::glass_shell::editable_input_limit(
+                        outer.height(),
+                        renderer.line_height,
+                    );
+                    let lines = (limit / renderer.line_height).floor() as usize + 1;
+                    assert!(
+                        lines < size.1,
+                        "fixture must remain in the actual native grid"
+                    );
+                    for _ in 0..lines {
+                        terminal.process_input(b"x\r\n");
+                    }
+                    let cells = terminal
+                        .projected_viewport(renderer.history_projection, true)
+                        .cells()
+                        .to_vec();
+                    renderer.sync_glass_presentation(&ctx, true, &terminal, outer.height());
+                    assert!(!renderer.chat_mode);
+                    assert!(renderer.continuous_block);
+                    let (fallback_native, _, footer) = reference_terminal_rects(outer, true, true);
+                    assert_eq!(
+                        renderer.grid_dimensions(fallback_native.size()),
+                        short_size,
+                        "input length must not resize actualPTY rows OR columns"
+                    );
+                    assert_native_cells_equal(
+                        terminal
+                            .projected_viewport(renderer.history_projection, true)
+                            .cells(),
+                        cells.as_slice(),
+                    );
+                    assert_eq!(footer.unwrap().height(), 98.0);
+                    // Readline redraws the same prompt with CUP + erase-to-end.
+                    // ED2 is different: it archives visible native content.
+                    terminal.process_input(b"\x1b[H\x1b[J$ ");
+                    assert_eq!(terminal.native_prompt_input_rows(), Some(1));
+                    renderer.sync_glass_presentation(&ctx, true, &terminal, outer.height());
+                    assert!(
+                        renderer.chat_mode,
+                        "shortening the same real prompt restores docking: pane={:?}, font={font}, line={}, native_rows={:?}, limit={limit}, cursor=({},{}), wrapped={:?}",
+                        outer.size(), renderer.line_height, terminal.native_prompt_input_rows(), terminal.cursor_row, terminal.cursor_col, terminal.grid.row_wrapped
+                    );
+                    assert_eq!(renderer.grid_dimensions(native.size()), short_size);
+                    assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), size);
+                    for _ in 0..lines {
+                        terminal.process_input(b"x\r\n");
+                    }
+                    let archived_cells = terminal.grid.to_vec()[..lines].to_vec();
+                    terminal.process_input(b"\x1b[2J\x1b[H");
+                    let actual_archive = terminal.scrollback.iter().map(|row| row.decompress()).collect::<Vec<_>>();
+                    assert_native_cells_equal(&actual_archive, &archived_cells);
+                    renderer.sync_glass_presentation(&ctx, true, &terminal, outer.height());
+                    assert!(!renderer.chat_mode, "ED2 may not delete archived real input to force a short dock");
+                    assert_eq!(renderer.grid_dimensions(native.size()), short_size);
+                }
+            }
+            // Zoom in the same pane: the very first decision must use new metrics.
+            let mut terminal = TerminalState::new(50, 30);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\ntwo\r\nthree\r\n");
+            renderer.font_size = 8.0;
+            renderer.sync_glass_presentation(&ctx, true, &terminal, 477.0);
+            assert!(renderer.chat_mode);
+            renderer.font_size = 48.0;
+            renderer.sync_glass_presentation(&ctx, true, &terminal, 477.0);
+            assert!(
+                !renderer.chat_mode,
+                "same-frame new font cannot reuse the previous small-font cap"
+            );
+        });
+        drop(output);
+    }
+
+    #[test]
+    fn continuous_glass_block_retains_raw_rows_copy_fractional_and_reading_anchor() {
+        let (mut renderer, mut terminal, mut policy) = fixture(false);
+        renderer.continuous_block = true;
+        policy.set_block_chrome(false, 0);
+        policy.set_block_spacing(false);
+        let revision = policy.revision();
+        assert!(policy.set_retain_identity_canvas(true));
+        assert!(policy.revision() > revision);
+        let identity = terminal.projected_viewport(renderer.history_projection, true);
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let retained =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(retained.is_transformed());
+        // The retained identity plan must not resurrect visual cards or their hits.
+        // First prove this real semantic fixture would have cards in the old style.
+        renderer.continuous_block = false;
+        assert!(renderer
+            .block_chrome_snapshot(&terminal, &retained, retained.rows())
+            .is_some());
+        assert!(renderer
+            .compute_projected_block_chrome(&terminal, &retained)
+            .is_some());
+        renderer.continuous_block = true;
+        assert!(renderer
+            .block_chrome_snapshot(&terminal, &retained, retained.rows())
+            .is_none());
+        assert!(renderer
+            .compute_projected_block_chrome(&terminal, &retained)
+            .is_none());
+        assert_native_cells_equal(retained.cells(), identity.cells());
+        let content = egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(360.0, 320.0));
+        renderer.last_content_rect = Some(content);
+        let cursor = retained.cursor();
+        assert!(retained.application_cell(cursor).is_some());
+        let pointer = cursor_rect(
+            content,
+            cursor.row,
+            cursor.column,
+            renderer.char_width,
+            renderer.line_height,
+        )
+        .center();
+        assert!(renderer.pointer_app_mouse_eligible_projected(&terminal, &retained, pointer));
+        assert!(renderer.pointer_link_eligible_projected(&terminal, &retained, pointer));
+        assert_eq!(
+            grid_position_from_content(
+                renderer.canvas_pointer_position(pointer),
+                renderer.canvas_mapping_rect(content),
+                renderer.char_width,
+                renderer.line_height,
+                retained.columns(),
+                retained.rows()
+            ),
+            (cursor.row, cursor.column)
+        );
+        assert!(!renderer.pointer_app_mouse_eligible_projected(
+            &terminal,
+            &retained,
+            content.max + egui::vec2(1.0, 1.0)
+        ));
+        for row in 0..retained.rows() {
+            assert_eq!(
+                retained.row_kind(row),
+                Some(crate::terminal::ProjectedRowKind::Raw)
+            );
+            for col in 0..retained.columns() {
+                assert_eq!(
+                    retained.raw_anchor_at(DisplayPoint::new(row, col)),
+                    identity.raw_anchor_at(DisplayPoint::new(row, col))
+                );
+            }
+        }
+        terminal.start_selection((0, 0));
+        terminal.update_selection((4, 10));
+        let raw_copy = terminal.copy_selection();
+        terminal.clear_text_selection();
+        terminal.start_selection_projected(&retained, (0, 0));
+        terminal.update_selection_projected(&retained, (4, 10));
+        assert_eq!(terminal.copy_selection(), raw_copy);
+        terminal.clear_text_selection();
+        canvas.scroll(3.25, true);
+        let scrolled =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(renderer.canvas_geometry.translation, 16.75);
+        assert_eq!(scrolled.rows(), retained.rows() + 1);
+        canvas.scroll(0.5, true);
+        renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(renderer.canvas_geometry.translation, 16.25);
+        canvas.scroll(87.5, true);
+        let held = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        let anchor = held.first_raw_anchor_in_row(0);
+        let translation = renderer.canvas_geometry.translation;
+        terminal.process_input(b"new output one\r\nnew output two\r\n");
+        let after = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(after.first_raw_anchor_in_row(0), anchor);
+        assert_eq!(renderer.canvas_geometry.translation, translation);
+        assert!(!state.follows_bottom());
+        assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 16));
+        terminal.process_input(b"\x1b[?1049h");
+        let native =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(!native.is_transformed());
+        terminal.process_input(b"\x1b[?1049l");
+        assert!(renderer
+            .canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx)
+            .is_transformed());
     }
 
     #[test]
