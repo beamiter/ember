@@ -850,12 +850,16 @@ mod reference_font_tests {
                 // Consume the atlas delta before assertions so their original
                 // failure remains readable even in debug/unwind builds.
                 output.textures_delta.clear();
+                // Glass Inspector role bases differ from the earlier compact
+                // shell. Keep these independent literals so the renderer
+                // cannot silently redefine its own scaling contract.
                 for (name, reference_size) in [
-                    ("Canvas renderer", 11.0),
-                    ("Visual acceptance fixture", 8.0),
-                    ("Model", 9.0),
-                    ("CURRENT STEP", 8.0),
-                    ("TASK QUEUE", 8.0),
+                    ("Canvas renderer", 14.0),
+                    ("Sample native component state", 14.0),
+                    ("Visual acceptance fixture", 11.0),
+                    ("Model", 14.0),
+                    ("CURRENT STEP", 12.0),
+                    ("TASK QUEUE", 12.0),
                 ] {
                     let role = roles.iter().find(|role| role.0 == name).unwrap();
                     assert_eq!(role.1, reference_size * scale, "painted role: {name}");
