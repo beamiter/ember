@@ -116,8 +116,8 @@ fn draw_steps(ui: &mut egui::Ui, steps: &[model::Step]) {
                     ui.add(
                         egui::Label::new(
                             RichText::new(&step.title)
-                                .size(11.0 * scale)
-                                .color(rgb(color::CANVAS_TEXT)),
+                                .size(10.0 * scale)
+                                .color(rgb(color::MESSAGE_STEP_TEXT)),
                         )
                         .truncate(),
                     )
@@ -210,12 +210,8 @@ fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
                             .truncate(),
                         )
                         .on_hover_text(&diff.path);
-                        ui.label(
-                            RichText::new(format!("+{} −{}", diff.added, diff.removed))
-                                .size(9.0 * scale)
-                                .color(Color32::from_rgb(69, 145, 111)),
-                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = shell::METADATA_GAP;
                             ui.add_enabled(
                                 false,
                                 egui::Button::new(
@@ -254,6 +250,11 @@ fn draw_diff(ui: &mut egui::Ui, diff: &model::CodeDiff) {
                                 RichText::new(&diff.language)
                                     .size(9.0 * scale)
                                     .color(rgb(color::CANVAS_MUTED)),
+                            );
+                            ui.label(
+                                RichText::new(format!("+{} −{}", diff.added, diff.removed))
+                                    .size(9.0 * scale)
+                                    .color(Color32::from_rgb(69, 145, 111)),
                             );
                         });
                     });
@@ -381,7 +382,7 @@ pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
                                 egui::Label::new(
                                     RichText::new(text)
                                         .size(12.0 * scale)
-                                        .color(rgb(color::CANVAS_TEXT)),
+                                        .color(rgb(color::MESSAGE_USER_TEXT)),
                                 )
                                 .halign(egui::Align::Min)
                                 .wrap()
@@ -418,6 +419,7 @@ pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
                 ui.label(
                     RichText::new(&message.author)
                         .size(shell::type_size::ROLE * scale)
+                        .family(egui::FontFamily::Name("reference-chrome-bold".into()))
                         .strong()
                         .color(rgb(color::CANVAS_TEXT)),
                 );
@@ -449,7 +451,7 @@ pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
                             egui::Label::new(
                                 RichText::new(text)
                                     .size(12.0 * scale)
-                                    .color(rgb(color::CANVAS_TEXT)),
+                                    .color(rgb(color::MESSAGE_BODY)),
                             )
                             .wrap()
                             .selectable(true),
@@ -500,25 +502,89 @@ pub(crate) fn draw_inspector(
         .stroke(Stroke::new(1.0, rgb(color::DARK_BORDER)))
         .inner_margin(13.0)
         .show(ui, |ui| {
-            ui.set_min_width((shell::INSPECTOR_WIDTH - 54.0).max(0.0));
+            // The inner width already excludes both panel margins and this
+            // frame's padding/stroke. A larger hard minimum shifts egui's
+            // right-panel clamp and steals two pixels from the inspector.
+            ui.set_min_width(ui.available_width());
             ui.set_min_height(573.0);
             ui.spacing_mut().interact_size.y = 18.0;
             ui.spacing_mut().item_spacing.y = 3.0;
             ui.horizontal(|ui| {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                ui.spacing_mut().item_spacing.x = shell::METADATA_GAP;
+                let heading_height = shell::INSPECTOR_BADGE_HEIGHT * scale;
+                let icon_size = 18.0 * scale;
+                let badge_font =
+                    egui::FontId::proportional(shell::INSPECTOR_BADGE_FONT_SIZE * scale);
+                let badge_text_width = ui
+                    .painter()
+                    .layout_no_wrap(inspector.badge.clone(), badge_font, rgb(color::CHROME_TEXT))
+                    .size()
+                    .x;
+                let padding_x = shell::INSPECTOR_BADGE_HORIZONTAL_PADDING * scale;
+                let padding_y = shell::INSPECTOR_BADGE_VERTICAL_PADDING * scale;
+                let badge_width = (badge_text_width + 2.0 * padding_x).min(
+                    (ui.available_width() - icon_size - 2.0 * shell::METADATA_GAP - 24.0 * scale)
+                        .max(2.0 * padding_x),
+                );
+                let title_available =
+                    (ui.available_width() - icon_size - 2.0 * shell::METADATA_GAP - badge_width)
+                        .max(0.0);
+                let title_width = ui
+                    .painter()
+                    .layout_no_wrap(
+                        inspector.title.clone(),
+                        egui::FontId::proportional(11.0 * scale),
+                        rgb(color::CHROME_TEXT),
+                    )
+                    .size()
+                    .x
+                    .min(title_available);
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(icon_size, heading_height),
+                    egui::Sense::hover(),
+                );
                 icon(ui, rect, Icon::Agent, rgb(color::ACCENT));
-                ui.add(
+                ui.add_sized(
+                    [title_width, heading_height],
                     egui::Label::new(RichText::new(&inspector.title).strong().size(11.0 * scale))
                         .truncate(),
+                )
+                .on_hover_text(&inspector.title);
+                let idle = matches!(
+                    inspector.badge.as_str(),
+                    "No task" | "Unavailable" | "Unsupported"
                 );
                 egui::Frame::NONE
-                    .fill(rgb(color::NAVIGATION_SELECTED))
-                    .corner_radius(5)
-                    .inner_margin(egui::Margin::symmetric(5, 2))
+                    .fill(rgb(if idle {
+                        color::NAVIGATION
+                    } else {
+                        color::NAVIGATION_SELECTED
+                    }))
+                    .corner_radius(shell::INSPECTOR_BADGE_RADIUS * scale)
+                    .inner_margin(egui::Margin::symmetric(
+                        padding_x.round() as i8,
+                        padding_y.round() as i8,
+                    ))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(&inspector.badge).size(8.0 * scale));
-                    });
+                        ui.add_sized(
+                            [
+                                (badge_width - 2.0 * padding_x).max(0.0),
+                                (heading_height - 2.0 * padding_y).max(0.0),
+                            ],
+                            egui::Label::new(
+                                RichText::new(&inspector.badge)
+                                    .size(shell::INSPECTOR_BADGE_FONT_SIZE * scale)
+                                    .color(rgb(if idle {
+                                        color::CHROME_MUTED
+                                    } else {
+                                        color::CHROME_TEXT
+                                    })),
+                            )
+                            .truncate(),
+                        );
+                    })
+                    .response
+                    .on_hover_text(&inspector.badge);
             });
             ui.label(
                 RichText::new(&inspector.subtitle)
@@ -553,7 +619,11 @@ pub(crate) fn draw_inspector(
             ui.painter().text(
                 egui::pos2(progress_row.right(), track.center().y),
                 egui::Align2::RIGHT_CENTER,
-                format!("{} / {} steps", inspector.completed, inspector.total),
+                if inspector.total == 0 {
+                    shell::NO_PROGRESS_LABEL.to_owned()
+                } else {
+                    format!("{} / {} steps", inspector.completed, inspector.total)
+                },
                 egui::FontId::proportional(8.0 * scale),
                 rgb(color::CHROME_MUTED),
             );
@@ -747,15 +817,18 @@ impl TerminalApp {
         let Some(start) = self.renderer.canvas_geometry.composer_start else {
             return;
         };
-        let bottom = self
+        let composer_top = self
             .renderer
             .shared_composer_rect(content, start..start + 1)
-            .top()
-            - 10.0;
+            .top();
         let header = self.reference_layout(ui.ctx()).header;
-        let rect = egui::Rect::from_min_max(
+        let background = egui::Rect::from_min_max(
             egui::pos2(outer.left(), header.y + header.height),
-            egui::pos2(outer.right(), bottom),
+            egui::pos2(outer.right(), composer_top),
+        );
+        let rect = egui::Rect::from_min_max(
+            background.min,
+            egui::pos2(background.right(), composer_top - 10.0),
         );
         if !rect.is_positive() {
             return;
@@ -769,7 +842,11 @@ impl TerminalApp {
             .metadata
             .session_id
             .clone();
-        crate::reference_workspace::paint_canvas_background(ui.painter(), rect);
+        // The fixture document owns its whole canvas background, including
+        // its bottom content inset. Leaving that gap unpainted exposes the
+        // already-rendered native terminal and its unrelated scrollbar.
+        // This changes no PTY cells, native viewport, copy or input ownership.
+        crate::reference_workspace::paint_canvas_background(ui.painter(), background);
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             ui.set_clip_rect(rect.intersect(ui.clip_rect()));
             *ui.visuals_mut() = egui::Visuals::light();

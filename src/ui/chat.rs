@@ -36,6 +36,14 @@ fn paint_reference_icon(
 
 /// Shared native tool slots for editable prompts and non-editable foreground
 /// chrome. This factory creates no text editor and never writes terminal bytes.
+fn reference_chrome_width_scale(ui: &Ui) -> f32 {
+    // The context owns UI typography; a transcript's local Main font cannot
+    // change chrome slots or the native input/PTY row budget.
+    (egui::TextStyle::Body.resolve(&ui.ctx().global_style()).size
+        / crate::config::DEFAULT_FONT_SIZE)
+        .max(1.0)
+}
+
 fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: bool, owner: usize) {
     use jterm_core::{
         reference_icons::Icon,
@@ -43,6 +51,13 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
     };
     let rgb = |[r, g, b]: [u8; 3]| Color32::from_rgb(r, g, b);
     let popup_color = |[r, g, b, a]: [u8; 4]| Color32::from_rgba_unmultiplied(r, g, b, a);
+    let width_scale = reference_chrome_width_scale(ui);
+    let composer_width = rect.width()
+        + shell::COMPOSER_CONTROL_LEFT
+        + shell::COMPOSER_CONTROL_RIGHT
+        + shell::COMPOSER_SEND_WIDTH
+        + shell::METADATA_GAP;
+    let normalized_width = composer_width / width_scale;
     ui.scope_builder(
         egui::UiBuilder::new()
             .id_salt(("reference-composer-tools", owner))
@@ -52,21 +67,51 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
             ui.spacing_mut().interact_size.y = shell::CONTROL_HEIGHT;
             *ui.visuals_mut() = egui::Visuals::light();
             ui.visuals_mut().disabled_alpha = 1.0;
-            let model_width = if rect.width() > 540.0 {
-                shell::COMPOSER_MODEL_MIN_WIDTH
+            let widgets = &mut ui.visuals_mut().widgets;
+            for visuals in [&mut widgets.inactive, &mut widgets.noninteractive] {
+                visuals.bg_fill = rgb(color::CONTROL_SURFACE);
+                visuals.weak_bg_fill = rgb(color::CONTROL_SURFACE);
+            }
+            for visuals in [&mut widgets.hovered, &mut widgets.active] {
+                visuals.bg_fill = rgb(color::ACCENT_PALE);
+                visuals.weak_bg_fill = rgb(color::ACCENT_PALE);
+            }
+            let model_width = if normalized_width >= shell::COMPOSER_MODEL_MIN_AVAILABLE {
+                shell::COMPOSER_MODEL_MIN_WIDTH * width_scale
             } else {
                 0.0
             };
-            let tools_right = rect.right() - model_width - shell::METADATA_GAP;
+            let tools_right = rect.right()
+                - model_width
+                - if model_width > 0.0 {
+                    shell::METADATA_GAP
+                } else {
+                    0.0
+                };
             let mut x = rect.left();
             for (kind, label, width, available) in [
-                (Icon::Plus, "", 28.0, false),
-                (Icon::Attach, "Attach", 57.0, false),
-                (Icon::Image, "Image", 57.0, false),
-                (Icon::Code, "Code", 52.0, false),
-                (Icon::Terminal, "Terminal", 72.0, true),
-                (Icon::Grid, "Tools", 70.0, true),
+                (Icon::Plus, "", shell::COMPOSER_PLUS_WIDTH, false),
+                (Icon::Attach, "Attach", shell::COMPOSER_ATTACH_WIDTH, false),
+                (Icon::Image, "Image", shell::COMPOSER_IMAGE_WIDTH, false),
+                (Icon::Code, "Code", shell::COMPOSER_CODE_WIDTH, false),
+                (
+                    Icon::Terminal,
+                    "Terminal",
+                    shell::COMPOSER_TERMINAL_WIDTH,
+                    true,
+                ),
+                (Icon::Grid, "Tools", shell::COMPOSER_TOOLS_WIDTH, true),
             ] {
+                if matches!(label, "Attach" | "Image" | "Code")
+                    && normalized_width < shell::COMPOSER_SECONDARY_MIN_WIDTH
+                {
+                    continue;
+                }
+                if label == "Terminal" && normalized_width < shell::COMPOSER_TERMINAL_MIN_AVAILABLE
+                {
+                    continue;
+                }
+                let width = width * width_scale;
                 if x + width > tools_right {
                     continue;
                 }
@@ -83,7 +128,6 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                                 egui::Button::new(
                                     egui::RichText::new("").size(shell::type_size::CONTROL),
                                 )
-                                .fill(rgb(color::CONTROL_SURFACE))
                                 .stroke(egui::Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
                                 .corner_radius(7),
                             )
@@ -91,33 +135,53 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                         .inner
                     })
                     .inner;
+                let tint = rgb(if enabled {
+                    color::CANVAS_TEXT
+                } else {
+                    color::DISABLED_TEXT
+                });
+                if enabled && response.has_focus() {
+                    ui.painter().rect_stroke(
+                        bounds,
+                        7,
+                        egui::Stroke::new(1.0, rgb(color::ACCENT)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
                 paint_reference_icon(
                     ui.painter(),
                     egui::Rect::from_center_size(
-                        egui::pos2(x + 13.0, bounds.center().y),
-                        egui::vec2(14.0, 14.0),
+                        egui::pos2(
+                            if label.is_empty() {
+                                bounds.center().x
+                            } else {
+                                x + 12.0
+                            },
+                            bounds.center().y,
+                        ),
+                        egui::vec2(12.0, 12.0),
                     ),
                     kind,
-                    rgb(color::DISABLED_TEXT),
+                    tint,
                 );
                 if !label.is_empty() {
                     ui.painter().text(
-                        egui::pos2(x + 24.0, bounds.center().y),
+                        egui::pos2(x + 22.0, bounds.center().y),
                         egui::Align2::LEFT_CENTER,
                         label,
                         FontId::proportional(shell::type_size::CONTROL),
-                        rgb(color::DISABLED_TEXT),
+                        tint,
                     );
                 }
                 if label == "Tools" {
                     paint_reference_icon(
                         ui.painter(),
                         egui::Rect::from_center_size(
-                            egui::pos2(bounds.right() - 9.0, bounds.center().y),
+                            egui::pos2(bounds.right() - 12.0, bounds.center().y),
                             egui::vec2(12.0, 12.0),
                         ),
                         Icon::ChevronDown,
-                        rgb(color::DISABLED_TEXT),
+                        tint,
                     );
                 }
                 response
@@ -283,7 +347,7 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                 paint_reference_icon(
                     ui.painter(),
                     egui::Rect::from_center_size(
-                        bounds.right_center() - egui::vec2(9.0, 0.0),
+                        bounds.right_center() - egui::vec2(12.0, 0.0),
                         egui::vec2(12.0, 12.0),
                     ),
                     Icon::ChevronDown,
@@ -822,7 +886,7 @@ impl TerminalRenderer {
             egui::pos2(
                 rect.right()
                     - shell::COMPOSER_CONTROL_RIGHT
-                    - shell::CONTROL_HEIGHT
+                    - shell::COMPOSER_SEND_WIDTH
                     - shell::METADATA_GAP,
                 rect.bottom() - shell::COMPOSER_CONTROL_BOTTOM,
             ),
@@ -842,10 +906,10 @@ impl TerminalRenderer {
         if !can_interrupt {
             let stop = egui::Rect::from_min_size(
                 egui::pos2(
-                    rect.right() - shell::COMPOSER_CONTROL_RIGHT - shell::CONTROL_HEIGHT,
+                    rect.right() - shell::COMPOSER_CONTROL_RIGHT - shell::COMPOSER_SEND_WIDTH,
                     y,
                 ),
-                egui::vec2(28.0, 28.0),
+                egui::vec2(shell::COMPOSER_SEND_WIDTH, shell::CONTROL_HEIGHT),
             );
             painter.rect_stroke(
                 stop,
@@ -855,7 +919,7 @@ impl TerminalRenderer {
             );
             paint_reference_icon(
                 &painter,
-                stop.shrink(7.0),
+                egui::Rect::from_center_size(stop.center(), egui::vec2(12.0, 12.0)),
                 Icon::Close,
                 rgb(color::CANVAS_MUTED),
             );
@@ -892,7 +956,7 @@ impl TerminalRenderer {
                 return false;
             }
             let footer = self.composer_footer_rect(content, composer);
-            let button_width = 28.0_f32.min(footer.width());
+            let button_width = jterm_core::reference_shell::COMPOSER_SEND_WIDTH.min(footer.width());
             let button = egui::Rect::from_min_max(
                 egui::pos2(footer.right() - button_width, footer.top()),
                 footer.max,
@@ -904,7 +968,10 @@ impl TerminalRenderer {
                     footer.bottom(),
                 ),
             );
-            if label_rect.width() < 260.0 {
+            if label_rect.width()
+                < jterm_core::reference_shell::COMPOSER_TOOLS_WIDTH
+                    * reference_chrome_width_scale(ui)
+            {
                 draw_chat_footer_hint(
                     ui,
                     label_rect,
@@ -939,7 +1006,11 @@ impl TerminalRenderer {
                 self.chat_pressed_action = None;
                 return false;
             }
-            Some((ChatInputAction::Interrupt { sequence:record.sequence },egui::Rect::from_min_size(egui::pos2(footer.right()-36.0,footer.bottom()-36.0),egui::vec2(28.0,28.0)),"Stop","Send Ctrl+C to the current foreground command. Native ownership and IME guards are revalidated before writing."))
+            let chrome = jterm_core::reference_shell::COMPOSER_CONTROL_RIGHT;
+            let width = jterm_core::reference_shell::COMPOSER_SEND_WIDTH;
+            let height = jterm_core::reference_shell::CONTROL_HEIGHT;
+            let bottom = jterm_core::reference_shell::COMPOSER_CONTROL_BOTTOM;
+            Some((ChatInputAction::Interrupt { sequence:record.sequence },egui::Rect::from_min_size(egui::pos2(footer.right()-chrome-width,footer.bottom()-bottom-height),egui::vec2(width,height)),"Stop","Send Ctrl+C to the current foreground command. Native ownership and IME guards are revalidated before writing."))
         } else if surface == jterm_core::chat_mode::ChatSurface::Running {
             viewport.chat_command_spans().iter().find(|command| command.sequence == record.sequence)
                 .filter(|command| matches!(viewport.row_kind(command.rows.end), Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. })))
@@ -965,7 +1036,7 @@ impl TerminalRenderer {
         let icon_control = matches!(action, ChatInputAction::Submit { .. })
             || self.foreground_footer_rect.is_some();
         let label_size = if icon_control {
-            egui::vec2(14.0, 14.0)
+            egui::vec2(12.0, 12.0)
         } else {
             ui.painter()
                 .layout_no_wrap(
@@ -1027,7 +1098,7 @@ impl TerminalRenderer {
         if icon_control {
             paint_reference_icon(
                 ui.painter(),
-                rect.shrink(7.0),
+                egui::Rect::from_center_size(rect.center(), egui::vec2(12.0, 12.0)),
                 if matches!(action, ChatInputAction::Submit { .. }) {
                     jterm_core::reference_icons::Icon::Send
                 } else {

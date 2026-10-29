@@ -98,14 +98,15 @@ fn header_action(ui: &mut egui::Ui, kind: Icon, label: &str) -> egui::Response {
     response.on_hover_text(label)
 }
 
-fn mode_control(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+fn mode_control(ui: &mut egui::Ui, label: &str, selected: bool, scale: f32) -> egui::Response {
     ui.push_id(("reference-mode", label), |ui| {
         let font = egui::TextStyle::Button.resolve(ui.style());
         let text = ui
             .painter()
             .layout_no_wrap(label.into(), font, Color32::WHITE);
         let size = egui::vec2(
-            text.size().x + 2.0 * ui.spacing().button_padding.x,
+            (text.size().x + 2.0 * ui.spacing().button_padding.x)
+                .max(shell::MODE_CONTROL_MIN_WIDTH * scale.max(1.0)),
             shell::CONTROL_HEIGHT,
         );
         let (slot, _) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -165,14 +166,21 @@ pub(crate) fn chrome_style(ui: &mut egui::Ui, scale: f32) {
 }
 
 fn nav_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let response = ui.add_sized(
-        [ui.available_width(), shell::NAVIGATION_ROW_HEIGHT],
-        egui::Button::new("")
-            .left_text(label)
-            .selected(selected)
-            .corner_radius(7)
-            .frame(selected),
-    );
+    let response = ui
+        .scope(|ui| {
+            // Only navigation rows use this compact height; composer/tool
+            // controls retain their shared 28px minimum hit area.
+            ui.spacing_mut().interact_size.y = shell::NAVIGATION_ROW_HEIGHT;
+            ui.add_sized(
+                [ui.available_width(), shell::NAVIGATION_ROW_HEIGHT],
+                egui::Button::new("")
+                    .left_text(label)
+                    .selected(selected)
+                    .corner_radius(7)
+                    .frame(selected),
+            )
+        })
+        .inner;
     if selected {
         let rect = response.rect;
         ui.painter().rect_filled(
@@ -342,7 +350,7 @@ impl TerminalApp {
                         ] {
                             let selected = (mode == config::TerminalMode::Chat)
                                 == self.config.chat_mode_enabled();
-                            if mode_control(ui, label, selected)
+                            if mode_control(ui, label, selected, scale)
                                 .on_hover_text("Change presentation of the same live shell")
                                 .clicked()
                                 && !selected
@@ -603,8 +611,8 @@ impl TerminalApp {
             let response = nav_row(ui, &format!("          {label}"), selected);
             icon(
                 ui,
-                egui::Rect::from_min_size(
-                    response.rect.min + egui::vec2(9.0, 8.0),
+                egui::Rect::from_center_size(
+                    response.rect.left_center() + egui::vec2(16.5, 0.0),
                     egui::vec2(15.0, 15.0),
                 ),
                 Icon::from_key(key),
@@ -677,13 +685,33 @@ impl TerminalApp {
                         rgb(color::CHROME_MUTED),
                     );
                     let left = rect.left() + 28.0;
-                    ui.painter().with_clip_rect(rect).text(
+                    let time_width = ui
+                        .painter()
+                        .layout_no_wrap(
+                            entry.time.clone(),
+                            egui::FontId::proportional(8.0 * scale),
+                            rgb(color::CHROME_MUTED),
+                        )
+                        .size()
+                        .x;
+                    let title_right =
+                        (rect.right() - 7.0 - time_width - shell::METADATA_GAP).max(left);
+                    let title_rect = egui::Rect::from_min_max(
                         egui::pos2(left, rect.top() + 5.0),
-                        egui::Align2::LEFT_TOP,
-                        &entry.title,
+                        egui::pos2(title_right, rect.bottom()),
+                    );
+                    let mut title_job = egui::text::LayoutJob::simple(
+                        entry.title.clone(),
                         egui::FontId::proportional(10.0 * scale),
                         rgb(color::CHROME_TEXT),
+                        title_rect.width(),
                     );
+                    title_job.wrap.max_rows = 1;
+                    title_job.wrap.break_anywhere = true;
+                    let title = ui.painter().layout_job(title_job);
+                    ui.painter()
+                        .with_clip_rect(title_rect.intersect(rect))
+                        .galley(title_rect.min, title, rgb(color::CHROME_TEXT));
                     ui.painter().text(
                         egui::pos2(left, rect.top() + 19.0),
                         egui::Align2::LEFT_TOP,

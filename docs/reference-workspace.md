@@ -17,6 +17,30 @@ Recent/Spaces section-to-row spacing and diff header groups use the fixed
 6-pixel shared gap. Inspector queue rows retain the shared 24-pixel height and
 2-pixel row gap; each row centers one title/elapsed baseline, with the full
 detail available on hover. The queue heading has a separate 6-pixel bottom gap.
+Available Terminal/Tools footer controls keep darker readable labels, pale blue hover and
+an explicit keyboard-focus outline; unavailable actions retain their muted
+labels. The Inspector's actual `No task` badge uses a neutral surface rather
+than the active-task blue. These are paint-only changes to existing fixed slots.
+Diff counts sit in the right auxiliary group before language/Copy/Apply, with
+the same fixed 6-pixel gaps; filename ellipsis and the header/gutter sizing stay.
+
+The canonical shell requires a 306-pixel Inspector and a 758-pixel center at
+1356×704, so the white composer is x320/y613/702×80. Inspector cards use their
+actual available inner width rather than a larger hard minimum that made egui
+shift the right panel by two pixels. Badge captions use shared 8-pixel type,
+18-pixel height, radius5 and padding5/2 at UI14; long titles/statuses truncate
+on one line and retain full tooltips. No task, Unavailable and Unsupported are
+neutral, and missing structured progress displays an empty track/No progress.
+
+At default UI14 the shared footer widths are plus28, Attach62, Image60, Code56,
+Terminal76, Tools68, model120 and Send28, with 6-pixel gaps, 10-pixel captions
+and 12-pixel icons. Mode controls have a 52-pixel minimum width and 28-pixel
+height. Below normalized composer widths564/392/304 the secondary attachments,
+model slot and Terminal respectively hide; Tools remains while it can fit.
+Width normalization uses the context's UI font group, never local Main zoom.
+Footer captions/icons and native footer height retain their existing fixed
+logical sizes; this does not claim complete large-UI font scaling support or
+change the PTY/input row budget. DPR remains the framework's responsibility.
 
 ## Runtime and fixture boundaries
 
