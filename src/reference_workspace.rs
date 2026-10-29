@@ -920,10 +920,41 @@ impl TerminalApp {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for entry in conversation::fixture_recent_entries() {
-                    let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), shell::RECENT_ROW_HEIGHT),
-                        egui::Sense::hover(),
+                    let row_width = ui.available_width();
+                    let time = ui.painter().layout_no_wrap(
+                        entry.time.clone(),
+                        FontId::proportional(12.0 * scale),
+                        rgb(color::CHROME_MUTED),
                     );
+                    let title_width =
+                        (row_width - 28.0 - 7.0 - time.size().x - shell::METADATA_GAP).max(1.0);
+                    let mut title_job = egui::text::LayoutJob::simple(
+                        entry.title.clone(),
+                        FontId::proportional(16.0 * scale),
+                        rgb(color::CHROME_TEXT),
+                        title_width,
+                    );
+                    title_job.wrap.max_rows = 1;
+                    title_job.wrap.break_anywhere = true;
+                    let title = ui.painter().layout_job(title_job);
+                    let mut detail_job = egui::text::LayoutJob::simple(
+                        entry.detail.clone(),
+                        FontId::proportional(12.0 * scale),
+                        rgb(color::CHROME_MUTED),
+                        (row_width - 35.0).max(1.0),
+                    );
+                    detail_job.wrap.max_rows = 1;
+                    detail_job.wrap.break_anywhere = true;
+                    let detail = ui.painter().layout_job(detail_job);
+                    let gap = 2.0 * scale;
+                    let group_height = title.size().y + gap + detail.size().y;
+                    let height = if scale <= 1.0 {
+                        shell::RECENT_ROW_HEIGHT
+                    } else {
+                        shell::RECENT_ROW_HEIGHT.max(group_height + 6.0)
+                    };
+                    let (rect, response) =
+                        ui.allocate_exact_size(egui::vec2(row_width, height), egui::Sense::hover());
                     if entry.selected {
                         ui.painter()
                             .rect_filled(rect, 6, rgb(color::NAVIGATION_SELECTED));
@@ -938,45 +969,19 @@ impl TerminalApp {
                         rgb(color::CHROME_MUTED),
                     );
                     let left = rect.left() + 28.0;
-                    let time_width = ui
-                        .painter()
-                        .layout_no_wrap(
-                            entry.time.clone(),
-                            egui::FontId::proportional(12.0 * scale),
-                            rgb(color::CHROME_MUTED),
-                        )
-                        .size()
-                        .x;
-                    let title_right =
-                        (rect.right() - 7.0 - time_width - shell::METADATA_GAP).max(left);
-                    let title_rect = egui::Rect::from_min_max(
-                        egui::pos2(left, rect.top() + 5.0),
-                        egui::pos2(title_right, rect.bottom()),
-                    );
-                    let mut title_job = egui::text::LayoutJob::simple(
-                        entry.title.clone(),
-                        egui::FontId::proportional(16.0 * scale),
-                        rgb(color::CHROME_TEXT),
-                        title_rect.width(),
-                    );
-                    title_job.wrap.max_rows = 1;
-                    title_job.wrap.break_anywhere = true;
-                    let title = ui.painter().layout_job(title_job);
-                    ui.painter()
-                        .with_clip_rect(title_rect.intersect(rect))
-                        .galley(title_rect.min, title, rgb(color::CHROME_TEXT));
-                    ui.painter().text(
-                        egui::pos2(left, rect.top() + 19.0),
-                        egui::Align2::LEFT_TOP,
-                        &entry.detail,
-                        egui::FontId::proportional(12.0 * scale),
+                    let title_top = rect.center().y - group_height * 0.5;
+                    let detail_top = title_top + title.size().y + gap;
+                    let time_top = title_top + (title.size().y - time.size().y) * 0.5;
+                    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                    painter.galley(egui::pos2(left, title_top), title, rgb(color::CHROME_TEXT));
+                    painter.galley(
+                        egui::pos2(left, detail_top),
+                        detail,
                         rgb(color::CHROME_MUTED),
                     );
-                    ui.painter().text(
-                        egui::pos2(rect.right() - 7.0, rect.top() + 6.0),
-                        egui::Align2::RIGHT_TOP,
-                        &entry.time,
-                        egui::FontId::proportional(12.0 * scale),
+                    painter.galley(
+                        egui::pos2(rect.right() - 7.0 - time.size().x, time_top),
+                        time,
                         rgb(color::CHROME_MUTED),
                     );
                     response.on_hover_text(format!("{}\n{}", entry.title, entry.detail));
@@ -1026,26 +1031,38 @@ impl TerminalApp {
                 Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], 32),
             );
             product_identity(ui, badge, name);
-            ui.painter().text(
-                egui::pos2(row.left() + 46.0, row.center().y),
-                egui::Align2::LEFT_CENTER,
-                name,
-                egui::FontId::proportional(16.0 * scale),
+            let name_galley = ui.painter().layout_no_wrap(
+                name.into(),
+                FontId::proportional(16.0 * scale),
                 rgb(color::CHROME_TEXT),
             );
-            ui.painter()
-                .with_clip_rect(egui::Rect::from_min_max(
-                    row.min + egui::vec2(101.0, 0.0),
-                    row.max,
-                ))
-                .text(
-                    egui::pos2(row.left() + 101.0, row.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    detail,
-                    egui::FontId::proportional(12.0 * scale),
-                    rgb(color::CHROME_MUTED),
-                );
-            response.on_hover_text("Opening sibling applications is unavailable");
+            let detail_left = row.left() + 46.0 + name_galley.size().x + shell::METADATA_GAP;
+            let mut detail_job = egui::text::LayoutJob::simple(
+                detail.into(),
+                FontId::proportional(12.0 * scale),
+                rgb(color::CHROME_MUTED),
+                (row.right() - detail_left).max(1.0),
+            );
+            detail_job.wrap.max_rows = 1;
+            detail_job.wrap.break_anywhere = true;
+            let detail_galley = ui.painter().layout_job(detail_job);
+            let painter = ui.painter().with_clip_rect(row.intersect(ui.clip_rect()));
+            painter.galley(
+                egui::pos2(
+                    row.left() + 46.0,
+                    row.center().y - name_galley.size().y * 0.5,
+                ),
+                name_galley,
+                rgb(color::CHROME_TEXT),
+            );
+            painter.galley(
+                egui::pos2(detail_left, row.center().y - detail_galley.size().y * 0.5),
+                detail_galley,
+                rgb(color::CHROME_MUTED),
+            );
+            response.on_hover_text(format!(
+                "{name} · {detail}\nOpening sibling applications is unavailable"
+            ));
         }
     }
 
@@ -1412,6 +1429,37 @@ impl TerminalApp {
                 }
                 let title_width = (ui.available_width() - 160.0 - icon_space).max(1.0);
                 let origin = ui.max_rect().min + egui::vec2(icon_space, 0.0);
+                let subtitle = if conversation::fixture_enabled() {
+                    conversation::FIXTURE_LABEL
+                } else if self.config.chat_mode_enabled() {
+                    "Chat · live shell"
+                } else {
+                    "Block · live terminal"
+                };
+                let title_height = ui
+                    .painter()
+                    .layout_no_wrap(
+                        "Ag".into(),
+                        FontId::proportional(shell::type_size::PAGE_TITLE * scale),
+                        rgb(color::CANVAS_TEXT),
+                    )
+                    .size()
+                    .y;
+                let subtitle_height = ui
+                    .painter()
+                    .layout_no_wrap(
+                        subtitle.into(),
+                        FontId::proportional(14.0 * scale),
+                        rgb(color::CANVAS_MUTED),
+                    )
+                    .size()
+                    .y;
+                let text_gap = 5.0 * scale;
+                let group_height = title_height + text_gap + subtitle_height;
+                let text_origin = egui::pos2(
+                    origin.x,
+                    rect.top() + ((rect.height() - group_height) * 0.5).max(4.0),
+                );
                 let display_title = if title.trim().is_empty() {
                     "Terminal session"
                 } else {
@@ -1420,12 +1468,12 @@ impl TerminalApp {
                 ui.scope_builder(
                     egui::UiBuilder::new()
                         .max_rect(egui::Rect::from_min_size(
-                            origin,
-                            egui::vec2(title_width, 56.0),
+                            text_origin,
+                            egui::vec2(title_width, group_height),
                         ))
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                     |ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.spacing_mut().item_spacing.y = text_gap;
                         ui.add(
                             egui::Label::new(
                                 RichText::new(display_title)
@@ -1435,17 +1483,15 @@ impl TerminalApp {
                             .truncate(),
                         )
                         .on_hover_text(display_title);
-                        ui.label(
-                            RichText::new(if conversation::fixture_enabled() {
-                                conversation::FIXTURE_LABEL
-                            } else if self.config.chat_mode_enabled() {
-                                "Chat · live shell"
-                            } else {
-                                "Block · live terminal"
-                            })
-                            .size(14.0 * scale)
-                            .color(rgb(color::CANVAS_MUTED)),
-                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(subtitle)
+                                    .size(14.0 * scale)
+                                    .color(rgb(color::CANVAS_MUTED)),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(subtitle);
                     },
                 );
                 ui.scope_builder(

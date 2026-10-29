@@ -958,11 +958,10 @@ impl TerminalRenderer {
                 "↑",
                 "Send Enter immediately when the shell and writer are ready. If unavailable, use the native keyboard; enhanced multi-byte button encodings are unsupported.",
             ))
-        } else if !self.chat_mode
-            && self.foreground_footer_rect.is_some()
-            && surface.allows_submit_affordance()
+        } else if let Some(footer) = self
+            .foreground_footer_rect
+            .filter(|_| !self.chat_mode && surface.allows_submit_affordance())
         {
-            let footer = self.foreground_footer_rect.unwrap();
             let r = egui::Rect::from_min_size(
                 egui::pos2(
                     footer.right()

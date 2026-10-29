@@ -11859,7 +11859,7 @@ mod transcript_canvas_tests {
         );
         renderer.block_mode = true;
         renderer.gpu_rendering = false;
-        let output = ctx.run_ui(Default::default(), |_| {
+        let mut output = ctx.run_ui(Default::default(), |_| {
             for outer in [
                 egui::Rect::from_min_size(egui::pos2(365.0, 171.0), egui::vec2(859.0, 759.0)),
                 egui::Rect::from_min_size(egui::pos2(310.0, 151.0), egui::vec2(350.0, 477.0)),
@@ -11944,6 +11944,7 @@ mod transcript_canvas_tests {
                 "same-frame new font cannot reuse the previous small-font cap"
             );
         });
+        output.textures_delta.clear();
         drop(output);
     }
 

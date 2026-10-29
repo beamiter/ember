@@ -347,6 +347,27 @@ fn draw_terminal(ui: &mut egui::Ui, title: &str, text: &str, max_height: f32) {
         });
 }
 
+fn draw_date_separator(ui: &mut egui::Ui, label: &str, initial_clip_inset: f32) {
+    let scale = content_scale(ui);
+    let inset = 4.0 * scale;
+    let date = ui.painter().layout_no_wrap(
+        label.into(),
+        egui::FontId::proportional(8.0 * scale),
+        rgb(color::CANVAS_MUTED),
+    );
+    let height =
+        shell::CONVERSATION_TOP_PADDING.max(initial_clip_inset + date.size().y + 2.0 * inset);
+    let (band, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    let origin = egui::pos2(
+        band.center().x - date.size().x * 0.5,
+        band.top() + initial_clip_inset + inset,
+    );
+    ui.painter().galley(origin, date, rgb(color::CANVAS_MUTED));
+}
+
 pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
     let scale = content_scale(ui);
     if message.role == model::Role::User {
@@ -761,22 +782,15 @@ impl TerminalApp {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
 
             let conversation = model::acceptance_fixture();
+            // Register the surface inset before ScrollArea offsets its document.
+            // Date paint then scrolls away normally instead of sticking to the clip.
+            let initial_clip_inset = (ui.clip_rect().top() - rect.top()).max(0.0);
             egui::ScrollArea::vertical()
                 .id_salt((identity.as_str(), "fixture-rich-canvas"))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    let (separator, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), shell::CONVERSATION_TOP_PADDING),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().text(
-                        separator.center(),
-                        egui::Align2::CENTER_CENTER,
-                        model::FIXTURE_DATE_SEPARATOR,
-                        egui::FontId::proportional(8.0 * content_scale(ui)),
-                        rgb(color::CANVAS_MUTED),
-                    );
+                    draw_date_separator(ui, model::FIXTURE_DATE_SEPARATOR, initial_clip_inset);
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for (index, message) in conversation.messages.iter().enumerate() {
                         ui.push_id(index, |ui| draw_message(ui, message));

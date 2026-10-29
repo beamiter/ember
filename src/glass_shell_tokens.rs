@@ -1,4 +1,4 @@
-//! Ember/Frost glass profile revision1. Native adapters consume straight RGBA.
+//! Ember/Frost glass profile revision2. Native adapters consume straight RGBA.
 //! Original shared core profile and Anvil/Forge are unchanged.
 #![allow(dead_code)]
 
@@ -34,9 +34,9 @@ pub const SHORT_BOTTOM_GAP: f32 = 12.0;
 
 pub const TOP: [u8; 4] = [27, 45, 91, 190];
 pub const RAIL: [u8; 4] = [10, 22, 46, 218];
-pub const NAVIGATION: [u8; 4] = [23, 40, 75, 178];
+pub const NAVIGATION: [u8; 4] = [23, 40, 75, 214];
 pub const CENTER: [u8; 4] = [36, 55, 102, 145];
-pub const INSPECTOR: [u8; 4] = [22, 39, 76, 185];
+pub const INSPECTOR: [u8; 4] = [22, 39, 76, 214];
 pub const INSPECTOR_CARD: [u8; 4] = [42, 59, 96, 155];
 pub const TERMINAL: [u8; 4] = [4, 10, 21, 214];
 pub const COMPOSER: [u8; 4] = [75, 94, 145, 174];
