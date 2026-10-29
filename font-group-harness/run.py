@@ -7,6 +7,8 @@ import re
 import subprocess
 import sys
 
+from production_wiring import verify_files_font_group_wiring
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
@@ -28,7 +30,9 @@ assert "self.render_reference_canvas_header(ui);" in main
 assert "ui.advance_cursor_after_rect(rect);" in workspace
 assert "                    self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);" in main
 assert re.search(r"self\.render_reference_rich_canvas\(ui\);\s*}\);\s*content\s*}\);", main)
-assert ".register(panel_rect, root_ui.layer_id(), font_zoom::FontGroup::Ui);" in main
+# Files moves between a background dock and a modeless Area. Its measured
+# response, not the old root layer, owns the current-frame UI font region.
+verify_files_font_group_wiring(main, workspace)
 assert "theme::configure_workspace_text(ui.style_mut(), self.config.font_size);" in main
 assert "theme::configure_workspace_text(root_ui.style_mut(), self.config.effective_ui_font_size());" in main
 # Every overlay must establish its current-frame input owner before zoom is
@@ -48,6 +52,7 @@ assert "font_size_accumulator" not in state
 assert "renderer.font_size = self.config.font_size;" in main
 assert "for renderer in &mut self.pane_renderers" in main
 print("PASS: production raw-input, layout, styles and renderer wiring checks", flush=True)
+subprocess.run([sys.executable, str(HERE / "test_production_wiring.py")], check=True)
 
 result = subprocess.run([sys.executable, str(HERE / "generate_config_harness.py")], check=True, capture_output=True, text=True)
 manifest = json.loads(result.stdout)

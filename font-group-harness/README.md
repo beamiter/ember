@@ -18,7 +18,9 @@ versions. CARGO_HOME and CARGO_TARGET_DIR can point to shared caches.
   ScrollArea, keyboard focus, floating overlays (including their first sizing
   frame), pointer event ordering, sidebar visibility/resize, shared edges,
   split-content ownership, smooth wheel magnitude and absence of global zoom
-  or wheel scroll after consumption.
+  or wheel scroll after consumption. Registered Inspector drawer cases use the
+  production provider: UI ownership, missing/wrong registration, first-frame
+  and steady covering popup/Settings layers, and hidden-owner retirement.
 - The entire production config.rs and persistence_file.rs, restricted to font
   tests: legacy migration, independent finite/clamped values, serialization and
   real atomic save/reload of both groups.
@@ -34,6 +36,12 @@ versions. CARGO_HOME and CARGO_TARGET_DIR can point to shared caches.
 - Static assertions for the actual raw-input/layout/style/renderer wiring,
   including the ordered render_ui tail: floating panels, Vim dialog, then font
   zoom. Both kinds of overlay establish ownership before any zoom is drained.
+- The Files integration guard extracts executable dock/drawer wiring, checks
+  both presentations share one renderer, and requires the measured owner
+  response rectangle and layer to remain in the UI font group. Python positive
+  and adversarial cases reject parent-layer substitution, a wrong font group or
+  rectangle, split renderers, duplicate registration, and examples hidden in
+  comments, strings, or dead blocks.
 
 The generator records SHA256 hashes for each exact source extract in
 extraction-manifest.json. Regenerate before running tests so stale copied code
@@ -49,4 +57,5 @@ font-group tests. Actual renderer rebuilding and debounced save scheduling are
 counted, not executed; native-input cancellation is counted at its call boundary.
 This is not a full Ember application build, native GUI
 visual validation, real pane/session lifecycle test, PTY-resize test, or
-desktop input-method test.
+desktop input-method test. The source guard verifies registration; it does not
+replace native drawer hover/wheel routing checks.

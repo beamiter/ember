@@ -3073,8 +3073,9 @@ impl TerminalApp {
             })
             .collect();
         let mut editor_deltas = std::collections::HashMap::<String, f64>::new();
+        let inspector_owner = self.font_zoom.inspector_drawer_owner();
         let [ui_delta, main_delta] = self.font_zoom.drain_with_main(
-            |pos| crate::font_zoom::workspace_layer_at(ctx, pos),
+            |pos| crate::font_zoom::workspace_layer_at_with_inspector(ctx, pos, inspector_owner),
             |pos, points| {
                 let Some((_, id)) = editor_panes.iter().find(|(rect, _)| {
                     pos.x >= rect.min.x

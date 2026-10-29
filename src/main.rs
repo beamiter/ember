@@ -4652,6 +4652,10 @@ impl TerminalApp {
             panel_response.response.layer_id,
             font_zoom::FontGroup::Ui,
         );
+        if drawer.is_some() {
+            self.font_zoom
+                .identify_inspector_drawer(panel_response.response.layer_id);
+        }
         self.sidebar.width = panel_rect.width().clamp(160.0, 640.0);
         self.sidebar_drop_rect = (self.sidebar.view == sidebar::SidebarView::Files
             && !self.sidebar.current_dir.as_os_str().is_empty())

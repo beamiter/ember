@@ -84,7 +84,7 @@
     {
       "source": "src/app/input.rs",
       "marker": "    pub fn handle_font_zoom(",
-      "sha256": "e9831b87edef4775179b9c059c4ad6c4df7dc92a4d46c0bf985ae28ad1d022c7"
+      "sha256": "17da2f762416706e96e3766f2716d95a96c109012e5b0e6c22a85c747aa8749e"
     },
     {
       "source": "src/theme.rs",

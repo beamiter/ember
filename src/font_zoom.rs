@@ -21,11 +21,20 @@ struct Region {
     group: FontGroup,
 }
 
+/// A current-frame UI registration owned by this application's Inspector.
+/// Private fields prevent an arbitrary popup layer from claiming this route.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InspectorDrawerOwner {
+    rect: Rect,
+    layer: LayerId,
+}
+
 #[derive(Default)]
 pub(crate) struct FontZoom {
     pointer: Option<Pos2>,
     wheels: Vec<Wheel>,
     regions: Vec<Region>,
+    inspector_drawer_layer: Option<LayerId>,
 }
 
 impl FontZoom {
@@ -72,10 +81,32 @@ impl FontZoom {
 
     pub fn begin_layout(&mut self) {
         self.regions.clear();
+        self.inspector_drawer_layer = None;
     }
 
     pub fn register(&mut self, rect: Rect, layer: LayerId, group: FontGroup) {
         self.regions.push(Region { rect, layer, group });
+    }
+
+    /// Called only with the real response of the Inspector's modeless Area.
+    /// It becomes an owner only after that layer has a measured UI region.
+    pub fn identify_inspector_drawer(&mut self, layer: LayerId) {
+        self.inspector_drawer_layer = Some(layer);
+    }
+
+    pub fn inspector_drawer_owner(&self) -> Option<InspectorDrawerOwner> {
+        let layer = self.inspector_drawer_layer?;
+        if layer.order != egui::Order::Middle {
+            return None;
+        }
+        self.regions
+            .iter()
+            .rev()
+            .find(|region| region.layer == layer && region.group == FontGroup::Ui)
+            .map(|region| InspectorDrawerOwner {
+                rect: region.rect,
+                layer,
+            })
     }
 
     /// The unified shell includes more than its former top/sidebar panels.
@@ -132,14 +163,33 @@ impl FontZoom {
 /// Include newly opened sizing-pass surfaces, which egui deliberately excludes
 /// from hit testing until the next frame. They still must not forward zoom to
 /// a terminal underneath. Tooltip/debug paint layers do not own wheel input.
+#[cfg(test)]
 pub(crate) fn workspace_layer_at(ctx: &egui::Context, position: Pos2) -> Option<LayerId> {
+    workspace_layer_at_with_inspector(ctx, position, None)
+}
+
+/// Only the application's measured, current-frame Inspector UI registration
+/// may own a Middle layer. Every other covering popup/window stays blocking.
+pub(crate) fn workspace_layer_at_with_inspector(
+    ctx: &egui::Context,
+    position: Pos2,
+    inspector: Option<InspectorDrawerOwner>,
+) -> Option<LayerId> {
     let layer = ctx.layer_id_at(position)?;
+    let inspector = inspector.filter(|owner| {
+        owner.layer == layer
+            && position.x >= owner.rect.min.x
+            && position.x < owner.rect.max.x
+            && position.y >= owner.rect.min.y
+            && position.y < owner.rect.max.y
+    });
     ctx.memory(|memory| {
         if !memory.allows_interaction(layer) {
             return None;
         }
         let covered = memory.areas().visible_layer_ids().into_iter().any(|id| {
             matches!(id.order, egui::Order::Middle | egui::Order::Foreground)
+                && inspector.is_none_or(|owner| owner.layer != id)
                 && memory
                     .area_rect(id.id)
                     .is_some_and(|rect| rect.contains(position))
@@ -163,6 +213,229 @@ mod tests {
             modifiers: Modifiers::CTRL,
             phase: egui::TouchPhase::Move,
         }
+    }
+
+    fn inspector_frame(
+        ctx: &egui::Context,
+        router: &mut FontZoom,
+        events: Vec<Event>,
+        drawer: bool,
+        registration: Option<FontGroup>,
+        identify: bool,
+        covering: Option<Order>,
+    ) -> [f32; 2] {
+        let mut input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1356.0, 704.0))),
+            events,
+            ..Default::default()
+        };
+        router.collect(&mut input.events, input.focused);
+        let mut delta = [0.0; 2];
+        let mut output = ctx.run_ui(input, |ui| {
+            router.begin_layout();
+            let workspace = ui.max_rect();
+            let root_layer = ui.layer_id();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |_| {});
+            router.register(workspace, root_layer, FontGroup::Main);
+            if drawer {
+                let response = egui::Area::new(Id::new("font-test-inspector"))
+                    .order(Order::Middle)
+                    .fixed_pos(Pos2::new(1050.0, 42.0))
+                    .show(ctx, |ui| {
+                        ui.allocate_exact_size(Vec2::new(306.0, 662.0), egui::Sense::hover());
+                    });
+                if let Some(group) = registration {
+                    router.register(response.response.rect, response.response.layer_id, group);
+                }
+                if identify {
+                    router.identify_inspector_drawer(response.response.layer_id);
+                }
+            }
+            if let Some(order) = covering {
+                let response = egui::Area::new(Id::new(("font-test-popup", order)))
+                    .order(order)
+                    .fixed_pos(Pos2::new(1100.0, 150.0))
+                    .default_size(Vec2::new(200.0, 200.0))
+                    .show(ctx, |ui| {
+                        ui.allocate_exact_size(Vec2::new(200.0, 200.0), egui::Sense::hover());
+                    });
+                assert!(
+                    response.response.rect.contains(Pos2::new(1150.0, 200.0)),
+                    "Cover fixture must actually cover the wheel: {:?}",
+                    response.response.rect
+                );
+            }
+            let inspector = router.inspector_drawer_owner();
+            delta = router.drain_with_main(
+                |point| workspace_layer_at_with_inspector(ctx, point, inspector),
+                |_, _| false,
+            );
+        });
+        output.textures_delta.clear();
+        delta
+    }
+
+    fn inspector_wheel() -> Vec<Event> {
+        vec![
+            Event::PointerMoved(Pos2::new(1150.0, 200.0)),
+            wheel(MouseWheelUnit::Line, 1.0),
+        ]
+    }
+
+    #[test]
+    fn registered_inspector_drawer_routes_ui_through_the_real_provider() {
+        let ctx = egui::Context::default();
+        let mut router = FontZoom::default();
+        for _ in 0..3 {
+            inspector_frame(
+                &ctx,
+                &mut router,
+                vec![],
+                true,
+                Some(FontGroup::Ui),
+                true,
+                None,
+            );
+        }
+        assert_eq!(
+            inspector_frame(
+                &ctx,
+                &mut router,
+                inspector_wheel(),
+                true,
+                Some(FontGroup::Ui),
+                true,
+                None
+            ),
+            [1.0, 0.0]
+        );
+        assert_eq!(ctx.zoom_factor(), 1.0);
+    }
+
+    #[test]
+    fn unregistered_unidentified_or_main_drawers_never_borrow_the_ui_route() {
+        for (registration, identify) in [
+            (None, true),
+            (Some(FontGroup::Main), true),
+            (Some(FontGroup::Ui), false),
+        ] {
+            let ctx = egui::Context::default();
+            let mut router = FontZoom::default();
+            for _ in 0..3 {
+                inspector_frame(
+                    &ctx,
+                    &mut router,
+                    vec![],
+                    true,
+                    registration,
+                    identify,
+                    None,
+                );
+            }
+            assert_eq!(
+                inspector_frame(
+                    &ctx,
+                    &mut router,
+                    inspector_wheel(),
+                    true,
+                    registration,
+                    identify,
+                    None
+                ),
+                [0.0, 0.0]
+            );
+        }
+    }
+
+    #[test]
+    fn inspector_drawer_never_bypasses_covering_popup_or_settings_layers() {
+        for covering in [Order::Middle, Order::Foreground] {
+            let ctx = egui::Context::default();
+            let mut router = FontZoom::default();
+            for _ in 0..3 {
+                inspector_frame(
+                    &ctx,
+                    &mut router,
+                    vec![],
+                    true,
+                    Some(FontGroup::Ui),
+                    true,
+                    None,
+                );
+            }
+            // Include the first sizing frame, before the new overlay joins hit testing.
+            assert_eq!(
+                inspector_frame(
+                    &ctx,
+                    &mut router,
+                    inspector_wheel(),
+                    true,
+                    Some(FontGroup::Ui),
+                    true,
+                    Some(covering)
+                ),
+                [0.0, 0.0]
+            );
+            for _ in 0..3 {
+                inspector_frame(
+                    &ctx,
+                    &mut router,
+                    vec![],
+                    true,
+                    Some(FontGroup::Ui),
+                    true,
+                    Some(covering),
+                );
+            }
+            assert_eq!(
+                inspector_frame(
+                    &ctx,
+                    &mut router,
+                    inspector_wheel(),
+                    true,
+                    Some(FontGroup::Ui),
+                    true,
+                    Some(covering)
+                ),
+                [0.0, 0.0]
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_inspector_retires_its_font_owner_in_the_current_layout() {
+        let ctx = egui::Context::default();
+        let mut router = FontZoom::default();
+        for _ in 0..3 {
+            inspector_frame(
+                &ctx,
+                &mut router,
+                vec![],
+                true,
+                Some(FontGroup::Ui),
+                true,
+                None,
+            );
+        }
+        assert!(router.inspector_drawer_owner().is_some());
+        for _ in 0..3 {
+            inspector_frame(&ctx, &mut router, vec![], false, None, false, None);
+        }
+        assert!(router.inspector_drawer_owner().is_none());
+        assert_eq!(
+            inspector_frame(
+                &ctx,
+                &mut router,
+                inspector_wheel(),
+                false,
+                None,
+                false,
+                None
+            ),
+            [0.0, 1.0]
+        );
     }
     fn layout(router: &mut FontZoom) {
         router.begin_layout();

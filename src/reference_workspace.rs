@@ -1130,9 +1130,17 @@ impl TerminalApp {
                 ..egui::Margin::same(shell::INSPECTOR_INSET as i8)
             });
         if let Some(rect) = self.reference_inspector_drawer_rect(root.ctx()) {
-            show_inspector_drawer(root, rect, "reference-inspector-drawer", frame, |ui| {
-                self.render_reference_inspector_contents(ui);
-            });
+            let response =
+                show_inspector_drawer(root, rect, "reference-inspector-drawer", frame, |ui| {
+                    self.render_reference_inspector_contents(ui);
+                });
+            self.font_zoom.register(
+                response.response.rect,
+                response.response.layer_id,
+                crate::font_zoom::FontGroup::Ui,
+            );
+            self.font_zoom
+                .identify_inspector_drawer(response.response.layer_id);
         } else {
             egui::Panel::right("reference-inspector")
                 .exact_size(shell::INSPECTOR_WIDTH)
