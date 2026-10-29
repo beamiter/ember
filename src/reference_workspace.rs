@@ -3,7 +3,10 @@
 //! This module owns chrome only. The live PTY, projection, IME and reading
 //! anchors continue to belong to the existing terminal renderer and session.
 use crate::reference_conversation_ui::{icon, icon_button};
-use crate::{app::state::TerminalApp, config, sidebar, theme};
+use crate::{
+    app::state::{ReferenceInspectorRequest, ReferenceInspectorTab, TerminalApp},
+    config, sidebar, theme,
+};
 use egui::{Color32, FontId, RichText, Stroke};
 use jterm_core::reference_shell::{self as shell, color};
 use jterm_core::{reference_conversation as conversation, reference_icons::Icon};
@@ -55,6 +58,57 @@ pub(crate) fn paint_canvas_background(painter: &egui::Painter, rect: egui::Rect)
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(1, 3, 2);
     painter.add(egui::Shape::mesh(mesh));
+}
+
+/// A compact inspector occupies a bounded overlay surface, never another
+/// terminal/session or a second copy of its widgets.
+pub(crate) fn show_inspector_drawer<R>(
+    root: &mut egui::Ui,
+    rect: egui::Rect,
+    id: &'static str,
+    frame: egui::Frame,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let ctx = root.ctx().clone();
+    crate::ui::remember_reference_chrome_scope(
+        &ctx,
+        egui::Id::new(id).with("input-scope"),
+        rect,
+        false,
+    );
+    egui::Area::new(egui::Id::new(id))
+        // This is modeless chrome: existing dialogs and popup menus retain
+        // their normal ability to appear in front of it.
+        .order(egui::Order::Middle)
+        .fixed_pos(rect.min)
+        .movable(false)
+        .constrain_to(ctx.viewport_rect())
+        .show(&ctx, |ui| {
+            ui.set_min_size(rect.size());
+            ui.set_max_size(rect.size());
+            ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+            ui.painter().rect_filled(rect, 0, frame.fill);
+            frame
+                .show(ui, |ui| {
+                    ui.set_min_height(ui.available_height());
+                    contents(ui)
+                })
+                .inner
+        })
+}
+
+pub(crate) fn remember_inspector_control(ui: &egui::Ui, response: &egui::Response) {
+    crate::ui::remember_reference_chrome_scope(
+        ui.ctx(),
+        response.id,
+        response.rect,
+        response.clicked(),
+    );
+    if response.has_focus() {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new("block-action-focus"), response.id);
+        });
+    }
 }
 
 fn header_action(ui: &mut egui::Ui, kind: Icon, label: &str) -> egui::Response {
@@ -233,11 +287,199 @@ impl TerminalApp {
         if changed {
             log::info!(target: "ember::reference_workspace", "REFERENCE_SHELL_STATE {state}");
         }
+        static TRACE_INSPECTOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE_INSPECTOR
+            .get_or_init(|| std::env::var_os("JTERM_REFERENCE_INSPECTOR_TRACE").is_some())
+        {
+            // Opt-in chrome metadata, not native widget geometry or PTY text.
+            // Pixel captures independently verify actual allocation/placement.
+            let layout = self.reference_layout(ctx);
+            let observation = format!(
+                "shown={} drawer={} tab={:?} center_x={} center_width={} composer_width={}",
+                self.reference_inspector_visible(ctx),
+                self.reference_inspector_drawer_rect(ctx).is_some(),
+                self.reference_selected_inspector_tab(),
+                layout.center.x,
+                layout.center.width,
+                layout.composer.width,
+            );
+            let key = egui::Id::new("reference-inspector-observation");
+            let changed = ctx.data_mut(|data| {
+                if data.get_temp::<String>(key).as_ref() == Some(&observation) {
+                    false
+                } else {
+                    data.insert_temp(key, observation.clone());
+                    true
+                }
+            });
+            if changed {
+                log::info!(target: "ember::reference_workspace", "REFERENCE_INSPECTOR_STATE {observation}");
+            }
+        }
     }
 
     pub(crate) fn reference_layout(&self, ctx: &egui::Context) -> shell::Layout {
         let size = ctx.viewport_rect().size();
-        shell::Layout::for_size(size.x, size.y)
+        let layout = shell::Layout::for_size(size.x, size.y);
+        if self.reference_inspector.open {
+            layout
+        } else {
+            layout.without_inspector()
+        }
+    }
+
+    pub(crate) fn reference_inspector_drawer_rect(
+        &self,
+        ctx: &egui::Context,
+    ) -> Option<egui::Rect> {
+        if !self.reference_inspector.open || !self.reference_inspector.narrow_drawer {
+            return None;
+        }
+        let screen = ctx.viewport_rect();
+        let layout = shell::Layout::for_size(screen.width(), screen.height());
+        if layout.inspector.is_some() {
+            return None;
+        }
+        let width = shell::INSPECTOR_WIDTH.min((screen.width() - layout.rail.width).max(0.0));
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(
+                screen.right() - width,
+                screen.top() + layout.titlebar.height,
+            ),
+            screen.right_bottom(),
+        );
+        rect.is_positive().then_some(rect)
+    }
+
+    pub(crate) fn reference_inspector_visible(&self, ctx: &egui::Context) -> bool {
+        self.reference_layout(ctx).inspector.is_some()
+            || self.reference_inspector_drawer_rect(ctx).is_some()
+    }
+
+    pub(crate) fn reference_open_inspector(&mut self, ctx: &egui::Context) {
+        self.reference_inspector.open = true;
+        let screen = ctx.viewport_rect();
+        if shell::Layout::for_size(screen.width(), screen.height())
+            .inspector
+            .is_none()
+        {
+            self.reference_inspector.narrow_drawer = true;
+        }
+    }
+
+    pub(crate) fn reference_selected_inspector_tab(&self) -> ReferenceInspectorTab {
+        if self.sidebar.view == sidebar::SidebarView::Files {
+            ReferenceInspectorTab::Files
+        } else if self.reference_inspector.selected_tab == ReferenceInspectorTab::Files {
+            ReferenceInspectorTab::Agent
+        } else {
+            self.reference_inspector.selected_tab
+        }
+    }
+
+    pub(crate) fn reference_select_inspector_tab(&mut self, tab: ReferenceInspectorTab) {
+        let previous_view = self.sidebar.view;
+        self.reference_inspector.selected_tab = tab;
+        match tab {
+            ReferenceInspectorTab::Files => {
+                self.sidebar.view = sidebar::SidebarView::Files;
+                self.sidebar.visible = true;
+            }
+            ReferenceInspectorTab::Agent if self.sidebar.view == sidebar::SidebarView::Files => {
+                self.sidebar.view = sidebar::SidebarView::Tasks;
+            }
+            ReferenceInspectorTab::Context if self.sidebar.view == sidebar::SidebarView::Files => {
+                self.sidebar.view = sidebar::SidebarView::Sessions;
+            }
+            _ => {}
+        }
+        self.reference_save_sidebar_view(previous_view);
+    }
+
+    fn reference_save_sidebar_view(&mut self, previous_view: sidebar::SidebarView) {
+        if self.sidebar.view != previous_view {
+            self.config.sidebar_view = self.sidebar.view;
+            self.schedule_config_save();
+            if self.sidebar.view == sidebar::SidebarView::Files {
+                if let Some(error) = self.sidebar.refresh() {
+                    self.set_status_for(
+                        format!("Files refresh failed: {error}"),
+                        std::time::Duration::from_secs(5),
+                    );
+                }
+            }
+        }
+    }
+
+    pub(crate) fn reference_request_inspector_tab(
+        &mut self,
+        tab: ReferenceInspectorTab,
+        ctx: &egui::Context,
+    ) {
+        // A Files/Agent transition must not allocate both right panels in the
+        // click frame. Keep the existing owner until the next frame begins.
+        self.reference_inspector.pending = Some(ReferenceInspectorRequest::Tab(tab));
+        self.return_focus_to_terminal(ctx);
+        ctx.request_repaint();
+    }
+
+    fn reference_request_sidebar_view(&mut self, view: sidebar::SidebarView, ctx: &egui::Context) {
+        self.sidebar.note_files_user_intent();
+        self.reference_inspector.pending = Some(ReferenceInspectorRequest::Navigation(view));
+        self.return_focus_to_terminal(ctx);
+        ctx.request_repaint();
+    }
+
+    fn render_reference_inspector_toggle(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let shown = self.reference_inspector_visible(ui.ctx());
+        let label = if shown {
+            "Hide right sidebar"
+        } else {
+            "Show right sidebar"
+        };
+        let response = ui
+            .push_id("reference-inspector-toggle", |ui| {
+                ui.put(
+                    rect,
+                    egui::Button::new("")
+                        .selected(shown)
+                        .fill(if shown {
+                            rgb(color::NAVIGATION_SELECTED)
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .stroke(Stroke::new(1.0, rgb(color::DARK_BORDER)))
+                        .corner_radius(7),
+                )
+            })
+            .inner
+            .on_hover_text(label);
+        icon(
+            ui,
+            rect.shrink(6.0),
+            Icon::PanelRight,
+            rgb(if shown {
+                color::CHROME_TEXT
+            } else {
+                color::CHROME_MUTED
+            }),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::Button, true, shown, label)
+        });
+        remember_inspector_control(ui, &response);
+        if response.clicked() {
+            if shown {
+                self.reference_inspector.open = false;
+                self.reference_inspector.narrow_drawer = false;
+            } else {
+                self.reference_open_inspector(ui.ctx());
+            }
+            // No session/terminal/input reset: the normal resize path detects
+            // the changed center width and retains its own reading anchor.
+            self.return_focus_to_terminal(ui.ctx());
+            ui.ctx().request_repaint();
+        }
     }
 
     /// The surrounding workspace is dark; both native presentations share
@@ -255,6 +497,27 @@ impl TerminalApp {
     }
 
     pub(crate) fn render_reference_topbar(&mut self, root: &mut egui::Ui) {
+        if let Some(request) = self.reference_inspector.pending.take() {
+            match request {
+                ReferenceInspectorRequest::Tab(tab) => {
+                    self.reference_select_inspector_tab(tab);
+                    self.reference_open_inspector(root.ctx());
+                }
+                ReferenceInspectorRequest::Navigation(view) => {
+                    let previous = self.sidebar.view;
+                    self.sidebar.visible = true;
+                    self.sidebar.view = view;
+                    if view == sidebar::SidebarView::Files {
+                        self.reference_inspector.selected_tab = ReferenceInspectorTab::Files;
+                        self.reference_open_inspector(root.ctx());
+                    } else if self.reference_inspector.selected_tab == ReferenceInspectorTab::Files
+                    {
+                        self.reference_inspector.selected_tab = ReferenceInspectorTab::Agent;
+                    }
+                    self.reference_save_sidebar_view(previous);
+                }
+            }
+        }
         let scale = self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE;
         egui::Panel::top("reference-titlebar")
             .exact_size(shell::TITLEBAR_HEIGHT)
@@ -272,99 +535,115 @@ impl TerminalApp {
                 if drag.drag_started() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
-                ui.horizontal_centered(|ui| {
-                    for (glyph, tip, command) in [
-                        ("×", "Close window", egui::ViewportCommand::Close),
-                        (
-                            "−",
-                            "Minimize window",
-                            egui::ViewportCommand::Minimized(true),
-                        ),
-                    ] {
+                let toggle = egui::Rect::from_min_size(
+                    egui::pos2(blank.right() - shell::CONTROL_HEIGHT, blank.top()),
+                    egui::Vec2::splat(shell::CONTROL_HEIGHT),
+                );
+                let content = egui::Rect::from_min_max(
+                    blank.min,
+                    egui::pos2(toggle.left() - shell::METADATA_GAP, blank.bottom()),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+                    // The application toggle keeps a fixed reachable slot even
+                    // when the compact titlebar's optional identity text hides.
+                    ui.set_clip_rect(content.intersect(ui.clip_rect()));
+                    ui.horizontal_centered(|ui| {
+                        for (glyph, tip, command) in [
+                            ("×", "Close window", egui::ViewportCommand::Close),
+                            (
+                                "−",
+                                "Minimize window",
+                                egui::ViewportCommand::Minimized(true),
+                            ),
+                        ] {
+                            if ui
+                                .add_sized(
+                                    [24.0, 24.0],
+                                    egui::Button::new(RichText::new(glyph).size(12.0 * scale))
+                                        .fill(Color32::TRANSPARENT)
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(5),
+                                )
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                ui.ctx().send_viewport_cmd(command);
+                            }
+                        }
                         if ui
                             .add_sized(
                                 [24.0, 24.0],
-                                egui::Button::new(RichText::new(glyph).size(12.0 * scale))
+                                egui::Button::new(RichText::new("□").size(12.0 * scale))
                                     .fill(Color32::TRANSPARENT)
                                     .stroke(Stroke::NONE)
                                     .corner_radius(5),
                             )
-                            .on_hover_text(tip)
+                            .on_hover_text("Maximize or restore window")
                             .clicked()
                         {
-                            ui.ctx().send_viewport_cmd(command);
+                            let maximized =
+                                ui.input(|input| input.viewport().maximized.unwrap_or(false));
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                         }
-                    }
-                    if ui
-                        .add_sized(
-                            [24.0, 24.0],
-                            egui::Button::new(RichText::new("□").size(12.0 * scale))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE)
-                                .corner_radius(5),
-                        )
-                        .on_hover_text("Maximize or restore window")
-                        .clicked()
-                    {
-                        let maximized =
-                            ui.input(|input| input.viewport().maximized.unwrap_or(false));
-                        ui.ctx()
-                            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                    }
-                    ui.add_space(8.0);
-                    let (brand, _) = ui.allocate_exact_size(
-                        egui::Vec2::splat(jterm_core::reference_identity::PRODUCT_ICON_SIZE),
-                        egui::Sense::hover(),
-                    );
-                    product_identity(ui, brand, "ember");
-                    ui.label(RichText::new("Ember").strong().size(12.0 * scale));
-                    ui.label(
-                        RichText::new(if self.config.chat_mode_enabled() {
-                            "Chat"
-                        } else {
-                            "Block"
-                        })
-                        .size(9.0 * scale)
-                        .color(rgb(color::CHROME_MUTED)),
-                    );
-                    let width = ui.available_width();
-                    if width > 780.0 {
-                        ui.add_space(18.0);
-                        let path = self.reference_workspace_path();
-                        ui.add_sized(
-                            [160.0, 22.0],
-                            egui::Label::new(
-                                RichText::new(path.as_str()).color(rgb(color::CHROME_MUTED)),
+                        ui.add_space(8.0);
+                        let (brand, _) = ui.allocate_exact_size(
+                            egui::Vec2::splat(jterm_core::reference_identity::PRODUCT_ICON_SIZE),
+                            egui::Sense::hover(),
+                        );
+                        product_identity(ui, brand, "ember");
+                        if blank.width() >= 500.0 {
+                            ui.label(RichText::new("Ember").strong().size(12.0 * scale));
+                            ui.label(
+                                RichText::new(if self.config.chat_mode_enabled() {
+                                    "Chat"
+                                } else {
+                                    "Block"
+                                })
+                                .size(9.0 * scale)
+                                .color(rgb(color::CHROME_MUTED)),
+                            );
+                        }
+                        let width = ui.available_width();
+                        if width > 780.0 {
+                            ui.add_space(18.0);
+                            let path = self.reference_workspace_path();
+                            ui.add_sized(
+                                [160.0, 22.0],
+                                egui::Label::new(
+                                    RichText::new(path.as_str()).color(rgb(color::CHROME_MUTED)),
+                                )
+                                .truncate(),
                             )
-                            .truncate(),
-                        )
-                        .on_hover_text(path);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, Icon::Settings, "Settings").clicked() {
-                            self.config_panel.open(&self.config);
+                            .on_hover_text(path);
                         }
-                        for (mode, label) in [
-                            (config::TerminalMode::Chat, "Chat"),
-                            (config::TerminalMode::Block, "Block"),
-                        ] {
-                            let selected = (mode == config::TerminalMode::Chat)
-                                == self.config.chat_mode_enabled();
-                            if mode_control(ui, label, selected, scale)
-                                .on_hover_text("Change presentation of the same live shell")
-                                .clicked()
-                                && !selected
-                            {
-                                self.config.terminal_mode = Some(mode);
-                                self.apply_runtime_config(ui.ctx());
-                                self.force_resize_session = true;
-                                self.return_focus_to_terminal(ui.ctx());
-                                self.config_panel.sync_from_config(&self.config);
-                                self.schedule_config_save();
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if icon_button(ui, Icon::Settings, "Settings").clicked() {
+                                self.config_panel.open(&self.config);
                             }
-                        }
+                            for (mode, label) in [
+                                (config::TerminalMode::Chat, "Chat"),
+                                (config::TerminalMode::Block, "Block"),
+                            ] {
+                                let selected = (mode == config::TerminalMode::Chat)
+                                    == self.config.chat_mode_enabled();
+                                if mode_control(ui, label, selected, scale)
+                                    .on_hover_text("Change presentation of the same live shell")
+                                    .clicked()
+                                    && !selected
+                                {
+                                    self.config.terminal_mode = Some(mode);
+                                    self.apply_runtime_config(ui.ctx());
+                                    self.force_resize_session = true;
+                                    self.return_focus_to_terminal(ui.ctx());
+                                    self.config_panel.sync_from_config(&self.config);
+                                    self.schedule_config_save();
+                                }
+                            }
+                        });
                     });
                 });
+                self.render_reference_inspector_toggle(ui, toggle);
                 if ui.max_rect().width() > 900.0 {
                     let width = shell::SEARCH_WIDTH;
                     let global_width = ui.ctx().viewport_rect().width();
@@ -489,9 +768,7 @@ impl TerminalApp {
                         if key == "search" {
                             self.command_palette.open();
                         } else {
-                            self.sidebar.note_files_user_intent();
-                            self.sidebar.visible = true;
-                            self.sidebar.view = view;
+                            self.reference_request_sidebar_view(view, ui.ctx());
                         }
                     }
                     ui.add_space(7.0);
@@ -591,7 +868,6 @@ impl TerminalApp {
             "Workspace switching is unavailable\n{full_path}\nBranch not reported"
         ));
         ui.add_space((shell::NAVIGATION_ITEMS_TOP - ui.cursor().top()).max(0.0));
-        let mut changed = false;
         for (key, label) in conversation::NAVIGATION {
             let label = if key == "conversation" {
                 if self.config.chat_mode_enabled() {
@@ -626,17 +902,16 @@ impl TerminalApp {
                 match key {
                     "settings" => self.config_panel.open(&self.config),
                     "folder" => {
-                        self.sidebar.view = sidebar::SidebarView::Files;
-                        changed = true;
+                        self.reference_request_sidebar_view(sidebar::SidebarView::Files, ui.ctx());
                     }
                     "agent" => {
-                        self.sidebar.view = sidebar::SidebarView::Tasks;
-                        changed = true;
+                        self.reference_request_sidebar_view(sidebar::SidebarView::Tasks, ui.ctx());
                     }
                     _ => {
-                        self.sidebar.view = sidebar::SidebarView::Sessions;
-                        changed = true;
-                        self.return_focus_to_terminal(ui.ctx());
+                        self.reference_request_sidebar_view(
+                            sidebar::SidebarView::Sessions,
+                            ui.ctx(),
+                        );
                     }
                 }
             }
@@ -649,7 +924,7 @@ impl TerminalApp {
                 .color(rgb(color::CHROME_MUTED)),
         );
         ui.add_space((heading.rect.bottom() + shell::METADATA_GAP - ui.cursor().top()).max(0.0));
-        changed
+        false // Navigation ownership changes are applied before next frame's panels.
     }
 
     pub(crate) fn render_reference_fixture_recent(&mut self, ui: &mut egui::Ui) {
@@ -843,74 +1118,70 @@ impl TerminalApp {
     }
 
     pub(crate) fn render_reference_inspector(&mut self, root: &mut egui::Ui) {
-        if self.reference_layout(root.ctx()).inspector.is_none()
+        if !self.reference_inspector_visible(root.ctx())
             || self.sidebar.view == sidebar::SidebarView::Files
         {
             return;
         }
-        egui::Panel::right("reference-inspector")
-            .exact_size(shell::INSPECTOR_WIDTH)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::NONE
-                    .fill(rgb(color::INSPECTOR))
-                    .inner_margin(egui::Margin {
-                        top: 11,
-                        ..egui::Margin::same(shell::INSPECTOR_INSET as i8)
-                    }),
-            )
-            .show(root, |ui| {
+        let frame = egui::Frame::NONE
+            .fill(rgb(color::INSPECTOR))
+            .inner_margin(egui::Margin {
+                top: 11,
+                ..egui::Margin::same(shell::INSPECTOR_INSET as i8)
+            });
+        if let Some(rect) = self.reference_inspector_drawer_rect(root.ctx()) {
+            show_inspector_drawer(root, rect, "reference-inspector-drawer", frame, |ui| {
+                self.render_reference_inspector_contents(ui);
+            });
+        } else {
+            egui::Panel::right("reference-inspector")
+                .exact_size(shell::INSPECTOR_WIDTH)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(frame)
+                .show(root, |ui| self.render_reference_inspector_contents(ui));
+        }
+    }
+
+    fn render_reference_inspector_contents(&mut self, ui: &mut egui::Ui) {
+        // Explicit global Ui identity preserves the same tab widgets and
+        // per-tab scroll state when a dock becomes a compact drawer.
+        ui.scope_builder(
+            egui::UiBuilder::new().id(egui::Id::new("reference-inspector-body")),
+            |ui| {
                 chrome_style(
                     ui,
                     self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE,
                 );
-                let key = ui.id().with("inspector-tab");
-                let mut tab = ui
-                    .ctx()
-                    .data_mut(|data| data.get_temp::<usize>(key).unwrap_or(0));
+                let tab = self.reference_selected_inspector_tab();
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_sized(
-                            [shell::INSPECTOR_TAB_WIDTH, 28.0],
-                            egui::Button::selectable(tab == 0, "Agent"),
-                        )
-                        .clicked()
-                    {
-                        tab = 0;
-                    }
-                    if ui
-                        .add_sized(
-                            [shell::INSPECTOR_TAB_WIDTH, 28.0],
-                            egui::Button::selectable(tab == 1, "Context"),
-                        )
-                        .clicked()
-                    {
-                        tab = 1;
-                    }
-                    if ui
-                        .add_sized(
-                            [shell::INSPECTOR_TAB_WIDTH, 28.0],
-                            egui::Button::new("Files"),
-                        )
-                        .clicked()
-                    {
-                        self.sidebar.view = sidebar::SidebarView::Files;
-                        self.sidebar.visible = true;
+                    for (candidate, label) in [
+                        (ReferenceInspectorTab::Agent, "Agent"),
+                        (ReferenceInspectorTab::Context, "Context"),
+                        (ReferenceInspectorTab::Files, "Files"),
+                    ] {
+                        let response = ui.add_sized(
+                            [shell::INSPECTOR_TAB_WIDTH, shell::CONTROL_HEIGHT],
+                            egui::Button::selectable(tab == candidate, label),
+                        );
+                        remember_inspector_control(ui, &response);
+                        if response.clicked() {
+                            self.reference_request_inspector_tab(candidate, ui.ctx());
+                        }
                     }
                 });
-                ui.ctx().data_mut(|data| data.insert_temp(key, tab));
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
-                    .id_salt("reference-inspector-scroll")
+                    .id_salt(("reference-inspector-scroll", tab))
                     .show(ui, |ui| {
-                        if tab == 1 {
+                        if tab == ReferenceInspectorTab::Context {
                             self.render_reference_context(ui);
                         } else {
                             self.render_reference_agent(ui);
                         }
                     });
-            });
+            },
+        );
     }
 
     fn render_reference_context(&mut self, ui: &mut egui::Ui) {

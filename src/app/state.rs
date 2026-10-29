@@ -138,7 +138,45 @@ pub struct TerminalMouseCapture {
     pub local_selection_cancelled: bool,
 }
 
-/// Main application state
+/// Selection survives moving the same inspector between a dock and drawer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum ReferenceInspectorTab {
+    #[default]
+    Agent,
+    Context,
+    Files,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReferenceInspectorRequest {
+    Tab(ReferenceInspectorTab),
+    Navigation(sidebar::SidebarView),
+}
+
+/// Application chrome state; terminal/session switches do not recreate it.
+pub(crate) struct ReferenceInspectorState {
+    pub open: bool,
+    /// An explicit open at a compact width uses an overlay instead of taking
+    /// the terminal's minimum center width. Automatic compact collapse stays
+    /// reversible when the window becomes wide again.
+    pub narrow_drawer: bool,
+    pub selected_tab: ReferenceInspectorTab,
+    /// Apply panel ownership changes before any panel is allocated next frame.
+    pub pending: Option<ReferenceInspectorRequest>,
+}
+
+impl Default for ReferenceInspectorState {
+    fn default() -> Self {
+        Self {
+            open: true,
+            narrow_drawer: false,
+            selected_tab: ReferenceInspectorTab::Agent,
+            pending: None,
+        }
+    }
+}
+
+/// Main application state.
 pub struct TerminalApp {
     pub session_manager: SessionManager,
     pub(crate) vim9_editors: std::collections::HashMap<String, crate::vim9_ide::Workbench>,
@@ -220,6 +258,7 @@ pub struct TerminalApp {
 
     // File-tree sidebar
     pub sidebar: sidebar::Sidebar,
+    pub(crate) reference_inspector: ReferenceInspectorState,
     /// 文件树名称输入对话框（New File / New Folder / Rename）。
     pub sidebar_name_dialog: Option<crate::FsNameDialog>,
     /// 文件树删除确认对话框。

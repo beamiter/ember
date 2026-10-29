@@ -2862,6 +2862,7 @@ impl TerminalApp {
                 }
                 sb
             },
+            reference_inspector: Default::default(),
             sidebar_name_dialog: None,
             sidebar_delete_dialog: None,
             sidebar_drop_rect: None,
@@ -3500,7 +3501,9 @@ impl TerminalApp {
         for message in self.sidebar.poll_op_results() {
             self.set_status_for(message, Duration::from_secs(5));
         }
-        if self.sidebar.visible && self.sidebar.view == sidebar::SidebarView::Files {
+        if self.sidebar.view == sidebar::SidebarView::Files
+            && self.reference_inspector_visible(root_ui.ctx())
+        {
             for error in self.sidebar.auto_revalidate_visible() {
                 self.set_status_for(
                     format!("Remote Files background revalidation failed: {error}"),
@@ -3511,7 +3514,12 @@ impl TerminalApp {
                 root_ui.ctx().request_repaint_after(Duration::from_secs(5));
             }
         }
-        if !self.sidebar.visible || self.reference_layout(root_ui.ctx()).navigation.is_none() {
+        let files_selected = self.sidebar.view == sidebar::SidebarView::Files;
+        if (files_selected && !self.reference_inspector_visible(root_ui.ctx()))
+            || (!files_selected
+                && (!self.sidebar.visible
+                    || self.reference_layout(root_ui.ctx()).navigation.is_none()))
+        {
             // 展开按钮统一由顶部栏内的 ☰ 负责(Top 模式在 tab 栏，Sidebar 模式在精简顶部栏)，
             // 不再使用浮动按钮，避免覆盖终端内容。后台结果仍需在上方收割，
             // 否则隐藏侧边栏会让自动 SSH follow 永久误判为“仍有操作”。
@@ -3637,7 +3645,10 @@ impl TerminalApp {
         };
 
         let files_inspector = self.sidebar.view == sidebar::SidebarView::Files
-            && self.reference_layout(root_ui.ctx()).inspector.is_some();
+            && self.reference_inspector_visible(root_ui.ctx());
+        let drawer = files_inspector
+            .then(|| self.reference_inspector_drawer_rect(root_ui.ctx()))
+            .flatten();
         let panel = if files_inspector {
             egui::Panel::right("file_tree")
         } else {
@@ -3648,25 +3659,37 @@ impl TerminalApp {
         } else {
             jterm_core::reference_shell::NAVIGATION_WIDTH
         };
-        let panel_response = panel
-            .resizable(false)
-            .exact_size(width)
-            .show_separator_line(false)
-            .frame(egui::Frame::NONE.fill(reference_workspace::rgb(jterm_core::reference_shell::color::NAVIGATION))
-                .inner_margin(jterm_core::reference_shell::NAVIGATION_PADDING))
-            .show(root_ui, |ui| {
-                reference_workspace::chrome_style(ui, self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE);
+        let frame = egui::Frame::NONE
+            .fill(reference_workspace::rgb(
+                jterm_core::reference_shell::color::NAVIGATION,
+            ))
+            .inner_margin(jterm_core::reference_shell::NAVIGATION_PADDING);
+        let mut render_body = |ui: &mut egui::Ui| {
+            let mut contents = |ui: &mut egui::Ui| {
+                reference_workspace::chrome_style(
+                    ui,
+                    self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE,
+                );
                 if files_inspector {
                     ui.horizontal(|ui| {
-                        if ui.selectable_label(false, "Agent").clicked() {
-                            self.sidebar.view = sidebar::SidebarView::Tasks;
-                            view_changed = true;
+                        let agent = ui.selectable_label(false, "Agent");
+                        reference_workspace::remember_inspector_control(ui, &agent);
+                        if agent.clicked() {
+                            self.reference_request_inspector_tab(
+                                crate::app::state::ReferenceInspectorTab::Agent,
+                                ui.ctx(),
+                            );
                         }
-                        if ui.selectable_label(false, "Context").clicked() {
-                            self.sidebar.view = sidebar::SidebarView::Sessions;
-                            view_changed = true;
+                        let context = ui.selectable_label(false, "Context");
+                        reference_workspace::remember_inspector_control(ui, &context);
+                        if context.clicked() {
+                            self.reference_request_inspector_tab(
+                                crate::app::state::ReferenceInspectorTab::Context,
+                                ui.ctx(),
+                            );
                         }
-                        let _ = ui.selectable_label(true, "Files");
+                        let files = ui.selectable_label(true, "Files");
+                        reference_workspace::remember_inspector_control(ui, &files);
                     });
                 } else {
                     view_changed |= self.render_reference_navigation(ui);
@@ -3926,7 +3949,7 @@ impl TerminalApp {
                         } else {
                             self.render_sidebar_sessions(ui);
                         }
-                    },
+                    }
                     sidebar::SidebarView::Commands => self.render_sidebar_commands(ui),
                     sidebar::SidebarView::Tasks => self.render_sidebar_tasks(ui),
                     sidebar::SidebarView::Files => {
@@ -3954,9 +3977,7 @@ impl TerminalApp {
                         } else {
                             let breadcrumbs = self.sidebar.breadcrumbs();
                             ui.horizontal_wrapped(|ui| {
-                                for (index, (label, path)) in
-                                    breadcrumbs.into_iter().enumerate()
-                                {
+                                for (index, (label, path)) in breadcrumbs.into_iter().enumerate() {
                                     if index > 0 {
                                         ui.label(egui::RichText::new("›").weak());
                                     }
@@ -4015,7 +4036,10 @@ impl TerminalApp {
                                     _ => "Transferring",
                                 };
                                 ui.label(format!("{verb} {}… {amount}", status.name));
-                                if ui.small_button("✕").on_hover_text("Cancel transfer").clicked()
+                                if ui
+                                    .small_button("✕")
+                                    .on_hover_text("Cancel transfer")
+                                    .clicked()
                                 {
                                     cancel_transfer = true;
                                 }
@@ -4050,7 +4074,8 @@ impl TerminalApp {
                             String::new()
                         };
                         let files_are_local = !self.sidebar.location().is_remote();
-                        let indent_guide = theme::Theme::rgb_to_color32(self.current_theme.ui.border);
+                        let indent_guide =
+                            theme::Theme::rgb_to_color32(self.current_theme.ui.border);
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             if let Some(root) = &self.sidebar.root {
                                 let filtered_root;
@@ -4219,7 +4244,34 @@ impl TerminalApp {
                 if self.sidebar.view != sidebar::SidebarView::Files {
                     self.render_reference_spaces(ui);
                 }
-            });
+            };
+            if files_inspector {
+                // The exact same Files widgets move between dock and drawer;
+                // independent parent identity retains edits/scroll/selection.
+                ui.scope_builder(
+                    egui::UiBuilder::new().id(egui::Id::new("reference-files-inspector-body")),
+                    &mut contents,
+                );
+            } else {
+                contents(ui);
+            }
+        };
+        let panel_response = if let Some(rect) = drawer {
+            reference_workspace::show_inspector_drawer(
+                root_ui,
+                rect,
+                "reference-files-inspector-drawer",
+                frame,
+                &mut render_body,
+            )
+        } else {
+            panel
+                .resizable(false)
+                .exact_size(width)
+                .show_separator_line(false)
+                .frame(frame)
+                .show(root_ui, &mut render_body)
+        };
 
         // File-browser shortcuts require actual focus on a tree row as well as
         // pointer scope. Merely hovering Files must not steal keys from the PTY,
@@ -4595,8 +4647,11 @@ impl TerminalApp {
 
         // 拖拽导入：面板矩形 + 行命中测试 + 悬停提示 + 落下分派。
         let panel_rect = panel_response.response.rect;
-        self.font_zoom
-            .register(panel_rect, root_ui.layer_id(), font_zoom::FontGroup::Ui);
+        self.font_zoom.register(
+            panel_rect,
+            panel_response.response.layer_id,
+            font_zoom::FontGroup::Ui,
+        );
         self.sidebar.width = panel_rect.width().clamp(160.0, 640.0);
         self.sidebar_drop_rect = (self.sidebar.view == sidebar::SidebarView::Files
             && !self.sidebar.current_dir.as_os_str().is_empty())
