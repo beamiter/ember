@@ -7,6 +7,7 @@ import select
 import termios
 import time
 import tty
+from native_ime_capture_budget import CaptureBudget, acknowledge, descriptor, publish_once, require_request
 
 out = Path(os.environ['EMBER_SMOKE_RAW_OUT'])
 out.mkdir(parents=True, exist_ok=False)
@@ -14,6 +15,7 @@ fd = 0
 saved = termios.tcgetattr(fd)
 received = bytearray()
 metadata = {'pid': os.getpid(), 'shell_pid': os.getppid(), 'tty': os.ttyname(fd)}
+budget = CaptureBudget(time.monotonic())
 
 def publish_live():
     temporary = out / 'live.tmp'
@@ -23,10 +25,21 @@ def publish_live():
 try:
     tty.setraw(fd)
     publish_live()
-    (out / 'ready').touch()
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
+    publish_once(out / 'ready', descriptor(os.getpid()))
+    while True:
+        now = time.monotonic()
+        if (out / 'preparing-request.json').exists() and budget.phase == 'capture':
+            require_request(out, 'preparing', os.getpid())
+            budget.prepare(now)
+            acknowledge(out, 'preparing', os.getpid())
+        if (out / 'commit-request.json').exists() and budget.phase != 'commit':
+            require_request(out, 'commit', os.getpid())
+            budget.commit(now)
+            acknowledge(out, 'commit', os.getpid())
+        budget.check(now)
         if (out / 'finish').exists():
+            if budget.phase == 'preparing':
+                raise RuntimeError('Capture finish precedes the commit trigger')
             break
         readable, _, _ = select.select([fd], [], [], 0.05)
         if readable:
@@ -35,10 +48,10 @@ try:
                 raise RuntimeError('PTY closed during capture')
             received.extend(chunk)
             publish_live()
+            if budget.phase == 'preparing':
+                raise RuntimeError('Terminal bytes arrived before the composition trigger')
             if len(received) > 16384:
                 raise RuntimeError('Synthetic byte capture bound exceeded')
-    else:
-        raise RuntimeError('Capture timed out')
     # Finish is issued only after the input driver has exited. Drain any final
     # bytes that were already queued, without injecting a delimiter/Enter.
     drain_deadline = time.monotonic() + 1
@@ -65,4 +78,5 @@ finally:
     finally:
         (out / 'bytes.bin').write_bytes(received)
         metadata['bytes'] = len(received)
+        metadata['capture_budget'] = budget.report()
         (out / 'result.json').write_text(json.dumps(metadata, indent=2))

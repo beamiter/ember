@@ -1,6 +1,8 @@
 """Socket-free causal parser and cancellation-order tests."""
 import importlib.util
 from pathlib import Path
+import json
+from native_ime_capture_budget import descriptor
 import tempfile
 import subprocess
 import unittest
@@ -98,10 +100,39 @@ class BarrierTests(unittest.TestCase):
         keyboard.stop()
         self.assertEqual(keyboard.process.events, ['terminate', 'wait', 'kill', 'wait', 'close'])
 
+    def test_exited_collector_cannot_release_the_native_return_barrier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / 'preedit').touch()
+            (path / 'live.bin').write_bytes(b'')
+            (path / 'result.json').write_text('{"status":"fail"}')
+            keyboard = self.keyboard()
+            with self.assertRaisesRegex(RuntimeError, 'capture exit'):
+                keyboard.release_return(path / 'preedit', path)
+            self.assertEqual(keyboard.process.events, [])
+            self.assertFalse(keyboard.released)
+            keyboard.stop()
+            self.assertEqual(keyboard.process.events, ['terminate', 'reap', 'close'])
+
+    def test_advertised_phase_capture_without_preparation_never_releases_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / 'preedit').touch()
+            (path / 'live.bin').write_bytes(b'')
+            (path / 'ready').write_text(json.dumps(descriptor(42)))
+            keyboard = self.keyboard()
+            with self.assertRaisesRegex(RuntimeError, 'preparation request is missing'):
+                keyboard.release_return(path / 'preedit', path)
+            self.assertEqual(keyboard.process.events, [])
+            self.assertFalse(keyboard.released)
+            keyboard.stop()
+            self.assertEqual(keyboard.process.events, ['terminate', 'reap', 'close'])
+
     def test_return_requires_marker_and_zero_bytes_and_is_once_only(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             marker = path / 'preedit'
+            (path / 'ready').touch()
             (path / 'live.bin').write_bytes(b'')
             keyboard = self.keyboard()
             with self.assertRaises(RuntimeError):

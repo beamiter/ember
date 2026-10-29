@@ -135,7 +135,7 @@ class LiveTests(unittest.TestCase):
                         live.exercise(smoke,None,None,None,None,SimpleNamespace(poll=lambda:None))
 
     def cycle_fixture(self,directory,fail_preedit=False,wrong_identity=False,fail_after=False,helper_wait=None,fail_park=False):
-        out=Path(directory);events=[];capture=out/'raw';capture.mkdir();(capture/'live.bin').write_bytes(b'')
+        out=Path(directory);events=[];capture=out/'raw';capture.mkdir();(capture/'live.bin').write_bytes(b'');(capture/'ready').touch()
         state={'status':None};seat=SimpleNamespace(poll=lambda:None)
         class Process:
             returncode=None

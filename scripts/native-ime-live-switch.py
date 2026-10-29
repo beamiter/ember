@@ -8,6 +8,7 @@ import json
 import subprocess
 from pathlib import Path
 import time
+from native_ime_capture_budget import prepare_capture
 
 MODES = ('normal', 'block', 'chat', 'normal')
 
@@ -49,6 +50,7 @@ def composition_cycle(smoke, module, keyboard_module, visual, helper, identity, 
         marker('connected')
         capture = smoke.raw_start(label)
         assert (capture / 'live.bin').read_bytes() == b''
+        prepare_capture(capture, module.wait_for)
         keyboard = keyboard_module.CompositionKeyboard(view)
         module.wait_for(keyboard.ready, label + ' owned keyboard release roundtrip')
         assert seat.poll() is None

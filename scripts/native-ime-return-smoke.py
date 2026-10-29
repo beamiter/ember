@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import time
+from native_ime_capture_budget import prepare_capture
 
 
 def main():
@@ -67,6 +68,7 @@ def main():
         smoke.park_pointer()
         capture = smoke.raw_start('ime-return-' + args.mode)
         assert (capture / 'live.bin').read_bytes() == b'', 'Bytes before keyboard readiness'
+        prepare_capture(capture, module.wait_for)
         keyboard = keyboard_module.CompositionKeyboard(smoke)
         module.wait_for(keyboard.ready, 'owned keyboard Shift release roundtrip')
         assert (capture / 'live.bin').read_bytes() == b'', 'Modifier readiness leaked PTY bytes'

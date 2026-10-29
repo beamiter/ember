@@ -423,6 +423,7 @@ jobs:
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
         run: |
           python3 scripts/test-native-ime-keyboard.py
+          EMBER_CAPTURE_BUDGET_EVIDENCE="$GITHUB_WORKSPACE/native-smoke-artifacts/capture-budget-unit" python3 scripts/test-native-ime-capture-budget.py
           python3 scripts/test-native-ime-visual.py
           python3 scripts/test-native-ime-body-observer.py
           mkdir -p "$RUNNER_TEMP/ember-ime"

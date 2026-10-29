@@ -1,6 +1,7 @@
 """Owned synthetic wtype keyboard with a fail-closed one-Return stdin barrier."""
 import re
 import subprocess
+from native_ime_capture_budget import arm_capture
 
 
 KEYBOARD_ARGS = ['wtype', '-s', '250', '-M', 'shift', '-m', 'shift',
@@ -60,6 +61,9 @@ class CompositionKeyboard:
             raise RuntimeError('Composition Return barrier is no longer available')
         if not preedit_marker.is_file() or (capture / 'live.bin').read_bytes() != b'':
             raise RuntimeError('Refusing Return without preedit and zero-byte proof')
+        # The collector acknowledges its unchanged 15s active budget before
+        # EOF triggers the real Return; passive OCR used only preparation time.
+        arm_capture(capture)
         # No input bytes are written. EOF advances exactly once to -k Return.
         self.released = True
         self.process.stdin.close()
