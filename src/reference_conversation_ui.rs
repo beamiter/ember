@@ -993,7 +993,9 @@ mod reference_font_tests {
                 for (name, reference_size) in [
                     ("One continuous canvas, a stable reading position", 20.0),
                     ("Read files", 9.0),
-                    ("Inspect the current renderer", 11.0),
+                    // The shared step role is 10px; keep the independent
+                    // painted-shape assertion aligned with that UI contract.
+                    ("Inspect the current renderer", 10.0),
                     ("src/canvas.rs", 10.0),
                     ("38", 9.0),
                     ("fn viewport_offset(row: f64) -> f64 {", 10.0),
