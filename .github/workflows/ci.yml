@@ -315,6 +315,8 @@ jobs:
         run: |
           mkdir -p native-smoke-artifacts
           { uname -a; rustc -Vv; dpkg-query -W xvfb sway wtype wl-clipboard libvulkan1 mesa-vulkan-drivers fonts-dejavu-core fonts-noto-cjk openbox tesseract-ocr; fc-match monospace; git rev-parse HEAD; sha256sum target/release/ember; } > native-smoke-artifacts/environment.txt
+          python3 scripts/test-native-render-environment.py
+          python3 scripts/native-render-environment.py --output native-smoke-artifacts/font-ocr-identities.json
 
       - name: Gate X11 installed release interactions
         if: steps.desktop-install.outcome == 'success'
