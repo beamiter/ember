@@ -16,7 +16,7 @@ pub const CARD_RADIUS: f32 = token::PANEL_RADIUS;
 pub const CONTROL_RADIUS: f32 = token::CONTROL_RADIUS;
 pub const CONTROL_HEIGHT: f32 = token::TOOL_BUTTON_HEIGHT;
 pub const METADATA_GAP: f32 = token::TOOL_GAP;
-pub const COMPOSER_CONTROL_BOTTOM: f32 = 6.0;
+pub const COMPOSER_CONTROL_BOTTOM: f32 = 5.0;
 pub const COMPOSER_CONTROL_LEFT: f32 = 6.0;
 pub const COMPOSER_CONTROL_RIGHT: f32 = 6.0;
 pub const COMPOSER_PLUS_WIDTH: f32 = 57.0;
@@ -31,7 +31,7 @@ pub const COMPOSER_SECONDARY_MIN_WIDTH: f32 = 850.0;
 pub const COMPOSER_MODEL_MIN_AVAILABLE: f32 = 560.0;
 pub const COMPOSER_TERMINAL_MIN_AVAILABLE: f32 = 280.0;
 pub const MODE_CONTROL_HEIGHT: f32 = 32.0;
-pub const MODE_CONTROL_TOP: f32 = 5.0;
+pub const MODE_CONTROL_TOP: f32 = 4.0;
 pub const MODE_CONTROL_MIN_WIDTH: f32 = 64.0;
 pub const SELECTED_RAIL_SIZE: f32 = 32.0;
 pub const PROFILE_DIAMETER: f32 = 32.0;
@@ -223,7 +223,7 @@ pub fn editor_dock_with_height(
     native_editor_top: f32,
     tools_height: f32,
 ) -> DockGeometry {
-    let control_height = (tools_height - 12.0).max(CONTROL_HEIGHT);
+    let control_height = (tools_height - 10.0).max(CONTROL_HEIGHT);
     let top = (outer.bottom() - tools_height)
         .min(native_editor_top - 6.0)
         .max(outer.top());
@@ -441,7 +441,7 @@ impl Layout {
     pub fn with_chrome_font_size(mut self, font_size: f32) -> Self {
         let control = chrome_control_height(font_size);
         let title = token::TOPBAR_HEIGHT
-            .max(control + 10.0)
+            .max(control + 8.0)
             .min(self.viewport_height);
         let main_top = (title + token::MAIN_TOP - token::TOPBAR_HEIGHT).min(self.viewport_height);
         let delta = (main_top - self.center.y).max(0.0);
@@ -463,7 +463,7 @@ impl Layout {
             .max(control + 4.0)
             .min(self.center.height);
         self.composer.height = token::TOOLBAR_HEIGHT
-            .max(control + 12.0)
+            .max(control + 10.0)
             .min((self.center.height - self.header.height).max(0.0));
         self.composer.y = self.center.y + self.center.height - self.composer.height;
         self
@@ -1014,7 +1014,7 @@ mod tests {
                 l.center.x,
                 l.inspector.unwrap().x
             ),
-            (4.0, 52.0, 274.0, 1320.0)
+            (4.0, 48.0, 270.0, 1320.0)
         );
         assert_eq!(
             (
@@ -1023,7 +1023,7 @@ mod tests {
                 l.composer.width,
                 l.composer.height
             ),
-            (274.0, 926.0, 1040.0, 44.0)
+            (270.0, 928.0, 1044.0, 42.0)
         );
         let hidden = l.without_inspector();
         assert_eq!(hidden.center.width - l.center.width, 294.0);
@@ -1040,18 +1040,18 @@ mod tests {
                 compact.header.height,
                 compact.composer.height
             ),
-            (42.0, 38.0, 44.0)
+            (40.0, 36.0, 42.0)
         );
         for font in [14.0, 18.0, 24.0, 32.0, 40.0, 72.0] {
             for height in [400.0, 700.0, 976.0] {
                 let layout = Layout::for_size(1280.0, height).with_chrome_font_size(font);
                 let control = chrome_control_height(font);
-                assert!(layout.titlebar.height >= control + 10.0);
+                assert!(layout.titlebar.height >= control + 8.0);
                 assert!(layout.header.height >= control + 4.0);
-                assert!(layout.composer.height >= control + 12.0);
+                assert!(layout.composer.height >= control + 10.0);
                 assert!(layout.composer.y >= layout.header.y + layout.header.height);
                 assert!(layout.center.width >= CENTER_MIN_WIDTH);
-                assert_eq!(layout.rail.width, 48.0);
+                assert_eq!(layout.rail.width, 44.0);
                 assert_eq!(layout.navigation.unwrap().width, 216.0);
                 assert_eq!(layout.inspector.unwrap().width, 288.0);
                 assert_eq!(layout.composer.y + layout.composer.height, height - 6.0);
@@ -1109,7 +1109,7 @@ mod tests {
                     assert!(editor_bottom + 6.0 <= dock.controls.top());
                     assert_eq!(dock.controls.height(), 32.0);
                     assert_eq!(dock.frame.bottom(), outer.bottom());
-                    assert!(dock.frame.height() >= 44.0);
+                    assert!(dock.frame.height() >= 42.0);
                 }
             }
         }

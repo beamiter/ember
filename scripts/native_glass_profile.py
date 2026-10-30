@@ -157,7 +157,7 @@ def mode_slot(owned, mode):
     layout(owned)
     settings_x = owned['width'] - 8 - 32 - 6 - 32
     x = settings_x - 8 - 64 - (70 if mode == 'block' else 0)
-    return dict(x=owned['x']+x, y=owned['y']+5, width=64, height=32)
+    return dict(x=owned['x']+x, y=owned['y']+4, width=64, height=32)
 
 
 def header_paint(image, owned, mode=None):

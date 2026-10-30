@@ -1756,6 +1756,9 @@ impl TerminalApp {
                         self.set_status(format!("Files refresh failed: {error}"));
                     }
                 }
+                self.force_resize_session = true;
+                self.return_focus_to_terminal(ctx);
+                ctx.request_repaint();
             }
             keybindings::Command::JshInstall => {
                 self.install_or_update_jsh();

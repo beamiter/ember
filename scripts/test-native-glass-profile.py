@@ -36,11 +36,11 @@ class GlassProfileTests(unittest.TestCase):
 
     def test_reference_domains_use_full_input_and_exclude_actual_control_row(self):
         p = g.layout(dict(x=0,y=0,width=1612,height=976))
-        self.assertEqual(p['header'], dict(x=0,y=0,width=1612,height=42))
-        self.assertEqual(p['center'], dict(x=274,y=84,width=1040,height=886))
-        self.assertEqual(p['terminal'], dict(x=282,y=90,width=1024,height=830))
-        self.assertEqual(p['native_body'], dict(x=282,y=90,width=1024,height=842))
-        self.assertEqual(p['native_body']['y']+p['native_body']['height'],932)
+        self.assertEqual(p['header'], dict(x=0,y=0,width=1612,height=40))
+        self.assertEqual(p['center'], dict(x=270,y=80,width=1044,height=890))
+        self.assertEqual(p['terminal'], dict(x=278,y=86,width=1028,height=836))
+        self.assertEqual(p['native_body'], dict(x=278,y=86,width=1028,height=847))
+        self.assertEqual(p['native_body']['y']+p['native_body']['height'],933)
 
     def test_compact_domains_reclaim_native_rows_and_columns_at_the_same_cell_size(self):
         current = g.layout(dict(x=0,y=0,width=1612,height=976))['terminal']
@@ -65,8 +65,8 @@ class GlassProfileTests(unittest.TestCase):
             offset=g.layout(dict(x=24,y=25,width=width,height=height))
             for name in ('header','center','native_body','terminal'):
                 self.assertEqual(offset[name], dict(plain[name],x=plain[name]['x']+24,y=plain[name]['y']+25))
-        self.assertEqual(g.layout(dict(x=0,y=0,width=1179,height=704))['center']['width'],901)
-        self.assertEqual(g.layout(dict(x=0,y=0,width=1180,height=704))['center']['width'],608)
+        self.assertEqual(g.layout(dict(x=0,y=0,width=1179,height=704))['center']['width'],905)
+        self.assertEqual(g.layout(dict(x=0,y=0,width=1180,height=704))['center']['width'],612)
         for bad in [dict(x=0,y=0,width=699,height=640),dict(x=0,y=0,width=1280.5,height=900),dict(x=-1,y=0,width=1280,height=900)]:
             with self.assertRaises(RuntimeError):g.layout(bad)
 

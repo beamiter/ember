@@ -5,12 +5,12 @@ sidebar visibility choices. The workspace now spends fewer pixels on chrome:
 
 | Area | Previous | Compact default |
 | --- | ---: | ---: |
-| Top bar | 69 px | 42 px |
-| Rail | 73 px | 48 px |
+| Top bar | 69 px | 40 px |
+| Rail | 73 px | 44 px |
 | Navigation default | 252 px | 216 px |
 | Inspector default | 350 px | 288 px |
-| Session header | 88 px | 38 px |
-| Bottom toolbar | 98 px | 44 px |
+| Session header | 88 px | 36 px |
+| Bottom toolbar | 98 px | 42 px |
 | Main bottom margin | 46 px | 6 px |
 | Toolbar controls | 54 px | 32 px |
 
@@ -38,7 +38,7 @@ also keeps its intrinsic content inside that allocation.
 
 Larger UI fonts grow the top bar, header, and toolbar before native geometry is
 calculated, across the supported UI8–72 range. At UI32, their heights become
-68, 62, and 70 px. Narrow toolbars use a 32 px Tools icon, and the top bar moves
+66, 62, and 68 px. Narrow toolbars use a 32 px Tools icon, and the top bar moves
 Chat/Block into a presentation menu when both labels cannot fit. The optional
 product name is measured against those controls before painting. Larger UI text
 uses a short Search caption; its full purpose and shortcut remain in the tooltip.
@@ -63,3 +63,7 @@ do not establish live native behavior. The Settings popup palette registration
 uses a fresh native capture with strict OCR selector provenance, exact edge
 colors, source hashes, and unchanged rejection thresholds. Root verification
 records executed Rust and native checks for the final binary.
+
+The rail workspace icon toggles navigation, using the same command as `Ctrl+\`.
+Collapsing navigation returns its width to the existing terminal and restores
+terminal focus without submitting or clearing the current input.

@@ -166,7 +166,7 @@ ascii_organism_enabled = true
                 run(["import", "-window", window, str(image)])
                 extra_at_reference(image, "Quiet production canvas; organism obeys actual native safe-area admission")
                 # Shared logical footer geometry, not a screenshot-derived locator.
-                run(["xdotool", "mousemove", "--window", window, str(round(655 * args.scale)), str(round(671 * args.scale))])
+                run(["xdotool", "mousemove", "--window", window, str(round(414 * args.scale)), str(round(677 * args.scale))])
                 run(["xdotool", "click", "1"])
                 time.sleep(0.5)
                 image = args.out / f"ember-{mode}-tools.png"

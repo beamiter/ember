@@ -1851,7 +1851,7 @@ impl TerminalRenderer {
         crate::glass_shell::footer_rows_with_height(
             self.padding,
             self.line_height,
-            (self.reference_tools_height - 12.0).max(crate::glass_shell::CONTROL_HEIGHT),
+            (self.reference_tools_height - 10.0).max(crate::glass_shell::CONTROL_HEIGHT),
         )
     }
 
@@ -7578,15 +7578,15 @@ mod tests {
             crate::config::ScrollbarVisibility::Auto,
             crate::theme::Theme::default(),
         );
-        // Compact glass profile: one44px toolbar and6px gap below the native pane.
+        // Compact glass profile: one42px toolbar and6px gap below the native pane.
         let outer = egui::Rect::from_min_size(egui::pos2(365.0, 171.0), egui::vec2(859.0, 759.0));
         let (native, footer) = reference_foreground_rects(outer, true);
         let footer = footer.unwrap();
         assert_eq!(native.min, outer.min);
         assert_eq!(native.right(), outer.right());
-        assert_eq!(footer.height(), 44.0);
-        assert_eq!(footer.top(), 886.0);
-        assert_eq!(native.bottom(), 880.0);
+        assert_eq!(footer.height(), 42.0);
+        assert_eq!(footer.top(), 888.0);
+        assert_eq!(native.bottom(), 882.0);
         assert_eq!(
             native.bottom() + crate::glass_shell::token::TERMINAL_FOOTER_GAP,
             footer.top()
@@ -10400,7 +10400,7 @@ mod tests {
         let (with_content, _) = renderer.layout_rects(pane);
         assert_eq!(renderer.grid_dimensions(available), (10, 5));
         assert_eq!(with_content.left(), 2.0 + BLOCK_GUTTER_WIDTH);
-        assert_eq!(with_content.width(), 80.0);
+        assert_eq!(with_content.width(), 82.0);
 
         // Compact is paint density only: toggling it cannot resize the PTY.
         renderer.block_compact = true;
@@ -10444,7 +10444,7 @@ mod tests {
                         let (cols, rows) = renderer.grid_dimensions(pane.size());
                         assert_eq!(cols, (content.width() / char_width).floor() as usize);
                         assert_eq!(content.left() - pane.left(), if block { 10.0 } else { 2.0 });
-                        assert_eq!(pane.right() - content.right(), 12.0);
+                        assert_eq!(pane.right() - content.right(), 10.0);
                         let mut terminal = TerminalState::new(cols, rows);
                         terminal.on_resize(cols, rows);
                         assert_eq!(terminal.grid.row_len(), cols);
@@ -12130,7 +12130,7 @@ mod transcript_canvas_tests {
                             .cells(),
                         cells.as_slice(),
                     );
-                    assert_eq!(footer.unwrap().height(), 44.0);
+                    assert_eq!(footer.unwrap().height(), 42.0);
                     // Readline redraws the same prompt with CUP + erase-to-end.
                     // ED2 is different: it archives visible native content.
                     terminal.process_input(b"\x1b[H\x1b[J$ ");

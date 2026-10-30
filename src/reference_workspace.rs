@@ -1078,14 +1078,23 @@ impl TerminalApp {
             .resizable(false)
             .show_separator_line(false)
             .frame(egui::Frame::NONE.inner_margin(egui::Margin {
-                left: 12,
-                right: 8,
+                left: 10,
+                right: 6,
                 top: 6,
                 bottom: 6,
             }))
             .show_bounded(root, |ui| {
                 chrome_style(ui, scale);
                 for (key, hint) in conversation::RAIL_NAVIGATION {
+                    let hint = if key == "workspace" {
+                        if self.sidebar.visible {
+                            "Hide left sidebar"
+                        } else {
+                            "Show left sidebar"
+                        }
+                    } else {
+                        hint
+                    };
                     let kind = if key == "workspace" {
                         Icon::Grid
                     } else {
@@ -1100,7 +1109,7 @@ impl TerminalApp {
                     let response = ui.add_sized(
                         [size, size],
                         egui::Button::new("")
-                            .fill(if key == "workspace" {
+                            .fill(if key == "workspace" && self.sidebar.visible {
                                 shell::rgba(shell::token::ACCENT_TOP)
                             } else {
                                 Color32::TRANSPARENT
@@ -1118,7 +1127,12 @@ impl TerminalApp {
                         shell::rgba(shell::token::TEXT),
                     );
                     if response.on_hover_text(hint).clicked() {
-                        if key == "search" {
+                        if key == "workspace" {
+                            self.dispatch_command(
+                                ui.ctx(),
+                                crate::keybindings::Command::SidebarToggle,
+                            );
+                        } else if key == "search" {
                             self.command_palette.open();
                         } else {
                             self.reference_request_sidebar_view(view, ui.ctx());

@@ -2,25 +2,25 @@
 //! Original shared core profile and Anvil/Forge are unchanged.
 #![allow(dead_code)]
 
-pub const TOPBAR_HEIGHT: f32 = 42.0;
-pub const MAIN_TOP: f32 = 46.0;
+pub const TOPBAR_HEIGHT: f32 = 40.0;
+pub const MAIN_TOP: f32 = 44.0;
 pub const OUTER_LEFT: f32 = 4.0;
 pub const OUTER_RIGHT: f32 = 4.0;
-pub const RAIL_WIDTH: f32 = 48.0;
+pub const RAIL_WIDTH: f32 = 44.0;
 pub const NAVIGATION_WIDTH: f32 = 216.0;
 pub const LEFT_GAP: f32 = 6.0;
 pub const INSPECTOR_WIDTH: f32 = 288.0;
 pub const INSPECTOR_GAP: f32 = 6.0;
 pub const MAIN_BOTTOM_GAP: f32 = 6.0;
 pub const NAVIGATION_BOTTOM_GAP: f32 = 6.0;
-pub const HEADER_HEIGHT: f32 = 38.0;
+pub const HEADER_HEIGHT: f32 = 36.0;
 pub const TERMINAL_INSET_LEFT: f32 = 8.0;
 pub const TERMINAL_INSET_RIGHT: f32 = 8.0;
 pub const TERMINAL_TOP_GAP: f32 = 6.0;
 pub const TERMINAL_FOOTER_GAP: f32 = 6.0;
 pub const TOOLBAR_INSET_LEFT: f32 = 0.0;
 pub const TOOLBAR_INSET_RIGHT: f32 = 0.0;
-pub const TOOLBAR_HEIGHT: f32 = 44.0;
+pub const TOOLBAR_HEIGHT: f32 = 42.0;
 pub const TOOL_BUTTON_HEIGHT: f32 = 32.0;
 pub const TOOL_GAP: f32 = 6.0;
 pub const PANEL_RADIUS: f32 = 8.0;
@@ -29,7 +29,7 @@ pub const BORDER_WIDTH: f32 = 1.0;
 
 pub const INSPECTOR_DRAWER_BREAKPOINT: f32 = 1180.0;
 pub const SHORT_HEIGHT: f32 = 760.0;
-pub const SHORT_HEADER_HEIGHT: f32 = 38.0;
+pub const SHORT_HEADER_HEIGHT: f32 = 36.0;
 pub const SHORT_BOTTOM_GAP: f32 = 6.0;
 
 pub const TOP: [u8; 4] = [27, 45, 91, 190];

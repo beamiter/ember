@@ -813,8 +813,8 @@ impl TerminalRenderer {
         };
         use crate::glass_shell::{self as shell};
         shell::paint_panel(ui.painter(), rect, shell::token::COMPOSER);
-        let control_height = (self.reference_tools_height - 12.0).max(shell::CONTROL_HEIGHT);
-        if rect.height() < control_height + 12.0 {
+        let control_height = (self.reference_tools_height - 10.0).max(shell::CONTROL_HEIGHT);
+        if rect.height() < control_height + 10.0 {
             return;
         }
         let y = rect.bottom() - shell::COMPOSER_CONTROL_BOTTOM - control_height;
@@ -923,12 +923,12 @@ impl TerminalRenderer {
                         - crate::glass_shell::COMPOSER_SEND_WIDTH,
                     footer.bottom()
                         - crate::glass_shell::COMPOSER_CONTROL_BOTTOM
-                        - (self.reference_tools_height - 12.0)
+                        - (self.reference_tools_height - 10.0)
                             .max(crate::glass_shell::CONTROL_HEIGHT),
                 ),
                 egui::vec2(
                     crate::glass_shell::COMPOSER_SEND_WIDTH,
-                    (self.reference_tools_height - 12.0).max(crate::glass_shell::CONTROL_HEIGHT),
+                    (self.reference_tools_height - 10.0).max(crate::glass_shell::CONTROL_HEIGHT),
                 ),
             );
             Some((
@@ -953,7 +953,7 @@ impl TerminalRenderer {
             let chrome = crate::glass_shell::COMPOSER_CONTROL_RIGHT;
             let width = crate::glass_shell::COMPOSER_SEND_WIDTH;
             let height =
-                (self.reference_tools_height - 12.0).max(crate::glass_shell::CONTROL_HEIGHT);
+                (self.reference_tools_height - 10.0).max(crate::glass_shell::CONTROL_HEIGHT);
             let bottom = crate::glass_shell::COMPOSER_CONTROL_BOTTOM;
             Some((ChatInputAction::Interrupt { sequence:record.sequence },egui::Rect::from_min_size(egui::pos2(footer.right()-chrome-width,footer.bottom()-bottom-height),egui::vec2(width,height)),"Stop","Send Ctrl+C to the current foreground command. Native ownership and IME guards are revalidated before writing."))
         } else if surface == jterm_core::chat_mode::ChatSurface::Running {
@@ -1278,10 +1278,10 @@ mod tests {
                 }
             }
             let mut renderer = renderer();
-            renderer.reference_tools_height = height + 12.0;
+            renderer.reference_tools_height = height + 10.0;
             renderer.foreground_footer_rect = Some(egui::Rect::from_min_size(
                 egui::pos2(20.0, 20.0),
-                egui::vec2(300.0, height + 11.0),
+                egui::vec2(300.0, height + 9.0),
             ));
             let terminal = TerminalState::new(80, 24);
             let output = ctx.run_ui(Default::default(), |ui| {
