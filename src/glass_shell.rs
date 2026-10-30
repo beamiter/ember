@@ -1015,7 +1015,7 @@ mod tests {
                 l.center.x,
                 l.inspector.unwrap().x
             ),
-            (0.0, 48.0, 270.0, 1324.0)
+            (0.0, 48.0, 266.0, 1324.0)
         );
         assert_eq!(
             (
@@ -1024,10 +1024,10 @@ mod tests {
                 l.composer.width,
                 l.composer.height
             ),
-            (298.0, 930.0, 992.0, 36.0)
+            (294.0, 930.0, 1000.0, 36.0)
         );
         let hidden = l.without_inspector();
-        assert_eq!(hidden.center.width - l.center.width, 294.0);
+        assert_eq!(hidden.center.width - l.center.width, 290.0);
         assert_eq!(hidden.composer.y, l.composer.y);
         assert!(Layout::for_size(800.0, 640.0).inspector.is_none());
     }
