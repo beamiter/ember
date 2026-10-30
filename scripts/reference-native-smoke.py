@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--fixture-ui", action="store_true")
     parser.add_argument("--details", action="store_true")
     parser.add_argument("--stream", action="store_true")
+    parser.add_argument("--dock-transitions", action="store_true")
     args = parser.parse_args()
     if args.stream and args.fixture_ui:
         parser.error("Streaming proof requires the production native canvas, without visual fixture overlay")
@@ -188,6 +189,43 @@ ascii_organism_enabled = true
                                 "physical_size":[round(width*args.scale),round(height*args.scale)],
                                 "dpr":float(state[3]), "capture":str(image), "detail":detail,
                                 "app_pid":app.pid, "rich_fixture_ui":args.fixture_ui})
+            if args.dock_transitions:
+                if args.scale != 1.0 or args.fixture_ui:
+                    raise RuntimeError("Dock transitions require unscaled production glass UI")
+                spec = importlib.util.spec_from_file_location("glass_dock", repo / "scripts/native_glass_profile.py")
+                glass = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(glass)
+                # A long, unsubmitted real readline command must survive mode
+                # switches and width reflow byte-for-byte, then execute once.
+                payload = "DOCK_" + "abcdefghij" * 60
+                dock_sentinel = args.out / mode / "dock-pty.txt"
+                command = "printf '%s' " + shlex.quote(payload) + " > " + shlex.quote(str(dock_sentinel))
+                run(["xdotool", "type", "--clearmodifiers", "--delay", "1", command])
+                for index, (width, height, target) in enumerate([
+                    (700,640,"chat"), (1500,850,"chat"),
+                    (800,640,"block"), (1356,704,"chat"), (1356,704,mode),
+                ]):
+                    run(["xdotool","windowsize","--sync",window,str(width),str(height)])
+                    time.sleep(0.3)
+                    slot = glass.mode_slot(dict(x=0,y=0,width=width,height=height), target)
+                    run(["xdotool","mousemove","--window",window,
+                         str(slot['x']+slot['width']//2),str(slot['y']+slot['height']//2),"click","1"])
+                    time.sleep(0.4)
+                    image = args.out / f"ember-{mode}-dock-{index}.png"
+                    run(["import","-window",window,str(image)])
+                    from PIL import Image
+                    with Image.open(image) as pixels:
+                        glass.header_paint(pixels, dict(x=0,y=0,width=width,height=height), target)
+                    assert run(["xdotool","getwindowfocus"],capture_output=True,text=True).stdout.strip() == window
+                    assert not dock_sentinel.exists(), "Layout must not submit input"
+                # Native footer click restores terminal focus after chrome controls.
+                run(["xdotool","mousemove","--window",window,"650","565","click","1"])
+                run(["xdotool","key","End","Return"])
+                wait_for(dock_sentinel.exists, "long command after dock transitions")
+                assert dock_sentinel.read_text() == payload, "PTY input changed during layout transitions"
+                results.append({**provenance, "requested_mode":mode,
+                                "dock_transition_pty_exact":True,
+                                "scope":"X11/Glow input and mode/resize smoke, not IME or WGPU acceptance"})
             if args.stream:
                 # Exercise the real retained terminal, not the visual fixture's ScrollArea.
                 stream_file = args.out / mode / "stream-state.txt"
