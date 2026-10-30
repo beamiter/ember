@@ -18,3 +18,15 @@ Ember adopts this bounded native-key hook for its Linux X11 and Wayland targets.
 Dependency/source/license policy and RustSec checks pass. Both the patched lockfile and the pre-vendor registry lockfile were audited so the path override cannot hide eframe's upstream advisory identity. No advisory exceptions were added; the existing ttf-parser unmaintained-notice exception is unchanged.
 
 Future eframe updates must rebase or remove this documented small patch. Vendoring introduces a maintenance obligation despite the small functional delta. Preserve the checksum, both licenses, integrity manifest, and paired-renderer regression gates during upgrades.
+
+## Eva native presentation boundary addition
+
+`App::on_native_frame_presented(viewport, pass)` is default no-op and native-only.
+Glow calls it after a successful `swap_buffers`; WGPU calls it only when the
+vendored egui-wgpu Painter confirms an actual `Queue::present` for this viewport.
+Skipped/error frames do not acknowledge retirement. Ember uses this to prove a
+cleared buffer reached the native submission boundary, not compositor scanout.
+The original native-key hook and web path are unchanged. Integrity hashes were
+updated for these scoped changes. Full Linux Ember cargo check passed for both
+compiled renderer paths; prior keyboard runtime results above are historical,
+not new Eva migration/physical visibility evidence.

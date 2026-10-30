@@ -1,0 +1,62 @@
+    Checking serde v1.0.229
+    Checking crossbeam-utils v0.8.22
+   Compiling zvariant_utils v4.2.0
+    Checking concurrent-queue v2.5.0
+   Compiling enumflags2 v0.7.12
+   Compiling zcheapstr v1.1.0
+    Checking async-io v2.6.0
+    Checking async-channel v2.5.0
+    Checking async-signal v0.2.14
+    Checking async-process v2.5.0
+    Checking blocking v1.7.0
+    Checking async-executor v1.14.0
+   Compiling crossbeam-epoch v0.9.20
+   Compiling crossbeam-deque v0.8.7
+    Checking companion-protocol v0.1.0 (<workspace>/jcompanion/crates/companion-protocol)
+   Compiling rayon-core v1.13.0
+   Compiling alloca v0.4.0
+    Checking ciborium-io v0.2.2
+    Checking plotters-backend v0.3.7
+    Checking clap_lex v1.1.0
+    Checking serde_norway v0.9.42
+    Checking clap_builder v4.6.6
+   Compiling zvariant_derive v5.15.0
+   Compiling zvariant v5.15.0
+    Checking zbus_names v4.3.4
+   Compiling zbus_xml v5.2.1
+   Compiling zbus_macros v5.19.0
+   Compiling zbus-lockstep v0.5.2
+   Compiling zbus-lockstep-macros v0.5.2
+    Checking plotters-svg v0.3.7
+    Checking ciborium-ll v0.2.2
+    Checking companion-core v0.1.0 (<workspace>/jcompanion/crates/companion-core)
+    Checking companion-client v0.1.0 (<workspace>/jcompanion/crates/companion-client)
+    Checking jagent v0.7.0 (https://github.com/beamiter/jagent.git?rev=f269c3c6afafcf9b6d60b3cccd741649fdb74576#f269c3c6)
+    Checking itertools v0.13.0
+    Checking crossbeam-channel v0.5.17
+    Checking cast v0.3.0
+    Checking same-file v1.0.6
+    Checking walkdir v2.5.0
+    Checking jterm_core v0.2.0 (<workspace>/jterm_core)
+    Checking zbus v5.19.0
+    Checking atspi-common v0.13.0
+    Checking mundy v0.2.3
+    Checking criterion-plot v0.8.2
+    Checking rayon v1.12.0
+    Checking ciborium v0.2.2
+    Checking plotters v0.3.7
+    Checking atspi-proxies v0.13.0
+    Checking accesskit_atspi_common v0.18.1
+    Checking clap v4.6.6
+    Checking tinytemplate v1.2.1
+    Checking page_size v0.6.0
+    Checking oorandom v11.1.5
+    Checking anes v0.1.6
+    Checking criterion v0.8.2
+    Checking atspi v0.29.0
+    Checking accesskit_unix v0.21.1
+    Checking accesskit_winit v0.32.2
+    Checking egui-winit v0.36.1 (<workspace>/ember/vendor/egui-winit)
+    Checking eframe v0.36.1 (<workspace>/ember/vendor/eframe)
+    Checking ember v0.4.0 (<workspace>/ember)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 54s

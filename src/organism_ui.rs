@@ -1100,6 +1100,7 @@ impl SystemMotion {
 }
 
 pub struct OrganismHost {
+    pub(crate) eva: crate::eva_companion::EvaHost,
     system_motion: SystemMotion,
 
     agent_pulses: AgentPulseTracker,
@@ -1154,6 +1155,7 @@ impl Default for OrganismHost {
             .map(|path| CompanionVoice::seed_for_key(&path.to_string_lossy()))
             .unwrap_or_else(|| CompanionVoice::seed_for_key("ember-companion"));
         Self {
+            eva: crate::eva_companion::EvaHost::default(),
             system_motion: SystemMotion::default(),
             agent_pulses: Default::default(),
             born: Instant::now(),
@@ -2665,6 +2667,29 @@ impl crate::TerminalApp {
         )>,
         frame_interactive: bool,
     ) {
+        if self.organism.eva.enabled() {
+            let host_id=self.organism.eva.host_id(ui.ctx());
+            let interactive = frame_interactive && !self.terminal_input_blocked(ui.ctx()) && !self.active_terminal_is_read_only();
+            let local = self.session_manager.sessions().get(self.session_manager.active_index()).is_some_and(|session| {
+                session.purpose == crate::session::SessionPurpose::Interactive
+                    && matches!(crate::ssh_files_follow::observe_session(session), crate::ssh_files_follow::Observation::None)
+                    && !matches!(crate::session_manager::get_foreground_command(session.get_shell_pid()).as_deref(),Some("ssh"|"mosh"|"telnet"))
+            });
+            if local {
+                if let Some(session)=self.session_manager.sessions().get(self.session_manager.active_index()) {
+                    if let Some(terminal)=session.terminal.try_lock() {
+                        if let Some(record)=terminal.command_records().back().filter(|r|r.start_mark_seen) {
+                            use jterm_core::companion_host::TaskStatus;
+                            let status=if record.complete {match record.exit_code {Some(0)=>TaskStatus::Succeeded,Some(_)=>TaskStatus::Failed,None=>TaskStatus::Unknown}} else if record.state==crate::terminal::CommandState::Running {TaskStatus::Running} else {TaskStatus::Unknown};
+                            // Opaque GUI/task sequence only; no command, cwd or output leaves the host.
+                            self.organism.eva.observe_task(ui.ctx(),jterm_core::companion_host::host_scoped_task_id(&host_id,&session.metadata.session_id,record.sequence),record.sequence.max(1),status);
+                        }
+                    }
+                }
+            }
+            self.organism.eva.draw(ui, if local {surface.map(|(session, block, _, rect)| (session,block,rect))}else{None}, interactive);
+            return;
+        }
         // Pane focus may have changed during this same terminal frame.
         self.prepare_organism(ui.ctx());
         let interactive = frame_interactive
@@ -2721,6 +2746,27 @@ impl crate::TerminalApp {
     }
 
     pub(crate) fn render_organism(&mut self, ui: &mut Ui) {
+        self.organism.eva.configure(self.config.eva_companion_enabled);
+        if self.organism.eva.enabled() {
+            self.organism.system_motion.connect(ui.ctx());
+            self.organism.eva.reduced_motion(self.organism.system_motion.reduced());
+            let host_id=self.organism.eva.host_id(ui.ctx());
+            if let Some(session)=self.session_manager.sessions().get(self.session_manager.active_index()) {
+                let task=session.terminal.try_lock().and_then(|t|t.command_records().back().filter(|r|r.start_mark_seen).map(|r|(jterm_core::companion_host::host_scoped_task_id(&host_id,&session.metadata.session_id,r.sequence),r.sequence.max(1))));
+                self.organism.eva.observe_context(ui.ctx(),session.metadata.session_id.clone(),task.as_ref().map(|(id,_)|id.clone()),task.map(|(_,rev)|rev).unwrap_or(1));
+            }
+            self.organism.eva.root(ui,self.vim9_editors.is_empty());
+            if self.organism.eva.take_capture_request(){
+                let selected=self.session_manager.sessions().get(self.session_manager.active_index()).and_then(|session|{
+                    let local=session.purpose==crate::session::SessionPurpose::Interactive
+                        && matches!(crate::ssh_files_follow::observe_session(session),crate::ssh_files_follow::Observation::None)
+                        && !matches!(crate::session_manager::get_foreground_command(session.get_shell_pid()).as_deref(),Some("ssh"|"mosh"|"telnet"));
+                    if local {session.terminal.try_lock().and_then(|t|t.copy_selection())}else{None}
+                });
+                self.organism.eva.captured_selection(selected);
+            }
+            return;
+        }
         // Resize events wake the host naturally. Use the actual remaining root
         // layout intersected with its clip, including vertically exhausted UI.
         // Before this layout is observed, input admission still uses the last
@@ -3080,6 +3126,10 @@ impl PreviewUi {
     }
 
     pub fn show(&mut self, ui: &mut Ui, motion: Option<OrganismMotion>) {
+        if jterm_core::companion_host::shared_mode_requested() || ui.ctx().data(|d|d.get_temp::<bool>(egui::Id::new("eva-shared-mode-active")).unwrap_or(false)) {
+            ui.label("Shared Eva: use the companion card for a static skin preview.");
+            return;
+        }
         let reduced = ui
             .ctx()
             .data(|data| data.get_temp::<bool>(system_motion_id()).unwrap_or(false));

@@ -1,0 +1,9 @@
+[package]
+name = "ember-eva-render-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+[workspace]
+[dependencies]
+egui = "=0.36.2"
+eva-character-atlas = { git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }

@@ -1,0 +1,7 @@
+    Checking companion-protocol v0.1.0 (<workspace>/jcompanion/crates/companion-protocol)
+    Checking eva-character-atlas v0.1.0 (<workspace>/jcompanion/crates/eva-character-atlas)
+    Checking companion-core v0.1.0 (<workspace>/jcompanion/crates/companion-core)
+    Checking companion-client v0.1.0 (<workspace>/jcompanion/crates/companion-client)
+    Checking jterm_core v0.2.0 (<workspace>/jterm_core)
+    Checking ember v0.4.0 (<workspace>/ember)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 02s

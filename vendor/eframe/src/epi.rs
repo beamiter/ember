@@ -279,6 +279,11 @@ pub trait App {
     /// This function does not return a value. Any changes to the input should be made directly to `_raw_input`.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {}
 
+    /// Successful native buffer submission boundary. Not compositor scanout proof.
+    /// Never called for hidden/skipped/failed presentation.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn on_native_frame_presented(&mut self, _viewport: egui::ViewportId, _pass: u64) {}
+
     /// Observe native keyboard identity before egui merges physical locations.
     ///
     /// Return true to consume this key event before egui conversion. The default

@@ -34,7 +34,7 @@
     },
     "src/epi.rs": {
       "upstream_sha256": "32e1f847a7a8871b09209caece45de79614d2149d629d62c6540f4992681ac0f",
-      "local_sha256": "4e58128c97fba2619f705a532071c771afec3ebdbc9db18dc15d3794c5b8a123"
+      "local_sha256": "117538b18d2732c7cd75025f4f1187a785504cc21b3c5e3cce14a28ab98c6cf2"
     },
     "src/icon_data.rs": {
       "upstream_sha256": "73f4e8c114c45e5da3906446a3018caad6bdf2fbc2a02b823f6df135eaf1f8e9",
@@ -62,7 +62,7 @@
     },
     "src/native/glow_integration.rs": {
       "upstream_sha256": "779dd92da38cf0e7702765348b4eacd3d42d6664c9280dfdb58190984371bc28",
-      "local_sha256": "3c933c97bf4072e4dc2bac757e715cc1698eacb8c9636bb27b7a1e524bd8d487"
+      "local_sha256": "0dc0b32b0cd766c6b320266b8f6fa9c1016df8aac0b137165dce1dd697abc250"
     },
     "src/native/macos.rs": {
       "upstream_sha256": "c8b100d27402d152e4a1bdfd235f73328ec9b99b9c67155707de9a4c5bf451cc",
@@ -78,7 +78,7 @@
     },
     "src/native/wgpu_integration.rs": {
       "upstream_sha256": "e4b1f49d2c6be50847627e8b4dccfe34b32e22fc75e13f41669a6924babec719",
-      "local_sha256": "a117dbcf1f58a15eaf33988881b2cf1b3c24f78f5cb8a13eadb8598af873a5ba"
+      "local_sha256": "b123d3ce0656eb5da14b9e6c4c2a2a14fb2701fb7ae703108726fd4476a4557e"
     },
     "src/native/winit_integration.rs": {
       "upstream_sha256": "8b789a850fdc5c420d1491d5cb951610d356639fbb4cf4003a64c081a78cf763",

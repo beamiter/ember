@@ -1,0 +1,25 @@
+    Checking companion-protocol v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+    Checking eva-character-atlas v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+    Checking companion-core v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+    Checking companion-client v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+    Checking jterm_core v0.2.0 (https://github.com/beamiter/jterm_core.git?rev=974ccad203375032fe87706caecab39ad516c238#974ccad2)
+    Checking ember v0.4.0 (<workspace>/ember)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 07s
+   Compiling eva-character-atlas v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+   Compiling ember-eva-render-harness v0.1.0 (<workspace>/ember/tools/eva-render-harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.71s
+     Running unittests src/lib.rs (eva-workspace/ember/tools/eva-render-harness/target/debug/deps/ember_eva_render_harness-f14f8798439831a9)
+
+running 4 tests
+test eva_glyphs::tests::input_ime_approval_and_selection_remove_region ... ok
+test eva_glyphs::tests::hidden_static_and_reduced_motion_have_no_animation_wake ... ok
+test eva_glyphs::tests::too_small_native_surface_does_not_paint ... ok
+test eva_glyphs::tests::actual_egui_glyphs_all_skins_and_poses_keep_bounds_colors_and_document_height ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.31s
+
+   Doc-tests ember_eva_render_harness
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

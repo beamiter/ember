@@ -818,6 +818,10 @@ impl WgpuWinitRunning<'_> {
                 window,
             );
 
+            if painter.last_presented_viewport() == Some(viewport_id) {
+                app.on_native_frame_presented(viewport_id, egui_ctx.cumulative_pass_nr());
+            }
+
             for action in viewport.actions_requested.drain(..) {
                 match action {
                     ActionRequested::Screenshot { .. } => {

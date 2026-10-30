@@ -2593,7 +2593,7 @@ impl TerminalApp {
         let workspace_drag_active = self.tab_drag_is_active(ctx) || self.pane_drag.is_some();
         let terminal_interaction_enabled = interaction_enabled && !workspace_drag_active;
         // Static is the same companion at rest, not a separate status mascot.
-        let companion_enabled = self.config.ascii_organism_enabled
+        let companion_enabled = (self.config.ascii_organism_enabled || self.organism.eva.enabled())
             && self.config.command_cards_enabled()
             && !jterm_core::reference_conversation::fixture_enabled();
         self.renderer.companion_enabled = companion_enabled;

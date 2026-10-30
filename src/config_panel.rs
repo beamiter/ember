@@ -140,6 +140,7 @@ pub struct ConfigPanel {
     edit_show_repo_strip: bool,
     edit_bottom_bar: bool,
     edit_organism_enabled: bool,
+    edit_eva_companion_enabled: bool,
     edit_organism_expanded: bool,
     edit_organism_motion: Option<OrganismMotion>,
     organism_preview: crate::organism_ui::PreviewUi,
@@ -220,6 +221,7 @@ impl ConfigPanel {
             edit_show_repo_strip: true,
             edit_bottom_bar: jterm_core::bottom_bar::ENABLED_BY_DEFAULT,
             edit_organism_enabled: false,
+            edit_eva_companion_enabled: false,
             edit_organism_expanded: false,
             edit_organism_motion: None,
             organism_preview: crate::organism_ui::PreviewUi::default(),
@@ -349,6 +351,7 @@ impl ConfigPanel {
         self.edit_show_repo_strip = config.show_repo_strip;
         self.edit_bottom_bar = config.bottom_bar;
         self.edit_organism_enabled = config.ascii_organism_enabled;
+        self.edit_eva_companion_enabled = config.eva_companion_enabled;
         self.edit_organism_expanded = config.ascii_organism_expanded;
         self.edit_organism_motion = config.ascii_organism_motion;
         self.edit_block_mode = config.block_mode;
@@ -420,6 +423,7 @@ impl ConfigPanel {
         config.show_repo_strip = self.edit_show_repo_strip;
         config.bottom_bar = self.edit_bottom_bar;
         config.ascii_organism_enabled = self.edit_organism_enabled;
+        config.eva_companion_enabled = self.edit_eva_companion_enabled;
         config.ascii_organism_expanded = self.edit_organism_expanded;
         config.ascii_organism_motion = self.edit_organism_motion;
         config.block_mode = self.edit_block_mode;
@@ -771,6 +775,8 @@ impl ConfigPanel {
         ui.label(RichText::new("Appearance Settings").strong().size(14.0));
         ui.separator();
 
+        if ui.checkbox(&mut self.edit_eva_companion_enabled, "Shared Eva companion (save and restart)").changed() { self.has_changes = true; }
+        ui.small("Shared mode replaces the local organism. Requires jcompaniond; disconnected bodies stay hidden. Disable old organism windows before enabling shared mode. Skin and motion are saved in the companion card by the coordinator.");
         let mut organism_changed = ui
             .checkbox(&mut self.edit_organism_enabled, "ASCII Organism")
             .changed();
@@ -816,7 +822,7 @@ impl ConfigPanel {
                 self.edit_organism_expanded,
             ));
         }
-        self.organism_preview.show(ui, self.edit_organism_motion);
+        if !self.edit_eva_companion_enabled { self.organism_preview.show(ui, self.edit_organism_motion); } else { ui.label("Eva skin previews are static in the companion card."); }
         ui.separator();
 
         // Theme selector

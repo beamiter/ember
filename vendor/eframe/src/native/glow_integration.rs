@@ -850,6 +850,7 @@ impl GlowWinitRunning<'_> {
                 })?;
 
                 gl_surface.swap_buffers(context)?;
+                app.on_native_frame_presented(viewport_id, integration.egui_ctx.cumulative_pass_nr());
                 frame_timer.resume();
             }
 
