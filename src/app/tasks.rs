@@ -1590,7 +1590,7 @@ fn native_follow_up_can_send(text: &str, completed_turns: usize) -> bool {
 }
 
 impl TerminalApp {
-    fn open_task_composer(&mut self) {
+    pub(crate) fn open_task_composer(&mut self) {
         let draft = &mut self.task_sidebar.composer;
         if draft.project.is_empty() {
             draft.project = self

@@ -45,6 +45,16 @@ fn state_icon(ui: &egui::Ui, rect: egui::Rect, state: model::StepState) {
         model::StepState::Complete => (Icon::Check, Color32::from_rgb(79, 162, 128)),
         model::StepState::Running => (Icon::Agent, rgb(color::ACCENT)),
         model::StepState::Queued => (Icon::History, rgb(color::CANVAS_MUTED)),
+        model::StepState::Attention => {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "!",
+                egui::FontId::proportional(rect.height()),
+                Color32::from_rgb(231, 155, 86),
+            );
+            return;
+        }
     };
     icon(ui, rect, kind, tint);
 }
@@ -603,7 +613,12 @@ pub(crate) fn draw_inspector(
                 if inspector.total == 0 {
                     "No progress".into()
                 } else {
-                    format!("{} / {} steps", inspector.completed, inspector.total)
+                    format!(
+                        "{} / {} {}",
+                        inspector.completed,
+                        inspector.total,
+                        if fixture { "steps" } else { "tasks" }
+                    )
                 },
                 egui::FontId::proportional(12.0 * scale),
                 shell::rgba(shell::token::MUTED_TEXT),
@@ -637,9 +652,13 @@ pub(crate) fn draw_inspector(
             }
             ui.add_space(22.0);
             ui.label(
-                RichText::new("CURRENT STEP")
-                    .size(12.0 * scale)
-                    .color(shell::rgba(shell::token::MUTED_TEXT)),
+                RichText::new(if fixture {
+                    "CURRENT STEP"
+                } else {
+                    "NEXT ACTION"
+                })
+                .size(12.0 * scale)
+                .color(shell::rgba(shell::token::MUTED_TEXT)),
             );
             ui.add_space(6.0);
             egui::Frame::NONE
@@ -671,16 +690,20 @@ pub(crate) fn draw_inspector(
                 });
             ui.add_space(25.0);
             ui.label(
-                RichText::new("TASK QUEUE")
+                RichText::new(if fixture { "TASK QUEUE" } else { "OTHER TASKS" })
                     .size(12.0 * scale)
                     .color(shell::rgba(shell::token::MUTED_TEXT)),
             );
             ui.add_space(8.0);
             if inspector.queue.is_empty() {
                 ui.label(
-                    RichText::new("No queued tasks")
-                        .size(14.0 * scale)
-                        .color(shell::rgba(shell::token::MUTED_TEXT)),
+                    RichText::new(if fixture {
+                        "No queued tasks"
+                    } else {
+                        "No other tasks"
+                    })
+                    .size(14.0 * scale)
+                    .color(shell::rgba(shell::token::MUTED_TEXT)),
                 );
             }
             for step in &inspector.queue {
@@ -823,6 +846,38 @@ mod reference_font_tests {
             }
             _ => {}
         }
+    }
+
+    #[test]
+    fn live_inspector_labels_real_tasks_and_attention_without_step_claims() {
+        let ctx = egui::Context::default();
+        let mut inspector = model::Inspector::empty();
+        inspector.completed = 1;
+        inspector.total = 2;
+        inspector.current_step = Some(model::Step {
+            title: "Review failed validation".into(),
+            detail: "Inspect the recorded exit and diff".into(),
+            state: model::StepState::Attention,
+            elapsed: None,
+        });
+        inspector
+            .queue
+            .push(inspector.current_step.clone().unwrap());
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            crate::reference_workspace::chrome_style(ui, 1.0);
+            ui.set_width(277.0);
+            draw_inspector(ui, &inspector, false, 1.0);
+        });
+        let mut roles = Vec::new();
+        for shape in &output.shapes {
+            text_roles(&shape.shape, &mut roles);
+        }
+        output.textures_delta.clear();
+        let has = |needle: &str| roles.iter().any(|(text, _, _)| text == needle);
+        assert!(has("1 / 2 tasks"));
+        assert!(has("NEXT ACTION"));
+        assert!(has("!"));
+        assert!(!has("1 / 2 steps"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! 快捷键帮助面板模块
 
 use crate::theme::ThemeExt as _;
+
 use egui::{Color32, RichText, Window};
 
 use crate::command_palette::{CommandCategory, CommandPalette};
@@ -35,10 +36,8 @@ impl HelpPanel {
             return;
         }
 
-        let text_color = Theme::rgb_to_color32(theme.ui.text);
-        let dim_color = Theme::rgb_to_color32(theme.ui.text_disabled);
-        let panel_bg = Theme::rgb_to_color32(theme.ui.panel_bg);
-        let border = Theme::rgb_to_color32(theme.ui.border);
+        let text_color = crate::glass_shell::rgba(crate::glass_shell::token::TEXT);
+        let dim_color = crate::glass_shell::rgba(crate::glass_shell::token::MUTED_TEXT);
         let palette_binding = keybindings
             .pretty_bindings_for(&Command::CommandPaletteToggle.to_string())
             .join(" / ");
@@ -60,13 +59,7 @@ impl HelpPanel {
             .default_size([680.0, 520.0])
             .resizable(true)
             .vscroll(true)
-            .frame(egui::Frame {
-                fill: panel_bg,
-                stroke: egui::Stroke::new(1.0, border),
-                corner_radius: egui::CornerRadius::same(10),
-                inner_margin: egui::Margin::same(12),
-                ..Default::default()
-            })
+            .frame(crate::theme::workspace_frame(12))
             .show(ctx, |ui| {
                 ui.heading(RichText::new("Ember keyboard shortcuts").size(18.0).color(text_color));
                 ui.label(

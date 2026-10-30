@@ -15,6 +15,12 @@
 # ascii_organism_enabled = false
 # terminal_mode = "block"
 
+# Drag the navigation/inspector edge grips to resize; double-click resets the
+# adaptive default. Widths use logical points and are saved when a drag ends.
+# sidebar_width = 312.0   # 180..480; omitted keeps responsive 220/232/252 defaults
+# inspector_width = 390.0 # 260..520; compact windows preserve this preference
+
+
 # Vim uses the native GUI buffer by default. Extra workbench panels are opt-in.
 # These settings apply only to explicitly opened Vim editors, not shell tabs.
 # [vim9]

@@ -3097,6 +3097,7 @@ impl PreviewUi {
         ui.label("Organism Preview");
         ui.label("Pose");
         egui::ComboBox::from_id_salt("organism_preview_pose")
+            .popup_style(crate::theme::configure_popup_style.into())
             .selected_text(self.pose.label())
             .show_ui(ui, |ui| {
                 for pose in PreviewPose::ALL {

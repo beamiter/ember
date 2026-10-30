@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 use jterm_core::ai::AiCancellationToken;
 
 use crate::config::Config;
-use crate::theme::ThemeExt as _;
 
 /// The sources' generated-command budget (`MAX_GENERATED_COMMAND_BYTES` in
 /// `jterm_core::ai`, `MAX_AGENT_COMMAND_BYTES` in ember's review_text).
@@ -346,7 +345,7 @@ impl AiCommandSuggestion {
         &mut self,
         ctx: &egui::Context,
         config: &Config,
-        theme: &crate::theme::Theme,
+        _theme: &crate::theme::Theme,
         active_session_id: Option<&str>,
         prompt_clean_idle: bool,
     ) -> SuggestionUiOutcome {
@@ -372,16 +371,7 @@ impl AiCommandSuggestion {
             // Above the correction card's anchor: both surfaces can be up at
             // once (a failure card plus a fresh `?` request).
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -200.0))
-            .frame(egui::Frame {
-                fill: crate::theme::Theme::rgb_to_color32(theme.ui.panel_bg),
-                stroke: egui::Stroke::new(
-                    1.0,
-                    crate::theme::Theme::rgb_to_color32(theme.ui.border),
-                ),
-                corner_radius: egui::CornerRadius::same(10),
-                inner_margin: egui::Margin::same(8),
-                ..Default::default()
-            })
+            .frame(crate::theme::workspace_frame(12))
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new(format!("{cwd} · {provider} · review only"))

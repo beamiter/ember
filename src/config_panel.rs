@@ -1,7 +1,5 @@
 use crate::config::{AppRendererType, Config, OrganismMotion, TabBarPosition};
-use crate::theme::{
-    bound_custom_theme_name, validate_saved_custom_theme_name, Theme, ThemeExt as _,
-};
+use crate::theme::{bound_custom_theme_name, validate_saved_custom_theme_name, Theme};
 use egui::{Color32, RichText};
 use jterm_core::jsh_remote::RemoteHostConfig;
 
@@ -18,16 +16,16 @@ fn organism_motion_explanation(motion: Option<OrganismMotion>) -> &'static str {
     }
 }
 
-fn accent_color(theme: &Theme) -> Color32 {
-    Theme::rgb_to_color32(theme.tabbar.active_border)
+fn accent_color(_theme: &Theme) -> Color32 {
+    crate::glass_shell::rgba(crate::glass_shell::token::ACCENT_TOP)
 }
 
-fn muted_text_color(theme: &Theme) -> Color32 {
-    Theme::rgb_to_color32(theme.ui.text_disabled)
+fn muted_text_color(_theme: &Theme) -> Color32 {
+    crate::glass_shell::rgba(crate::glass_shell::token::MUTED_TEXT)
 }
 
-fn warning_color(theme: &Theme) -> Color32 {
-    Theme::rgb_to_color32(theme.terminal.ansi_colors[11])
+fn warning_color(_theme: &Theme) -> Color32 {
+    crate::theme::workspace_visuals().warn_fg_color
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,6 +316,13 @@ impl ConfigPanel {
         self.refresh_theme_list();
     }
 
+    pub(crate) fn open_ai(&mut self, config: &Config) {
+        if !self.is_open {
+            self.open(config);
+        }
+        self.active_tab = ConfigTab::Ai;
+    }
+
     pub fn sync_from_config(&mut self, config: &Config) {
         self.renew_remote_editor_epoch();
         self.has_changes = false;
@@ -499,14 +504,9 @@ impl ConfigPanel {
             .movable(true)
             .default_pos(panel_pos)
             .fixed_size([panel_width, panel_height])
-            .frame(egui::Frame {
-                fill: Theme::rgb_to_color32(theme.ui.panel_bg),
-                stroke: egui::Stroke::new(1.0, Theme::rgb_to_color32(theme.ui.border)),
-                inner_margin: egui::Margin::same(12),
-                corner_radius: egui::CornerRadius::same(4),
-                ..Default::default()
-            })
+            .frame(crate::theme::workspace_frame(12))
             .show(ctx, |ui| {
+                *ui.visuals_mut() = crate::theme::workspace_visuals();
                 // 标题栏
                 ui.horizontal(|ui| {
                     ui.heading(RichText::new("Settings").size(18.0).strong());
@@ -659,7 +659,7 @@ impl ConfigPanel {
             ui.label(
                 RichText::new(&current_display)
                     .strong()
-                    .color(accent_color(theme)),
+                    .color(ui.visuals().text_color()),
             );
         });
 
@@ -777,6 +777,7 @@ impl ConfigPanel {
         ui.horizontal(|ui| {
             ui.label("Organism Motion");
             egui::ComboBox::from_id_salt("organism_motion")
+                .popup_style(crate::theme::configure_popup_style.into())
                 .selected_text(match self.edit_organism_motion {
                     None => "Automatic",
                     Some(OrganismMotion::Full) => "Full",
@@ -822,6 +823,7 @@ impl ConfigPanel {
         ui.horizontal(|ui| {
             ui.label("Theme:");
             if egui::ComboBox::from_id_salt("theme_selector")
+                .popup_style(crate::theme::configure_popup_style.into())
                 .selected_text(self.edit_theme.clone())
                 .show_ui(ui, |ui| {
                     let mut changed = false;
@@ -897,6 +899,7 @@ impl ConfigPanel {
             ui.horizontal(|ui| {
                 ui.label("Base:");
                 egui::ComboBox::from_id_salt("base_theme_for_new")
+                    .popup_style(crate::theme::configure_popup_style.into())
                     .selected_text(self.base_theme_for_new.clone())
                     .width(120.0)
                     .show_ui(ui, |ui| {
@@ -1688,6 +1691,7 @@ impl ConfigPanel {
         ui.horizontal(|ui| {
             ui.label("Terminal mode");
             egui::ComboBox::from_id_salt("terminal-mode")
+                .popup_style(crate::theme::configure_popup_style.into())
                 .selected_text(match mode {
                     crate::config::TerminalMode::Normal => "Block",
                     crate::config::TerminalMode::Block => "Block",
@@ -1942,6 +1946,7 @@ impl ConfigPanel {
                         64,
                     );
                     egui::ComboBox::from_id_salt("remote_host_deploy")
+                        .popup_style(crate::theme::configure_popup_style.into())
                         .selected_text(current_label)
                         .width(110.0)
                         .show_ui(ui, |ui| {
@@ -2074,6 +2079,19 @@ fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool 
 mod tests {
     use super::{organism_motion_explanation, ConfigPanel, RemoteHostDraft};
     use crate::config::{Config, OrganismMotion};
+
+    #[test]
+    fn inspector_ai_settings_route_preserves_an_open_draft() {
+        let config = Config::default();
+        let mut panel = ConfigPanel::new();
+        panel.is_open = true;
+        panel.edit_ai_model = "unsaved-model-draft".into();
+        panel.has_changes = true;
+        panel.open_ai(&config);
+        assert_eq!(panel.active_tab, super::ConfigTab::Ai);
+        assert_eq!(panel.edit_ai_model, "unsaved-model-draft");
+        assert!(panel.has_changes);
+    }
 
     #[test]
     fn font_group_drafts_apply_independently_and_survive_reopening() {

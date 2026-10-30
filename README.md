@@ -131,6 +131,10 @@ moving its text or covering Vim's separator/status rows.
   It browses SSH hosts and Docker containers natively (no sshfs), with
   right-click file operations that work the same locally and remotely
 - Built-in/custom themes, live configuration reload and resilient configurable bindings
+- Drag either sidebar's inner edge to resize navigation or the Agent/Context/Files
+  inspector. Widths are saved after release and restored after window resize,
+  hiding/showing panels, and restart. Double-click a grip to restore its adaptive
+  default; the terminal keeps a protected minimum reading width.
 - Bounded PTY channels, parser-work adaptive budgets, viewport-only historical
   reflow and dirty-row GPU uploads
 - Crash-safe atomic state writes, bounded session restore, corrupt-snapshot

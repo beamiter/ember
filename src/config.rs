@@ -258,6 +258,14 @@ pub struct Config {
     #[serde(default = "default_scrollback_lines")]
     pub scrollback_lines: usize,
 
+    /// User-resized navigation width in logical points. Missing keeps adaptive defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<f32>,
+
+    /// User-resized Agent / Context / Files inspector width in logical points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspector_width: Option<f32>,
+
     #[serde(default = "default_initial_width")]
     pub initial_width: f32,
 
@@ -689,6 +697,8 @@ impl Default for Config {
             line_spacing: default_line_spacing(),
             scrollbar_visibility: ScrollbarVisibility::default(),
             scrollback_lines: default_scrollback_lines(),
+            sidebar_width: None,
+            inspector_width: None,
             initial_width: default_initial_width(),
             initial_height: default_initial_height(),
             cols: default_cols(),
@@ -1013,6 +1023,30 @@ impl Config {
         normalize_f32!(font_sharpness, 0.5, 2.0, default_font_sharpness());
         normalize_f32!(padding, 0.0, 20.0, default_padding());
         normalize_f32!(line_spacing, 0.8, 3.0, default_line_spacing());
+        for (name, preference, minimum, maximum) in [
+            (
+                "sidebar_width",
+                &mut self.sidebar_width,
+                crate::glass_shell::NAVIGATION_MIN_WIDTH,
+                crate::glass_shell::NAVIGATION_MAX_WIDTH,
+            ),
+            (
+                "inspector_width",
+                &mut self.inspector_width,
+                crate::glass_shell::INSPECTOR_MIN_WIDTH,
+                crate::glass_shell::INSPECTOR_MAX_WIDTH,
+            ),
+        ] {
+            if let Some(value) = *preference {
+                let normalized = value.is_finite().then(|| value.clamp(minimum, maximum));
+                if normalized != Some(value) {
+                    warnings.push(format!(
+                        "{name} is outside the supported range; using {normalized:?}"
+                    ));
+                }
+                *preference = normalized;
+            }
+        }
         normalize_f32!(initial_width, 320.0, 16_384.0, default_initial_width());
         normalize_f32!(initial_height, 200.0, 16_384.0, default_initial_height());
         normalize_f32!(opacity, 0.05, 1.0, default_opacity());
@@ -1489,6 +1523,28 @@ fn valid_config_path(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_width_preferences_round_trip_and_legacy_defaults_remain_adaptive() {
+        let legacy: Config = toml::from_str("").unwrap();
+        assert_eq!((legacy.sidebar_width, legacy.inspector_width), (None, None));
+        let mut config: Config =
+            toml::from_str("sidebar_width = 312.0\ninspector_width = 390.0\n").unwrap();
+        config.normalize();
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            (restored.sidebar_width, restored.inspector_width),
+            (Some(312.0), Some(390.0))
+        );
+        config.sidebar_width = Some(f32::NAN);
+        config.inspector_width = Some(9999.0);
+        assert!(!config.normalize().is_empty());
+        assert_eq!(config.sidebar_width, None);
+        assert_eq!(
+            config.inspector_width,
+            Some(crate::glass_shell::INSPECTOR_MAX_WIDTH)
+        );
+    }
 
     #[test]
     fn font_groups_default_to_the_existing_size() {

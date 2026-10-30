@@ -12,7 +12,6 @@ use egui::{RichText, Window};
 use jterm_core::jsh_remote::RemoteHostConfig;
 
 use crate::theme::Theme;
-use crate::theme::ThemeExt as _;
 
 #[derive(Debug, Clone, Default)]
 pub struct RemotePicker {
@@ -31,7 +30,7 @@ impl RemotePicker {
         &mut self,
         ctx: &egui::Context,
         hosts: &[RemoteHostConfig],
-        theme: &Theme,
+        _theme: &Theme,
     ) -> Option<usize> {
         if !self.is_open {
             return None;
@@ -39,23 +38,15 @@ impl RemotePicker {
         let mut chosen = None;
         let mut open = true;
 
-        let text_color = Theme::rgb_to_color32(theme.ui.text);
-        let dim_color = Theme::rgb_to_color32(theme.ui.text_disabled);
-        let panel_bg = Theme::rgb_to_color32(theme.ui.panel_bg);
-        let border = Theme::rgb_to_color32(theme.ui.border);
+        let text_color = crate::glass_shell::rgba(crate::glass_shell::token::TEXT);
+        let dim_color = crate::glass_shell::rgba(crate::glass_shell::token::MUTED_TEXT);
 
         Window::new("🖧  Remote hosts")
             .open(&mut open)
             .default_size([460.0, 320.0])
             .resizable(true)
             .collapsible(false)
-            .frame(egui::Frame {
-                fill: panel_bg,
-                stroke: egui::Stroke::new(1.0, border),
-                corner_radius: egui::CornerRadius::same(10),
-                inner_margin: egui::Margin::same(12),
-                ..Default::default()
-            })
+            .frame(crate::theme::workspace_frame(12))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (index, host) in hosts

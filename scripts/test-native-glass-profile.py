@@ -30,17 +30,34 @@ class GlassProfileTests(unittest.TestCase):
         image = Image.new('RGB', (1660, 1024), (17, 33, 71))
         r = g.mode_slot(self.owned, mode)
         draw=ImageDraw.Draw(image)
-        draw.rounded_rectangle((r['x'],r['y'],r['x']+r['width']-1,r['y']+r['height']-1), radius=12, fill=(62,108,255))
-        draw.text((r['x']+12,r['y']+12),mode.title(),fill=(239,245,255))
+        draw.rounded_rectangle((r['x'],r['y'],r['x']+r['width']-1,r['y']+r['height']-1), radius=6, fill=(62,108,255))
+        draw.text((r['x']+12,r['y']+10),mode.title(),fill=(239,245,255))
         return image
 
     def test_reference_domains_use_full_input_and_exclude_actual_control_row(self):
         p = g.layout(dict(x=0,y=0,width=1612,height=976))
-        self.assertEqual(p['header'], dict(x=0,y=0,width=1612,height=69))
-        self.assertEqual(p['center'], dict(x=342,y=158,width=902,height=772))
-        self.assertEqual(p['terminal'], dict(x=365,y=171,width=859,height=648))
-        self.assertEqual(p['native_body'], dict(x=365,y=171,width=859,height=683))
-        self.assertEqual(p['native_body']['y']+p['native_body']['height'],854)
+        self.assertEqual(p['header'], dict(x=0,y=0,width=1612,height=42))
+        self.assertEqual(p['center'], dict(x=274,y=84,width=1040,height=886))
+        self.assertEqual(p['terminal'], dict(x=282,y=90,width=1024,height=830))
+        self.assertEqual(p['native_body'], dict(x=282,y=90,width=1024,height=842))
+        self.assertEqual(p['native_body']['y']+p['native_body']['height'],932)
+
+    def test_compact_domains_reclaim_native_rows_and_columns_at_the_same_cell_size(self):
+        current = g.layout(dict(x=0,y=0,width=1612,height=976))['terminal']
+        previous = dict(width=859,height=648)
+        # Compare real observation space at unchanged 8px columns/18px rows.
+        self.assertGreaterEqual(current['width']//8 - previous['width']//8, 20)
+        self.assertGreaterEqual(current['height']//18 - previous['height']//18, 10)
+
+    def test_compact_mode_slots_keep_touch_targets_inside_the_topbar(self):
+        for width in (700, 959, 960, 1179, 1180, 1279, 1280, 1612):
+            owned = dict(x=24,y=25,width=width,height=704)
+            topbar = g.layout(owned)['header']
+            block, chat = [g.mode_slot(owned, mode) for mode in ('block', 'chat')]
+            for slot in (block, chat):
+                self.assertTrue(g.contained(slot, topbar))
+                self.assertEqual((slot['width'], slot['height']), (64, 32))
+            self.assertEqual(chat['x'] - block['x'] - block['width'], 6)
 
     def test_offset_short_narrow_and_threshold_are_exact(self):
         for width,height in [(700,640),(1179,704),(1180,704),(1280,875)]:
@@ -48,8 +65,8 @@ class GlassProfileTests(unittest.TestCase):
             offset=g.layout(dict(x=24,y=25,width=width,height=height))
             for name in ('header','center','native_body','terminal'):
                 self.assertEqual(offset[name], dict(plain[name],x=plain[name]['x']+24,y=plain[name]['y']+25))
-        self.assertEqual(g.layout(dict(x=0,y=0,width=1179,height=704))['center']['width'],858)
-        self.assertEqual(g.layout(dict(x=0,y=0,width=1180,height=704))['center']['width'],499)
+        self.assertEqual(g.layout(dict(x=0,y=0,width=1179,height=704))['center']['width'],901)
+        self.assertEqual(g.layout(dict(x=0,y=0,width=1180,height=704))['center']['width'],608)
         for bad in [dict(x=0,y=0,width=699,height=640),dict(x=0,y=0,width=1280.5,height=900),dict(x=-1,y=0,width=1280,height=900)]:
             with self.assertRaises(RuntimeError):g.layout(bad)
 
@@ -70,7 +87,7 @@ class GlassProfileTests(unittest.TestCase):
             if case=='one-pixel':draw.point((r['x']+5,r['y']+5),fill=(62,108,255))
             if case=='partial':draw.rectangle((r['x'],r['y'],r['x']+20,r['y']+40),fill=(62,108,255))
             if case=='duplicate':
-                c=g.mode_slot(self.owned,'chat');draw.rounded_rectangle((c['x'],c['y'],c['x']+c['width']-1,c['y']+c['height']-1),radius=12,fill=(62,108,255))
+                c=g.mode_slot(self.owned,'chat');draw.rounded_rectangle((c['x'],c['y'],c['x']+c['width']-1,c['y']+c['height']-1),radius=6,fill=(62,108,255))
             if case=='foreign':
                 draw.rectangle((r['x'],r['y'],r['x']+r['width']-1,r['y']+r['height']-1),fill=(0,0,0));draw.rectangle((2,2,100,50),fill=(62,108,255))
             with self.subTest(case=case),self.assertRaises(RuntimeError):g.header_paint(image,self.owned)
@@ -102,10 +119,17 @@ class SyntheticSmoke:
         self.captures.append(label)
         image=Image.new('RGB',(1280,900),(21,34,61));draw=ImageDraw.Draw(image)
         r=g.mode_slot(self.rect,'block')
-        draw.rounded_rectangle((r['x'],r['y'],r['x']+r['width']-1,r['y']+r['height']-1),radius=12,fill=(62,108,255))
-        draw.text((r['x']+12,r['y']+12),'Block',fill=(239,245,255))
-        if self.present:draw.rectangle((380,750,559,767),fill=(180,70,220))
+        draw.rounded_rectangle((r['x'],r['y'],r['x']+r['width']-1,r['y']+r['height']-1),radius=6,fill=(62,108,255))
+        draw.text((r['x']+12,r['y']+10),'Block',fill=(239,245,255))
+        if self.present:
+            token = self.token_box()
+            draw.rectangle((token['x'], token['y'], token['x']+token['width']-1,
+                            token['y']+token['height']-1), fill=(180,70,220))
         image.save(self.out/(label+'.png'))
+
+    def token_box(self):
+        body = g.layout(self.rect)['native_body']
+        return dict(x=380, y=body['y']+body['height']-20, width=180, height=18)
 
     def run(self,args,**kwargs):
         if args[:3]==['swaymsg','-t','get_tree']:
@@ -135,7 +159,8 @@ class SyntheticSmoke:
         rows=[word('status',400,300,w=45,h=14)]
         if self.present and not (self.only_whole and crop['x']):
             text='X'+visual.PREEDIT_TOKEN if self.partial else visual.PREEDIT_TOKEN
-            rows.append(word(text,380+(self.shift_body if '-native-body-' in label else 0),750))
+            token = self.token_box()
+            rows.append(word(text, token['x']+(self.shift_body if '-native-body-' in label else 0), token['y']))
         return rows
 
 
@@ -155,8 +180,11 @@ class GlassIntegrationTests(unittest.TestCase):
         during=self.capture('during',True,before)
         after=self.capture('after',False,before)
         self.assertEqual([item['observed_token_count'] for item in (before,during,after)],[0,1,0])
-        self.assertEqual(visual.box(during['matches'][0]),dict(x=380,y=750,width=180,height=18))
-        self.assertGreater(750,g.layout(self.smoke.rect)['terminal']['y']+g.layout(self.smoke.rect)['terminal']['height'])
+        token = self.smoke.token_box()
+        self.assertEqual(visual.box(during['matches'][0]),token)
+        terminal = g.layout(self.smoke.rect)['terminal']
+        self.assertGreater(token['y']+token['height'],terminal['y']+terminal['height'])
+        self.assertTrue(g.contained(token, g.layout(self.smoke.rect)['native_body']))
         self.assertEqual(during['native_body_regions'][0]['rectangle'],g.layout(self.smoke.rect)['native_body'])
         self.assertEqual(set(during['token_observation_groups'][0]['sources']),{'whole-image-psm6','whole-native-canvas-psm6','during-native-body-0'})
         self.assertTrue(visual.verify_restoration(self.smoke,before,during,after)['after_restored'])

@@ -44,11 +44,75 @@ pub(crate) fn validate_saved_custom_theme_name(name: &str) -> Result<(), String>
     Theme::validate_custom_theme_name(name)
 }
 
-/// Keep semantic popup surfaces on the shared panel palette.
+/// Floating controls belong to the glass workspace, independently of the
+/// terminal's ANSI/custom theme. Keep their surface opaque so an open menu
+/// remains readable above terminal output and translucent navigation panels.
+#[allow(dead_code)] // Also consumed by binary-only workspace builders.
+pub(crate) fn workspace_visuals() -> egui::Visuals {
+    use crate::glass_shell::{rgba, token};
+
+    let mut visuals = egui::Visuals::dark();
+    let surface = rgba(token::INSPECTOR).to_opaque();
+    let text = rgba(token::TEXT);
+    let border = egui::Stroke::new(token::BORDER_WIDTH, rgba(token::BORDER));
+    visuals.window_fill = surface;
+    visuals.panel_fill = surface;
+    visuals.window_stroke = border;
+    visuals.window_corner_radius = egui::CornerRadius::same(token::PANEL_RADIUS as u8);
+    visuals.menu_corner_radius = egui::CornerRadius::same(token::CONTROL_RADIUS as u8);
+    visuals.override_text_color = Some(text);
+    visuals.weak_text_color = Some(rgba(token::MUTED_TEXT));
+    visuals.extreme_bg_color = rgba(token::TERMINAL).to_opaque();
+    visuals.faint_bg_color = rgba(token::INSPECTOR_CARD);
+    visuals.code_bg_color = rgba(token::RAIL).to_opaque();
+    visuals.selection.bg_fill = rgba(token::SELECTED_NAV);
+    visuals.selection.stroke = egui::Stroke::new(1.0, text);
+    visuals.hyperlink_color = rgba(token::MUTED_TEXT);
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.fg_stroke = egui::Stroke::new(1.0, text);
+        widget.bg_stroke = border;
+        widget.corner_radius = egui::CornerRadius::same(token::CONTROL_RADIUS as u8);
+    }
+    visuals.widgets.noninteractive.bg_fill = surface;
+    visuals.widgets.noninteractive.weak_bg_fill = Color32::TRANSPARENT;
+    visuals.widgets.inactive.bg_fill = rgba(token::BUTTON);
+    visuals.widgets.inactive.weak_bg_fill = rgba(token::BUTTON);
+    visuals.widgets.hovered.bg_fill = rgba(token::BUTTON_HOVER);
+    visuals.widgets.hovered.weak_bg_fill = rgba(token::BUTTON_HOVER);
+    visuals.widgets.active.bg_fill = rgba(token::SELECTED_NAV);
+    visuals.widgets.active.weak_bg_fill = rgba(token::SELECTED_NAV);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, rgba(token::ACCENT_TOP));
+    visuals.widgets.open = visuals.widgets.active;
+    visuals
+}
+
+/// Shared frame for settings, pickers and review panels above the workspace.
+#[allow(dead_code)] // Several consumers are binary-only modules.
+pub(crate) fn workspace_frame(inner_margin: i8) -> egui::Frame {
+    let visuals = workspace_visuals();
+    egui::Frame {
+        fill: visuals.window_fill,
+        stroke: visuals.window_stroke,
+        corner_radius: visuals.window_corner_radius,
+        shadow: visuals.window_shadow,
+        inner_margin: egui::Margin::same(inner_margin),
+        ..Default::default()
+    }
+}
+
+/// Reassert the workspace palette at every popup boundary: chrome deliberately
+/// uses transparent panels and can override the global egui style locally.
 #[allow(dead_code)] // Shared with the binary popup builders.
 pub(crate) fn configure_popup_style(style: &mut egui::Style) {
+    style.visuals = workspace_visuals();
     egui::containers::menu::menu_style(style);
-    style.visuals.window_fill = style.visuals.panel_fill;
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
 }
 
 /// Apply one font group in egui logical points, scoped to the supplied style.
@@ -203,19 +267,113 @@ mod tests {
     }
 
     #[test]
-    fn popup_surface_uses_effective_panel_color_instead_of_window_color() {
-        for panel in [
-            egui::Color32::from_rgb(30, 31, 33),
-            egui::Color32::from_rgb(245, 246, 248),
-            egui::Color32::from_rgb(27, 49, 71),
-        ] {
-            let mut style = egui::Style::default();
-            style.visuals.window_fill = egui::Color32::MAGENTA;
-            style.visuals.panel_fill = panel;
-            configure_popup_style(&mut style);
-            assert_eq!(style.visuals.window_fill, panel);
-            assert_eq!(style.visuals.window_fill.a(), 255);
+    fn popup_and_nested_menu_keep_glass_surface_above_transparent_chrome() {
+        for parent_visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            let context = egui::Context::default();
+            context.set_visuals(parent_visuals);
+            context.all_styles_mut(|style| {
+                style.visuals.panel_fill = Color32::TRANSPARENT;
+                style.visuals.window_fill = Color32::MAGENTA;
+                style.override_font_id = Some(egui::FontId::proportional(19.0));
+            });
+            let mut submenu_rect = egui::Rect::NOTHING;
+            let mut rendered = false;
+            for pass in 0..4 {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    ..Default::default()
+                };
+                if pass > 0 {
+                    input
+                        .events
+                        .push(egui::Event::PointerMoved(submenu_rect.center()));
+                }
+                let output = context.run_ui(input, |ui| {
+                    let button = ui.button("Actions");
+                    egui::Popup::menu(&button)
+                        .open(true)
+                        .style(configure_popup_style)
+                        .show(|ui| {
+                            let expected = workspace_visuals();
+                            assert_eq!(ui.visuals().window_fill, expected.window_fill);
+                            assert_eq!(ui.visuals().window_fill.a(), 255);
+                            assert_eq!(ui.visuals().window_stroke, expected.window_stroke);
+                            assert!(ui.visuals().disabled_alpha < 1.0);
+                            assert_eq!(
+                                ui.style().override_font_id,
+                                Some(egui::FontId::proportional(19.0))
+                            );
+                            ui.add_enabled(false, egui::Button::new("Unavailable"));
+                            let parent_open_visuals = ui.visuals().widgets.open;
+                            let advanced = ui.menu_button("Advanced", |ui| {
+                                // Hover opens an actual SubMenuButton, which
+                                // must carry the parent menu's style modifier.
+                                assert_eq!(ui.visuals().window_fill, expected.window_fill);
+                                assert_eq!(ui.visuals().widgets.open, parent_open_visuals);
+                                let _ = ui.selectable_label(true, "Selected action");
+                                rendered = true;
+                            });
+                            submenu_rect = advanced.response.rect;
+                        });
+                    assert_eq!(ui.visuals().panel_fill, Color32::TRANSPARENT);
+                    assert_eq!(ui.visuals().window_fill, Color32::MAGENTA);
+                });
+                output.drop_without_applying_deltas();
+            }
+            assert!(rendered, "pointer hover must open the real submenu");
         }
+    }
+
+    #[test]
+    fn combobox_opened_in_transparent_chrome_uses_workspace_popup_palette() {
+        let context = egui::Context::default();
+        let mut button_rect = egui::Rect::NOTHING;
+        let mut rendered = false;
+        for pass in 0..4 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                ..Default::default()
+            };
+            if pass == 1 || pass == 2 {
+                input
+                    .events
+                    .push(egui::Event::PointerMoved(button_rect.center()));
+                input.events.push(egui::Event::PointerButton {
+                    pos: button_rect.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: pass == 1,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let output = context.run_ui(input, |ui| {
+                *ui.visuals_mut() = egui::Visuals::light();
+                ui.visuals_mut().panel_fill = Color32::TRANSPARENT;
+                let response = egui::ComboBox::from_id_salt("glass-theme-picker")
+                    .popup_style(configure_popup_style.into())
+                    .selected_text("Theme")
+                    .show_ui(ui, |ui| {
+                        let expected = workspace_visuals();
+                        assert_eq!(ui.visuals().window_fill, expected.window_fill);
+                        assert_eq!(ui.visuals().text_color(), expected.text_color());
+                        assert_eq!(ui.visuals().selection, expected.selection);
+                        let _ = ui.selectable_label(true, "Current theme");
+                        rendered = true;
+                    });
+                button_rect = response.response.rect;
+                assert_eq!(ui.visuals().panel_fill, Color32::TRANSPARENT);
+            });
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            rendered,
+            "the pointer interaction must open the real ComboBox"
+        );
     }
 
     #[test]

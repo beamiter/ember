@@ -75,7 +75,6 @@ const fn primary_action_label(run_allowed: bool) -> &'static str {
 
 use crate::config::Config;
 use crate::terminal::CompletedCommandEvent;
-use crate::theme::ThemeExt as _;
 
 /// Names the probe's stdout reader thread so a stuck reader is attributable to
 /// ember in `ps`/`gdb`.
@@ -367,7 +366,7 @@ impl CorrectionMonitor {
     pub(crate) fn show(
         &mut self,
         ctx: &egui::Context,
-        theme: &crate::theme::Theme,
+        _theme: &crate::theme::Theme,
         active_session_id: Option<&str>,
         prompt_clean_idle: bool,
     ) -> CorrectionUiOutcome {
@@ -396,16 +395,7 @@ impl CorrectionMonitor {
             .resizable(false)
             .default_width(560.0)
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
-            .frame(egui::Frame {
-                fill: crate::theme::Theme::rgb_to_color32(theme.ui.panel_bg),
-                stroke: egui::Stroke::new(
-                    1.0,
-                    crate::theme::Theme::rgb_to_color32(theme.ui.border),
-                ),
-                corner_radius: egui::CornerRadius::same(10),
-                inner_margin: egui::Margin::same(8),
-                ..Default::default()
-            })
+            .frame(crate::theme::workspace_frame(12))
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new(card.proposal.candidate().display_badge(exit_code))

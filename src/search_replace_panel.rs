@@ -7,7 +7,6 @@
 use crate::search::MAX_SEARCH_QUERY_BYTES;
 use crate::search_replace::{ReplaceOptions, SearchAndReplaceEngine, SearchConfig};
 use crate::theme::Theme;
-use crate::theme::ThemeExt as _;
 use eframe::egui;
 
 fn bound_field(text: impl Into<String>, max_bytes: usize) -> String {
@@ -92,7 +91,7 @@ impl SearchReplacePanel {
 
     /// 渲染面板。返回调用方需要执行的动作（若用户点击了某个按钮）。
     #[allow(deprecated)]
-    pub fn show(&mut self, ctx: &egui::Context, theme: &Theme) -> Option<SearchReplaceAction> {
+    pub fn show(&mut self, ctx: &egui::Context, _theme: &Theme) -> Option<SearchReplaceAction> {
         if !self.is_open {
             return None;
         }
@@ -100,13 +99,7 @@ impl SearchReplacePanel {
         let mut action = None;
 
         let modal_response = egui::Modal::new(egui::Id::new("find_replace_modal"))
-            .frame(egui::Frame {
-                fill: Theme::rgb_to_color32(theme.search.bg),
-                stroke: egui::Stroke::new(1.0, Theme::rgb_to_color32(theme.search.border)),
-                corner_radius: egui::CornerRadius::same(8),
-                inner_margin: egui::Margin::same(8),
-                ..Default::default()
-            })
+            .frame(crate::theme::workspace_frame(12))
             .show(ctx, |ui| {
                 ui.set_width(350.0_f32.min((ctx.viewport_rect().width() - 32.0).max(240.0)));
                 if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -192,7 +185,7 @@ impl SearchReplacePanel {
                 if !self.status.is_empty() {
                     ui.label(
                         egui::RichText::new(&self.status)
-                            .color(Theme::rgb_to_color32(theme.search.text)),
+                            .color(crate::glass_shell::rgba(crate::glass_shell::token::TEXT)),
                     );
                 }
             });

@@ -139,17 +139,20 @@ fn history_picker_row(
     id: egui::Id,
     record: &jterm_core::command_history::CommandHistoryRecord,
     selected: bool,
-    current_theme: &theme::Theme,
+    _current_theme: &theme::Theme,
 ) -> egui::Response {
     let line_height = ui.text_style_height(&egui::TextStyle::Body);
     let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), line_height * 2.0 + 10.0));
     let response = ui.interact(rect, id, egui::Sense::click());
     if selected || response.hovered() {
-        let accent = crate::theme::Theme::rgb_to_color32(current_theme.tabbar.active_border);
         ui.painter().rect_filled(
             rect,
-            3.0,
-            accent.gamma_multiply(if selected { 0.18 } else { 0.08 }),
+            ui.visuals().menu_corner_radius,
+            if selected {
+                ui.visuals().selection.bg_fill
+            } else {
+                ui.visuals().widgets.hovered.weak_bg_fill
+            },
         );
     }
     if response.has_focus() {
@@ -234,16 +237,7 @@ fn draw_history_picker(
             .resizable(false)
             .movable(false)
             .fixed_rect(picker_rect)
-            .frame(egui::Frame {
-                fill: crate::theme::Theme::rgb_to_color32(current_theme.ui.panel_bg),
-                stroke: egui::Stroke::new(
-                    1.0,
-                    crate::theme::Theme::rgb_to_color32(current_theme.ui.border),
-                ),
-                corner_radius: egui::CornerRadius::same(10),
-                inner_margin: egui::Margin::same(8),
-                ..Default::default()
-            })
+            .frame(crate::theme::workspace_frame(8))
             .show(ctx, |ui| {
                 // 搜索输入框：编辑即重置高亮（与 frost 的 on_input 一致）。
                 ui.horizontal(|ui| {
@@ -371,14 +365,8 @@ fn draw_history_picker(
     }
 }
 
-fn workflow_frame(current_theme: &theme::Theme) -> egui::Frame {
-    egui::Frame {
-        fill: theme::Theme::rgb_to_color32(current_theme.ui.panel_bg),
-        stroke: egui::Stroke::new(1.0, theme::Theme::rgb_to_color32(current_theme.ui.border)),
-        corner_radius: egui::CornerRadius::same(10),
-        inner_margin: egui::Margin::same(8),
-        ..Default::default()
-    }
+fn workflow_frame(_current_theme: &theme::Theme) -> egui::Frame {
+    crate::theme::workspace_frame(8)
 }
 
 #[derive(Debug)]
@@ -538,7 +526,7 @@ fn workflow_picker_row(
     id: egui::Id,
     workflow: &crate::workflows::Workflow,
     selected: bool,
-    current_theme: &theme::Theme,
+    _current_theme: &theme::Theme,
 ) -> egui::Response {
     let line_height = ui.text_style_height(&egui::TextStyle::Body);
     let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), line_height * 2.0 + 10.0));
@@ -546,9 +534,12 @@ fn workflow_picker_row(
     if selected || response.hovered() {
         ui.painter().rect_filled(
             rect,
-            3.0,
-            theme::Theme::rgb_to_color32(current_theme.tabbar.active_border)
-                .gamma_multiply(if selected { 0.18 } else { 0.08 }),
+            ui.visuals().menu_corner_radius,
+            if selected {
+                ui.visuals().selection.bg_fill
+            } else {
+                ui.visuals().widgets.hovered.weak_bg_fill
+            },
         );
     }
     if response.has_focus() {
@@ -2037,6 +2028,10 @@ impl TerminalApp {
             self.set_status("Working directory is not an absolute local path");
             return;
         };
+        self.reveal_files_at_local_directory(path);
+    }
+
+    pub(crate) fn reveal_files_at_local_directory(&mut self, path: std::path::PathBuf) {
         self.sidebar.note_files_user_intent();
         self.sidebar.visible = true;
         self.sidebar.view = crate::sidebar::SidebarView::Files;
@@ -2647,11 +2642,12 @@ impl TerminalApp {
             self.prompt_fill_enter_latch,
         );
         self.renderer.chat_controls_enabled = chat_controls_enabled;
+        let tools_height = self.reference_layout(ctx).composer.height;
+        self.renderer.reference_tools_height = tools_height;
         let outer = ui.available_rect_before_wrap();
-        let available_rect = egui::Rect::from_min_max(
-            outer.min + egui::vec2(16.0, 0.0),
-            outer.max - egui::vec2(17.0, 0.0),
-        );
+        // The renderer already owns the configured cell padding. Additional chrome
+        // insets cost native columns and must not be applied a second time.
+        let available_rect = outer;
         // Keep the focused pane's geometry current even in single-pane mode,
         // so split commands can validate the resulting child sizes before
         // creating another shell session.
@@ -2672,6 +2668,9 @@ impl TerminalApp {
                 .collect()
         };
         self.ensure_pane_renderer_capacity(ctx);
+        for renderer in &mut self.pane_renderers {
+            renderer.reference_tools_height = tools_height;
+        }
         if self.layout().panes().len() == 1 {
             let session = self.session_manager.get_active_session_mut();
             self.renderer.sync_glass_presentation(
@@ -2683,7 +2682,14 @@ impl TerminalApp {
         }
         // Native size is independent of docking and input length. Resolve the
         // presentation below, after resize has reflowed the real prompt rows.
-        let single_pty_rect = crate::ui::reference_terminal_rects(available_rect, true, true).0;
+        // Both stages use the same compact/adaptive chrome allocation.
+        let single_pty_rect = crate::ui::reference_terminal_rects_with_height(
+            available_rect,
+            true,
+            true,
+            tools_height,
+        )
+        .0;
         let (cols, rows) = self.renderer.grid_dimensions(single_pty_rect.size());
         crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
 
@@ -2773,7 +2779,13 @@ impl TerminalApp {
                 } else {
                     renderer.sync_font_metrics(ctx);
                 }
-                let pty_rect = crate::ui::reference_terminal_rects(pane_outer_rect, true, true).0;
+                let pty_rect = crate::ui::reference_terminal_rects_with_height(
+                    pane_outer_rect,
+                    true,
+                    true,
+                    tools_height,
+                )
+                .0;
                 let (pane_cols, pane_rows) =
                     self.pane_renderers[pane_idx].grid_dimensions(pty_rect.size());
                 if let Some(session) = self.session_manager.get_session_mut(session_idx) {
@@ -3331,16 +3343,7 @@ impl TerminalApp {
                 ))
                 .default_size([search_width, search_height])
                 .fixed_size([search_width, search_height])
-                .frame(egui::Frame {
-                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.search.bg),
-                    stroke: egui::Stroke::new(
-                        1.0,
-                        crate::theme::Theme::rgb_to_color32(self.current_theme.search.border),
-                    ),
-                    corner_radius: egui::CornerRadius::same(8),
-                    inner_margin: egui::Margin::same(6),
-                    ..Default::default()
-                })
+                .frame(crate::theme::workspace_frame(6))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         // 搜索输入框
@@ -3471,16 +3474,7 @@ impl TerminalApp {
                 .default_pos(palette_pos)
                 .default_size([palette_width, palette_height])
                 .fixed_size([palette_width, palette_height])
-                .frame(egui::Frame {
-                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
-                    stroke: egui::Stroke::new(
-                        1.0,
-                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border),
-                    ),
-                    corner_radius: egui::CornerRadius::same(10),
-                    inner_margin: egui::Margin::same(8),
-                    ..Default::default()
-                })
+                .frame(crate::theme::workspace_frame(8))
                 .show(ctx, |ui| {
                     // 搜索输入框
                     ui.horizontal(|ui| {
@@ -3563,10 +3557,7 @@ impl TerminalApp {
                                 let is_selected = idx == selected_index;
 
                                 let bg_color = if is_selected {
-                                    crate::theme::Theme::rgb_to_color32(
-                                        self.current_theme.tabbar.active_border,
-                                    )
-                                    .gamma_multiply(0.18)
+                                    ui.visuals().selection.bg_fill
                                 } else {
                                     egui::Color32::TRANSPARENT
                                 };
@@ -3825,16 +3816,7 @@ impl TerminalApp {
                 .resizable(false)
                 .movable(false)
                 .fixed_rect(picker_rect)
-                .frame(egui::Frame {
-                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
-                    stroke: egui::Stroke::new(
-                        1.0,
-                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border),
-                    ),
-                    corner_radius: egui::CornerRadius::same(10),
-                    inner_margin: egui::Margin::same(8),
-                    ..Default::default()
-                })
+                .frame(crate::theme::workspace_frame(8))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("🔍");
@@ -4140,10 +4122,7 @@ impl TerminalApp {
                                         ui.painter().rect_filled(
                                             rect,
                                             2.0,
-                                            crate::theme::Theme::rgb_to_color32(
-                                                self.current_theme.tabbar.active_border,
-                                            )
-                                            .gamma_multiply(0.18),
+                                            ui.visuals().selection.bg_fill,
                                         );
                                     }
 
@@ -4963,9 +4942,9 @@ impl TerminalApp {
             return;
         }
 
-        let panel_bg = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
-        let border = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border);
-        let text_color = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.text);
+        let panel_bg = crate::theme::workspace_visuals().window_fill;
+        let border = crate::theme::workspace_visuals().window_stroke.color;
+        let text_color = crate::theme::workspace_visuals().text_color();
         let alpha = (fade_alpha * 230.0) as u8;
         let bg =
             egui::Color32::from_rgba_unmultiplied(panel_bg.r(), panel_bg.g(), panel_bg.b(), alpha);
@@ -4983,7 +4962,7 @@ impl TerminalApp {
                 egui::Frame {
                     fill: bg,
                     stroke: egui::Stroke::new(1.0, border),
-                    corner_radius: egui::CornerRadius::same(8),
+                    corner_radius: crate::theme::workspace_visuals().window_corner_radius,
                     inner_margin: egui::Margin::symmetric(12, 8),
                     ..Default::default()
                 }
@@ -5024,9 +5003,7 @@ impl TerminalApp {
         };
         let decision_armed = pending.decision_armed;
 
-        let panel_bg = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
-        let text_color = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.text);
-        let border = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border);
+        let text_color = crate::theme::workspace_visuals().text_color();
 
         let line_count = pending.text.lines().count();
         let byte_len = pending.text.len();
@@ -5066,13 +5043,7 @@ impl TerminalApp {
         };
         // Some(true) = paste, Some(false) = cancel.
         let modal_response = egui::Modal::new(egui::Id::new("paste_confirmation_modal"))
-            .frame(egui::Frame {
-                fill: panel_bg,
-                stroke: egui::Stroke::new(1.0, border),
-                corner_radius: egui::CornerRadius::same(10),
-                inner_margin: egui::Margin::same(14),
-                ..Default::default()
-            })
+            .frame(crate::theme::workspace_frame(14))
             .show(ctx, |ui| {
                 ui.set_max_width(640.0);
                 ui.heading("⚠ Confirm paste");
@@ -5100,7 +5071,7 @@ impl TerminalApp {
                 }
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style())
-                    .stroke(egui::Stroke::new(1.0, border))
+                    .stroke(crate::theme::workspace_visuals().window_stroke)
                     .show(ui, |ui| {
                         ui.set_min_width(600.0);
                         egui::ScrollArea::vertical()

@@ -69,6 +69,7 @@ mod windows_compat;
 mod workflow_picker;
 mod workflows;
 
+use crate::glass_shell::BoundedPanel as _;
 use crate::theme::ThemeExt as _;
 use app::events::{
     normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
@@ -721,36 +722,10 @@ fn configure_fonts_and_gpu(
     }
 }
 
-fn apply_theme_visuals(ctx: &egui::Context, theme: &theme::Theme) {
-    let ui = &theme.ui;
-    let brightness =
-        u16::from(ui.window_bg[0]) + u16::from(ui.window_bg[1]) + u16::from(ui.window_bg[2]);
-    let mut visuals = if brightness > 382 {
-        egui::Visuals::light()
-    } else {
-        egui::Visuals::dark()
-    };
-
-    let panel = theme::Theme::rgb_to_color32(ui.panel_bg);
-    let text = theme::Theme::rgb_to_color32(ui.text);
-    let border = theme::Theme::rgb_to_color32(ui.border);
-    visuals.window_fill = theme::Theme::rgb_to_color32(ui.window_bg);
-    visuals.panel_fill = panel;
-    visuals.extreme_bg_color = panel;
-    visuals.override_text_color = Some(text);
-    visuals.widgets.noninteractive.bg_stroke.color = border;
-    visuals.widgets.inactive.bg_stroke.color = border;
-    visuals.widgets.active.bg_stroke.color = border;
-    visuals.widgets.hovered.bg_stroke.color = border;
-    let hover_fill = panel.lerp_to_gamma(text, 0.12);
-    let active_fill = panel.lerp_to_gamma(text, 0.20);
-    visuals.widgets.hovered.weak_bg_fill = hover_fill;
-    visuals.widgets.hovered.bg_fill = hover_fill;
-    visuals.widgets.active.weak_bg_fill = active_fill;
-    visuals.widgets.active.bg_fill = active_fill;
-    visuals.selection.bg_fill = panel.lerp_to_gamma(text, 0.28);
-
-    ctx.set_visuals(visuals);
+fn apply_theme_visuals(ctx: &egui::Context, _theme: &theme::Theme) {
+    // The upgraded workspace has its own glass identity. Terminal themes are
+    // applied by the terminal renderer, not by floating workspace controls.
+    ctx.set_visuals(theme::workspace_visuals());
 }
 
 fn main() -> Result<(), eframe::Error> {
@@ -3668,22 +3643,26 @@ impl TerminalApp {
             crate::glass_shell::token::NAVIGATION_BOTTOM_GAP
         };
         let width = if files_inspector {
-            crate::glass_shell::INSPECTOR_WIDTH + 18.0
+            glass_layout.inspector.map_or_else(
+                || drawer.map_or(crate::glass_shell::INSPECTOR_WIDTH, |rect| rect.width()),
+                |rect| rect.width,
+            ) + crate::glass_shell::token::INSPECTOR_GAP
+                + crate::glass_shell::token::OUTER_RIGHT
         } else {
             glass_layout.navigation.map_or(0.0, |r| r.width)
         };
         let frame = egui::Frame::NONE.inner_margin(if files_inspector {
             egui::Margin {
-                left: 20,
-                right: 18,
-                top: 15,
-                bottom: if short { 12 } else { 46 },
+                left: 10 + crate::glass_shell::token::INSPECTOR_GAP as i8,
+                right: 10 + crate::glass_shell::token::OUTER_RIGHT as i8,
+                top: 10,
+                bottom: bottom as i8,
             }
         } else {
             egui::Margin {
-                left: 17,
-                right: 16,
-                top: 17,
+                left: 10,
+                right: 10,
+                top: 10,
                 bottom: bottom as i8,
             }
         });
@@ -3694,7 +3673,7 @@ impl TerminalApp {
                     self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE,
                 );
                 if files_inspector {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let agent = ui.selectable_label(false, "Agent");
                         reference_workspace::remember_inspector_control(ui, &agent);
                         if agent.clicked() {
@@ -3718,7 +3697,7 @@ impl TerminalApp {
                     view_changed |= self.render_reference_navigation(ui);
                 }
                 if self.sidebar.view == sidebar::SidebarView::Files {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let (pending, queued) = self.sidebar.scan_activity();
                         let refresh_tip = match self.sidebar.last_scan_timing() {
                             Some(timing) => format!(
@@ -3824,7 +3803,7 @@ impl TerminalApp {
                             show_hidden_changed = Some(!self.sidebar.show_hidden());
                         }
                     });
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ssh_retry_available
                             && ui
                                 .button("Retry SSH")
@@ -3838,6 +3817,7 @@ impl TerminalApp {
                         let hosts = &self.config.remote_hosts;
                         let current = self.sidebar.location().clone();
                         let location_picker = egui::ComboBox::from_id_salt("sidebar-fs-location")
+                            .popup_style(crate::theme::configure_popup_style.into())
                             .selected_text(current.label(hosts))
                             .show_ui(ui, |ui| {
                                 if ui
@@ -3978,7 +3958,7 @@ impl TerminalApp {
                     sidebar::SidebarView::Tasks => self.render_sidebar_tasks(ui),
                     sidebar::SidebarView::Files => {
                         if self.sidebar.path_entry_open {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Path:");
                                 let response = ui.add(
                                     egui::TextEdit::singleline(&mut self.sidebar.path_entry)
@@ -4020,7 +4000,7 @@ impl TerminalApp {
                             });
                         }
                         if let Some(target) = self.sidebar.navigation_pending_target() {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.spinner();
                                 ui.label(
                                     egui::RichText::new(format!(
@@ -4033,7 +4013,7 @@ impl TerminalApp {
                             });
                         }
                         if self.sidebar.is_starting() {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.spinner();
                                 ui.label("Verifying new location… (current tree stays usable)");
                             });
@@ -4044,7 +4024,7 @@ impl TerminalApp {
                             );
                         }
                         if let Some(status) = self.sidebar.transfer_status() {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.spinner();
                                 let amount = match status.total {
                                     Some(total) => format!(
@@ -4070,7 +4050,7 @@ impl TerminalApp {
                             });
                         }
                         if self.sidebar.filter_open {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 let resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.sidebar.filter)
                                         .hint_text("Filter names, Esc closes")
@@ -4100,7 +4080,7 @@ impl TerminalApp {
                         let files_are_local = !self.sidebar.location().is_remote();
                         let indent_guide =
                             theme::Theme::rgb_to_color32(self.current_theme.ui.border);
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+                        let mut tree_contents = |ui: &mut egui::Ui| {
                             if let Some(root) = &self.sidebar.root {
                                 let filtered_root;
                                 let root = if filter_query.is_empty() {
@@ -4121,37 +4101,36 @@ impl TerminalApp {
                                     .unwrap_or_default();
                                 let root_selected = self.sidebar.selection.contains_key(&root_dir);
                                 let root_resp = ui
-                                    .selectable_label(
-                                        root_selected,
-                                        format!("📁 {}", root.name),
-                                    )
-                                    .on_hover_text(format!("{}{snapshot_hint}", root_dir.display()));
+                                    .selectable_label(root_selected, format!("📁 {}", root.name))
+                                    .on_hover_text(format!(
+                                        "{}{snapshot_hint}",
+                                        root_dir.display()
+                                    ));
                                 tree_has_focus |= root_resp.has_focus();
                                 tree_row_rects.push((root_resp.rect, root_dir.clone(), true));
                                 if root_resp.clicked() {
-                                    select_action = Some((
-                                        root_dir.clone(),
-                                        true,
-                                        FsSelectMode::Single,
-                                    ));
+                                    select_action =
+                                        Some((root_dir.clone(), true, FsSelectMode::Single));
                                 }
-                                egui::Popup::context_menu(&root_resp).style(crate::theme::configure_popup_style).show(|ui| {
-                                    Self::fs_context_menu(
-                                        ui,
-                                        FsMenuTarget {
-                                            entry: None,
-                                            targets: &[],
-                                            target_dir: &root_dir,
-                                        },
-                                        &mut fs_menu_action,
-                                        paste_state,
-                                        files_are_local,
-                                        self.config.effective_ui_font_size(),
-                                    );
-                                });
+                                egui::Popup::context_menu(&root_resp)
+                                    .style(crate::theme::configure_popup_style)
+                                    .show(|ui| {
+                                        Self::fs_context_menu(
+                                            ui,
+                                            FsMenuTarget {
+                                                entry: None,
+                                                targets: &[],
+                                                target_dir: &root_dir,
+                                            },
+                                            &mut fs_menu_action,
+                                            paste_state,
+                                            files_are_local,
+                                            self.config.effective_ui_font_size(),
+                                        );
+                                    });
                                 files_popup_open |= root_resp.context_menu_opened();
                                 if root.is_refreshing() {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.spinner();
                                         ui.label(match &snapshot_age {
                                             Some(age) => {
@@ -4161,13 +4140,13 @@ impl TerminalApp {
                                         });
                                     });
                                 } else if root.is_loading() {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.spinner();
                                         ui.label("Reading directory…");
                                     });
                                 } else if let Some(error) = root.load_error() {
                                     let retry_cooldown = self.sidebar.retry_cooldown(&root.path);
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.colored_label(
                                             ui.visuals().error_fg_color,
                                             if root.has_stale_error() {
@@ -4262,7 +4241,14 @@ impl TerminalApp {
                                     );
                                 }
                             }
-                        });
+                        };
+                        if files_inspector {
+                            // The inspector scrolls tabs, actions and tree as
+                            // one document, including at the largest UI size.
+                            tree_contents(ui);
+                        } else {
+                            egui::ScrollArea::vertical().show(ui, tree_contents);
+                        }
                     }
                 }
                 if self.sidebar.view != sidebar::SidebarView::Files {
@@ -4274,12 +4260,23 @@ impl TerminalApp {
                 // independent parent identity retains edits/scroll/selection.
                 ui.scope_builder(
                     egui::UiBuilder::new().id(egui::Id::new("reference-files-inspector-body")),
-                    &mut contents,
+                    |ui| {
+                        let height = ui.available_height();
+                        egui::ScrollArea::vertical()
+                            .id_salt("reference-files-inspector-scroll")
+                            .max_height(height)
+                            .auto_shrink([false, false])
+                            .show(ui, &mut contents);
+                    },
                 );
             } else {
                 let bounds = ui.available_rect_before_wrap();
                 let status = egui::Rect::from_min_max(
-                    egui::pos2(bounds.left(), (bounds.bottom() - 60.0).max(bounds.top())),
+                    egui::pos2(
+                        bounds.left(),
+                        (bounds.bottom() - crate::glass_shell::NAVIGATION_STATUS_HEIGHT)
+                            .max(bounds.top()),
+                    ),
                     bounds.max,
                 );
                 let body =
@@ -4309,7 +4306,7 @@ impl TerminalApp {
                 .exact_size(width)
                 .show_separator_line(false)
                 .frame(frame)
-                .show(root_ui, &mut render_body)
+                .show_bounded(root_ui, &mut render_body)
         };
 
         // File-browser shortcuts require actual focus on a tree row as well as
@@ -4695,7 +4692,11 @@ impl TerminalApp {
             self.font_zoom
                 .identify_inspector_drawer(panel_response.response.layer_id);
         }
-        self.sidebar.width = panel_rect.width().clamp(160.0, 640.0);
+        // Legacy Vim workbench width belongs to the left navigation only.
+        // The right Files inspector must never overwrite that preference.
+        if !files_inspector {
+            self.sidebar.width = panel_rect.width().clamp(160.0, 640.0);
+        }
         self.sidebar_drop_rect = (self.sidebar.view == sidebar::SidebarView::Files
             && !self.sidebar.current_dir.as_os_str().is_empty())
         .then_some(panel_rect);
@@ -5745,17 +5746,20 @@ impl TerminalApp {
         let frame = egui::Frame::NONE.inner_margin(egui::Margin {
             left: crate::glass_shell::token::LEFT_GAP as i8,
             right,
-            top: 1,
+            top: (layout.center.y - layout.titlebar.height) as i8,
             bottom: bottom as i8,
         });
         let main_panel = egui::CentralPanel::default()
             .frame(frame)
-            .show(root_ui, |ui| {
+            .show_bounded(root_ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                self.render_reference_canvas_header(ui);
+                // Capture the real allocated center before any child can
+                // report an intrinsic minimum larger than its fixed surface.
                 let bounds = ui.available_rect_before_wrap();
+                self.render_reference_canvas_header(ui);
                 let content = egui::Rect::from_min_max(
                     bounds.min
+                        + egui::vec2(0.0, layout.header.height)
                         + egui::vec2(
                             crate::glass_shell::token::TOOLBAR_INSET_LEFT,
                             crate::glass_shell::token::TERMINAL_TOP_GAP,
@@ -6299,11 +6303,20 @@ impl eframe::App for TerminalApp {
             app::input::clear_terminal_preedit_for_ui_owner(&mut terminal, true);
         }
 
+        let sidebar_resize_pointer_claimed = self.handle_reference_sidebar_resize(
+            ctx,
+            !ui_input_blocked
+                && !egui::Popup::is_any_open(ctx)
+                && self.dragging_tab_session_id.is_none()
+                && self.pane_drag.is_none(),
+        );
+
         // Route pointer input to the pane under the pointer before taking the
         // active-session borrow below. The renderer used to switch focus only
         // at the end of the frame, which sent a click (and mouse protocol
         // coordinates) to the previously focused PTY.
         let pointer_targets_terminal = !ui_input_blocked
+            && !sidebar_resize_pointer_claimed
             && !app::input::semantic_paste_precedes_mouse_input(&self.frame_events)
             && ctx.input(|input| {
                 input.pointer.button_pressed(egui::PointerButton::Primary)
@@ -6325,8 +6338,10 @@ impl eframe::App for TerminalApp {
             }
         }
 
-        let native_vim9_pointer_claimed =
-            self.handle_vim9_input(ctx, !ui_input_blocked && !terminal_input_blocked);
+        let native_vim9_pointer_claimed = self.handle_vim9_input(
+            ctx,
+            !ui_input_blocked && !terminal_input_blocked && !sidebar_resize_pointer_claimed,
+        );
         self.prepare_organism(ctx);
         let active_session_idx = self.session_manager.active_index();
         let active_pane_renderer_idx = (self.layout().panes().len() > 1).then(|| {
@@ -6635,7 +6650,8 @@ impl eframe::App for TerminalApp {
             semantic_paste_blocks_pointer,
         );
 
-        terminal_pointer_input_blocked |= native_vim9_pointer_claimed;
+        terminal_pointer_input_blocked |=
+            native_vim9_pointer_claimed || sidebar_resize_pointer_claimed;
         // An admitted organism control is GUI chrome, so its pointer gesture
         // must not become terminal selection/input or trigger typing retreat.
         let organism_pointer_claimed = !terminal_pointer_input_blocked

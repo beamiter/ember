@@ -147,14 +147,20 @@ pub(crate) enum ReferenceInspectorTab {
     Files,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum ReferenceInspectorRequest {
     Tab(ReferenceInspectorTab),
     Navigation(sidebar::SidebarView),
+    /// Resolve this stable session again before changing panel ownership.
+    RevealSessionDirectory {
+        session_id: String,
+        directory: std::path::PathBuf,
+    },
 }
 
 /// Application chrome state; terminal/session switches do not recreate it.
 pub(crate) struct ReferenceInspectorState {
+    pub sidebar_resize: crate::glass_shell::SidebarResizeState,
     pub open: bool,
     /// An explicit open at a compact width uses an overlay instead of taking
     /// the terminal's minimum center width. Automatic compact collapse stays
@@ -168,6 +174,7 @@ pub(crate) struct ReferenceInspectorState {
 impl Default for ReferenceInspectorState {
     fn default() -> Self {
         Self {
+            sidebar_resize: Default::default(),
             open: true,
             narrow_drawer: false,
             selected_tab: ReferenceInspectorTab::Agent,

@@ -49,6 +49,35 @@ def presentation_mode(value):
     raise RuntimeError('Unknown terminal presentation: ' + str(value))
 
 
+def settings_advanced_tab(words, *, reference_shell_fixture):
+    """Find Advanced only on its unique, independently anchored Settings tab row."""
+    def shares_row(row, anchor):
+        return max(int(row['top']), int(anchor['top'])) < min(
+            int(row['top']) + int(row['height']),
+            int(anchor['top']) + int(anchor['height']))
+    framing = "‘’'\".,:;()[]"
+    anchors = []
+    if reference_shell_fixture:
+        appearance = [r for r in words if r['text'] == 'Appearance']
+        assert len(appearance) == 1, ('ambiguous Appearance tab anchor', appearance)
+        # Rounded selected-tab framing can be captured as peripheral OCR
+        # punctuation. Strip only the same framing allowed for Advanced;
+        # spelling, case, same-row placement and uniqueness remain exact.
+        font = [r for r in words if r['text'].strip(framing) == 'Font'
+                and shares_row(r, appearance[0])]
+        assert len(font) == 1, ('ambiguous Font tab-row anchor', font)
+        anchors = [appearance[0], font[0]]
+    else:
+        for label in ('Appearance', 'Remote'):
+            matches = [r for r in words if r['text'] == label]
+            assert len(matches) == 1, ('ambiguous tab anchor', label, matches)
+            anchors.append(matches[0])
+    rows = [r for r in words if r['text'].strip(framing).casefold() == 'advanced'
+            and all(shares_row(r, anchor) for anchor in anchors)]
+    assert len(rows) == 1, ('ambiguous or absent Advanced tab', rows)
+    return rows[0]
+
+
 def settings_mode_selector(rows, current):
     """Exact mode value beside the Settings label, never the window title."""
     def bounds(row):
@@ -167,8 +196,88 @@ def registered_settings_popup_rows(rows, region):
     return result
 
 
-def settings_mode_popup_plane(pixels, region, selector):
-    """Measure the native popup's two vertical border runs, never its words."""
+# Glass-v1 compact-palette calibration uses an immutable native popup capture
+# after the strict OCR selector succeeded. The existing exact paired-edge
+# algorithm measured one 100x62 plane with 48 paired rows, without tolerance.
+SETTINGS_GLASS_POPUP_PROVENANCE = {
+    'source_image': '.cloud-environment/compact-ui/palette/after/ember/block/mode-menu.png',
+    'source_image_sha256': '3b3e31d9d60d6f3e7ad8b736c7c5ccc35e04f76902a1db3e637ae4a8b13edef2',
+    'source_binary': '.cloud-environment/target/debug/ember',
+    'source_binary_sha256': '5a4235d633bc0cd94700e5fe6b3cbf1f431d7dbf412a0580ff98380387de6634',
+    'selector_source': '.cloud-environment/compact-ui/palette/after/ember/block/mode-selector.png',
+    'selector_source_sha256': 'bfc467c108852a24d6b8cb10e3afa06f3a99ab86a26ddedc733e7de2f7ad5282',
+    'backend': 'x11', 'renderer': 'glow', 'scale': 1,
+    'selector_observer': 'strict native OCR selector',
+    'paired_exact_rows': 48,
+    'measured_plane': {'x': 502, 'y': 516, 'width': 100, 'height': 62},
+}
+
+
+def settings_popup_profile_metadata(native_ui_profile):
+    if native_ui_profile == 'legacy-reference':
+        return {'profile': native_ui_profile, 'border_rgb': [60, 60, 60],
+                'minimum_contiguous_rows': '2 * selector height'}
+    if native_ui_profile == 'glass-v1':
+        return {'profile': native_ui_profile,
+                'left_border_rgb': [42, 64, 108], 'right_border_rgb': [36, 51, 84],
+                'minimum_paired_exact_rows': '2 * selector height',
+                'maximum_missing_raster_rows': 2,
+                'calibration': SETTINGS_GLASS_POPUP_PROVENANCE.copy()}
+    raise RuntimeError('Unknown native Settings popup observation profile')
+
+
+def glass_settings_mode_popup_plane(pixels, region, selector):
+    """Register exact paired glass edges despite at most two raster-row gaps.
+
+    The translucent stroke composites differently on its left/right edges.
+    Glyph/line antialiasing interrupts a few edge pixels. Each entire edge and
+    its paired support must retain at least two selector heights of exact RGB
+    rows, with no gap exceeding two missing raster rows. No color tolerance,
+    coordinate fallback, or fragmented-segment search is admitted.
+    """
+    width, height = region['width'], region['height']
+    if len(pixels) != width*height*3:
+        raise RuntimeError('Invalid Settings popup RGB size')
+    minimum = 2*int(selector['height'])
+    if minimum <= 0:
+        raise RuntimeError('Invalid native Settings selector height')
+    center = int(selector['left'])+int(selector['width'])/2
+    def supported(rows):
+        return len(rows) >= minimum and all(b-a <= 3 for a,b in zip(rows,rows[1:]))
+    def columns(color):
+        result=[]
+        for x in range(width):
+            rows=[y for y in range(height)
+                  if pixels[(y*width+x)*3:(y*width+x)*3+3] == bytes(color)]
+            if supported(rows):
+                result.append((x,rows))
+        return result
+    planes=[]
+    for left,left_rows in columns((42,64,108)):
+        for right,right_rows in columns((36,51,84)):
+            if not (region['x']+left<center<region['x']+right and
+                    right-left+1>=int(selector['width'])):
+                continue
+            paired=sorted(set(left_rows).intersection(right_rows))
+            if not supported(paired):
+                continue
+            # Both complete edge spans belong to this one supported pair.
+            # Include their directly observed endpoints, so antialiased top
+            # glyphs are not cropped to the later of the two exact-color runs.
+            top=min(left_rows[0],right_rows[0])
+            bottom=max(left_rows[-1],right_rows[-1])+1
+            planes.append(dict(x=region['x']+left,y=region['y']+top,
+                               width=right-left+1,height=bottom-top))
+    if len(planes)>1:
+        raise RuntimeError('Ambiguous native Settings popup border plane')
+    return planes[0] if planes else None
+
+
+def settings_mode_popup_plane(pixels, region, selector, native_ui_profile='legacy-reference'):
+    """Measure the registered profile's native border plane, never its words."""
+    settings_popup_profile_metadata(native_ui_profile)  # Reject unknown profiles.
+    if native_ui_profile == 'glass-v1':
+        return glass_settings_mode_popup_plane(pixels, region, selector)
     width, height = region['width'], region['height']
     if len(pixels) != width*height*3:
         raise RuntimeError('Invalid Settings popup RGB size')
@@ -523,7 +632,8 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
               and int(word['left'])+int(word['width'])<=r['x']+r['width']
               and int(word['top'])+int(word['height'])<=r['y']+r['height']]
         metadata={'owned':before,'source_sha256':digest,
-            'analysis_sha256':hashlib.sha256(analysis.read_bytes()).hexdigest(),'algorithm':'ImageMagick -colorspace Gray -negate','ocr_psm':11}
+            'analysis_sha256':hashlib.sha256(analysis.read_bytes()).hexdigest(),'algorithm':'ImageMagick -colorspace Gray -negate','ocr_psm':11,
+            'native_ui_profile': self.native_ui_profile}
         if popup_selector is not None:
             if not label.endswith('-mode-menu'):
                 raise RuntimeError('Popup ROI is limited to an observed Settings mode menu')
@@ -531,11 +641,12 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             pixels = self.run(['convert',str(source),'-crop',
                        f"{admissible['width']}x{admissible['height']}+{admissible['x']}+{admissible['y']}",
                        '+repage','-colorspace','sRGB','-alpha','off','-depth','8','RGB:-'],capture_output=True).stdout
-            region = settings_mode_popup_plane(pixels, admissible, popup_selector)
+            profile_metadata = settings_popup_profile_metadata(self.native_ui_profile)
+            region = settings_mode_popup_plane(pixels, admissible, popup_selector, self.native_ui_profile)
             # Geometry chooses the authoritative observation before reading
             # any popup words. An unregistered surface cannot justify a click.
             if region is None:
-                metadata['popup']={'admissible':admissible,'registered':False}
+                metadata['popup']={'admissible':admissible,'registered':False,'observation_profile':profile_metadata}
                 if (owned()!=before or hashlib.sha256(source.read_bytes()).hexdigest()!=digest or
                         hashlib.sha256(analysis.read_bytes()).hexdigest()!=metadata['analysis_sha256']):
                     raise RuntimeError('Settings popup ownership or immutable pixels changed')
@@ -561,6 +672,7 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
                     hashlib.sha256(target.read_bytes()).hexdigest()!=crop_digest):
                 raise RuntimeError('Settings popup ownership or immutable pixels changed')
             metadata['popup']={'rectangle':region,'admissible':admissible,'selector':popup_selector,'image':str(target),
+                               'observation_profile':profile_metadata,
                                'image_sha256':crop_digest,'ocr_psm':11,'source':'same Gray-inverted immutable full capture'}
             metadata['popup']['action_observer']='single fixed-PSM pass in independently registered native popup'
             metadata['popup']['whole_image_role']='retained diagnostic, not an additional action observation'
@@ -576,32 +688,8 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         # using the actual tab-row anchors, never arbitrary first/top match.
         observe = self.reference_settings_words if getattr(self, 'reference_shell_fixture', False) else self.words
         words = observe(new + '-settings')
-        anchors = []
-        # The reference shell uses the same native Settings dialog, but its
-        # registered DejaVu chrome makes the far Remote word unstable to OCR.
-        # Font and Appearance are exact, unique same-row anchors; Advanced
-        # still must share both anchors' row, never a coordinate fallback.
-        def shares_row(row, anchor):
-            return max(int(row['top']), int(anchor['top'])) < min(
-                int(row['top']) + int(row['height']),
-                int(anchor['top']) + int(anchor['height']))
-        if getattr(self, 'reference_shell_fixture', False):
-            appearance = [r for r in words if r['text'] == 'Appearance']
-            assert len(appearance) == 1, ('ambiguous Appearance tab anchor', appearance)
-            font = [r for r in words if r['text'] == 'Font' and shares_row(r, appearance[0])]
-            assert len(font) == 1, ('ambiguous Font tab-row anchor', font)
-            anchors = [appearance[0], font[0]]
-        else:
-            for label in ('Appearance', 'Remote'):
-                matches = [r for r in words if r['text'] == label]
-                assert len(matches) == 1, ('ambiguous tab anchor', label, matches)
-                anchors.append(matches[0])
-        # Selected tab backgrounds can introduce peripheral OCR punctuation.
-        # Exact normalized word only: no fuzzy/substring or coordinate fallback.
-        rows = [r for r in words if r['text'].strip("‘’'\".,:;()[]").casefold() == 'advanced'
-                and all(shares_row(r, anchor) for anchor in anchors)]
-        assert len(rows) == 1, ('ambiguous or absent Advanced tab', rows)
-        row = rows[0]
+        row = settings_advanced_tab(
+            words, reference_shell_fixture=getattr(self, 'reference_shell_fixture', False))
         self.click(int(row['left']) + int(row['width']) // 2,
                    int(row['top']) + int(row['height']) // 2)
         row = settings_mode_selector(observe(new + '-mode-selector'), old.title())

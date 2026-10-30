@@ -1289,6 +1289,7 @@ fn active_companion_region(
 
 /// Foreground content paints above the shared footer. The native allocation
 /// is owned by `reference_terminal_rects` and stays stable at the Prompt too.
+#[allow(dead_code)] // Public library compatibility helper; the app supplies adaptive chrome height.
 pub fn reference_foreground_rects(
     outer: egui::Rect,
     foreground: bool,
@@ -1296,7 +1297,18 @@ pub fn reference_foreground_rects(
     if !foreground {
         return (outer, None);
     }
-    let height = crate::glass_shell::COMPOSER_HEIGHT.min((outer.height() - 24.0).max(0.0));
+    reference_foreground_rects_with_height(outer, foreground, crate::glass_shell::COMPOSER_HEIGHT)
+}
+
+pub fn reference_foreground_rects_with_height(
+    outer: egui::Rect,
+    foreground: bool,
+    tools_height: f32,
+) -> (egui::Rect, Option<egui::Rect>) {
+    if !foreground {
+        return (outer, None);
+    }
+    let height = tools_height.min((outer.height() - 24.0).max(0.0));
     let top = outer.bottom() - height;
     (
         egui::Rect::from_min_max(
@@ -1306,24 +1318,35 @@ pub fn reference_foreground_rects(
                 (top - crate::glass_shell::token::TERMINAL_FOOTER_GAP).max(outer.top()),
             ),
         ),
-        (height > 0.0).then(|| {
-            egui::Rect::from_min_max(
-                egui::pos2(outer.left() - 16.0, top),
-                outer.max + egui::vec2(17.0, 0.0),
-            )
-        }),
+        (height > 0.0).then(|| egui::Rect::from_min_max(egui::pos2(outer.left(), top), outer.max)),
     )
 }
 
 /// One native budget is shared by Prompt and foreground/TUI. Only the
 /// presentation may use additional virtual rows for the docked composer.
+#[allow(dead_code)] // Public library compatibility helper; the app supplies adaptive chrome height.
 pub fn reference_terminal_rects(
     outer: egui::Rect,
     retained: bool,
     foreground: bool,
 ) -> (egui::Rect, egui::Rect, Option<egui::Rect>) {
-    let native = reference_foreground_rects(outer, retained).0;
-    let (presentation, footer) = reference_foreground_rects(outer, foreground);
+    reference_terminal_rects_with_height(
+        outer,
+        retained,
+        foreground,
+        crate::glass_shell::COMPOSER_HEIGHT,
+    )
+}
+
+pub fn reference_terminal_rects_with_height(
+    outer: egui::Rect,
+    retained: bool,
+    foreground: bool,
+    tools_height: f32,
+) -> (egui::Rect, egui::Rect, Option<egui::Rect>) {
+    let native = reference_foreground_rects_with_height(outer, retained, tools_height).0;
+    let (presentation, footer) =
+        reference_foreground_rects_with_height(outer, foreground, tools_height);
     (native, presentation, footer)
 }
 
@@ -1535,6 +1558,7 @@ pub struct TerminalRenderer {
     pub chat_control_rect: Option<egui::Rect>,
     /// Non-editable chrome outside the already reduced foreground PTY viewport.
     pub foreground_footer_rect: Option<egui::Rect>,
+    pub reference_tools_height: f32,
     /// Canvas-only rows; never resize the native PTY for a prompt dock.
     pub projection_view_rows: Option<usize>,
     /// Same-frame explicit input action; target identity must be revalidated by the app.
@@ -1640,7 +1664,7 @@ pub struct TerminalRenderer {
 }
 
 impl TerminalRenderer {
-    const SCROLLBAR_WIDTH: f32 = 8.0;
+    const SCROLLBAR_WIDTH: f32 = 6.0;
     const SCROLLBAR_GAP: f32 = 2.0;
     const MIN_THUMB_HEIGHT: f32 = 24.0;
     const MIN_SPLIT_COLS: f32 = 8.0;
@@ -1699,6 +1723,7 @@ impl TerminalRenderer {
             chat_controls_enabled: false,
             chat_control_rect: None,
             foreground_footer_rect: None,
+            reference_tools_height: crate::glass_shell::COMPOSER_HEIGHT,
             projection_view_rows: None,
             chat_input_action: None,
             chat_native_owner: None,
@@ -1770,7 +1795,11 @@ impl TerminalRenderer {
         terminal: &TerminalState,
         outer_height: f32,
     ) {
-        let limit = crate::glass_shell::editable_input_limit(outer_height, self.line_height);
+        let limit = crate::glass_shell::editable_input_limit_with_height(
+            outer_height,
+            self.line_height,
+            self.reference_tools_height,
+        );
         let fallback = chat
             && terminal.chat_surface().composer_docked()
             && terminal
@@ -1805,7 +1834,12 @@ impl TerminalRenderer {
     ) -> egui::Rect {
         self.configure_glass_presentation(self.glass_chat_requested, terminal, outer.height());
         let foreground = !self.chat_mode || !terminal.chat_surface().composer_docked();
-        let (_, presentation, footer) = reference_terminal_rects(outer, true, foreground);
+        let (_, presentation, footer) = reference_terminal_rects_with_height(
+            outer,
+            true,
+            foreground,
+            self.reference_tools_height,
+        );
         self.foreground_footer_rect = footer;
         self.projection_view_rows = self
             .chat_mode
@@ -1814,7 +1848,11 @@ impl TerminalRenderer {
     }
 
     pub fn chat_footer_rows(&self) -> usize {
-        crate::glass_shell::footer_rows(self.padding, self.line_height)
+        crate::glass_shell::footer_rows_with_height(
+            self.padding,
+            self.line_height,
+            (self.reference_tools_height - 12.0).max(crate::glass_shell::CONTROL_HEIGHT),
+        )
     }
 
     /// Only Chat keeps display-row separators between its capsules.
@@ -7364,6 +7402,174 @@ mod tests {
     }
 
     #[test]
+    fn actual_egui_panel_allocation_keeps_files_and_large_fonts_out_of_native_budget() {
+        use crate::glass_shell::{self as shell, BoundedPanel as _};
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1356.0, 850.0));
+        for font in [14.0, 32.0, 72.0] {
+            for widths in [
+                shell::SidebarWidths::default(),
+                shell::SidebarWidths {
+                    navigation: Some(256.0),
+                    inspector: Some(318.0),
+                },
+            ] {
+                let ctx = egui::Context::default();
+                ctx.global_style_mut(|style| crate::theme::configure_workspace_text(style, font));
+                let layout =
+                    shell::Layout::with_sidebar_widths(viewport.width(), viewport.height(), widths)
+                        .with_chrome_font_size(font);
+                let mut previous_grid = None;
+                // The real application changes panel ordering on Context→Files.
+                for files in [false, true, false, true] {
+                    let mut actual_native = None;
+                    let output = ctx.run_ui(egui::RawInput { screen_rect: Some(viewport), ..Default::default() }, |root| {
+                        egui::Panel::top("allocation-top").exact_size(layout.titlebar.height).frame(egui::Frame::NONE)
+                            .show_bounded(root, |_| {});
+                        egui::Panel::left("allocation-rail").exact_size(shell::token::OUTER_LEFT + layout.rail.width).frame(egui::Frame::NONE)
+                            .show_bounded(root, |_| {});
+                        let navigation = |root: &mut egui::Ui| {
+                            egui::Panel::left("allocation-navigation").exact_size(layout.navigation.unwrap().width).frame(egui::Frame::NONE)
+                                .show_bounded(root, |ui| { ui.label("long workspace title ".repeat(40)); });
+                        };
+                        let inspector = |root: &mut egui::Ui| {
+                            egui::Panel::right(if files { "allocation-files" } else { "allocation-context" })
+                                .exact_size(layout.inspector.unwrap().width + shell::token::INSPECTOR_GAP + shell::token::OUTER_RIGHT)
+                                .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 14, top: 10, bottom: 6 }))
+                                .show_bounded(root, |ui| {
+                                    // Reproduce the actual failure: intrinsic tab/action
+                                    // widths exceed the fixed right panel at UI14/32/72.
+                                    ui.horizontal(|ui| {
+                                        for _ in 0..if files { 9 } else { 3 } { ui.add_sized([80.0, 32.0], egui::Button::new("Inspect action")); }
+                                    });
+                                });
+                        };
+                        if files { navigation(root); inspector(root); } else { inspector(root); navigation(root); }
+                        egui::CentralPanel::default().frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 6, right: 0, top: 4, bottom: 6 }))
+                            .show_bounded(root, |ui| {
+                                let allocated = ui.available_rect_before_wrap();
+                                assert_eq!(allocated.min, egui::pos2(layout.center.x, layout.center.y));
+                                assert_eq!(allocated.right(), layout.center.x + layout.center.width);
+                                assert_eq!(allocated.bottom(), layout.center.y + layout.center.height);
+                                let header = egui::Rect::from_min_size(allocated.min, egui::vec2(allocated.width(), layout.header.height));
+                                shell::bounded_ui_at(ui, header, |header_ui| {
+                                    header_ui.allocate_exact_size(egui::vec2(header.width() + 400.0, header.height()), egui::Sense::hover());
+                                });
+                                assert_eq!(ui.available_width(), allocated.width(), "header intrinsic minima cannot widen the following native pane");
+                                let terminal_outer = egui::Rect::from_min_max(allocated.min + egui::vec2(0.0, layout.header.height + 6.0), allocated.max);
+                                actual_native = Some(reference_terminal_rects_with_height(terminal_outer, true, true, layout.composer.height).0);
+                            });
+                    });
+                    output.drop_without_applying_deltas();
+                    let native = actual_native.unwrap();
+                    assert_eq!(
+                        native.right(),
+                        layout.inspector.unwrap().x - shell::token::INSPECTOR_GAP
+                    );
+                    let renderer = TerminalRenderer::new(
+                        14.0,
+                        8.0,
+                        1.0,
+                        crate::config::ScrollbarVisibility::Auto,
+                        crate::theme::Theme::default(),
+                    );
+                    let grid = renderer.grid_dimensions(native.size());
+                    if let Some(previous) = previous_grid {
+                        assert_eq!(
+                            grid, previous,
+                            "Context→Files must not resize the real native grid"
+                        );
+                    }
+                    previous_grid = Some(grid);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_workspace_reclaims_native_cells_with_same_panels_and_metrics() {
+        use crate::glass_shell as shell;
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        renderer.continuous_block = true;
+        for (width, height) in [(1612.0, 976.0), (1280.0, 900.0)] {
+            let layout = shell::Layout::for_size(width, height).with_chrome_font_size(14.0);
+            assert!(layout.navigation.is_some() && layout.inspector.is_some());
+            let outer = egui::Rect::from_min_max(
+                egui::pos2(
+                    layout.center.x,
+                    layout.header.y + layout.header.height + shell::token::TERMINAL_TOP_GAP,
+                ),
+                egui::pos2(
+                    layout.center.x + layout.center.width,
+                    layout.center.y + layout.center.height,
+                ),
+            );
+            let native = reference_terminal_rects(outer, true, false).0;
+            // The preceding profile's real native rectangle included both
+            // duplicated column insets and its 98px footer + 13px footer gap.
+            let preceding = egui::Rect::from_min_max(
+                egui::pos2(365.0, 171.0),
+                egui::pos2(
+                    width - 8.0 - 350.0 - 10.0 - 3.0 - 17.0,
+                    height - 46.0 - 98.0 - 13.0,
+                ),
+            );
+            for padding in [8.0, 16.0] {
+                renderer.padding = padding;
+                let before = renderer.grid_dimensions(preceding.size());
+                let after = renderer.grid_dimensions(native.size());
+                assert!(after.0 >= before.0 + 18, "columns: {before:?} -> {after:?}");
+                assert!(after.1 >= before.1 + 10, "rows: {before:?} -> {after:?}");
+                assert_eq!(renderer.font_size, 14.0);
+                assert_eq!(renderer.padding, padding);
+                let content = renderer.layout_rects(native).0;
+                assert_eq!(content.left(), native.left() + padding);
+                assert_eq!(content.top(), native.top() + padding);
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_chrome_uses_one_native_budget_and_keeps_controls_below_input() {
+        use crate::glass_shell as shell;
+        for font in [14.0, 18.0, 24.0, 32.0, 40.0, 72.0] {
+            let layout = shell::Layout::for_size(1280.0, 700.0).with_chrome_font_size(font);
+            let outer = egui::Rect::from_min_max(
+                egui::pos2(
+                    layout.center.x,
+                    layout.header.y + layout.header.height + shell::token::TERMINAL_TOP_GAP,
+                ),
+                egui::pos2(
+                    layout.center.x + layout.center.width,
+                    layout.center.y + layout.center.height,
+                ),
+            );
+            let tools = layout.composer.height;
+            let native = reference_terminal_rects_with_height(outer, true, false, tools).0;
+            let foreground = reference_terminal_rects_with_height(outer, true, true, tools);
+            assert_eq!(foreground.0, native);
+            assert_eq!(foreground.1, native);
+            assert_eq!(foreground.2.unwrap().height(), tools);
+            let control = shell::chrome_control_height(font);
+            let padding = 8.0;
+            let line = 18.0;
+            let editor_bottom = outer.bottom()
+                - padding
+                - shell::footer_rows_with_height(padding, line, control) as f32 * line;
+            let dock = shell::editor_dock_with_height(outer, editor_bottom - line, tools);
+            assert_eq!(dock.controls.height(), control);
+            assert!(editor_bottom + 6.0 <= dock.controls.top());
+            assert!(outer.contains_rect(dock.frame));
+            assert!(dock.frame.contains_rect(dock.controls));
+        }
+    }
+
+    #[test]
     fn foreground_footer_uses_one_reduced_native_viewport_without_moving_ime_origin() {
         let renderer = TerminalRenderer::new(
             14.0,
@@ -7372,20 +7578,20 @@ mod tests {
             crate::config::ScrollbarVisibility::Auto,
             crate::theme::Theme::default(),
         );
-        // Explicit glass profile: one98px toolbar and13px gap below a real native pane.
+        // Compact glass profile: one44px toolbar and6px gap below the native pane.
         let outer = egui::Rect::from_min_size(egui::pos2(365.0, 171.0), egui::vec2(859.0, 759.0));
         let (native, footer) = reference_foreground_rects(outer, true);
         let footer = footer.unwrap();
         assert_eq!(native.min, outer.min);
         assert_eq!(native.right(), outer.right());
-        assert_eq!(footer.height(), 98.0);
-        assert_eq!(footer.top(), 832.0);
-        assert_eq!(native.bottom(), 819.0);
+        assert_eq!(footer.height(), 44.0);
+        assert_eq!(footer.top(), 886.0);
+        assert_eq!(native.bottom(), 880.0);
         assert_eq!(
             native.bottom() + crate::glass_shell::token::TERMINAL_FOOTER_GAP,
             footer.top()
         );
-        assert_eq!((footer.left(), footer.right()), (349.0, 1241.0));
+        assert_eq!((footer.left(), footer.right()), (365.0, 1224.0));
         let full_content = renderer.layout_rects(outer).0;
         let native_content = renderer.layout_rects(native).0;
         assert_eq!(
@@ -11924,7 +12130,7 @@ mod transcript_canvas_tests {
                             .cells(),
                         cells.as_slice(),
                     );
-                    assert_eq!(footer.unwrap().height(), 98.0);
+                    assert_eq!(footer.unwrap().height(), 44.0);
                     // Readline redraws the same prompt with CUP + erase-to-end.
                     // ED2 is different: it archives visible native content.
                     terminal.process_input(b"\x1b[H\x1b[J$ ");
@@ -11979,55 +12185,67 @@ mod transcript_canvas_tests {
         let mut saw_dock = false;
         let mut saw_fallback = false;
         let mut output = ctx.run_ui(Default::default(), |_| {
-            for (chat, width, height) in [
-                (true, 900.0, 759.0),
-                (true, 240.0, 350.0),
-                (true, 900.0, 759.0),
-                (false, 900.0, 759.0),
-                (true, 900.0, 759.0),
-                (true, 500.0, 477.0),
-                (true, 900.0, 759.0),
+            for tools_height in [
+                crate::glass_shell::COMPOSER_HEIGHT,
+                crate::glass_shell::chrome_control_height(32.0) + 12.0,
+                crate::glass_shell::chrome_control_height(72.0) + 12.0,
             ] {
-                let outer =
-                    egui::Rect::from_min_size(egui::pos2(80.0, 150.0), egui::vec2(width, height));
-                renderer.sync_glass_presentation(&ctx, chat, &terminal, height);
-                let native = reference_terminal_rects(outer, true, true).0;
-                let size = renderer.grid_dimensions(native.size());
-                terminal.on_resize(size.0, size.1);
-                let cursor = (terminal.cursor_row, terminal.cursor_col);
-                let cells = terminal.grid.to_vec();
-                let presentation = renderer.resolve_glass_layout(&terminal, outer);
-                let expected = chat
-                    && terminal.native_prompt_input_rows().is_some_and(|rows| {
-                        rows as f32 * renderer.line_height
-                            <= crate::glass_shell::editable_input_limit(
-                                height,
-                                renderer.line_height,
-                            )
-                    });
-                assert_eq!(renderer.chat_mode, expected);
-                saw_dock |= chat && expected;
-                saw_fallback |= chat && !expected;
-                assert_eq!(
-                    presentation,
-                    reference_terminal_rects(outer, true, !expected).1
-                );
-                assert_eq!(renderer.projection_view_rows.is_some(), expected);
-                assert_eq!(renderer.foreground_footer_rect.is_none(), expected);
-                assert_eq!(renderer.grid_dimensions(native.size()), size);
-                assert_eq!((terminal.cursor_row, terminal.cursor_col), cursor);
-                assert_native_cells_equal(&terminal.grid.to_vec(), &cells);
-                assert_eq!(terminal.preedit_text, "中文组合");
-                assert_eq!(terminal.preedit_cursor, 2);
-                assert!(terminal.ime_enabled && renderer.ime_enabled);
-                assert!(renderer.requested_initial_focus);
-                let metrics = (renderer.char_width, renderer.line_height);
-                renderer.sync_font_metrics(&ctx);
-                assert_eq!(
-                    (renderer.char_width, renderer.line_height),
-                    metrics,
-                    "a fallback render cannot change next frame's PTY budget"
-                );
+                renderer.reference_tools_height = tools_height;
+                for (chat, width, height) in [
+                    (true, 900.0, 759.0),
+                    (true, 240.0, 350.0),
+                    (true, 900.0, 759.0),
+                    (false, 900.0, 759.0),
+                    (true, 900.0, 759.0),
+                    (true, 500.0, 477.0),
+                    (true, 900.0, 759.0),
+                ] {
+                    let outer = egui::Rect::from_min_size(
+                        egui::pos2(80.0, 150.0),
+                        egui::vec2(width, height),
+                    );
+                    renderer.sync_glass_presentation(&ctx, chat, &terminal, height);
+                    let native =
+                        reference_terminal_rects_with_height(outer, true, true, tools_height).0;
+                    let size = renderer.grid_dimensions(native.size());
+                    terminal.on_resize(size.0, size.1);
+                    let cursor = (terminal.cursor_row, terminal.cursor_col);
+                    let cells = terminal.grid.to_vec();
+                    let presentation = renderer.resolve_glass_layout(&terminal, outer);
+                    let expected = chat
+                        && terminal.native_prompt_input_rows().is_some_and(|rows| {
+                            rows as f32 * renderer.line_height
+                                <= crate::glass_shell::editable_input_limit_with_height(
+                                    height,
+                                    renderer.line_height,
+                                    tools_height,
+                                )
+                        });
+                    assert_eq!(renderer.chat_mode, expected);
+                    saw_dock |= chat && expected;
+                    saw_fallback |= chat && !expected;
+                    assert_eq!(
+                        presentation,
+                        reference_terminal_rects_with_height(outer, true, !expected, tools_height)
+                            .1
+                    );
+                    assert_eq!(renderer.projection_view_rows.is_some(), expected);
+                    assert_eq!(renderer.foreground_footer_rect.is_none(), expected);
+                    assert_eq!(renderer.grid_dimensions(native.size()), size);
+                    assert_eq!((terminal.cursor_row, terminal.cursor_col), cursor);
+                    assert_native_cells_equal(&terminal.grid.to_vec(), &cells);
+                    assert_eq!(terminal.preedit_text, "中文组合");
+                    assert_eq!(terminal.preedit_cursor, 2);
+                    assert!(terminal.ime_enabled && renderer.ime_enabled);
+                    assert!(renderer.requested_initial_focus);
+                    let metrics = (renderer.char_width, renderer.line_height);
+                    renderer.sync_font_metrics(&ctx);
+                    assert_eq!(
+                        (renderer.char_width, renderer.line_height),
+                        metrics,
+                        "a fallback render cannot change next frame's PTY budget"
+                    );
+                }
             }
         });
         output.textures_delta.clear();
