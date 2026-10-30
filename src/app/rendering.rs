@@ -2674,35 +2674,16 @@ impl TerminalApp {
         self.ensure_pane_renderer_capacity(ctx);
         if self.layout().panes().len() == 1 {
             let session = self.session_manager.get_active_session_mut();
-            self.renderer.configure_glass_presentation(
+            self.renderer.sync_glass_presentation(
+                ctx,
                 self.config.chat_mode_enabled(),
                 &session.terminal.lock(),
                 available_rect.height(),
             );
         }
-        let foreground = self.renderer.chat_mode
-            && !self
-                .session_manager
-                .get_active_session_mut()
-                .terminal
-                .lock()
-                .chat_surface()
-                .composer_docked();
-        let (single_pty_rect, single_presentation_rect, single_footer) =
-            crate::ui::reference_terminal_rects(
-                available_rect,
-                true,
-                !self.renderer.chat_mode || foreground,
-            );
-        self.renderer.foreground_footer_rect = single_footer;
-        // Prompt's virtual dock and foreground's footer have the same native
-        // budget. Presentation rows can grow; the PTY must not resize merely
-        // because OSC C/D changed the shell's surface state.
-        self.renderer.projection_view_rows = self.renderer.chat_mode.then(|| {
-            self.renderer
-                .grid_dimensions(single_presentation_rect.size())
-                .1
-        });
+        // Native size is independent of docking and input length. Resolve the
+        // presentation below, after resize has reflowed the real prompt rows.
+        let single_pty_rect = crate::ui::reference_terminal_rects(available_rect, true, true).0;
         let (cols, rows) = self.renderer.grid_dimensions(single_pty_rect.size());
         crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
 
@@ -2723,6 +2704,12 @@ impl TerminalApp {
             }
             self.force_resize_session = false;
         }
+
+        let single_presentation_rect = {
+            let session = self.session_manager.get_active_session_mut();
+            self.renderer
+                .resolve_glass_layout(&session.terminal.lock(), available_rect)
+        };
 
         // Block-mode gutter clicks reported by whichever renderer drew the
         // clicked pane this frame, applied after every pane has rendered.
@@ -2786,28 +2773,7 @@ impl TerminalApp {
                 } else {
                     renderer.sync_font_metrics(ctx);
                 }
-                let foreground = self.pane_renderers[pane_idx].chat_mode
-                    && self
-                        .session_manager
-                        .sessions()
-                        .get(session_idx)
-                        .is_some_and(|session| {
-                            !session.terminal.lock().chat_surface().composer_docked()
-                        });
-                let (pty_rect, content_rect, footer) = crate::ui::reference_terminal_rects(
-                    pane_outer_rect,
-                    true,
-                    !self.pane_renderers[pane_idx].chat_mode || foreground,
-                );
-                self.pane_renderers[pane_idx].foreground_footer_rect = footer;
-                // 按本窗格 rect 的尺寸 resize 该窗格会话的 shell + 终端 grid,
-                // 否则窗格内的 shell 仍以为自己拥有整窗口宽高,导致换行/清屏错乱。
-                self.pane_renderers[pane_idx].projection_view_rows =
-                    self.pane_renderers[pane_idx].chat_mode.then(|| {
-                        self.pane_renderers[pane_idx]
-                            .grid_dimensions(content_rect.size())
-                            .1
-                    });
+                let pty_rect = crate::ui::reference_terminal_rects(pane_outer_rect, true, true).0;
                 let (pane_cols, pane_rows) =
                     self.pane_renderers[pane_idx].grid_dimensions(pty_rect.size());
                 if let Some(session) = self.session_manager.get_session_mut(session_idx) {
@@ -2820,6 +2786,8 @@ impl TerminalApp {
                         terminal_guard.on_resize(pane_cols, pane_rows);
                         let _ = session.shell.resize(pane_cols, pane_rows);
                     }
+                    let content_rect = self.pane_renderers[pane_idx]
+                        .resolve_glass_layout(&terminal_guard, pane_outer_rect);
                     prune_permanently_unavailable_collapses(
                         &mut session.projection_policy,
                         &terminal_guard,

@@ -1790,9 +1790,27 @@ impl TerminalRenderer {
         terminal: &TerminalState,
         outer_height: f32,
     ) {
+        self.glass_chat_requested = chat;
         self.chat_mode = chat; // Metrics follow the requested role, never input length.
         self.sync_font_metrics(ctx);
         self.configure_glass_presentation(chat, terminal, outer_height);
+    }
+
+    /// Resolve presentation only after the native grid has accepted this frame's
+    /// size. Docking must never feed back into PTY dimensions or clear IME state.
+    pub fn resolve_glass_layout(
+        &mut self,
+        terminal: &TerminalState,
+        outer: egui::Rect,
+    ) -> egui::Rect {
+        self.configure_glass_presentation(self.glass_chat_requested, terminal, outer.height());
+        let foreground = !self.chat_mode || !terminal.chat_surface().composer_docked();
+        let (_, presentation, footer) = reference_terminal_rects(outer, true, foreground);
+        self.foreground_footer_rect = footer;
+        self.projection_view_rows = self
+            .chat_mode
+            .then(|| self.grid_dimensions(presentation.size()).1);
+        presentation
     }
 
     pub fn chat_footer_rows(&self) -> usize {
@@ -2100,7 +2118,7 @@ impl TerminalRenderer {
         // Chat's native Run/Interrupt labels share the terminal font size.
         // Reserve their actual egui line box plus the footer's inset/padding,
         // including when the GPU atlas has tighter ascent/descent metrics.
-        let control_line_height = if self.chat_mode {
+        let control_line_height = if self.chat_mode || self.glass_chat_requested {
             ctx.fonts_mut(|fonts| {
                 // A laid-out galley is pixel-rounded, unlike row_height. Use
                 // the same labels/font as draw_chat_controls so its fit check
@@ -11949,6 +11967,112 @@ mod transcript_canvas_tests {
     }
 
     #[test]
+    fn glass_layout_redocks_after_resize_and_preserves_input_ownership() {
+        let ctx = egui::Context::default();
+        let (mut renderer, mut terminal, _) = fixture(true);
+        terminal.process_input("中abc".repeat(50).as_bytes());
+        terminal.ime_enabled = true;
+        terminal.preedit_text = "中文组合".into();
+        terminal.preedit_cursor = 2;
+        renderer.ime_enabled = true;
+        renderer.requested_initial_focus = true;
+        let mut saw_dock = false;
+        let mut saw_fallback = false;
+        let mut output = ctx.run_ui(Default::default(), |_| {
+            for (chat, width, height) in [
+                (true, 900.0, 759.0),
+                (true, 240.0, 350.0),
+                (true, 900.0, 759.0),
+                (false, 900.0, 759.0),
+                (true, 900.0, 759.0),
+                (true, 500.0, 477.0),
+                (true, 900.0, 759.0),
+            ] {
+                let outer =
+                    egui::Rect::from_min_size(egui::pos2(80.0, 150.0), egui::vec2(width, height));
+                renderer.sync_glass_presentation(&ctx, chat, &terminal, height);
+                let native = reference_terminal_rects(outer, true, true).0;
+                let size = renderer.grid_dimensions(native.size());
+                terminal.on_resize(size.0, size.1);
+                let cursor = (terminal.cursor_row, terminal.cursor_col);
+                let cells = terminal.grid.to_vec();
+                let presentation = renderer.resolve_glass_layout(&terminal, outer);
+                let expected = chat
+                    && terminal.native_prompt_input_rows().is_some_and(|rows| {
+                        rows as f32 * renderer.line_height
+                            <= crate::glass_shell::editable_input_limit(
+                                height,
+                                renderer.line_height,
+                            )
+                    });
+                assert_eq!(renderer.chat_mode, expected);
+                saw_dock |= chat && expected;
+                saw_fallback |= chat && !expected;
+                assert_eq!(
+                    presentation,
+                    reference_terminal_rects(outer, true, !expected).1
+                );
+                assert_eq!(renderer.projection_view_rows.is_some(), expected);
+                assert_eq!(renderer.foreground_footer_rect.is_none(), expected);
+                assert_eq!(renderer.grid_dimensions(native.size()), size);
+                assert_eq!((terminal.cursor_row, terminal.cursor_col), cursor);
+                assert_native_cells_equal(&terminal.grid.to_vec(), &cells);
+                assert_eq!(terminal.preedit_text, "中文组合");
+                assert_eq!(terminal.preedit_cursor, 2);
+                assert!(terminal.ime_enabled && renderer.ime_enabled);
+                assert!(renderer.requested_initial_focus);
+                let metrics = (renderer.char_width, renderer.line_height);
+                renderer.sync_font_metrics(&ctx);
+                assert_eq!(
+                    (renderer.char_width, renderer.line_height),
+                    metrics,
+                    "a fallback render cannot change next frame's PTY budget"
+                );
+            }
+        });
+        output.textures_delta.clear();
+        assert!(saw_dock && saw_fallback);
+    }
+
+    #[test]
+    fn glass_fallback_metrics_and_short_prompt_recovery_are_stable() {
+        let ctx = egui::Context::default();
+        let (mut renderer, mut terminal, _) = fixture(true);
+        let outer = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 477.0));
+        for _ in 0..12 {
+            terminal.process_input(b"line\r\n");
+        }
+        let mut output = ctx.run_ui(Default::default(), |_| {
+            renderer.sync_glass_presentation(&ctx, true, &terminal, outer.height());
+            renderer.resolve_glass_layout(&terminal, outer);
+            assert!(!renderer.chat_mode);
+            let metrics = (renderer.char_width, renderer.line_height);
+            for _ in 0..32 {
+                renderer.sync_font_metrics(&ctx);
+                renderer.resolve_glass_layout(&terminal, outer);
+                assert!(!renderer.chat_mode);
+                assert_eq!((renderer.char_width, renderer.line_height), metrics);
+            }
+            terminal.process_input(b"\x1b[H\x1b[J$ ");
+            renderer.resolve_glass_layout(&terminal, outer);
+            assert!(renderer.chat_mode);
+            terminal.process_input(b"echo running\r\n\x1b]133;C\x07");
+            renderer.resolve_glass_layout(&terminal, outer);
+            assert!(renderer.chat_mode && renderer.foreground_footer_rect.is_some());
+            terminal.process_input(b"done\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+            renderer.resolve_glass_layout(&terminal, outer);
+            assert!(renderer.chat_mode && renderer.foreground_footer_rect.is_none());
+            renderer.sync_glass_presentation(&ctx, false, &terminal, outer.height());
+            renderer.resolve_glass_layout(&terminal, outer);
+            assert!(!renderer.chat_mode && !renderer.glass_chat_requested);
+            let block_metrics = (renderer.char_width, renderer.line_height);
+            renderer.sync_font_metrics(&ctx);
+            assert_eq!((renderer.char_width, renderer.line_height), block_metrics);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
     fn continuous_glass_block_retains_raw_rows_copy_fractional_and_reading_anchor() {
         let (mut renderer, mut terminal, mut policy) = fixture(false);
         renderer.continuous_block = true;
@@ -12092,6 +12216,29 @@ mod transcript_canvas_tests {
             before_anchor
         );
         assert!(renderer.pointer_app_mouse_eligible_projected(&terminal, &after, point));
+        // Repeated precision events cross whole-row boundaries without moving
+        // the editor or changing which real cell receives a pointer/IME cursor.
+        for _ in 0..128 {
+            canvas.scroll(0.75, true);
+            let frame =
+                renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+            let row = frame.cursor().row;
+            assert_eq!(renderer.canvas_row_span(content, row, 20.0).0, before_y);
+            let mapped = renderer.canvas_pointer_position(point);
+            let (row, col) = grid_position_from_content(
+                mapped,
+                renderer.canvas_mapping_rect(content),
+                9.0,
+                20.0,
+                frame.columns(),
+                frame.rows(),
+            );
+            assert_eq!(
+                frame.raw_anchor_at(DisplayPoint::new(row, col)),
+                before_anchor
+            );
+            assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 16));
+        }
     }
 
     #[test]
