@@ -229,7 +229,7 @@ fn paint_topbar_title(
     let color = shell::rgba(shell::token::TEXT);
     let galley =
         ui.painter()
-            .layout_no_wrap("Ember".into(), FontId::proportional(18.0 * scale), color);
+            .layout_no_wrap("Ember".into(), FontId::proportional(10.0 * scale), color);
     let rect = egui::Rect::from_min_size(
         egui::pos2(132.0, (titlebar_height - galley.size().y) * 0.5),
         galley.size(),
@@ -244,7 +244,7 @@ fn paint_topbar_title(
 fn header_action(ui: &mut egui::Ui, kind: Icon, label: &str) -> egui::Response {
     let response = ui
         .push_id(("reference-header-action", label), |ui| {
-            let size = ui.available_height().max(shell::HEADER_ACTION_SIZE);
+            let size = shell::HEADER_ACTION_SIZE;
             ui.spacing_mut().interact_size = egui::vec2(shell::HEADER_ACTION_SIZE, size);
             ui.spacing_mut().button_padding = egui::Vec2::ZERO;
             let visuals = ui.visuals_mut();
@@ -266,7 +266,7 @@ fn header_action(ui: &mut egui::Ui, kind: Icon, label: &str) -> egui::Response {
         .inner;
     icon(
         ui,
-        egui::Rect::from_center_size(response.rect.center(), egui::Vec2::splat(16.0)),
+        egui::Rect::from_center_size(response.rect.center(), egui::Vec2::splat(14.0)),
         kind,
         rgb(color::CANVAS_MUTED),
     );
@@ -296,10 +296,10 @@ pub(crate) fn chrome_style(ui: &mut egui::Ui, scale: f32) {
     style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
     style.visuals.widgets.hovered.weak_bg_fill = rgb(color::NAVIGATION_SELECTED);
     style.spacing.item_spacing = egui::vec2(shell::METADATA_GAP, 4.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
     style.spacing.interact_size.y = 28.0;
     for font in style.text_styles.values_mut() {
-        *font = FontId::proportional(16.0 * scale);
+        *font = FontId::proportional(10.0 * scale);
     }
 }
 
@@ -357,7 +357,7 @@ fn nav_row(ui: &mut egui::Ui, label: &str, selected: bool, kind: Option<Icon>) -
             ui,
             egui::Rect::from_center_size(
                 rect.left_center() + egui::vec2(16.5, 0.0),
-                egui::vec2(15.0, 15.0),
+                egui::vec2(13.0, 13.0),
             ),
             kind,
             tint,
@@ -654,7 +654,7 @@ impl TerminalApp {
             .on_hover_text(label);
         icon(
             ui,
-            egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(16.0)),
+            egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(14.0)),
             Icon::PanelRight,
             rgb(if shown {
                 color::CHROME_TEXT
@@ -854,7 +854,7 @@ impl TerminalApp {
                 );
                 icon(
                     ui,
-                    egui::Rect::from_center_size(settings.center(), egui::Vec2::splat(16.0)),
+                    egui::Rect::from_center_size(settings.center(), egui::Vec2::splat(14.0)),
                     Icon::Settings,
                     shell::rgba(shell::token::TEXT),
                 );
@@ -884,7 +884,7 @@ impl TerminalApp {
                             r,
                             egui::Button::new(
                                 RichText::new(label)
-                                    .size(14.0 * scale)
+                                    .size(10.0 * scale)
                                     .color(shell::rgba(shell::token::TEXT)),
                             )
                             .truncate()
@@ -1001,7 +1001,7 @@ impl TerminalApp {
                     let shortcut_galley = (scale <= 1.0).then(|| {
                         ui.painter().layout_no_wrap(
                             shortcut,
-                            FontId::proportional(13.0 * scale),
+                            FontId::proportional(9.0 * scale),
                             shell::rgba(shell::token::TEXT),
                         )
                     });
@@ -1021,7 +1021,7 @@ impl TerminalApp {
                         } else {
                             "Search commands, files, tools…"
                         },
-                        FontId::proportional(14.0 * scale),
+                        FontId::proportional(10.0 * scale),
                         shell::rgba(shell::token::MUTED_TEXT),
                     );
                     if let Some(galley) = shortcut_galley {
@@ -1110,7 +1110,7 @@ impl TerminalApp {
                         [size, size],
                         egui::Button::new("")
                             .fill(if key == "workspace" && self.sidebar.visible {
-                                shell::rgba(shell::token::ACCENT_TOP)
+                                shell::rgba(shell::token::SELECTED_NAV)
                             } else {
                                 Color32::TRANSPARENT
                             })
@@ -1121,7 +1121,7 @@ impl TerminalApp {
                         ui,
                         egui::Rect::from_center_size(
                             response.rect.center(),
-                            egui::Vec2::splat(16.0),
+                            egui::Vec2::splat(14.0),
                         ),
                         kind,
                         shell::rgba(shell::token::TEXT),
@@ -1152,7 +1152,7 @@ impl TerminalApp {
         ui.spacing_mut().item_spacing.y = shell::NAVIGATION_ROW_GAP;
         ui.label(
             RichText::new("WORKSPACE")
-                .size(13.0 * scale)
+                .size(9.0 * scale)
                 .color(rgb(color::CHROME_MUTED)),
         );
         let (workspace, workspace_detail) = self.reference_workspace_identity();
@@ -1180,7 +1180,7 @@ impl TerminalApp {
             name_rect.left_center(),
             egui::Align2::LEFT_CENTER,
             workspace,
-            egui::FontId::proportional(16.0 * scale),
+            egui::FontId::proportional(10.0 * scale),
             rgb(color::CHROME_TEXT),
         );
         icon(
@@ -1325,8 +1325,8 @@ impl TerminalApp {
         }
         ui.add_space(18.0);
         let heading = ui.label(
-            RichText::new("TABS")
-                .size(13.0 * scale)
+            RichText::new("RECENT")
+                .size(9.0 * scale)
                 .color(rgb(color::CHROME_MUTED)),
         );
         ui.add_space((heading.rect.bottom() + shell::METADATA_GAP - ui.cursor().top()).max(0.0));
@@ -1351,14 +1351,14 @@ impl TerminalApp {
                     let row_width = ui.available_width();
                     let time = ui.painter().layout_no_wrap(
                         entry.time.clone(),
-                        FontId::proportional(12.0 * scale),
+                        FontId::proportional(9.0 * scale),
                         rgb(color::CHROME_MUTED),
                     );
                     let title_width =
                         (row_width - 28.0 - 7.0 - time.size().x - shell::METADATA_GAP).max(1.0);
                     let mut title_job = egui::text::LayoutJob::simple(
                         entry.title.clone(),
-                        FontId::proportional(16.0 * scale),
+                        FontId::proportional(10.0 * scale),
                         rgb(color::CHROME_TEXT),
                         title_width,
                     );
@@ -1367,7 +1367,7 @@ impl TerminalApp {
                     let title = ui.painter().layout_job(title_job);
                     let mut detail_job = egui::text::LayoutJob::simple(
                         entry.detail.clone(),
-                        FontId::proportional(12.0 * scale),
+                        FontId::proportional(9.0 * scale),
                         rgb(color::CHROME_MUTED),
                         (row_width - 35.0).max(1.0),
                     );
@@ -1419,73 +1419,40 @@ impl TerminalApp {
 
     pub(crate) fn render_reference_spaces(&mut self, ui: &mut egui::Ui) {
         let scale = self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE;
-        ui.add_space(20.0);
-        let heading = ui.label(
+        let row_height = shell::SPACES_ROW_HEIGHT.max(24.0 * scale + 4.0);
+        let height = 16.0 * scale + shell::METADATA_GAP + 4.0 * row_height;
+        // Fill the spare navigation space before Spaces, keeping recent tabs
+        // near the top and product destinations above the session footer.
+        ui.add_space((ui.clip_rect().bottom() - height - ui.cursor().top()).max(16.0));
+        ui.label(
             RichText::new("SPACES")
-                .size(13.0 * scale)
+                .size(8.0 * scale)
                 .color(rgb(color::CHROME_MUTED)),
         );
         ui.spacing_mut().item_spacing.y = 0.0;
-        ui.add_space((heading.rect.bottom() + shell::METADATA_GAP - ui.cursor().top()).max(0.0));
-        for ((name, detail), tint) in conversation::SPACES.into_iter().zip([
-            [129, 150, 246],
-            [231, 155, 86],
-            [237, 132, 114],
-            [120, 188, 235],
-        ]) {
+        for (name, detail) in conversation::SPACES {
             let (row, response) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), shell::SPACES_ROW_HEIGHT),
+                egui::vec2(ui.available_width(), row_height),
                 egui::Sense::hover(),
             );
-            if name.eq_ignore_ascii_case("Ember") {
-                ui.painter()
-                    .rect_filled(row, 8, shell::rgba(shell::token::BUTTON));
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(
-                        row.min + egui::vec2(-5.0, 4.0),
-                        egui::vec2(4.0, row.height() - 8.0),
-                    ),
-                    2,
-                    Color32::from_rgb(255, 157, 66),
-                );
-            }
             let badge = egui::Rect::from_center_size(
-                egui::pos2(row.left() + 16.0, row.center().y),
-                egui::vec2(32.0, 32.0),
-            );
-            ui.painter().rect_filled(
-                badge,
-                6,
-                Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], 32),
+                egui::pos2(row.left() + 11.0, row.center().y),
+                egui::Vec2::splat(jterm_core::reference_identity::SPACE_ICON_SIZE),
             );
             product_identity(ui, badge, name);
-            let name_galley = ui.painter().layout_no_wrap(
-                name.into(),
-                FontId::proportional(16.0 * scale),
-                rgb(color::CHROME_TEXT),
-            );
-            let detail_left = row.left() + 46.0 + name_galley.size().x + shell::METADATA_GAP;
-            let mut detail_job = egui::text::LayoutJob::simple(
-                detail.into(),
-                FontId::proportional(12.0 * scale),
-                rgb(color::CHROME_MUTED),
-                (row.right() - detail_left).max(1.0),
-            );
-            detail_job.wrap.max_rows = 1;
-            detail_job.wrap.break_anywhere = true;
-            let detail_galley = ui.painter().layout_job(detail_job);
             let painter = ui.painter().with_clip_rect(row.intersect(ui.clip_rect()));
-            painter.galley(
-                egui::pos2(
-                    row.left() + 46.0,
-                    row.center().y - name_galley.size().y * 0.5,
-                ),
-                name_galley,
+            painter.text(
+                egui::pos2(row.left() + 30.0, row.center().y - 6.0 * scale),
+                egui::Align2::LEFT_CENTER,
+                name,
+                FontId::proportional(10.0 * scale),
                 rgb(color::CHROME_TEXT),
             );
-            painter.galley(
-                egui::pos2(detail_left, row.center().y - detail_galley.size().y * 0.5),
-                detail_galley,
+            painter.text(
+                egui::pos2(row.left() + 30.0, row.center().y + 6.0 * scale),
+                egui::Align2::LEFT_CENTER,
+                detail,
+                FontId::proportional(8.0 * scale),
                 rgb(color::CHROME_MUTED),
             );
             response.on_hover_text(format!(
@@ -1524,7 +1491,7 @@ impl TerminalApp {
                     text.left_center(),
                     egui::Align2::LEFT_CENTER,
                     "Local session",
-                    FontId::proportional(13.0 * scale),
+                    FontId::proportional(9.0 * scale),
                     shell::rgba(shell::token::MUTED_TEXT),
                 );
         }
@@ -1553,7 +1520,7 @@ impl TerminalApp {
         }
         icon(
             ui,
-            egui::Rect::from_center_size(settings.center(), egui::Vec2::splat(16.0)),
+            egui::Rect::from_center_size(settings.center(), egui::Vec2::splat(14.0)),
             Icon::Settings,
             shell::rgba(shell::token::TEXT),
         );
@@ -1672,7 +1639,7 @@ impl TerminalApp {
                 );
                 let tab = self.reference_selected_inspector_tab();
                 ui.horizontal_wrapped(|ui| {
-                    ui.visuals_mut().selection.bg_fill = shell::rgba(shell::token::ACCENT_TOP);
+                    ui.visuals_mut().selection.bg_fill = shell::rgba(shell::token::SELECTED_NAV);
                     ui.visuals_mut().selection.stroke =
                         Stroke::new(1.0, shell::rgba(shell::token::BORDER));
                     for (candidate, label) in [
@@ -1681,7 +1648,7 @@ impl TerminalApp {
                         (ReferenceInspectorTab::Files, "Files"),
                     ] {
                         let response = ui.add_sized(
-                            [shell::INSPECTOR_TAB_WIDTH, 42.0],
+                            [shell::INSPECTOR_TAB_WIDTH, 26.0],
                             egui::Button::selectable(tab == candidate, label)
                                 .corner_radius(shell::CONTROL_RADIUS),
                         );
@@ -1691,7 +1658,7 @@ impl TerminalApp {
                         }
                     }
                 });
-                ui.add_space(16.0);
+                ui.add_space(10.0);
                 egui::ScrollArea::vertical()
                     .id_salt(("reference-inspector-scroll", tab))
                     .show(ui, |ui| {
@@ -1804,10 +1771,10 @@ impl TerminalApp {
         for (label, value) in &fields {
             ui.label(
                 RichText::new(*label)
-                    .size(13.0 * scale)
+                    .size(9.0 * scale)
                     .color(rgb(color::CHROME_MUTED)),
             );
-            ui.add(egui::Label::new(RichText::new(value).size(13.0 * scale)).wrap())
+            ui.add(egui::Label::new(RichText::new(value).size(9.0 * scale)).wrap())
                 .on_hover_text(value);
             ui.add_space(12.0);
         }
@@ -1935,7 +1902,11 @@ impl TerminalApp {
             }
         });
         if !enabled {
-            ui.label("Enable the Tasks dashboard to create isolated Git worktrees, start an Agent, review changes and validate its work.");
+            ui.label(
+                RichText::new("Enable Agent Tasks in Settings to start a task.")
+                    .small()
+                    .weak(),
+            );
             if inspector_button(ui, true, "Configure Agent features…").clicked() {
                 self.config_panel.open_ai(&self.config);
             }
@@ -2017,7 +1988,7 @@ impl TerminalApp {
         } else {
             ui.add_space(8.0);
             ui.strong("No visible Agent tasks");
-            ui.label("Create a task with a goal and validation command, or open a saved conversation. Each task keeps its own worktree and must be started explicitly.");
+            ui.label(RichText::new("Start or select a task").small().weak());
             if inspector_button(ui, true, "Open terminal assistant").clicked() {
                 let session_id = self.session_manager.sessions()
                     [self.session_manager.active_index()]
@@ -2028,9 +1999,6 @@ impl TerminalApp {
             }
         }
         ui.add_space(12.0);
-        if selected.is_none() {
-            return;
-        }
         let mut model =
             conversation::observed_task_inspector(self.task_manager.tasks(), selected, |id| {
                 let task = self.task_manager.get(id);
@@ -2091,6 +2059,11 @@ impl TerminalApp {
         } else {
             self.tab_title(self.tabs.active_index())
         };
+        let title = if title.starts_with("Workspace / ") {
+            title
+        } else {
+            format!("Workspace / {title}")
+        };
         let (rect, _) = ui.allocate_exact_size(
             egui::vec2(
                 ui.available_width(),
@@ -2103,31 +2076,54 @@ impl TerminalApp {
             [rect.left_bottom(), rect.right_bottom()],
             Stroke::new(1.0, rgb(color::LIGHT_BORDER)),
         );
-        shell::bounded_ui_at(ui, rect.shrink2(egui::vec2(8.0, 5.0)), |ui| {
+        shell::bounded_ui_at(ui, rect.shrink2(egui::vec2(28.0, 8.0)), |ui| {
             ui.visuals_mut().override_text_color = Some(rgb(color::CANVAS_TEXT));
             let origin = ui.max_rect().min;
-            let action_size = (rect.height() - 10.0).max(shell::HEADER_ACTION_SIZE);
             let title_width = (ui.available_width()
                 - 3.0 * shell::HEADER_ACTION_SIZE
                 - 2.0 * shell::HEADER_ACTION_GAP
                 - 8.0)
                 .max(0.0);
             let title_rect =
-                egui::Rect::from_min_size(origin, egui::vec2(title_width, action_size));
-            ui.put(
-                title_rect,
-                egui::Label::new(
-                    RichText::new(if title.trim().is_empty() {
-                        "Terminal session"
-                    } else {
-                        title.as_str()
-                    })
-                    .size(shell::type_size::PAGE_TITLE * scale)
-                    .strong(),
+                egui::Rect::from_min_size(origin, egui::vec2(title_width, 18.0 * scale));
+            let mut heading = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(title_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            heading
+                .add(
+                    egui::Label::new(
+                        RichText::new(&title)
+                            .size(shell::type_size::PAGE_TITLE * scale)
+                            .strong(),
+                    )
+                    .truncate()
+                    .halign(egui::Align::Min),
                 )
-                .truncate(),
-            )
-            .on_hover_text(&title);
+                .on_hover_text(&title);
+            let subtitle = egui::Rect::from_min_size(
+                origin + egui::vec2(0.0, 18.0 * scale),
+                egui::vec2(title_width, 13.0 * scale),
+            );
+            let mut detail = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(subtitle)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            detail.add(
+                egui::Label::new(
+                    RichText::new(if self.config.chat_mode_enabled() {
+                        "Chat session · Local"
+                    } else {
+                        "Block session · Local"
+                    })
+                    .size(9.0 * scale)
+                    .color(rgb(color::CHROME_MUTED)),
+                )
+                .truncate()
+                .halign(egui::Align::Min),
+            );
             ui.scope_builder(
                     egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(
                         egui::pos2(

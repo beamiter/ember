@@ -17,52 +17,52 @@ pub const CONTROL_RADIUS: f32 = token::CONTROL_RADIUS;
 pub const CONTROL_HEIGHT: f32 = token::TOOL_BUTTON_HEIGHT;
 pub const METADATA_GAP: f32 = token::TOOL_GAP;
 pub const COMPOSER_CONTROL_BOTTOM: f32 = 5.0;
-pub const COMPOSER_CONTROL_LEFT: f32 = 6.0;
-pub const COMPOSER_CONTROL_RIGHT: f32 = 6.0;
-pub const COMPOSER_PLUS_WIDTH: f32 = 57.0;
-pub const COMPOSER_ATTACH_WIDTH: f32 = 91.0;
-pub const COMPOSER_IMAGE_WIDTH: f32 = 89.0;
-pub const COMPOSER_CODE_WIDTH: f32 = 89.0;
-pub const COMPOSER_TERMINAL_WIDTH: f32 = 88.0;
-pub const COMPOSER_TOOLS_WIDTH: f32 = 88.0;
-pub const COMPOSER_SEND_WIDTH: f32 = 32.0;
-pub const COMPOSER_MODEL_MIN_WIDTH: f32 = 180.0;
-pub const COMPOSER_SECONDARY_MIN_WIDTH: f32 = 850.0;
-pub const COMPOSER_MODEL_MIN_AVAILABLE: f32 = 560.0;
+pub const COMPOSER_CONTROL_LEFT: f32 = 8.0;
+pub const COMPOSER_CONTROL_RIGHT: f32 = 8.0;
+pub const COMPOSER_PLUS_WIDTH: f32 = 26.0;
+pub const COMPOSER_ATTACH_WIDTH: f32 = 62.0;
+pub const COMPOSER_IMAGE_WIDTH: f32 = 60.0;
+pub const COMPOSER_CODE_WIDTH: f32 = 56.0;
+pub const COMPOSER_TERMINAL_WIDTH: f32 = 76.0;
+pub const COMPOSER_TOOLS_WIDTH: f32 = 68.0;
+pub const COMPOSER_SEND_WIDTH: f32 = 26.0;
+pub const COMPOSER_MODEL_MIN_WIDTH: f32 = 120.0;
+pub const COMPOSER_SECONDARY_MIN_WIDTH: f32 = 564.0;
+pub const COMPOSER_MODEL_MIN_AVAILABLE: f32 = 392.0;
 pub const COMPOSER_TERMINAL_MIN_AVAILABLE: f32 = 280.0;
-pub const MODE_CONTROL_HEIGHT: f32 = 32.0;
-pub const MODE_CONTROL_TOP: f32 = 4.0;
-pub const MODE_CONTROL_MIN_WIDTH: f32 = 64.0;
+pub const MODE_CONTROL_HEIGHT: f32 = 28.0;
+pub const MODE_CONTROL_TOP: f32 = 7.0;
+pub const MODE_CONTROL_MIN_WIDTH: f32 = 52.0;
 pub const SELECTED_RAIL_SIZE: f32 = 32.0;
-pub const PROFILE_DIAMETER: f32 = 32.0;
+pub const PROFILE_DIAMETER: f32 = 28.0;
 pub const NAVIGATION_PADDING: f32 = 10.0;
-pub const NAVIGATION_ROW_HEIGHT: f32 = 32.0;
-pub const NAVIGATION_ROW_GAP: f32 = 4.0;
+pub const NAVIGATION_ROW_HEIGHT: f32 = 26.0;
+pub const NAVIGATION_ROW_GAP: f32 = 3.0;
 pub const WORKSPACE_SELECTOR_TOP: f32 = 108.0;
-pub const WORKSPACE_SELECTOR_HEIGHT: f32 = 36.0;
+pub const WORKSPACE_SELECTOR_HEIGHT: f32 = 33.0;
 pub const NAVIGATION_ITEMS_TOP: f32 = 153.0;
 pub const REFERENCE_RECENT_TOP: f32 = 398.0;
 pub const REFERENCE_SPACES_TOP: f32 = 620.0;
-pub const RECENT_ROW_HEIGHT: f32 = 42.0;
-pub const SPACES_ROW_HEIGHT: f32 = 46.0;
-pub const NAVIGATION_STATUS_HEIGHT: f32 = 32.0;
+pub const RECENT_ROW_HEIGHT: f32 = 30.0;
+pub const SPACES_ROW_HEIGHT: f32 = 30.0;
+pub const NAVIGATION_STATUS_HEIGHT: f32 = 42.0;
 pub const NAVIGATION_STATUS_TEXT_BOTTOM: f32 = 28.0;
-pub const HEADER_ACTION_SIZE: f32 = 28.0;
+pub const HEADER_ACTION_SIZE: f32 = 24.0;
 pub const HEADER_ACTION_GAP: f32 = 4.0;
-pub const INSPECTOR_TAB_WIDTH: f32 = 80.0;
+pub const INSPECTOR_TAB_WIDTH: f32 = 64.0;
 pub const INSPECTOR_INSET: f32 = 10.0;
-pub const INSPECTOR_METADATA_ROW_HEIGHT: f32 = 28.0;
-pub const INSPECTOR_CURRENT_HEIGHT: f32 = 58.0;
+pub const INSPECTOR_METADATA_ROW_HEIGHT: f32 = 19.0;
+pub const INSPECTOR_CURRENT_HEIGHT: f32 = 45.0;
 pub const INSPECTOR_PROGRESS_TARGET_Y: f32 = 238.0;
 pub const INSPECTOR_METADATA_TARGET_Y: f32 = 282.0;
 pub const INSPECTOR_CURRENT_TARGET_Y: f32 = 453.0;
-pub const INSPECTOR_OUTPUT_HEIGHT: f32 = 170.0;
+pub const INSPECTOR_OUTPUT_HEIGHT: f32 = 140.0;
 
 pub mod type_size {
     pub use jterm_core::reference_shell::type_size::*;
-    pub const PAGE_TITLE: f32 = 16.0;
-    pub const CONTROL: f32 = 14.0;
-    pub const SECTION: f32 = 13.0;
+    pub const PAGE_TITLE: f32 = 12.0;
+    pub const CONTROL: f32 = 10.0;
+    pub const SECTION: f32 = 8.0;
 }
 
 pub fn rgba([r, g, b, a]: [u8; 4]) -> Color32 {
@@ -248,7 +248,7 @@ pub fn chrome_control_height(font_size: f32) -> f32 {
     } else {
         1.0
     };
-    (16.5 * scale * 1.3 + 8.0)
+    (11.0 * scale * 1.3 + 8.0)
         .ceil()
         .max(token::TOOL_BUTTON_HEIGHT)
 }
@@ -461,6 +461,7 @@ impl Layout {
         self.header.y = main_top;
         self.header.height = token::HEADER_HEIGHT
             .max(control + 4.0)
+            .max(31.0 * (font_size / 14.0).max(1.0) + 16.0)
             .min(self.center.height);
         self.composer.height = token::TOOLBAR_HEIGHT
             .max(control + 10.0)
@@ -1014,7 +1015,7 @@ mod tests {
                 l.center.x,
                 l.inspector.unwrap().x
             ),
-            (4.0, 48.0, 270.0, 1320.0)
+            (0.0, 48.0, 270.0, 1324.0)
         );
         assert_eq!(
             (
@@ -1023,7 +1024,7 @@ mod tests {
                 l.composer.width,
                 l.composer.height
             ),
-            (270.0, 928.0, 1044.0, 42.0)
+            (298.0, 930.0, 992.0, 36.0)
         );
         let hidden = l.without_inspector();
         assert_eq!(hidden.center.width - l.center.width, 294.0);
@@ -1040,7 +1041,7 @@ mod tests {
                 compact.header.height,
                 compact.composer.height
             ),
-            (40.0, 36.0, 42.0)
+            (42.0, 49.0, 36.0)
         );
         for font in [14.0, 18.0, 24.0, 32.0, 40.0, 72.0] {
             for height in [400.0, 700.0, 976.0] {
@@ -1051,10 +1052,13 @@ mod tests {
                 assert!(layout.composer.height >= control + 10.0);
                 assert!(layout.composer.y >= layout.header.y + layout.header.height);
                 assert!(layout.center.width >= CENTER_MIN_WIDTH);
-                assert_eq!(layout.rail.width, 44.0);
+                assert_eq!(layout.rail.width, 48.0);
                 assert_eq!(layout.navigation.unwrap().width, 216.0);
                 assert_eq!(layout.inspector.unwrap().width, 288.0);
-                assert_eq!(layout.composer.y + layout.composer.height, height - 6.0);
+                assert_eq!(
+                    layout.composer.y + layout.composer.height,
+                    height - token::MAIN_BOTTOM_GAP
+                );
             }
         }
         let ctx = egui::Context::default();
@@ -1107,9 +1111,9 @@ mod tests {
                     let dock = editor_dock(outer, editor_top);
                     assert!(dock.history_bottom <= editor_top);
                     assert!(editor_bottom + 6.0 <= dock.controls.top());
-                    assert_eq!(dock.controls.height(), 32.0);
+                    assert_eq!(dock.controls.height(), CONTROL_HEIGHT);
                     assert_eq!(dock.frame.bottom(), outer.bottom());
-                    assert!(dock.frame.height() >= 42.0);
+                    assert!(dock.frame.height() >= COMPOSER_HEIGHT);
                 }
             }
         }

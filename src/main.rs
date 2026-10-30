@@ -2857,7 +2857,7 @@ impl TerminalApp {
             block_review: None,
             reading_history: Default::default(),
             block_selection: None,
-            block_bar_user_hidden: true,
+            block_bar_user_hidden: false,
             block_search: Default::default(),
             block_bookmarks: Default::default(),
             pending_session_export: None,
@@ -3952,7 +3952,7 @@ impl TerminalApp {
                         if jterm_core::reference_conversation::fixture_enabled() {
                             self.render_reference_fixture_recent(ui);
                         } else {
-                            ui.spacing_mut().interact_size.y = 42.0;
+                            ui.spacing_mut().interact_size.y = crate::glass_shell::RECENT_ROW_HEIGHT;
                             self.render_sidebar_sessions(ui);
                         }
                     }

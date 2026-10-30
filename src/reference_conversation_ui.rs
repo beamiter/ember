@@ -530,26 +530,26 @@ pub(crate) fn draw_inspector(
         (screen.height() - if short { 28.0 } else { 80.0 } - ui.cursor().top()).max(0.0);
     egui::Frame::NONE
         .fill(shell::rgba(shell::token::INSPECTOR_CARD))
-        .corner_radius(18)
+        .corner_radius(12)
         .stroke(Stroke::new(1.0, shell::rgba(shell::token::BORDER)))
-        .inner_margin(16.0)
+        .inner_margin(12.0)
         .show(ui, |ui| {
-            let top = ui.min_rect().top() - 16.0;
-            ui.set_min_height((target_height - 32.0).max(0.0));
+            let top = ui.min_rect().top() - 12.0;
+            ui.set_min_height((target_height - 24.0).max(0.0));
             ui.set_min_width(ui.available_width());
             ui.spacing_mut().interact_size.y = 24.0;
             ui.spacing_mut().item_spacing.y = 6.0;
             ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(egui::vec2(24.0, 26.0), egui::Sense::hover());
+                let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 20.0), egui::Sense::hover());
                 icon(ui, r, Icon::Agent, shell::rgba(shell::token::ACCENT_TOP));
                 let badge_width = (inspector.badge.len() as f32 * 6.5 * scale + 16.0)
                     .min(ui.available_width() * 0.45);
                 let title_width = (ui.available_width() - badge_width - 8.0).max(0.0);
                 ui.add_sized(
-                    [title_width, 26.0],
+                    [title_width, 20.0],
                     egui::Label::new(
                         RichText::new(&inspector.title)
-                            .size(14.0 * scale)
+                            .size(10.0 * scale)
                             .color(shell::rgba(shell::token::TEXT)),
                     )
                     .truncate(),
@@ -564,7 +564,7 @@ pub(crate) fn draw_inspector(
                             [badge_width - 12.0, 18.0],
                             egui::Label::new(
                                 RichText::new(&inspector.badge)
-                                    .size(11.0 * scale)
+                                    .size(8.0 * scale)
                                     .color(shell::rgba(shell::token::MUTED_TEXT)),
                             )
                             .truncate(),
@@ -575,17 +575,17 @@ pub(crate) fn draw_inspector(
             ui.add_space(5.0);
             ui.label(
                 RichText::new(&inspector.subtitle)
-                    .size(14.0 * scale)
+                    .size(10.0 * scale)
                     .color(shell::rgba(shell::token::MUTED_TEXT)),
             );
             if fixture {
                 ui.label(
                     RichText::new("Visual acceptance fixture")
-                        .size(11.0 * scale)
+                        .size(8.0 * scale)
                         .color(shell::rgba(shell::token::MUTED_TEXT)),
                 );
             }
-            ui.add_space((top + 94.0 - ui.cursor().top()).max(8.0));
+            ui.add_space((top + 60.0 - ui.cursor().top()).max(8.0));
             let (progress, _) = ui
                 .allocate_exact_size(egui::vec2(ui.available_width(), 16.0), egui::Sense::hover());
             let track = egui::Rect::from_min_size(
@@ -620,21 +620,21 @@ pub(crate) fn draw_inspector(
                         if fixture { "steps" } else { "tasks" }
                     )
                 },
-                egui::FontId::proportional(12.0 * scale),
+                egui::FontId::proportional(8.0 * scale),
                 shell::rgba(shell::token::MUTED_TEXT),
             );
-            ui.add_space((top + 132.0 - ui.cursor().top()).max(12.0));
+            ui.add_space((top + 88.0 - ui.cursor().top()).max(12.0));
             ui.spacing_mut().item_spacing.y = 0.0;
             for (label, value) in &inspector.metadata {
                 let (r, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 28.0),
+                    egui::vec2(ui.available_width(), shell::INSPECTOR_METADATA_ROW_HEIGHT),
                     egui::Sense::hover(),
                 );
                 ui.painter().text(
                     r.left_center(),
                     egui::Align2::LEFT_CENTER,
                     label,
-                    egui::FontId::proportional(14.0 * scale),
+                    egui::FontId::proportional(10.0 * scale),
                     shell::rgba(shell::token::MUTED_TEXT),
                 );
                 let v = egui::Rect::from_min_max(r.min + egui::vec2(110.0, 0.0), r.max);
@@ -642,7 +642,7 @@ pub(crate) fn draw_inspector(
                     v,
                     egui::Label::new(
                         RichText::new(value)
-                            .size(14.0 * scale)
+                            .size(10.0 * scale)
                             .color(shell::rgba(shell::token::TEXT)),
                     )
                     .halign(egui::Align::Min)
@@ -650,14 +650,14 @@ pub(crate) fn draw_inspector(
                 )
                 .on_hover_text(value);
             }
-            ui.add_space(22.0);
+            ui.add_space(12.0);
             ui.label(
                 RichText::new(if fixture {
                     "CURRENT STEP"
                 } else {
                     "NEXT ACTION"
                 })
-                .size(12.0 * scale)
+                .size(8.0 * scale)
                 .color(shell::rgba(shell::token::MUTED_TEXT)),
             );
             ui.add_space(6.0);
@@ -665,33 +665,33 @@ pub(crate) fn draw_inspector(
                 .fill(shell::rgba([12, 25, 53, 130]))
                 .corner_radius(12)
                 .stroke(Stroke::new(1.0, shell::rgba(shell::token::BORDER)))
-                .inner_margin(14.0)
+                .inner_margin(10.0)
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.set_min_height(30.0);
+                    ui.set_min_height(20.0);
                     if let Some(step) = &inspector.current_step {
                         ui.label(
                             RichText::new(&step.title)
-                                .size(14.0 * scale)
+                                .size(10.0 * scale)
                                 .color(shell::rgba(shell::token::TEXT)),
                         );
                         ui.label(
                             RichText::new(&step.detail)
-                                .size(12.0 * scale)
+                                .size(8.0 * scale)
                                 .color(shell::rgba(shell::token::MUTED_TEXT)),
                         );
                     } else {
                         ui.label(
                             RichText::new("No current step")
-                                .size(14.0 * scale)
+                                .size(10.0 * scale)
                                 .color(shell::rgba(shell::token::MUTED_TEXT)),
                         );
                     }
                 });
-            ui.add_space(25.0);
+            ui.add_space(14.0);
             ui.label(
                 RichText::new(if fixture { "TASK QUEUE" } else { "OTHER TASKS" })
-                    .size(12.0 * scale)
+                    .size(8.0 * scale)
                     .color(shell::rgba(shell::token::MUTED_TEXT)),
             );
             ui.add_space(8.0);
@@ -702,7 +702,7 @@ pub(crate) fn draw_inspector(
                     } else {
                         "No other tasks"
                     })
-                    .size(14.0 * scale)
+                    .size(10.0 * scale)
                     .color(shell::rgba(shell::token::MUTED_TEXT)),
                 );
             }
@@ -714,7 +714,7 @@ pub(crate) fn draw_inspector(
                     ui.add(
                         egui::Label::new(
                             RichText::new(&step.title)
-                                .size(13.0 * scale)
+                                .size(9.0 * scale)
                                 .color(shell::rgba(shell::token::TEXT)),
                         )
                         .truncate(),
@@ -726,25 +726,25 @@ pub(crate) fn draw_inspector(
             ui.add_space((terminal_target - ui.cursor().top()).max(24.0));
             ui.label(
                 RichText::new(&inspector.output_title)
-                    .size(14.0 * scale)
+                    .size(10.0 * scale)
                     .color(shell::rgba(shell::token::TEXT)),
             );
             ui.add_space(7.0);
             egui::Frame::NONE
                 .fill(shell::rgba(shell::token::TERMINAL))
                 .corner_radius(12)
-                .inner_margin(14.0)
+                .inner_margin(10.0)
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.set_min_height(142.0);
+                    ui.set_min_height(120.0);
                     egui::ScrollArea::both()
                         .id_salt("inspector-output")
-                        .max_height(142.0)
+                        .max_height(120.0)
                         .show(ui, |ui| {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(&inspector.output)
-                                        .size(13.0 * scale)
+                                        .size(9.0 * scale)
                                         .color(shell::rgba(shell::token::MUTED_TEXT)),
                                 )
                                 .selectable(true),

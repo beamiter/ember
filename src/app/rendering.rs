@@ -2397,7 +2397,7 @@ impl TerminalApp {
             None
         };
         if !block_workspace_should_show(
-            self.config.command_cards_enabled(),
+            self.config.command_cards_enabled() && !self.config.chat_mode_enabled(),
             self.block_bar_user_hidden,
             terminal.is_alt_buffer_active(),
             self.renderer.native_vim9_frame.is_some(),
@@ -2510,8 +2510,8 @@ impl TerminalApp {
             egui::vec2(ui.available_width(), workspace_height),
             egui::Sense::hover(),
         );
-        let fill = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
-        let border = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border);
+        let fill = crate::glass_shell::rgba(crate::glass_shell::token::TOP);
+        let border = crate::glass_shell::rgba(crate::glass_shell::token::BORDER);
         let accent = crate::theme::Theme::rgb_to_color32(self.current_theme.tabbar.active_border);
         ui.painter().rect_filled(rect, 0.0, fill);
         ui.painter().hline(
@@ -2524,6 +2524,10 @@ impl TerminalApp {
             egui::UiBuilder::new()
                 .id_salt(("block-workspace", &snapshot.session_id))
                 .max_rect(rect),
+        );
+        crate::reference_workspace::chrome_style(
+            &mut toolbar_ui,
+            self.config.effective_ui_font_size() / crate::config::DEFAULT_FONT_SIZE,
         );
         if !enabled || snapshot.alternate_screen {
             toolbar_ui.disable();

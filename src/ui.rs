@@ -1800,14 +1800,16 @@ impl TerminalRenderer {
             self.line_height,
             self.reference_tools_height,
         );
-        let fallback = chat
-            && terminal.chat_surface().composer_docked()
+        let fallback = terminal.chat_surface().composer_docked()
             && terminal
                 .native_prompt_input_rows()
                 .is_none_or(|rows| rows as f32 * self.line_height > limit);
         self.glass_chat_requested = chat;
-        self.chat_mode = chat && !fallback;
-        self.continuous_block = !self.chat_mode;
+        // Both presentations dock the real prompt. Only Chat transforms
+        // completed commands into right-aligned conversation bubbles.
+        self.chat_mode = !fallback;
+        self.chat_command_bubbles = chat;
+        self.continuous_block = fallback;
         self.block_mode = true;
     }
 
@@ -2156,7 +2158,7 @@ impl TerminalRenderer {
         // Chat's native Run/Interrupt labels share the terminal font size.
         // Reserve their actual egui line box plus the footer's inset/padding,
         // including when the GPU atlas has tighter ascent/descent metrics.
-        let control_line_height = if self.chat_mode || self.glass_chat_requested {
+        let control_line_height = if self.block_mode {
             ctx.fonts_mut(|fonts| {
                 // A laid-out galley is pixel-rounded, unlike row_height. Use
                 // the same labels/font as draw_chat_controls so its fit check
@@ -5717,6 +5719,39 @@ impl TerminalRenderer {
                 rows,
                 interaction_enabled,
             );
+        }
+
+        if !self.glass_chat_requested {
+            if let Some(composer) = viewport.chat_composer_rows() {
+                let empty_history = viewport
+                    .cells()
+                    .iter()
+                    .take(composer.start)
+                    .all(|row| row.iter().all(|cell| cell.character.is_whitespace()));
+                if empty_history && background_rect.height() > 100.0 {
+                    let hint = egui::Rect::from_min_max(
+                        background_rect.min + egui::vec2(12.0, 12.0),
+                        egui::pos2(background_rect.right() - 12.0, background_rect.top() + 76.0),
+                    );
+                    painter.rect_filled(hint, 8.0, Color32::from_white_alpha(8));
+                    for (offset, text, size) in [
+                        (-10.0, "Finished commands become reusable cards here.", 10.0),
+                        (
+                            10.0,
+                            "Click a card header to select · Right-click for actions",
+                            9.0,
+                        ),
+                    ] {
+                        painter.with_clip_rect(hint).text(
+                            hint.center() + egui::vec2(0.0, offset),
+                            egui::Align2::CENTER_CENTER,
+                            text,
+                            FontId::proportional(size),
+                            crate::glass_shell::rgba(crate::glass_shell::token::MUTED_TEXT),
+                        );
+                    }
+                }
+            }
         }
 
         self.draw_reference_foreground_footer(ui, terminal);
@@ -12130,7 +12165,7 @@ mod transcript_canvas_tests {
                             .cells(),
                         cells.as_slice(),
                     );
-                    assert_eq!(footer.unwrap().height(), 42.0);
+                    assert_eq!(footer.unwrap().height(), crate::glass_shell::COMPOSER_HEIGHT);
                     // Readline redraws the same prompt with CUP + erase-to-end.
                     // ED2 is different: it archives visible native content.
                     terminal.process_input(b"\x1b[H\x1b[J$ ");
@@ -12212,15 +12247,14 @@ mod transcript_canvas_tests {
                     let cursor = (terminal.cursor_row, terminal.cursor_col);
                     let cells = terminal.grid.to_vec();
                     let presentation = renderer.resolve_glass_layout(&terminal, outer);
-                    let expected = chat
-                        && terminal.native_prompt_input_rows().is_some_and(|rows| {
-                            rows as f32 * renderer.line_height
-                                <= crate::glass_shell::editable_input_limit_with_height(
-                                    height,
-                                    renderer.line_height,
-                                    tools_height,
-                                )
-                        });
+                    let expected = terminal.native_prompt_input_rows().is_some_and(|rows| {
+                        rows as f32 * renderer.line_height
+                            <= crate::glass_shell::editable_input_limit_with_height(
+                                height,
+                                renderer.line_height,
+                                tools_height,
+                            )
+                    });
                     assert_eq!(renderer.chat_mode, expected);
                     saw_dock |= chat && expected;
                     saw_fallback |= chat && !expected;
@@ -12253,6 +12287,27 @@ mod transcript_canvas_tests {
     }
 
     #[test]
+    fn block_presentation_docks_the_real_prompt_without_command_bubbles() {
+        let ctx = egui::Context::default();
+        let (mut renderer, terminal, _) = fixture(true);
+        let outer = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 600.0));
+        let cells = terminal.grid.to_vec();
+        let cursor = (terminal.cursor_row, terminal.cursor_col);
+        let _ = ctx.run_ui(Default::default(), |_| {
+            for chat in [false, true, false] {
+                renderer.sync_glass_presentation(&ctx, chat, &terminal, outer.height());
+                renderer.resolve_glass_layout(&terminal, outer);
+                assert!(renderer.chat_mode);
+                assert!(!renderer.continuous_block);
+                assert_eq!(renderer.chat_command_bubbles, chat);
+                assert!(renderer.foreground_footer_rect.is_none());
+                assert_native_cells_equal(&terminal.grid.to_vec(), &cells);
+                assert_eq!((terminal.cursor_row, terminal.cursor_col), cursor);
+            }
+        });
+    }
+
+    #[test]
     fn glass_fallback_metrics_and_short_prompt_recovery_are_stable() {
         let ctx = egui::Context::default();
         let (mut renderer, mut terminal, _) = fixture(true);
@@ -12282,7 +12337,8 @@ mod transcript_canvas_tests {
             assert!(renderer.chat_mode && renderer.foreground_footer_rect.is_none());
             renderer.sync_glass_presentation(&ctx, false, &terminal, outer.height());
             renderer.resolve_glass_layout(&terminal, outer);
-            assert!(!renderer.chat_mode && !renderer.glass_chat_requested);
+            assert!(renderer.chat_mode && !renderer.glass_chat_requested);
+            assert!(!renderer.chat_command_bubbles);
             let block_metrics = (renderer.char_width, renderer.line_height);
             renderer.sync_font_metrics(&ctx);
             assert_eq!((renderer.char_width, renderer.line_height), block_metrics);

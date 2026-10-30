@@ -113,13 +113,7 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                                 egui::Button::new(
                                     egui::RichText::new("").size(shell::type_size::CONTROL),
                                 )
-                                .fill(if label == "Terminal" {
-                                    crate::glass_shell::rgba(
-                                        crate::glass_shell::token::ACCENT_BOTTOM,
-                                    )
-                                } else {
-                                    rgb(color::CONTROL_SURFACE)
-                                })
+                                .fill(rgb(color::CONTROL_SURFACE))
                                 .stroke(egui::Stroke::new(1.0, rgb(color::CONTROL_BORDER)))
                                 .corner_radius(shell::CONTROL_RADIUS),
                             )
@@ -151,14 +145,14 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                             },
                             bounds.center().y,
                         ),
-                        egui::vec2(16.0, 16.0),
+                        egui::vec2(12.0, 12.0),
                     ),
                     kind,
                     tint,
                 );
                 if show_label {
                     ui.painter().text(
-                        egui::pos2(x + 27.0, bounds.center().y),
+                        egui::pos2(x + 25.0, bounds.center().y),
                         egui::Align2::LEFT_CENTER,
                         label,
                         FontId::proportional(shell::type_size::CONTROL * width_scale),
@@ -170,7 +164,7 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                         ui.painter(),
                         egui::Rect::from_center_size(
                             egui::pos2(bounds.right() - 16.0, bounds.center().y),
-                            egui::vec2(16.0, 16.0),
+                            egui::vec2(12.0, 12.0),
                         ),
                         Icon::ChevronDown,
                         tint,
@@ -715,13 +709,15 @@ impl TerminalRenderer {
                 if !card.rect.is_positive() {
                     continue;
                 }
-                if chat_output_is_quiet(
-                    card.command,
-                    card.composer,
-                    entry.selected,
-                    entry.active,
-                    matches!(entry.outcome, crate::block_mode::BlockOutcome::Success),
-                ) {
+                if self.chat_command_bubbles
+                    && chat_output_is_quiet(
+                        card.command,
+                        card.composer,
+                        entry.selected,
+                        entry.active,
+                        matches!(entry.outcome, crate::block_mode::BlockOutcome::Success),
+                    )
+                {
                     continue;
                 }
                 let color = if card.composer || entry.active {
@@ -729,7 +725,9 @@ impl TerminalRenderer {
                 } else {
                     self.theme.terminal_foreground()
                 };
-                let alpha = if card.composer {
+                let alpha = if !self.chat_command_bubbles && !card.composer {
+                    80
+                } else if card.composer {
                     95
                 } else if entry.selected {
                     100
@@ -746,6 +744,9 @@ impl TerminalRenderer {
                     ),
                     egui::StrokeKind::Inside,
                 );
+            }
+            if !self.chat_command_bubbles {
+                continue;
             }
             let Some(record) = terminal.command_records().get(entry.span.record_index) else {
                 continue;
@@ -981,7 +982,7 @@ impl TerminalRenderer {
         let icon_control = matches!(action, ChatInputAction::Submit { .. })
             || self.foreground_footer_rect.is_some();
         let label_size = if icon_control {
-            egui::vec2(18.0, 18.0)
+            egui::vec2(12.0, 12.0)
         } else {
             ui.painter()
                 .layout_no_wrap(
@@ -1043,7 +1044,7 @@ impl TerminalRenderer {
         if icon_control {
             paint_reference_icon(
                 ui.painter(),
-                egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 18.0)),
+                egui::Rect::from_center_size(rect.center(), egui::vec2(12.0, 12.0)),
                 if matches!(action, ChatInputAction::Submit { .. }) {
                     jterm_core::reference_icons::Icon::Send
                 } else {
@@ -1944,8 +1945,8 @@ mod tests {
     fn chat_run_button_stays_inside_narrow_composer_footer() {
         // Real egui allocation, paint clips, hit regions and pointer events.
         // ui.put's max_rect alone is not a hard bound for a wrapping Button.
-        // Compact glass contract: a 32px action target retains the native submit path.
-        assert_eq!(crate::glass_shell::COMPOSER_SEND_WIDTH, 32.0);
+        // The compact action target retains the native submit path.
+        assert_eq!(crate::glass_shell::COMPOSER_SEND_WIDTH, 26.0);
         for font in [10.0, 16.0, 32.0] {
             for width in [48.0, 64.0, 80.0, 120.0, 240.0] {
                 for dpi in [1.0, 1.5, 2.0] {
@@ -2016,7 +2017,7 @@ mod tests {
                                     ..Default::default()
                                 },
                                 |ui| {
-                                    let text_size = egui::vec2(20.0, 20.0);
+                                    let text_size = egui::vec2(12.0, 12.0);
                                     expected_visible = button.width() >= text_size.x + 12.0
                                         && button.height() >= text_size.y + 2.0;
                                     renderer
