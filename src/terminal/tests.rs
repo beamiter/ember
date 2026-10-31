@@ -8800,7 +8800,10 @@ fn chat_docked_input_reserves_three_rows_and_spare_space_without_native_cells() 
                     )
                 })
                 .expect("toolbar remains below the editor");
-            assert!(footer - dock.start >= 4, "three editor rows plus spare space");
+            assert!(
+                footer - dock.start >= 4,
+                "three editor rows plus spare space"
+            );
             assert!(
                 footer - dock.start > native_rows,
                 "spare row below real input"
