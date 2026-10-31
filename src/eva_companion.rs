@@ -50,6 +50,9 @@ pub(crate) struct EvaHost {
     dialogue_status: String,
     dialogue_displayed: bool,
     dialogue_display_pending: Option<(String, u64)>,
+    /// Local request error, shown until the history view changes.
+    history_error: Option<(String, u64)>,
+    history_text: Option<(u64, String)>,
     memory_entries: Vec<host::MemoryEntry>,
     memory_managed_scope: Option<host::MemoryScope>,
     memory_scope_review: Option<(host::ContextRef, host::MemoryScope, String, String)>,
@@ -114,6 +117,8 @@ impl Default for EvaHost {
             dialogue_status: String::new(),
             dialogue_displayed: false,
             dialogue_display_pending: None,
+            history_error: None,
+            history_text: None,
             memory_entries: vec![],
             memory_managed_scope: None,
             memory_scope_review: None,
@@ -395,6 +400,11 @@ impl EvaHost {
                 _ => atlas::Motion::Calm,
             };
         }
+        self.runtime
+            .as_mut()
+            .unwrap()
+            .history
+            .context_changed(self.context.as_ref());
         while let Some(host::Reply::Dialogue {
             turn_id,
             context,
@@ -640,6 +650,7 @@ impl EvaHost {
                         let shown=ui.label(&self.dialogue_text);
                         if !self.dialogue_displayed && shown.rect.intersects(ui.clip_rect()) {if let Some((turn_id,_))=&self.dialogue_turn {self.dialogue_display_pending=Some((turn_id.clone(),pass));}}
                     }
+                    ui.collapsing("Conversation history · read-only", |ui| self.history_ui(ui));
                     ui.collapsing("Memory · inspect and explicitly review changes",|ui|self.memory_ui(ui));
                 });
             if old_appearance != (self.skin, self.motion) {
@@ -715,6 +726,79 @@ impl EvaHost {
             self.approved_selection = None;
             self.memory_entries.clear();
             self.runtime(ctx).send(Request::ContextObserved { context });
+        }
+    }
+    /// Static, explicitly requested history. No avatar; loading never moves focus.
+    fn history_ui(&mut self, ui: &mut Ui) {
+        let Self {
+            runtime,
+            context,
+            history_error,
+            history_text,
+            ..
+        } = self;
+        let Some(runtime) = runtime.as_mut() else {
+            return;
+        };
+        let mut scope = runtime.history.scope();
+        egui::ComboBox::from_label("History scope")
+            .selected_text(host::history::scope_label(scope))
+            .show_ui(ui, |ui| {
+                for option in host::history::SCOPES {
+                    ui.selectable_value(&mut scope, option, host::history::scope_label(option));
+                }
+            });
+        runtime.history.set_scope(scope);
+        ui.label("Eva dialogue only. Terminal output and voice transcripts are never included.");
+        let (load, older) = ui
+            .horizontal(|ui| {
+                (
+                    ui.add_enabled(
+                        !runtime.history.pending(),
+                        egui::Button::new("Load history"),
+                    )
+                    .clicked(),
+                    ui.add_enabled(runtime.history.can_load_older(), egui::Button::new("Older"))
+                        .clicked(),
+                )
+            })
+            .inner;
+        if load || older {
+            let result = match context.clone() {
+                Some(context) => {
+                    runtime.send(Request::ContextObserved {
+                        context: context.clone(),
+                    });
+                    runtime.request_history(&context, older)
+                }
+                None => Err("Focus a terminal pane first."),
+            };
+            *history_error = result
+                .err()
+                .map(|message| (message.to_owned(), runtime.history.revision()));
+        }
+        let revision = runtime.history.revision();
+        match history_error.as_ref().filter(|(_, at)| *at == revision) {
+            Some((message, _)) => {
+                ui.label(message.as_str());
+            }
+            None if runtime.history.status().is_empty() => {
+                ui.label("Nothing is loaded until you choose Load history.");
+            }
+            None => {
+                ui.label(runtime.history.status());
+            }
+        }
+        if history_text.as_ref().is_none_or(|(at, _)| *at != revision) {
+            *history_text = Some((revision, runtime.history.text(context.as_ref())));
+        }
+        if let Some((_, text)) = history_text.as_ref().filter(|(_, t)| !t.is_empty()) {
+            egui::ScrollArea::vertical()
+                .id_salt("eva-history")
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    ui.label(text.as_str());
+                });
         }
     }
     fn current_memory_scope(&self) -> Option<host::MemoryScope> {
