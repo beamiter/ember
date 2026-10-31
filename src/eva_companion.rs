@@ -53,6 +53,7 @@ pub(crate) struct EvaHost {
     /// Local request error, shown until the history view changes.
     history_error: Option<(String, u64)>,
     history_text: Option<(u64, String)>,
+    voice_text_error: Option<(String, u64)>,
     memory_entries: Vec<host::MemoryEntry>,
     memory_managed_scope: Option<host::MemoryScope>,
     memory_scope_review: Option<(host::ContextRef, host::MemoryScope, String, String)>,
@@ -119,6 +120,7 @@ impl Default for EvaHost {
             dialogue_display_pending: None,
             history_error: None,
             history_text: None,
+            voice_text_error: None,
             memory_entries: vec![],
             memory_managed_scope: None,
             memory_scope_review: None,
@@ -898,6 +900,62 @@ impl EvaHost {
                 }
             }
         }
+        // Eva's spoken replies stay only briefly in Eva's memory. The
+        // coordinator verifies the text against the recorded reply; the normal
+        // review still decides whether anything is saved.
+        let (voice_pending, voice_status, voice_revision) = {
+            let runtime = self.runtime.as_ref().unwrap();
+            (
+                runtime.voice_text.pending(),
+                runtime.voice_text.status().to_owned(),
+                runtime.voice_text.revision(),
+            )
+        };
+        let (review_voice, forget_voice) = ui
+            .horizontal_wrapped(|ui| {
+                (
+                    ui.add_enabled(
+                        scope.is_some() && !voice_pending,
+                        egui::Button::new("Review saving Eva's last spoken reply"),
+                    )
+                    .clicked(),
+                    ui.add_enabled(
+                        !voice_pending,
+                        egui::Button::new("Forget Eva's retained spoken text"),
+                    )
+                    .clicked(),
+                )
+            })
+            .inner;
+        let result = if review_voice {
+            scope.clone().map(|scope| {
+                self.memory_review = None;
+                self.runtime
+                    .as_mut()
+                    .unwrap()
+                    .request_voice_text_review(&context, scope)
+            })
+        } else if forget_voice {
+            Some(self.runtime.as_mut().unwrap().forget_voice_text(&context))
+        } else {
+            None
+        };
+        if let Some(Err(reason)) = result {
+            self.voice_text_error = Some((reason.into(), voice_revision));
+        }
+        let current = self.runtime.as_ref().unwrap().voice_text.revision();
+        ui.label(match &self.voice_text_error {
+            Some((message, at)) if *at == current => message.clone(),
+            _ if voice_status.is_empty() || current != voice_revision => {
+                let status = self.runtime.as_ref().unwrap().voice_text.status();
+                if status.is_empty() {
+                    "Eva keeps recent spoken replies only briefly in memory. Nothing is saved unless you review it here.".to_owned()
+                } else {
+                    status.to_owned()
+                }
+            }
+            _ => voice_status,
+        });
         ui.label(if self.memory_managed_scope.is_some() {
             "Archived management only: changes below use the exact reviewed scope above, never model retrieval."
         } else if self.memory_global {
