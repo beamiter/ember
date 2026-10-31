@@ -8631,10 +8631,7 @@ fn chat_shared_composer_changes_history_alignment_without_moving_native_input() 
         .chat_command_spans()
         .first()
         .expect("same completed command");
-    assert!(
-        chat_command.column > 0,
-        "Chat alone aligns its command capsule right"
-    );
+    assert_eq!(chat_command.column, 1, "Chat uses one stable left inset");
     assert_eq!(
         chat.raw_anchor_at(DisplayPoint::new(
             chat_command.rows.start,
@@ -8718,7 +8715,7 @@ fn chat_history_redraw_and_mode_switch_preserve_draft_and_command_identity() {
 }
 
 #[test]
-fn chat_projection_pins_real_prompt_and_right_aligns_command_without_fake_cells() {
+fn chat_projection_pins_real_prompt_and_left_aligns_command_without_fake_cells() {
     let mut terminal = TerminalState::new(80, 24);
     chat_pair(&mut terminal, "printf hello", "hello");
     chat_prompt(&mut terminal, "draft");
@@ -8733,7 +8730,8 @@ fn chat_projection_pins_real_prompt_and_right_aligns_command_without_fake_cells(
     assert_eq!(composer.end, 24);
     assert!(composer.start > 12);
     let command = &viewport.chat_command_spans()[0];
-    assert!(command.column > 40, "short command is a right-hand capsule");
+    assert_eq!(command.column, 1, "short commands share a left reading edge");
+    assert_eq!(command.columns, "$ printf hello".len());
     assert_eq!(
         viewport.raw_anchor_at(DisplayPoint::new(command.rows.start, command.column - 1)),
         None
@@ -8769,6 +8767,74 @@ fn chat_projection_pins_real_prompt_and_right_aligns_command_without_fake_cells(
         !terminal.has_text_selection(),
         "capsule padding cannot become terminal text"
     );
+}
+
+#[test]
+fn chat_docked_input_reserves_three_rows_and_spare_space_without_native_cells() {
+    for bubbles in [false, true] {
+        for input in [
+            "",
+            "one\r\ntwo",
+            "one\r\ntwo\r\nthree",
+            "one\r\ntwo\r\nthree\r\nfour",
+        ] {
+            let mut terminal = TerminalState::new(80, 24);
+            chat_pair(&mut terminal, "printf retained", "retained output");
+            chat_prompt(&mut terminal, input);
+            let native_rows = terminal.native_prompt_input_rows().unwrap();
+            let native_cursor = terminal.get_cursor_pos();
+            let native_cells = format!("{:?}", terminal.get_visible_cells());
+            let mut policy = chat_policy();
+            policy.set_chat_command_bubbles(bubbles);
+            let view = spaced_view(&mut terminal, &policy, &mut ProjectionViewState::new());
+            let dock = view.chat_composer_rows().expect("short real prompt docks");
+            let footer = dock
+                .clone()
+                .find(|&row| {
+                    matches!(
+                        view.row_kind(row),
+                        Some(ProjectedRowKind::CompanionStatus { .. })
+                    )
+                })
+                .expect("toolbar remains below the editor");
+            assert!(footer - dock.start >= 3, "three visible editor rows");
+            assert!(
+                footer - dock.start > native_rows,
+                "spare row below real input"
+            );
+            assert_eq!(view.application_cell(view.cursor()), Some(native_cursor));
+            for row in dock.start + native_rows..footer {
+                assert_eq!(view.row_kind(row), Some(ProjectedRowKind::Padding));
+                assert!(view.cells()[row].iter().all(|cell| cell.character == ' '));
+                for column in 0..view.columns() {
+                    assert_eq!(view.raw_anchor_at(DisplayPoint::new(row, column)), None);
+                    assert_eq!(view.application_cell(DisplayPoint::new(row, column)), None);
+                }
+            }
+            assert_eq!(format!("{:?}", terminal.get_visible_cells()), native_cells);
+            assert_eq!(terminal.get_cursor_pos(), native_cursor);
+        }
+    }
+}
+
+#[test]
+fn chat_command_capsules_keep_one_left_edge_when_the_window_widens() {
+    let mut terminal = TerminalState::new(40, 24);
+    chat_pair(&mut terminal, "echo hi", "hi");
+    chat_pair(&mut terminal, "printf retained", "retained");
+    chat_prompt(&mut terminal, "draft");
+    let policy = chat_policy();
+    for columns in [40, 80, 120, 40] {
+        terminal.on_resize(columns, 24);
+        let view = spaced_view(&mut terminal, &policy, &mut ProjectionViewState::new());
+        assert_eq!(view.chat_command_spans().len(), 2);
+        for command in view.chat_command_spans() {
+            assert_eq!(command.column, 1, "resizing keeps the reading edge stable");
+            let (left, right) = view.real_column_bounds(command.rows.start).unwrap();
+            assert_eq!(left, command.column);
+            assert_eq!(right - left, command.columns);
+        }
+    }
 }
 
 #[test]

@@ -529,6 +529,10 @@ impl TerminalRenderer {
             rect.min.x = (content.left() + command.column as f32 * self.char_width
                 - self.char_width * 0.8)
                 .max(content.left());
+            rect.max.x = (content.left()
+                + command.column.saturating_add(command.columns) as f32 * self.char_width
+                + self.char_width * 0.8)
+                .min(content.right());
             // Padding is drawn in proven synthetic/blank space, never by
             // translating the terminal text independently of its origins.
             rect.min.y = (rect.top() - self.line_height * 0.12).max(content.top());
@@ -629,19 +633,21 @@ impl TerminalRenderer {
             surface[3] = (surface[3] as f32 * self.opacity.clamp(0.0, 1.0)) as u8;
             return crate::glass_shell::rgba(surface);
         }
+        if self.chat_command_bubbles
+            && chat_output_is_quiet(
+                card.command,
+                card.composer,
+                entry.selected,
+                entry.active,
+                matches!(entry.outcome, crate::block_mode::BlockOutcome::Success),
+            )
+        {
+            return Color32::TRANSPARENT;
+        }
         if !card.command && !entry.selected && !entry.active {
             let mut surface = crate::glass_shell::token::TERMINAL;
             surface[3] = (surface[3] as f32 * self.opacity.clamp(0.0, 1.0)) as u8;
             return crate::glass_shell::rgba(surface);
-        }
-        if chat_output_is_quiet(
-            card.command,
-            card.composer,
-            entry.selected,
-            entry.active,
-            matches!(entry.outcome, crate::block_mode::BlockOutcome::Success),
-        ) {
-            return Color32::TRANSPARENT;
         }
         let color = if card.command {
             self.block_accent_color()
@@ -1361,25 +1367,48 @@ mod tests {
     #[test]
     fn chat_neutral_output_joins_canvas_without_hiding_important_surfaces() {
         assert!(chat_output_is_quiet(false, false, false, false, true));
-        let source = include_str!("chat.rs");
-        for body in [
-            source
-                .split_once("    fn chat_card_fill(")
-                .unwrap()
-                .1
-                .split_once("    pub(super) fn draw_chat_backgrounds")
-                .unwrap()
-                .0,
-            source
-                .split_once("    pub(super) fn draw_chat_foreground(")
-                .unwrap()
-                .1
-                .split_once("    pub(super) fn draw_chat_controls(")
-                .unwrap()
-                .0,
-        ] {
-            assert!(body.contains("crate::block_mode::BlockOutcome::Success"));
-            assert!(!body.contains("crate::block_mode::BlockOutcome::Background"));
+        for exit_code in [0, 1] {
+            let mut renderer = renderer();
+            let mut terminal = TerminalState::new(80, 24);
+            terminal.process_input(format!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07echo result\r\n\x1b]133;C\x07result\r\n\x1b]133;D;{exit_code}\x07"
+            ).as_bytes());
+            prompt(&mut terminal);
+            let mut policy = ProjectionPolicy::new();
+            policy.set_chat_mode(true);
+            policy.set_block_chrome(true, 0);
+            policy.set_block_spacing(true);
+            let view = renderer.projected_viewport_with_state(
+                &mut terminal,
+                &policy,
+                &mut ProjectionViewState::new(),
+            );
+            let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+            let mut entries = renderer
+                .block_chrome_snapshot(&terminal, &view, 24)
+                .unwrap();
+            let entry = entries.iter_mut().find(|entry| !entry.live).unwrap();
+            let card = renderer
+                .chat_cards(&terminal, &view, entry, content)
+                .into_iter()
+                .find(|card| !card.command && !card.composer)
+                .unwrap();
+            assert_eq!(
+                renderer.chat_card_fill(entry, card) == Color32::TRANSPARENT,
+                exit_code == 0
+            );
+            entry.selected = true;
+            assert_ne!(renderer.chat_card_fill(entry, card), Color32::TRANSPARENT);
+            entry.selected = false;
+            entry.active = true;
+            assert_ne!(renderer.chat_card_fill(entry, card), Color32::TRANSPARENT);
+            entry.active = false;
+            renderer.chat_command_bubbles = false;
+            assert_ne!(
+                renderer.chat_card_fill(entry, card),
+                Color32::TRANSPARENT,
+                "Block retains its output card surface"
+            );
         }
 
         for flags in [
@@ -1731,6 +1760,12 @@ mod tests {
                         .unwrap();
                     let cards = renderer.chat_cards(&terminal, &view, entry, content);
                     let capsule = cards.iter().find(|card| card.command).unwrap();
+                    assert!(capsule.rect.left() <= content.left() + renderer.char_width);
+                    assert!(
+                        capsule.rect.width()
+                            <= (command.columns as f32 + 1.6) * renderer.char_width + 0.01,
+                        "short capsules fit their content instead of stretching across the pane"
+                    );
                     for row in command.rows.clone() {
                         let (left, right) = view.real_column_bounds(row).unwrap();
                         for column in left..right {
@@ -2105,18 +2140,20 @@ mod tests {
                             )
                         })
                         .expect("explicit synthetic footer rows");
-                    assert_eq!(
-                        view.row_kind(footer_row - 1),
-                        Some(crate::terminal::ProjectedRowKind::Raw)
-                    );
+                    let input_row = (composer.start..footer_row)
+                        .rev()
+                        .find(|&row| {
+                            view.row_kind(row) == Some(crate::terminal::ProjectedRowKind::Raw)
+                        })
+                        .expect("real input above the display-only spare rows");
                     assert!(
-                        view.raw_anchor_at(DisplayPoint::new(footer_row - 1, 0))
+                        view.raw_anchor_at(DisplayPoint::new(input_row, 0))
                             .is_some(),
                         "the boundary click must target a retained native row"
                     );
                     let pointer = egui::pos2(
                         content.right() - 10.0,
-                        content.top() + footer_row as f32 * renderer.line_height - 1.0,
+                        content.top() + (input_row + 1) as f32 * renderer.line_height - 1.0,
                     );
                     renderer.set_projection_frame(&terminal, view, &policy);
                     let events = if phase == 0 {

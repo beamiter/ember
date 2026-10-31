@@ -2249,6 +2249,8 @@ pub struct ChatCommandSpan {
     pub sequence: u64,
     pub rows: std::ops::Range<usize>,
     pub column: usize,
+    /// Full command width, retained when only part of a multiline capsule is visible.
+    pub columns: usize,
 }
 
 /// Immutable materialized viewport plus its stable raw-cell provenance.

@@ -261,13 +261,10 @@ impl super::TerminalState {
                 continue;
             }
             let width = rows.iter().map(|(_, width)| *width).max().unwrap_or(0);
-            // Two display columns are visual padding, not terminal cells. Long
-            // commands deliberately retain full width instead of being cut.
-            let offset = if command_bubbles {
-                plan.cols.saturating_sub(width.saturating_add(2))
-            } else {
-                0
-            };
+            // A stable left inset keeps successive commands on one reading
+            // edge. It is visual padding, never a terminal cell. Full-width
+            // commands retain their original columns instead of being cut.
+            let offset = usize::from(command_bubbles && width.saturating_add(2) <= plan.cols);
             for (index, content_end) in rows {
                 let row = &mut plan.rows[index];
                 row.raw_slices.retain_mut(|slice| {
@@ -282,6 +279,7 @@ impl super::TerminalState {
                 sequence: sources[owner].0,
                 rows: first..last + 1,
                 column: offset,
+                columns: width,
             });
         }
         // Unlike Block, Chat intentionally removes all proven empty terminal
@@ -308,6 +306,7 @@ impl super::TerminalState {
                 .and_then(|(absolute, _)| self.raw_row_id_at_absolute(absolute))
                 .and_then(|row_id| plan.raw_cell_document_row(RawCellAnchor { row_id, column: 0 }));
             if let Some(start) = plan.chat_dock_start {
+                let input_rows = plan.document_rows().saturating_sub(start);
                 if plan
                     .document_rows()
                     .saturating_sub(start)
@@ -320,6 +319,28 @@ impl super::TerminalState {
                             column: origin.col_start,
                         })
                     }) {
+                        // Reserve a comfortable editor without inventing PTY
+                        // rows: three rows at minimum, with one blank row below
+                        // all real input/completion content. Short viewports
+                        // retain history and toolbar space before this padding.
+                        let padding_rows = 3_usize
+                            .saturating_sub(input_rows)
+                            .max(1)
+                            .min(
+                                self.grid
+                                    .rows()
+                                    .saturating_sub(input_rows)
+                                    .saturating_sub(footer_rows)
+                                    .saturating_sub(1),
+                            );
+                        for _ in 0..padding_rows {
+                            plan.rows.push_back(ProjectionPlanRow {
+                                raw_slices: SmallVec::new(),
+                                row_source: None,
+                                wrapped: false,
+                                kind: ProjectedRowKind::Padding,
+                            });
+                        }
                         for index in 0..footer_rows {
                             plan.rows.push_back(ProjectionPlanRow {
                                 raw_slices: SmallVec::new(),
@@ -519,6 +540,7 @@ impl super::TerminalState {
                     sequence: command.sequence,
                     rows: first..last + 1,
                     column: command.column,
+                    columns: command.columns,
                 });
             }
         }

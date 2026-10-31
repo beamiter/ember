@@ -1809,7 +1809,7 @@ impl TerminalRenderer {
                 .is_none_or(|rows| rows as f32 * self.line_height > limit);
         self.glass_chat_requested = chat;
         // Both presentations dock the real prompt. Only Chat transforms
-        // completed commands into right-aligned conversation bubbles.
+        // completed commands into compact, left-aligned conversation bubbles.
         self.chat_mode = !fallback;
         self.chat_command_bubbles = chat;
         self.continuous_block = fallback;
