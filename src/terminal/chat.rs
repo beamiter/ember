@@ -335,8 +335,51 @@ impl super::TerminalState {
                         }
                     }
                 }
+                Self::space_docked_prompt(plan, start);
             }
         }
+    }
+
+    /// The docked prompt's frame starts above its first row and the history
+    /// panel ends one gap above that frame. One display-only spacer keeps the
+    /// last history row (and its card edge) out of both. It holds no cells,
+    /// selection origins or application mouse coordinates.
+    fn space_docked_prompt(plan: &mut ProjectionPlan, start: usize) {
+        if start == 0
+            || matches!(
+                plan.rows.get(start - 1).map(|row| &row.kind),
+                Some(ProjectedRowKind::BlockSpacer { .. })
+            )
+        {
+            return;
+        }
+        let Some(before) = plan.rows.get(start).and_then(|row| {
+            row.raw_slices.first().and_then(|slice| {
+                slice.origin.map(|origin| RawCellAnchor {
+                    row_id: origin.row,
+                    column: 0,
+                })
+            })
+        }) else {
+            return;
+        };
+        plan.rows.insert(
+            start,
+            ProjectionPlanRow {
+                raw_slices: SmallVec::new(),
+                row_source: None,
+                wrapped: false,
+                kind: ProjectedRowKind::BlockSpacer { before },
+            },
+        );
+        plan.spacer_count += 1;
+        for command in &mut plan.chat_commands {
+            if command.rows.start >= start {
+                command.rows = command.rows.start + 1..command.rows.end + 1;
+            }
+        }
+        plan.chat_dock_start = Some(start + 1);
+        plan.rebuild_raw_row_placements();
     }
 
     pub(super) fn materialize_chat_or_block_viewport(

@@ -469,12 +469,13 @@ impl TerminalRenderer {
                     ),
             )
         });
-        crate::glass_shell::editor_dock_with_height(
-            outer,
-            native.top(),
-            self.reference_tools_height,
-        )
-        .frame
+        // The projection leaves one blank row above the docked prompt. With
+        // short lines, narrow the frame's top margin so that row still covers
+        // the frame margin plus the history panel gap.
+        let margin = 6.0 + crate::glass_shell::token::TERMINAL_FOOTER_GAP;
+        let native_top = native.top() + (margin - self.line_height).clamp(0.0, 6.0);
+        crate::glass_shell::editor_dock_with_height(outer, native_top, self.reference_tools_height)
+            .frame
     }
 
     fn composer_footer_rect(

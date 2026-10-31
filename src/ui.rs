@@ -1982,7 +1982,11 @@ impl TerminalRenderer {
         if let Some(start) = self.canvas_geometry.composer_start {
             let top = self.shared_composer_rect(content, start..start + 1).top();
             if row < start {
-                clip.max.y = clip.max.y.min(top);
+                // History ends at its own panel edge, above the dock's gap.
+                clip.max.y = clip
+                    .max
+                    .y
+                    .min(top - crate::glass_shell::token::TERMINAL_FOOTER_GAP);
             } else {
                 clip.min.y = clip.min.y.max(top);
             }
@@ -4788,6 +4792,15 @@ impl TerminalRenderer {
             egui::pos2(rect.left(), content_rect.top()),
             egui::pos2(rect.right(), rect.bottom()),
         ));
+        // Block cards and their chrome belong to the history panel. They never
+        // paint into the gap or frame of a docked prompt, even mid-scroll.
+        let history_painter = if viewport.chat_composer_rows().is_some() {
+            let mut clip = painter.clip_rect();
+            clip.max.y = clip.max.y.min(background_rect.bottom());
+            painter.with_clip_rect(clip)
+        } else {
+            painter.clone()
+        };
         if let (Some(_), Some(input), Some(snapshot)) = (
             &native_buffer,
             &self.native_vim9_input,
@@ -4880,7 +4893,7 @@ impl TerminalRenderer {
                 self.draw_chat_backgrounds(&painter, terminal, &viewport, entries, content_rect, bg)
             } else {
                 self.draw_block_card_backgrounds(
-                    &painter,
+                    &history_painter,
                     entries,
                     content_rect,
                     line_height,
@@ -4919,7 +4932,10 @@ impl TerminalRenderer {
                 }
             })
             .unwrap_or_else(|| {
-                Some(
+                // A projection reports a cursor outside its rows/columns
+                // (`usize::MAX` sentinel) when the real cursor is not shown;
+                // there is then no caret position to offer the IME.
+                (cursor_pos.0 < viewport.rows() && cursor_pos.1 < viewport.columns()).then(|| {
                     cursor_rect(
                         content_rect,
                         cursor_pos.0,
@@ -4930,8 +4946,8 @@ impl TerminalRenderer {
                     .translate(egui::vec2(
                         0.0,
                         -self.canvas_geometry.row_offset(cursor_pos.0, line_height),
-                    )),
-                )
+                    ))
+                })
             });
 
         let preedit = if focus_enabled && terminal.ime_enabled && !terminal.preedit_text.is_empty()
@@ -5696,12 +5712,18 @@ impl TerminalRenderer {
         // verified against blank cells; the stripe lives wholly in the
         // layout-owned gutter, so neither path covers a glyph.
         if let Some(entries) = &block_chrome {
-            self.draw_block_metadata(&painter, terminal, entries, content_rect, line_height);
+            self.draw_block_metadata(
+                &history_painter,
+                terminal,
+                entries,
+                content_rect,
+                line_height,
+            );
             if self.chat_mode {
                 self.draw_chat_foreground(&painter, terminal, &viewport, entries, content_rect);
             } else {
                 self.draw_block_chrome(
-                    &painter,
+                    &history_painter,
                     entries,
                     &grid,
                     content_rect,
@@ -11927,6 +11949,47 @@ mod transcript_canvas_tests {
         assert_eq!(text_row(&finished, "firstline"), first);
         assert_eq!(text_row(&finished, "thirdline"), first + 2);
         assert_eq!(renderer.canvas_geometry.translation, 0.0);
+    }
+
+    #[test]
+    fn docked_prompt_keeps_one_spacer_between_full_history_and_its_frame() {
+        let (mut renderer, _, policy) = fixture(true);
+        let mut terminal = TerminalState::new(40, 24);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07seq 1 80\r\n\x1b]133;C\x07");
+        for line in 1..=80 {
+            terminal.process_input(format!("{line}\r\n").as_bytes());
+        }
+        terminal.process_input(b"done-marker\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let viewport =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        let dock = viewport.chat_composer_rows().expect("docked prompt");
+        let last = text_row(&viewport, "done-marker");
+        assert_eq!(last + 2, dock.start, "history ends one row above the dock");
+        assert!(matches!(
+            viewport.row_kind(dock.start - 1),
+            Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. })
+        ));
+        assert!(viewport.cells()[dock.start - 1]
+            .iter()
+            .all(|cell| cell.character == ' ' || cell.character == '\0'));
+        // The frame and panel gap fit inside that spacer for every line height.
+        for line_height in [10.0, 14.0, 18.0, 32.0] {
+            renderer.line_height = line_height;
+            let content = egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(400.0, 24.0 * line_height),
+            );
+            let panel_bottom = renderer.shared_composer_rect(content, dock.clone()).top()
+                - crate::glass_shell::token::TERMINAL_FOOTER_GAP;
+            let history_bottom = content.top() + (dock.start - 1) as f32 * line_height;
+            assert!(
+                history_bottom <= panel_bottom + 0.01,
+                "{line_height}: {history_bottom} > {panel_bottom}"
+            );
+        }
     }
 
     #[test]
