@@ -8730,7 +8730,10 @@ fn chat_projection_pins_real_prompt_and_left_aligns_command_without_fake_cells()
     assert_eq!(composer.end, 24);
     assert!(composer.start > 12);
     let command = &viewport.chat_command_spans()[0];
-    assert_eq!(command.column, 1, "short commands share a left reading edge");
+    assert_eq!(
+        command.column, 1,
+        "short commands share a left reading edge"
+    );
     assert_eq!(command.columns, "$ printf hello".len());
     assert_eq!(
         viewport.raw_anchor_at(DisplayPoint::new(command.rows.start, command.column - 1)),
@@ -8797,7 +8800,7 @@ fn chat_docked_input_reserves_three_rows_and_spare_space_without_native_cells() 
                     )
                 })
                 .expect("toolbar remains below the editor");
-            assert!(footer - dock.start >= 3, "three visible editor rows");
+            assert!(footer - dock.start >= 4, "three editor rows plus spare space");
             assert!(
                 footer - dock.start > native_rows,
                 "spare row below real input"
@@ -8832,7 +8835,7 @@ fn chat_command_capsules_keep_one_left_edge_when_the_window_widens() {
             assert_eq!(command.column, 1, "resizing keeps the reading edge stable");
             let (left, right) = view.real_column_bounds(command.rows.start).unwrap();
             assert_eq!(left, command.column);
-            assert_eq!(right - left, command.columns);
+            assert_eq!(right - left + 1, command.columns);
         }
     }
 }

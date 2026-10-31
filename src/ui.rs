@@ -12364,7 +12364,7 @@ mod transcript_canvas_tests {
         let outer = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 600.0));
         let cells = terminal.grid.to_vec();
         let cursor = (terminal.cursor_row, terminal.cursor_col);
-        let _ = ctx.run_ui(Default::default(), |_| {
+        ctx.run_ui(Default::default(), |_| {
             for chat in [false, true, false] {
                 renderer.sync_glass_presentation(&ctx, chat, &terminal, outer.height());
                 renderer.resolve_glass_layout(&terminal, outer);
@@ -12375,7 +12375,8 @@ mod transcript_canvas_tests {
                 assert_native_cells_equal(&terminal.grid.to_vec(), &cells);
                 assert_eq!((terminal.cursor_row, terminal.cursor_col), cursor);
             }
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]

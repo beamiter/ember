@@ -1768,7 +1768,7 @@ mod tests {
                     );
                     for row in command.rows.clone() {
                         let (left, right) = view.real_column_bounds(row).unwrap();
-                        for column in left..right {
+                        for column in left..=right {
                             let center = content.min
                                 + egui::vec2(
                                     (column as f32 + 0.5) * renderer.char_width,

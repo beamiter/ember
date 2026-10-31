@@ -320,19 +320,17 @@ impl super::TerminalState {
                         })
                     }) {
                         // Reserve a comfortable editor without inventing PTY
-                        // rows: three rows at minimum, with one blank row below
-                        // all real input/completion content. Short viewports
+                        // rows: at least three editor rows plus one blank row
+                        // below all real input/completion content. Short viewports
                         // retain history and toolbar space before this padding.
-                        let padding_rows = 3_usize
-                            .saturating_sub(input_rows)
-                            .max(1)
-                            .min(
-                                self.grid
-                                    .rows()
-                                    .saturating_sub(input_rows)
-                                    .saturating_sub(footer_rows)
-                                    .saturating_sub(1),
-                            );
+                        let preferred_padding = 3_usize.saturating_sub(input_rows).saturating_add(1);
+                        let padding_rows = preferred_padding.min(
+                            self.grid
+                                .rows()
+                                .saturating_sub(input_rows)
+                                .saturating_sub(footer_rows)
+                                .saturating_sub(1),
+                        );
                         for _ in 0..padding_rows {
                             plan.rows.push_back(ProjectionPlanRow {
                                 raw_slices: SmallVec::new(),
