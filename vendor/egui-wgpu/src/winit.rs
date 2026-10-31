@@ -28,6 +28,7 @@ struct SurfaceState {
 ///
 /// NOTE: all egui viewports share the same painter.
 pub struct Painter {
+    native_feedback_pass: Option<u64>,
     // Ember: set only after actual Queue::present, never on skipped frames.
     last_presented_viewport: Option<ViewportId>,
     context: Context,
@@ -48,6 +49,10 @@ pub struct Painter {
 }
 
 impl Painter {
+    /// Request publication and X11 scene evidence for this exact UI pass.
+    pub fn set_native_frame_feedback(&mut self, pass: Option<u64>) {
+        self.native_feedback_pass = pass;
+    }
     /// Native submission evidence, not compositor scanout proof.
     pub fn last_presented_viewport(&self) -> Option<ViewportId> { self.last_presented_viewport }
 
@@ -73,6 +78,7 @@ impl Painter {
         let instance = config.wgpu_setup.new_instance().await;
 
         Self {
+            native_feedback_pass: None,
             last_presented_viewport: None,
             context,
             config,
@@ -490,6 +496,7 @@ impl Painter {
         window: &Arc<winit::window::Window>,
     ) -> f32 {
         self.last_presented_viewport = None;
+        let native_feedback_pass = self.native_feedback_pass.take();
         profiling::function_scope!();
 
         /// Guard to ensure that commands are always submitted to the renderer queue
@@ -582,6 +589,16 @@ impl Painter {
                         &image_delta,
                     );
                 }
+            }
+
+            if window.defer_native_frame() {
+                // Public Painter callers also respect pacing. Flush uploads
+                // before freeing resources, and never acquire/discard a native
+                // swapchain image while its predecessor awaits scene feedback.
+                let _ = render_state.queue.submit([]);
+                render_queue_guard.commands_submitted = true;
+                for id in textures_delta.free.drain() { renderer.free_texture(&id); }
+                return vsync_sec;
             }
 
             renderer.update_buffers(
@@ -765,13 +782,27 @@ impl Painter {
             );
         }
 
+        let feedback_pass = native_feedback_pass.filter(|pass| {
+            window.begin_native_frame_feedback(*pass, surface_state.width, surface_state.height)
+        });
         window.pre_present_notify();
 
         {
             profiling::scope!("present");
             // wgpu doesn't document where vsync can happen. Maybe here?
             let start = web_time::Instant::now();
-            render_state.queue.present(output_frame);
+            #[cfg(target_os = "linux")]
+            let published = if feedback_pass.is_some() {
+                wgpu_hal::vulkan::publication::observe(|| render_state.queue.present(output_frame)).1
+            } else {
+                render_state.queue.present(output_frame);
+                false
+            };
+            #[cfg(not(target_os = "linux"))]
+            let published = { render_state.queue.present(output_frame); false };
+            if let Some(pass) = feedback_pass {
+                window.finish_native_frame_feedback(pass, published);
+            }
             self.last_presented_viewport = Some(viewport_id);
             vsync_sec += start.elapsed().as_secs_f32();
         }

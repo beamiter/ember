@@ -9,6 +9,7 @@
 
 #![expect(clippy::manual_range_contains)]
 
+use std::collections::HashMap;
 #[cfg(target_os = "windows")]
 use std::collections::HashSet;
 
@@ -93,6 +94,7 @@ pub struct State {
     /// We keep a copy so we can stamp
     /// it onto per-event `modifiers` fields and emit [`egui::Event::ModifiersChanged`].
     modifiers: egui::Modifiers,
+    pressed_key_identity: PressedKeyIdentity,
 
     pointer_pos_in_points: Option<egui::Pos2>,
     any_pointer_button_down: bool,
@@ -158,6 +160,7 @@ impl State {
             egui_ctx,
             egui_input,
             modifiers: egui::Modifiers::default(),
+            pressed_key_identity: PressedKeyIdentity::default(),
             pointer_pos_in_points: None,
             any_pointer_button_down: false,
             current_cursor_icon: None,
@@ -321,6 +324,10 @@ impl State {
         }
 
         match event {
+            WindowEvent::NativeFramePresented { .. } => EventResponse {
+                consumed: false,
+                repaint: false,
+            },
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 let native_pixels_per_point = *scale_factor as f32;
 
@@ -438,6 +445,7 @@ impl State {
                 if !focused {
                     // Avoid sticky modifiers when focus is lost (egui clears its own copy too).
                     self.modifiers = egui::Modifiers::default();
+                    self.pressed_key_identity.0.clear();
                 }
                 self.egui_input
                     .events
@@ -1016,8 +1024,9 @@ impl State {
         // emit events as if the corresponding keys from the Latin layout were pressed. In this case, clipboard shortcuts
         // are mapped to the physical keys that normally contain C, X, V, etc.
         // See also: https://github.com/emilk/egui/issues/3653
-        if let Some(active_key) = resolve_logical_or_physical_key(winit_logical_key, physical_key) {
-            if pressed {
+        let candidate = resolve_logical_or_physical_key(winit_logical_key, physical_key);
+        if pressed {
+            if let Some(active_key) = candidate {
                 if is_cut_command(self.modifiers, active_key) {
                     self.egui_input.events.push(egui::Event::Cut);
                     return;
@@ -1034,7 +1043,11 @@ impl State {
                     return;
                 }
             }
-
+        }
+        if let Some(active_key) =
+            self.pressed_key_identity
+                .resolve(event.physical_key, candidate, pressed)
+        {
             self.egui_input.events.push(egui::Event::Key {
                 key: active_key,
                 physical_key,
@@ -1444,6 +1457,33 @@ fn translate_mouse_button(button: winit::event::MouseButton) -> Option<egui::Poi
     }
 }
 
+// Pair forwarded logical keys with their original physical press. Text and
+// clipboard handling still use the current logical event and modifiers.
+#[derive(Default)]
+struct PressedKeyIdentity(HashMap<winit::keyboard::PhysicalKey, Option<egui::Key>>);
+
+impl PressedKeyIdentity {
+    fn resolve(
+        &mut self,
+        physical: winit::keyboard::PhysicalKey,
+        candidate: Option<egui::Key>,
+        pressed: bool,
+    ) -> Option<egui::Key> {
+        // An unidentified physical key need not uniquely identify a key.
+        // Preserve the existing logical fallback instead of merging presses.
+        if !matches!(physical, winit::keyboard::PhysicalKey::Code(_)) {
+            return candidate;
+        }
+        if pressed {
+            // Shift/layout changes may alter a repeat or release's logical
+            // symbol. Always release the key actually delivered on press.
+            *self.0.entry(physical).or_insert(candidate)
+        } else {
+            self.0.remove(&physical).unwrap_or(candidate)
+        }
+    }
+}
+
 // A remapped/virtual keyboard can put a printable character on any physical
 // keycode. If egui has no logical enum for that character (for example `>`),
 // falling back to Enter would emit a control action AND the printable Text.
@@ -1529,6 +1569,106 @@ fn physical_key_can_represent_text(key: egui::Key) -> bool {
 mod ember_keyboard_fallback_tests {
     use super::*;
     use winit::keyboard::{Key, NamedKey, NativeKey};
+
+    fn deliver_key(
+        ctx: &egui::Context,
+        keys: &mut PressedKeyIdentity,
+        code: winit::keyboard::KeyCode,
+        logical: &str,
+        pressed: bool,
+    ) {
+        let physical_key = key_from_key_code(code);
+        let candidate =
+            resolve_logical_or_physical_key(&Key::Character(logical.into()), physical_key);
+        let events = keys
+            .resolve(winit::keyboard::PhysicalKey::Code(code), candidate, pressed)
+            .map(|key| egui::Event::Key {
+                key,
+                physical_key,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            })
+            .into_iter()
+            .collect();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn changed_release_symbols_clear_actual_egui_held_keys() {
+        use winit::keyboard::KeyCode;
+        let ctx = egui::Context::default();
+        let mut keys = PressedKeyIdentity::default();
+        for (code, down, up, expected) in [
+            (KeyCode::Semicolon, ":", ";", egui::Key::Colon),
+            (KeyCode::BracketLeft, "{", "[", egui::Key::OpenCurlyBracket),
+            (
+                KeyCode::BracketRight,
+                "}",
+                "]",
+                egui::Key::CloseCurlyBracket,
+            ),
+        ] {
+            deliver_key(&ctx, &mut keys, code, down, true);
+            assert!(ctx.input(|i| i.key_down(expected)));
+            deliver_key(&ctx, &mut keys, code, up, false);
+            assert!(ctx.input(|i| i.keys_down.is_empty()), "{down} -> {up}");
+        }
+    }
+
+    #[test]
+    fn changed_repeat_keeps_one_logical_key_until_physical_release() {
+        use winit::keyboard::KeyCode;
+        let ctx = egui::Context::default();
+        let mut keys = PressedKeyIdentity::default();
+        deliver_key(&ctx, &mut keys, KeyCode::Semicolon, ":", true);
+        deliver_key(&ctx, &mut keys, KeyCode::Semicolon, ";", true);
+        assert!(ctx.input(|i| i.key_down(egui::Key::Colon)));
+        assert!(!ctx.input(|i| i.key_down(egui::Key::Semicolon)));
+        deliver_key(&ctx, &mut keys, KeyCode::Semicolon, ";", false);
+        assert!(ctx.input(|i| i.keys_down.is_empty()));
+    }
+
+    #[test]
+    fn unidentified_physical_keys_keep_independent_logical_fallbacks() {
+        let mut keys = PressedKeyIdentity::default();
+        let physical = winit::keyboard::PhysicalKey::Unidentified(
+            winit::keyboard::NativeKeyCode::Unidentified,
+        );
+        for key in [egui::Key::A, egui::Key::B] {
+            assert_eq!(keys.resolve(physical, Some(key), true), Some(key));
+        }
+        for key in [egui::Key::A, egui::Key::B] {
+            assert_eq!(keys.resolve(physical, Some(key), false), Some(key));
+        }
+        assert!(keys.0.is_empty());
+    }
+
+    #[test]
+    fn unforwarded_printable_key_cannot_turn_into_control_on_release() {
+        use winit::keyboard::KeyCode;
+        let mut keys = PressedKeyIdentity::default();
+        let physical = winit::keyboard::PhysicalKey::Code(KeyCode::Enter);
+        let candidate =
+            resolve_logical_or_physical_key(&Key::Character(">".into()), Some(egui::Key::Enter));
+        assert_eq!(keys.resolve(physical, candidate, true), None);
+        assert_eq!(keys.resolve(physical, Some(egui::Key::Enter), false), None);
+        // Focus loss clears identities; the next real press owns its new key.
+        let colon = winit::keyboard::PhysicalKey::Code(KeyCode::Semicolon);
+        keys.resolve(colon, Some(egui::Key::Colon), true);
+        keys.0.clear();
+        assert_eq!(
+            keys.resolve(colon, Some(egui::Key::Semicolon), true),
+            Some(egui::Key::Semicolon)
+        );
+    }
 
     #[test]
     fn printable_logical_characters_never_manufacture_control_keys() {
@@ -2454,6 +2594,7 @@ pub fn short_window_event_description(event: &winit::event::WindowEvent) -> &'st
     use winit::event::WindowEvent;
 
     match event {
+        WindowEvent::NativeFramePresented { .. } => "WindowEvent::NativeFramePresented",
         WindowEvent::ActivationTokenDone { .. } => "WindowEvent::ActivationTokenDone",
         WindowEvent::Resized { .. } => "WindowEvent::Resized",
         WindowEvent::Moved { .. } => "WindowEvent::Moved",

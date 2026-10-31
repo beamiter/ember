@@ -850,7 +850,6 @@ impl GlowWinitRunning<'_> {
                 })?;
 
                 gl_surface.swap_buffers(context)?;
-                app.on_native_frame_presented(viewport_id, integration.egui_ctx.cumulative_pass_nr());
                 frame_timer.resume();
             }
 
@@ -885,6 +884,11 @@ impl GlowWinitRunning<'_> {
     ) -> EventResult {
         let mut glutin = self.glutin.borrow_mut();
         let viewport_id = glutin.viewport_from_window.get(&window_id).copied();
+
+        if let winit::event::WindowEvent::NativeFramePresented { serial } = event {
+            if let Some(viewport) = viewport_id { self.app.on_native_frame_presented(viewport, *serial); }
+            return EventResult::Wait;
+        }
 
         // On Windows, if a window is resized by the user, it should repaint synchronously, inside the
         // event handler.

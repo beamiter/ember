@@ -1374,7 +1374,10 @@ fn canvas_padding_companion_region(
         })
         .last()?;
     let bottom = composer_top.min(content.top() + end as f32 * line_height) - 8.0;
-    let top = (content.top() + start as f32 * line_height + 8.0).max(bottom - 88.0);
+    // The shared atlas is taller than the legacy ornament. Offer the proven
+    // existing padding instead of imposing a legacy 88px ceiling; this does
+    // not add projection rows or borrow any terminal/composer cells.
+    let top = content.top() + start as f32 * line_height + 8.0;
     let rect = egui::Rect::from_min_max(
         egui::pos2((content.right() - 280.0).max(content.left() + 8.0), top),
         egui::pos2(content.right() - 8.0, bottom),
@@ -6015,26 +6018,11 @@ impl TerminalRenderer {
                 .as_deref()
                 .and_then(|entries| entries.iter().find(|entry| entry.live))
                 .and_then(|entry| {
-                    let cursor = Self::projected_buffer_point(
-                        terminal,
-                        &viewport,
-                        (
-                            terminal
-                                .total_lines_scrolled
-                                .saturating_add(terminal.get_cursor_pos().0 as u64),
-                            terminal.get_cursor_pos().1,
-                        ),
-                    )?;
-                    active_companion_region(
-                        &viewport,
-                        entry.span,
-                        cursor.row,
-                        content_rect,
-                        line_height,
-                        self.block_compact,
-                    )
-                    .or_else(|| {
-                        viewport.chat_composer_rows().and_then(|rows| {
+                    // Structural canvas padding can fit the full shared
+                    // atlas even when the active raw card only fits Compact.
+                    viewport
+                        .chat_composer_rows()
+                        .and_then(|rows| {
                             canvas_padding_companion_region(
                                 &viewport,
                                 content_rect,
@@ -6042,8 +6030,27 @@ impl TerminalRenderer {
                                 self.shared_composer_rect(content_rect, rows).top(),
                             )
                         })
-                    })
-                    .map(|region| (entry.id.clone(), viewport.key(), region))
+                        .or_else(|| {
+                            let cursor = Self::projected_buffer_point(
+                                terminal,
+                                &viewport,
+                                (
+                                    terminal
+                                        .total_lines_scrolled
+                                        .saturating_add(terminal.get_cursor_pos().0 as u64),
+                                    terminal.get_cursor_pos().1,
+                                ),
+                            )?;
+                            active_companion_region(
+                                &viewport,
+                                entry.span,
+                                cursor.row,
+                                content_rect,
+                                line_height,
+                                self.block_compact,
+                            )
+                        })
+                        .map(|region| (entry.id.clone(), viewport.key(), region))
                 });
         }
 
@@ -7759,7 +7766,8 @@ mod tests {
         let region =
             canvas_padding_companion_region(&viewport, content, 20.0, composer_top).unwrap();
         assert!(
-            region.width() >= 264.0 && region.height() >= 80.0,
+            region.width() >= jterm_core::companion_host::atlas::WIDTH as f32 * 6.6
+                && region.height() >= jterm_core::companion_host::atlas::HEIGHT as f32 * 11.0,
             "the shared graphical body fits wholly inside proven structural padding"
         );
         assert!(region.bottom() < composer_top);

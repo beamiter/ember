@@ -365,6 +365,7 @@ pub struct ShellSession {
     /// Absolute shell executable resolved when an interactive session was
     /// created. One-shot command sessions have no source-shell identity.
     shell_program: Option<String>,
+    shell_identity: companion_host::shell_identity::ShellIdentity,
 }
 
 impl ShellSession {
@@ -433,6 +434,10 @@ impl ShellSession {
             Ok(pty) => {
                 // 在把 pty 放入 Arc<Mutex> 前获取 child_pid
                 let child_pid = pty.get_child_pid();
+                let shell_identity = companion_host::shell_identity::ShellIdentity::capture(
+                    child_pid,
+                    shell_program.as_deref().map(std::path::Path::new),
+                );
 
                 // 有界 channel 提供背压:UI 消费不及时,IO 线程会阻塞在 send 上,
                 // 停止读取 PTY → 内核 PTY 缓冲填满 → 高产出进程(如 yes)自身阻塞,
@@ -518,6 +523,7 @@ impl ShellSession {
                     write_tx,
                     started_at: std::time::Instant::now(),
                     shell_program,
+                    shell_identity,
                 })
             }
             Err(e) => Err(format!("Failed to create shell session: {}", e)),
@@ -540,6 +546,14 @@ impl ShellSession {
 
     pub fn shell_program(&self) -> Option<&str> {
         self.shell_program.as_deref()
+    }
+
+    pub fn matches_interactive_shell_program(&self) -> bool {
+        self.shell_identity.matches_current_program()
+    }
+
+    pub fn session_activity(&self) -> companion_host::pty_session::Activity {
+        self.pty.lock().session_activity()
     }
 
     fn send_event(

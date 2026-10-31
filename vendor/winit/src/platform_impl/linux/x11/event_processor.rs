@@ -11,7 +11,7 @@ use x11_dl::xinput2::{
 use x11_dl::xlib::{
     self, Display as XDisplay, Window as XWindow, XAnyEvent, XClientMessageEvent, XConfigureEvent,
     XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XMapEvent, XPropertyEvent,
-    XReparentEvent, XSelectionEvent, XVisibilityEvent, XkbAnyEvent, XkbStateRec,
+    XReparentEvent, XSelectionEvent, XUnmapEvent, XVisibilityEvent, XkbAnyEvent, XkbStateRec,
 };
 use x11rb::protocol::xinput;
 use x11rb::protocol::xkb::ID as XkbId;
@@ -148,6 +148,42 @@ impl EventProcessor {
         F: FnMut(&RootAEL, Event<T>),
     {
         let event_type = xev.get_type();
+
+        let wt = Self::window_target(&self.target);
+        // These native resource transitions must invalidate proof before IME
+        // filtering or app callbacks can defer the next UI/native draw.
+        if event_type == xlib::UnmapNotify {
+            let event: &XUnmapEvent = xev.as_ref();
+            if event.send_event == xlib::False {
+                self.with_window(event.window as u32, |window| window.native_frame_mapping_changed(false));
+            }
+        } else if event_type == xlib::MapNotify {
+            let event: &XMapEvent = xev.as_ref();
+            if event.send_event == xlib::False {
+                self.with_window(event.window as u32, |window| window.native_frame_mapping_changed(true));
+            }
+        }
+        if wt.xconn.frame_authority_event_base() == Some(event_type) {
+            // XFixesSelectionNotify is extension event zero. The Xlib decoder
+            // was installed while registering this native window. Synthetic
+            // client events cannot invalidate a pending authority generation.
+            let event = unsafe { &*(xev as *const XEvent as *const x11_dl::xfixes::XFixesSelectionNotifyEvent) };
+            if event.send_event == xlib::False && (0..=2).contains(&event.subtype) {
+                self.with_window(event.window as u32, |window| {
+                    window.native_frame_selection_changed(event.selection as u32);
+                });
+            }
+            return;
+        }
+        if event_type == xlib::PropertyNotify && wt.xconn.frame_authority_event_base().is_some() {
+            let property: &XPropertyEvent = xev.as_ref();
+            if property.send_event == xlib::False {
+                let windows: Vec<_> = wt.windows.borrow().values().filter_map(|window| window.upgrade()).collect();
+                for window in windows {
+                    window.native_frame_marker_changed(property.window as u32, property.atom as u32);
+                }
+            }
+        }
 
         // If we have IME disabled, don't try to `filter_event`, since only IME can consume them
         // and forward back. This is not desired for e.g. games since some IMEs may delay the input
@@ -419,13 +455,24 @@ impl EventProcessor {
         let window = xev.window as xproto::Window;
         let window_id = mkwid(window);
 
-        if xev.data.get_long(0) as xproto::Atom == wt.wm_delete_window {
+        let (handled, presented) = self.with_window(window, |w| w.native_frame_feedback_message(xev))
+            .unwrap_or((false, None));
+        if handled {
+            if let Some(serial) = presented {
+                callback(&self.target, Event::WindowEvent { window_id, event: WindowEvent::NativeFramePresented { serial } });
+            }
+            return;
+        }
+
+        if xev.message_type == atoms[WM_PROTOCOLS] as c_ulong
+            && xev.data.get_long(0) as xproto::Atom == wt.wm_delete_window {
             let event = Event::WindowEvent { window_id, event: WindowEvent::CloseRequested };
             callback(&self.target, event);
             return;
         }
 
-        if xev.data.get_long(0) as xproto::Atom == wt.net_wm_ping {
+        if xev.message_type == atoms[WM_PROTOCOLS] as c_ulong
+            && xev.data.get_long(0) as xproto::Atom == wt.net_wm_ping {
             let client_msg = xproto::ClientMessageEvent {
                 response_type: xproto::CLIENT_MESSAGE_EVENT,
                 format: xev.format as _,
@@ -781,6 +828,9 @@ impl EventProcessor {
         }
 
         if resized {
+            // A resized/replaced native backing cannot certify the old frame,
+            // including an ABA resize back to the original dimensions.
+            window.invalidate_native_frame_feedback();
             callback(&self.target, Event::WindowEvent {
                 window_id,
                 event: WindowEvent::Resized(new_inner_size.into()),

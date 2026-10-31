@@ -639,6 +639,44 @@ impl Window {
         self.window.maybe_queue_on_main(|w| w.pre_present_notify());
     }
 
+    /// Whether an enabled X11 window has a pending WM sync request.
+    pub fn native_frame_feedback_requested(&self) -> bool {
+        #[cfg(x11_platform)]
+        { return self.window.maybe_wait_on_main(|w| w.native_frame_feedback_requested()); }
+        #[cfg(not(x11_platform))]
+        { false }
+    }
+
+    /// Defer all native presentation while an evidence frame awaits compositor
+    /// feedback. Records a deferred repaint; receipt completion wakes it once.
+    /// Call before consuming UI input/deltas or acquiring a surface texture.
+    pub fn defer_native_frame(&self) -> bool {
+        #[cfg(x11_platform)]
+        { return self.window.maybe_wait_on_main(|w| w.defer_native_frame()); }
+        #[cfg(not(x11_platform))]
+        { false }
+    }
+
+    /// Begin an opt-in JWM/X11 extended-counter frame, before native present.
+    /// `finish_native_frame_feedback` requires exact producer publication evidence.
+    /// Unsupported compositors/platforms return false.
+    pub fn begin_native_frame_feedback(&self, serial: u64, width: u32, height: u32) -> bool {
+        #[cfg(x11_platform)]
+        { return self.window.maybe_wait_on_main(move |w| w.begin_native_frame_feedback(serial, width, height)); }
+        #[cfg(not(x11_platform))]
+        { let _ = (serial, width, height); false }
+    }
+
+    /// Publish the even counter only for the exact, completed native present.
+    /// Successful feedback arrives later as `NativeFramePresented`, carrying
+    /// this original serial. This does not certify physical scanout.
+    pub fn finish_native_frame_feedback(&self, serial: u64, published: bool) {
+        #[cfg(x11_platform)]
+        self.window.maybe_queue_on_main(move |w| w.finish_native_frame_feedback(serial, published));
+        #[cfg(not(x11_platform))]
+        let _ = (serial, published);
+    }
+
     /// Reset the dead key state of the keyboard.
     ///
     /// This is useful when a dead key is bound to trigger an action. Then

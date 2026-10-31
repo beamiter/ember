@@ -44,6 +44,7 @@ pub mod ffi;
 mod ime;
 mod monitor;
 mod util;
+mod frame_feedback;
 mod window;
 mod xdisplay;
 mod xsettings;
@@ -803,6 +804,7 @@ impl Drop for Window {
     fn drop(&mut self) {
         let window = self.deref();
         let xconn = &window.xconn;
+        window.destroy_native_frame_feedback();
 
         if let Ok(c) = xconn.xcb_connection().destroy_window(window.id().0 as xproto::Window) {
             c.ignore_error();

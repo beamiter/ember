@@ -20,6 +20,26 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  native-feedback:
+    name: Native frame receipt state
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: clippy,rustfmt
+      - name: Check native receipt sources
+        run: |
+          python3 tools/check-host-bundle.py
+          cargo fmt --manifest-path tools/native-feedback-harness/Cargo.toml -- --check
+          cargo test --locked --manifest-path tools/native-feedback-harness/Cargo.toml
+          cargo clippy --locked --manifest-path tools/native-feedback-harness/Cargo.toml --all-targets -- -D warnings
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

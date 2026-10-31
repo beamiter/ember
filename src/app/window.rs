@@ -55,6 +55,61 @@ fn save_resolved_session_snapshot(
 const SESSION_SAVE_FAILURE_STATUS: &str =
     "Session layout was not saved; check the storage path and permissions.";
 
+fn session_window_close_blocker(session: &crate::session::Session) -> Option<&'static str> {
+    use crate::session::SessionPurpose;
+    if session.purpose == SessionPurpose::RetainedCommand {
+        return None;
+    }
+    let child = session.get_shell_pid();
+    let foreground = session
+        .shell
+        .foreground_pgid()
+        .or_else(|| jterm_core::process::foreground_pgid_via_stat(child));
+    match foreground {
+        Some(group) if group != child => return Some(
+            "A foreground process is still running. Stop it or close its tab before closing this window.",
+        ),
+        _ => {}
+    }
+    // Explicit argv is a live command even when it is its own PTY session
+    // leader. Only an ordinary interactive shell can use that group as idle.
+    // A vanished/exited child is different from an unreadable live terminal.
+    #[cfg(target_os = "linux")]
+    match jterm_core::process::process_stat_result(child) {
+        Ok(state) if !state.is_live() => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        _ => {}
+    }
+    if foreground == Some(child) && session.purpose == SessionPurpose::Interactive {
+        if !session.shell.matches_interactive_shell_program() {
+            return Some("The shell was replaced by a command. Stop it or close its tab before closing this window.");
+        }
+        match session.shell.session_activity() {
+            companion_host::pty_session::Activity::Busy => return Some(
+                "A background process is still attached. Stop it or close its tab before closing this window.",
+            ),
+            companion_host::pty_session::Activity::Unknown => return Some(
+                "Cannot verify attached terminal work. Check the session or close its tab explicitly.",
+            ),
+            companion_host::pty_session::Activity::Idle => {}
+        }
+        let terminal = session.terminal.lock();
+        if terminal.prompt_input_is_empty() {
+            return None;
+        }
+        return Some(if terminal.has_prompt_marks() {
+            "Terminal work or unfinished input is still present. Return to an empty prompt or close its tab explicitly."
+        } else {
+            "Shell activity is unavailable. Exit this shell or close its tab explicitly before closing this window."
+        });
+    }
+    Some(if session.purpose == SessionPurpose::EphemeralCommand {
+        "A terminal command is still running. Stop it or close its tab before closing this window."
+    } else {
+        "Cannot verify that a terminal is idle. Try closing again after checking its work."
+    })
+}
+
 fn session_save_notice_slot_available(
     message: &str,
     expires_at: Option<std::time::Instant>,
@@ -179,6 +234,47 @@ fn sessions_snapshot_for_persistence(
 }
 
 impl TerminalApp {
+    /// Normal window close must preflight every pane before shared withdrawal.
+    /// Keep a refused request unarmed: ending a job does not mean "close now".
+    pub(crate) fn guard_window_close(&mut self, ctx: &eframe::egui::Context) {
+        if self.organism.eva.take_close_cancellation() {
+            self.vim9_window_close_pending = false;
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
+            return;
+        }
+        self.guard_vim9_window_close(ctx);
+        if !self.vim9_editors.is_empty() {
+            return;
+        }
+        let requested =
+            ctx.input(|input| input.viewport().close_requested()) || self.vim9_window_close_pending;
+        let retiring = self.organism.eva.close_in_progress();
+        // Explicit process termination retains its existing shutdown behavior.
+        // This guard handles ordinary WM/title-bar/keyboard close requests.
+        if (requested || retiring)
+            && !crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(reason) = self.window_close_blocker() {
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
+                self.vim9_window_close_pending = false;
+                self.organism.eva.pause_close_for_work();
+                self.set_status_for(reason, std::time::Duration::from_secs(5));
+                ctx.request_repaint();
+                return;
+            }
+        }
+        // An editor's deferred close is an explicit intent even after the
+        // original native CloseRequested event has left the current frame.
+        self.organism.eva.guard_close(ctx, requested);
+    }
+
+    fn window_close_blocker(&self) -> Option<&'static str> {
+        self.session_manager
+            .sessions()
+            .iter()
+            .find_map(session_window_close_blocker)
+    }
+
     // 配置保存相关方法
     pub fn schedule_config_save(&mut self) {
         self.config_save_pending = true;
@@ -627,6 +723,115 @@ mod tests {
             session_id.clone(),
         );
         (session, session_id, repaint)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn window_close_distinguishes_real_command_root_from_interactive_shell() {
+        use std::time::{Duration, Instant};
+        let (first, _, repaint) = interactive_fixture_session("close-role");
+        let mut manager =
+            crate::session_manager::SessionManager::new(first, repaint, Some("/bin/sh".into()));
+        let command = manager
+            .new_command_session_in_cwd(
+                "owned command".into(),
+                vec!["/bin/sleep".into(), "30".into()],
+                std::path::Path::new("/tmp"),
+                80,
+                24,
+                100,
+            )
+            .unwrap();
+        for session in manager.sessions() {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while session.shell.foreground_pgid() != Some(session.get_shell_pid()) {
+                assert!(
+                    Instant::now() < deadline,
+                    "real PTY root never gained foreground"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let interactive = &manager.sessions()[0];
+        // The spawn handshake proves exec, not that shell startup helpers
+        // have finished. Wait for the actual empty session before supplying
+        // the synthetic prompt used by this parser/role test.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while interactive.shell.session_activity() != companion_host::pty_session::Activity::Idle {
+            assert!(
+                Instant::now() < deadline,
+                "fixture shell still has attached startup work"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            super::session_window_close_blocker(interactive).is_some(),
+            "an uninstrumented live shell does not prove idle"
+        );
+        interactive
+            .terminal
+            .lock()
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(super::session_window_close_blocker(interactive).is_none());
+        interactive.terminal.lock().note_user_input(b"read value\r");
+        assert!(
+            super::session_window_close_blocker(interactive).is_some(),
+            "accepted submit cannot race the C marker"
+        );
+        interactive
+            .terminal
+            .lock()
+            .process_input(b"read value\r\n\x1b]133;C\x07");
+        assert!(
+            super::session_window_close_blocker(interactive).is_some(),
+            "a builtin can execute in the shell's own foreground group"
+        );
+        interactive
+            .terminal
+            .lock()
+            .process_input(b"\x1b]133;D;0\x07");
+        assert!(super::session_window_close_blocker(interactive).is_some());
+        interactive
+            .terminal
+            .lock()
+            .process_input(b"\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(super::session_window_close_blocker(interactive).is_none());
+        let owned = &manager.sessions()[command.session_index];
+        assert_eq!(
+            owned.purpose,
+            crate::session::SessionPurpose::EphemeralCommand
+        );
+        assert!(super::session_window_close_blocker(owned).is_some());
+        let pid = owned.get_shell_pid();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while jterm_core::process::process_stat_result(pid).is_ok_and(|state| state.is_live()) {
+            assert!(Instant::now() < deadline, "fixture command did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(super::session_window_close_blocker(owned).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn window_close_checks_actual_exec_even_with_a_forged_empty_prompt() {
+        use std::time::{Duration, Instant};
+        let (session, _, _) = interactive_fixture_session("close-exec");
+        session.shell.write(b"exec /bin/sleep 30\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while session.shell.matches_interactive_shell_program() {
+            assert!(Instant::now() < deadline, "real exec did not replace shell");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session
+            .terminal
+            .lock()
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(session.terminal.lock().prompt_input_is_empty());
+        assert!(
+            super::session_window_close_blocker(&session).is_some(),
+            "PTY output cannot make the exec process an idle shell"
+        );
     }
 
     #[test]

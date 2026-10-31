@@ -124,6 +124,7 @@ pub struct UnownedWindow {
     pub shared_state: Mutex<SharedState>,
     redraw_sender: WakeSender<WindowId>,
     activation_sender: WakeSender<super::ActivationToken>,
+    frame_feedback: Mutex<Option<super::frame_feedback::Feedback>>,
 }
 
 macro_rules! leap {
@@ -351,6 +352,7 @@ impl UnownedWindow {
             shared_state: SharedState::new(guessed_monitor, &window_attrs),
             redraw_sender: event_loop.redraw_sender.clone(),
             activation_sender: event_loop.activation_sender.clone(),
+            frame_feedback: Mutex::new(None),
         };
 
         // Title must be set before mapping. Some tiling window managers (i.e. i3) use the window
@@ -1846,6 +1848,64 @@ impl UnownedWindow {
     }
 
     #[inline]
+    pub fn native_frame_feedback_requested(&self) -> bool {
+        self.frame_feedback.lock().unwrap().as_ref().is_some_and(|f| f.needs_frame())
+    }
+    pub fn defer_native_frame(&self) -> bool {
+        self.frame_feedback.lock().unwrap().as_mut()
+            .is_some_and(|f| f.defer(&self.xconn).unwrap_or(true))
+    }
+    pub fn invalidate_native_frame_feedback(&self) {
+        if let Some(f) = self.frame_feedback.lock().unwrap().as_mut() { f.invalidate(); }
+    }
+    pub fn native_frame_mapping_changed(&self, mapped: bool) {
+        let redraw = self.frame_feedback.lock().unwrap().as_mut().is_some_and(|f| {
+            f.mapping_changed(mapped);
+            tracing::debug!(target: "eva_native_publication", window = self.xwindow, mapped, "native mapping changed; pending frame generation invalidated");
+            f.take_redraw()
+        });
+        if redraw { self.request_redraw(); }
+    }
+    pub fn native_frame_selection_changed(&self, selection: u32) {
+        let redraw = self.frame_feedback.lock().unwrap().as_mut()
+            .is_some_and(|f| f.selection_changed(selection) && f.take_redraw());
+        if redraw {
+            tracing::debug!(target: "eva_native_publication", window = self.xwindow, selection, "compositor authority changed; native proof invalidated");
+            self.request_redraw();
+        }
+    }
+    pub fn native_frame_marker_changed(&self, root: u32, property: u32) {
+        let redraw = self.frame_feedback.lock().unwrap().as_mut()
+            .is_some_and(|f| f.marker_changed(root, property) && f.take_redraw());
+        if redraw { self.request_redraw(); }
+    }
+    pub fn begin_native_frame_feedback(&self, pass: u64, width: u32, height: u32) -> bool {
+        let mut feedback = self.frame_feedback.lock().unwrap();
+        if feedback.is_none() {
+            *feedback = super::frame_feedback::Feedback::new(&self.xconn, self.xwindow, self.root, self.screen_id).ok();
+        }
+        feedback.as_mut().is_some_and(|f| f.begin(&self.xconn, self.xwindow, pass, [width, height]).unwrap_or(false))
+    }
+    pub fn finish_native_frame_feedback(&self, pass: u64, published: bool) {
+        if let Some(f) = self.frame_feedback.lock().unwrap().as_mut() {
+            if let Err(error) = f.finish(&self.xconn, self.xwindow, pass, published) {
+                tracing::warn!(%error, "native frame feedback failed closed");
+            }
+        }
+    }
+    pub fn native_frame_feedback_message(&self, event: &ffi::XClientMessageEvent) -> (bool, Option<u64>) {
+        let (result, redraw) = self.frame_feedback.lock().unwrap().as_mut()
+            .map(|f| {
+                let result = f.message(&self.xconn, event).unwrap_or((true, None));
+                (result, f.take_redraw() || f.needs_frame())
+            }).unwrap_or(((false, None), false));
+        if redraw { self.request_redraw(); }
+        result
+    }
+    pub fn destroy_native_frame_feedback(&self) {
+        if let Some(mut f) = self.frame_feedback.lock().unwrap().take() { f.destroy(&self.xconn, self.xwindow); }
+    }
+
     pub fn pre_present_notify(&self) {
         // TODO timer
     }

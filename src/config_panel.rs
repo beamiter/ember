@@ -775,7 +775,15 @@ impl ConfigPanel {
         ui.label(RichText::new("Appearance Settings").strong().size(14.0));
         ui.separator();
 
-        if ui.checkbox(&mut self.edit_eva_companion_enabled, "Shared Eva companion (save and restart)").changed() { self.has_changes = true; }
+        if ui
+            .checkbox(
+                &mut self.edit_eva_companion_enabled,
+                "Shared Eva companion (save and restart)",
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
         ui.small("Shared mode replaces the local organism. Requires jcompaniond; disconnected bodies stay hidden. Disable old organism windows before enabling shared mode. Skin and motion are saved in the companion card by the coordinator.");
         let mut organism_changed = ui
             .checkbox(&mut self.edit_organism_enabled, "ASCII Organism")
@@ -822,7 +830,11 @@ impl ConfigPanel {
                 self.edit_organism_expanded,
             ));
         }
-        if !self.edit_eva_companion_enabled { self.organism_preview.show(ui, self.edit_organism_motion); } else { ui.label("Eva skin previews are static in the companion card."); }
+        if !self.edit_eva_companion_enabled {
+            self.organism_preview.show(ui, self.edit_organism_motion);
+        } else {
+            ui.label("Eva skin previews are static in the companion card.");
+        }
         ui.separator();
 
         // Theme selector

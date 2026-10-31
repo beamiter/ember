@@ -303,6 +303,7 @@ features = [
     "dl-libxcb",
     "randr",
     "resource_manager",
+    "sync",
     "xinput",
     "xkb",
 ]

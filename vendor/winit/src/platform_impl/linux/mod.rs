@@ -547,6 +547,31 @@ impl Window {
     }
 
     #[inline]
+    pub fn native_frame_feedback_requested(&self) -> bool {
+        match self {
+            #[cfg(x11_platform)] Self::X(window) => window.native_frame_feedback_requested(),
+            #[cfg(wayland_platform)] Self::Wayland(_) => false,
+        }
+    }
+    pub fn defer_native_frame(&self) -> bool {
+        match self {
+            #[cfg(x11_platform)] Self::X(window) => window.defer_native_frame(),
+            #[cfg(wayland_platform)] Self::Wayland(_) => false,
+        }
+    }
+    pub fn begin_native_frame_feedback(&self, pass: u64, width: u32, height: u32) -> bool {
+        match self {
+            #[cfg(x11_platform)] Self::X(window) => window.begin_native_frame_feedback(pass, width, height),
+            #[cfg(wayland_platform)] Self::Wayland(_) => false,
+        }
+    }
+    pub fn finish_native_frame_feedback(&self, pass: u64, published: bool) {
+        match self {
+            #[cfg(x11_platform)] Self::X(window) => window.finish_native_frame_feedback(pass, published),
+            #[cfg(wayland_platform)] Self::Wayland(_) => {},
+        }
+    }
+
     pub fn pre_present_notify(&self) {
         x11_or_wayland!(match self; Window(w) => w.pre_present_notify())
     }

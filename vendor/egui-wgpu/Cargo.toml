@@ -338,3 +338,8 @@ priority = -1
 
 [lints.rustdoc]
 all = "warn"
+
+[target.'cfg(target_os = "linux")'.dependencies.wgpu-hal]
+version = "=30.0.1"
+default-features = false
+features = ["vulkan"]

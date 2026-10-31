@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::{fmt, ptr};
 
 use crate::window::CursorIcon;
@@ -57,6 +57,15 @@ pub struct XConnection {
 
     pub latest_error: Mutex<Option<XError>>,
     pub cursor_cache: Mutex<HashMap<Option<CursorIcon>, ffi::Cursor>>,
+
+    // Keep the extension library alive until after XCloseDisplay: Xlib retains
+    // its wire-event converter pointers even after an individual window closes.
+    frame_authority: OnceLock<Option<FrameAuthority>>,
+}
+
+struct FrameAuthority {
+    fixes: x11_dl::xfixes::Xlib,
+    event_base: i32,
 }
 
 unsafe impl Send for XConnection {}
@@ -137,9 +146,48 @@ impl XConnection {
             monitor_handles: Mutex::new(None),
             database: RwLock::new(database),
             cursor_cache: Default::default(),
+            frame_authority: OnceLock::new(),
             randr_version: (randr_version.major_version, randr_version.minor_version),
             xsettings_screen,
         })
+    }
+
+    pub(super) fn frame_authority_event_base(&self) -> Option<i32> {
+        Some(self.frame_authority.get()?.as_ref()?.event_base)
+    }
+
+    pub(super) fn watch_frame_authority(
+        &self,
+        window: u32,
+        root: u32,
+        selection: u32,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let authority = self.frame_authority.get_or_init(|| {
+            let fixes = x11_dl::xfixes::Xlib::open().ok()?;
+            let (mut event_base, mut error_base) = (0, 0);
+            let (mut major, mut minor) = (1, 0);
+            // Query through Xlib, not just XCB, so its extension wire decoder
+            // is installed on the connection actually used by the event loop.
+            unsafe {
+                if (fixes.XFixesQueryExtension)(self.display, &mut event_base, &mut error_base) == 0
+                    || (fixes.XFixesQueryVersion)(self.display, &mut major, &mut minor) == 0
+                    || major < 1
+                {
+                    return None;
+                }
+            }
+            Some(FrameAuthority { fixes, event_base })
+        }).as_ref().ok_or("XFixes compositor authority events unavailable")?;
+        unsafe {
+            // SetSelectionOwner, owner window destruction and owner disconnect.
+            (authority.fixes.XFixesSelectSelectionInput)(self.display, window.into(), selection.into(), 7);
+        }
+        self.sync_with_server()?;
+        let conn = self.xcb_connection();
+        let attributes = conn.get_window_attributes(root)?.reply()?;
+        conn.change_window_attributes(root, &xproto::ChangeWindowAttributesAux::new()
+            .event_mask(attributes.your_event_mask | xproto::EventMask::PROPERTY_CHANGE))?.check()?;
+        Ok(())
     }
 
     fn new_xsettings_screen(xcb: &XCBConnection, default_screen: usize) -> Option<xproto::Atom> {

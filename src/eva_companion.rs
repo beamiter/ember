@@ -1,13 +1,22 @@
 //! One window-level shared Eva overlay. No terminal bytes or scrollback writes.
+use companion_host::{self as host, atlas, Request, RetirementCapability, SharedHost};
 use egui::{FontId, RichText, Ui};
-use jterm_core::companion_host::{self as host, atlas, Request, RetirementCapability, SharedHost};
 use std::time::Instant;
+
+struct NativeCandidate {
+    body: Option<host::Token>,
+    clear: bool,
+    dialogue: Option<String>,
+}
 
 pub(crate) struct EvaHost {
     runtime: Option<SharedHost>,
     enabled: Option<bool>,
-    closing: Option<host::Token>,
     close_requested: bool,
+    close_paused_for_work: bool,
+    close_ui_revision: u64,
+    close_cancelled: bool,
+    cancel_key: host::CancelKeyLease,
     force_close: bool,
     born: Instant,
     reduced_motion: bool,
@@ -24,8 +33,10 @@ pub(crate) struct EvaHost {
     focus: Option<bool>,
     input: Option<(bool, bool)>,
     painted_pass: Option<u64>,
+    confirmed_body: Option<host::Token>,
+    native_candidates: std::collections::BTreeMap<u64, NativeCandidate>,
     revision: u64,
-    connection_generation: u64,
+    admission_generation: u64,
     task: Option<(String, u64, host::TaskStatus)>,
     anchor: Option<(String, String)>,
     context: Option<host::ContextRef>,
@@ -34,6 +45,7 @@ pub(crate) struct EvaHost {
     approved_selection: Option<host::SelectionEvidence>,
     dialogue_draft: String,
     dialogue_turn: Option<(String, host::ContextRef)>,
+    dialogue_save: host::DialogueSave,
     dialogue_text: String,
     dialogue_status: String,
     dialogue_displayed: bool,
@@ -64,8 +76,11 @@ impl Default for EvaHost {
         Self {
             runtime: None,
             enabled: None,
-            closing: None,
             close_requested: false,
+            close_paused_for_work: false,
+            close_ui_revision: 0,
+            close_cancelled: false,
+            cancel_key: Default::default(),
             force_close: false,
             born: Instant::now(),
             reduced_motion: false,
@@ -82,8 +97,10 @@ impl Default for EvaHost {
             focus: None,
             input: None,
             painted_pass: None,
+            confirmed_body: None,
+            native_candidates: Default::default(),
             revision: 0,
-            connection_generation: 0,
+            admission_generation: 0,
             task: None,
             anchor: None,
             context: None,
@@ -92,6 +109,7 @@ impl Default for EvaHost {
             approved_selection: None,
             dialogue_draft: String::new(),
             dialogue_turn: None,
+            dialogue_save: Default::default(),
             dialogue_text: String::new(),
             dialogue_status: String::new(),
             dialogue_displayed: false,
@@ -150,27 +168,47 @@ impl EvaHost {
             return true;
         };
         if !self.close_requested {
+            self.close_ui_revision = self.close_ui_revision.saturating_add(1);
             self.close_requested = true;
-            self.closing = runtime.gate.possible_body_token().cloned();
             runtime.send(Request::Withdraw);
             return false;
         }
-        if self.closing.is_none() {
-            self.closing = runtime.gate.possible_body_token().cloned();
-        }
+        // The negotiated gate binds the current intent to its authoritative
+        // retirement token, including any grant that was already in flight.
         runtime.gate.withdrawal_accepted()
-            && self
-                .closing
-                .as_ref()
-                .is_none_or(|token| runtime.gate.retirement_accepted(token))
     }
-    pub fn guard_close(&mut self, ctx: &egui::Context) {
+    pub fn close_in_progress(&self) -> bool {
+        self.close_requested
+    }
+    pub fn pause_close_for_work(&mut self) {
+        if self.close_requested {
+            // Withdrawal may already have cleared/retired the old body. Keep
+            // that proof intact, but require a fresh intent to close the GUI.
+            self.close_paused_for_work = true;
+        }
+    }
+    pub fn guard_close(&mut self, ctx: &egui::Context, requested: bool) {
         if !self.enabled() {
             return;
         }
         if self.close_requested {
             if let Some(runtime) = self.runtime.as_mut() {
                 runtime.poll();
+            }
+            if self.close_paused_for_work {
+                if !requested {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    if self
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|r| r.gate.pending_retirement())
+                    {
+                        ctx.request_repaint();
+                    }
+                    return;
+                }
+                self.close_paused_for_work = false;
+                self.close_ui_revision = self.close_ui_revision.saturating_add(1);
             }
             if self.can_close_now() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -184,21 +222,124 @@ impl EvaHost {
                     ctx.request_repaint();
                 }
             }
-        } else if ctx.input(|i| i.viewport().close_requested()) && !self.can_close_now() {
+        } else if requested && !self.can_close_now() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.request_repaint();
         }
     }
+    pub fn native_frame_feedback_required(&mut self, pass: u64) -> bool {
+        if !self.enabled() {
+            return false;
+        }
+        let Some(r) = self.runtime.as_ref() else {
+            return false;
+        };
+        let body = (self.painted_pass == Some(pass))
+            .then(|| r.gate.token().cloned())
+            .flatten();
+        let needs_body = body.is_some() && body != self.confirmed_body;
+        let clear = r.gate.pending_retirement() && r.gate.token().is_none();
+        let dialogue = self
+            .dialogue_display_pending
+            .as_ref()
+            .filter(|(_, at)| pass >= *at)
+            .map(|(id, _)| id.clone());
+        if !clear && !needs_body && dialogue.is_none() {
+            return false;
+        }
+        if self.native_candidates.len() == 64 {
+            self.native_candidates.pop_first();
+        }
+        self.native_candidates.insert(
+            pass,
+            NativeCandidate {
+                body,
+                clear,
+                dialogue,
+            },
+        );
+        true
+    }
+    pub(crate) fn keep_window_open(&mut self, ctx: &egui::Context) {
+        self.close_ui_revision = self.close_ui_revision.saturating_add(1);
+        self.close_requested = false;
+        self.close_paused_for_work = false;
+        self.force_close = false;
+        self.close_cancelled = true;
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.cancel_withdrawal();
+        }
+        // In-flight NativeCandidate clearance and its original token remain.
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.request_repaint();
+    }
+    pub fn take_close_cancellation(&mut self) -> bool {
+        std::mem::take(&mut self.close_cancelled)
+    }
+    pub(crate) fn close_dialog_owns_input(&self) -> bool {
+        self.close_requested && !self.close_paused_for_work
+    }
+    pub(crate) fn route_close_escape(
+        &mut self,
+        event: &egui::Event,
+        ctx: &egui::Context,
+        focused: bool,
+    ) -> bool {
+        match event {
+            egui::Event::WindowFocused(false) => self.cancel_key.focus_lost(),
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                pressed: true,
+                repeat,
+                modifiers,
+                ..
+            } => {
+                match self.cancel_key.press(
+                    self.close_dialog_owns_input() && modifiers.is_none(),
+                    *repeat,
+                ) {
+                    host::CancelKeyAction::Cancel => {
+                        self.keep_window_open(ctx);
+                        return true;
+                    }
+                    host::CancelKeyAction::Suppress => return true,
+                    host::CancelKeyAction::Pass => {}
+                }
+            }
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                pressed: false,
+                ..
+            } => return self.cancel_key.release(focused),
+            egui::Event::Key { pressed: true, .. }
+            | egui::Event::PointerButton { pressed: true, .. } => self.cancel_key.other_input(),
+            _ => {}
+        }
+        false
+    }
     pub fn presented(&mut self, pass: u64) {
+        let Some(candidate) = self.native_candidates.remove(&pass) else {
+            return;
+        };
         if let Some(r) = &mut self.runtime {
-            r.frame_presented(pass);
-            if let Some((turn_id, at)) = self.dialogue_display_pending.take() {
-                if pass >= at
-                    && self
-                        .dialogue_turn
-                        .as_ref()
-                        .is_some_and(|(id, _)| id == &turn_id)
+            if let Some(token) = candidate
+                .body
+                .filter(|token| r.gate.accepts_callback(token))
+            {
+                // Later UI draws must not relabel this delayed callback.
+                r.body_submitted(pass);
+                r.frame_presented(pass);
+                self.confirmed_body = Some(token);
+            } else if candidate.clear && r.gate.token().is_none() {
+                r.frame_presented(pass);
+            }
+            if let Some(turn_id) = candidate.dialogue {
+                if self
+                    .dialogue_turn
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == &turn_id)
                 {
+                    self.dialogue_display_pending = None;
                     r.send(Request::DialogueDisplayed { turn_id });
                     self.dialogue_displayed = true;
                 }
@@ -217,15 +358,26 @@ impl EvaHost {
             ui.ctx().request_repaint();
         }
         if changed {
-            let generation = self.runtime.as_ref().unwrap().gate.connection_generation();
-            if generation != self.connection_generation {
-                self.connection_generation = generation;
+            let generation = self.runtime.as_ref().unwrap().gate.admission_generation();
+            if generation != self.admission_generation {
+                self.admission_generation = generation;
                 self.geometry = None;
                 self.focus = None;
                 self.input = None;
                 self.task = None;
                 self.memory_managed_scope = None;
                 self.memory_scope_review = None;
+                self.memory_review = None;
+                self.selection_review = None;
+                self.approved_selection = None;
+                self.capture_requested = false;
+                self.use_global_memory = false;
+                self.memory_entries.clear();
+                self.memory_edit_revision = None;
+                self.dialogue_turn = None;
+                self.dialogue_save.clear();
+                self.dialogue_text.clear();
+                self.dialogue_display_pending = None;
                 if let Some(context) = self.context.clone() {
                     self.runtime
                         .as_mut()
@@ -250,6 +402,8 @@ impl EvaHost {
             reply,
         }) = self.runtime.as_mut().unwrap().take_dialogue()
         {
+            self.dialogue_save
+                .observe(&turn_id, &context, &status, reply.as_deref());
             if self.dialogue_turn.as_ref() == Some(&(turn_id, context)) {
                 self.dialogue_status = status;
                 if let Some(reply) = reply {
@@ -329,11 +483,50 @@ impl EvaHost {
             self.card = !self.card;
         }
         if self.close_requested {
-            egui::Window::new("Retiring Eva before closing").collapsible(false).show(ui.ctx(),|ui|{
-                ui.label("Waiting for coordinator withdrawal and a verified cleared native frame. No timeout is treated as proof.");
-                ui.label("Force close may leave global transfer recovery blocked; it will not report retirement success.");
-                if ui.add_enabled(force_close_allowed,egui::Button::new("Force close — retirement remains unknown")).clicked(){self.force_close=true;ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);}
-            });
+            let mut keep_open = false;
+            let title = if self.close_paused_for_work {
+                "Window kept open for terminal work"
+            } else {
+                "Closing this window"
+            };
+            egui::Window::new(title)
+                .id(egui::Id::new((
+                    "eva-close-progress",
+                    self.close_ui_revision,
+                )))
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    if ui
+                        .button(if self.close_paused_for_work {
+                            "Keep window open"
+                        } else {
+                            "Keep window open · Esc"
+                        })
+                        .clicked()
+                    {
+                        keep_open = true;
+                    }
+                    if self.close_paused_for_work {
+                        ui.label("Work is still running. Finish it, or keep this window open.");
+                        return;
+                    }
+                    ui.label(
+                        "Eva is leaving this window. You can keep it open and continue working.",
+                    );
+                    ui.label(
+                        "Closing before Eva finishes may keep it from appearing in another window.",
+                    );
+                    if ui
+                        .add_enabled(force_close_allowed, egui::Button::new("Close anyway"))
+                        .clicked()
+                    {
+                        self.force_close = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            if keep_open {
+                self.keep_window_open(ui.ctx());
+            }
         }
         // A text dock only: never another animated avatar or a top Tab strip.
         egui::Area::new("eva-companion-dock".into())
@@ -433,7 +626,9 @@ impl EvaHost {
                             if let Some(context)=self.context.clone() {
                                 let turn_id=uuid::Uuid::new_v4().to_string();
                                 self.runtime.as_mut().unwrap().send(Request::ContextObserved{context:context.clone()});
-                                self.runtime.as_mut().unwrap().send(Request::DialogueStart{turn_id:turn_id.clone(),context:context.clone(),text:std::mem::take(&mut self.dialogue_draft),approved_selection:self.approved_selection.take().filter(|e|e.context==context)});
+                                let text = std::mem::take(&mut self.dialogue_draft);
+                                self.dialogue_save.begin(&turn_id, &context, &text);
+                                self.runtime.as_mut().unwrap().send(Request::DialogueStart{turn_id:turn_id.clone(),context:context.clone(),text,approved_selection:self.approved_selection.take().filter(|e|e.context==context)});
                                 self.dialogue_turn=Some((turn_id,context));self.dialogue_text.clear();self.dialogue_status="Awaiting coordinator".into();
                             }
                         }
@@ -595,6 +790,30 @@ impl EvaHost {
             self.memory_edit_revision = None;
         }
         let scope = self.current_memory_scope();
+        let exchange = self.dialogue_save.turn_id().map(str::to_owned);
+        if ui
+            .add_enabled(
+                exchange.is_some() && scope.is_some(),
+                egui::Button::new("Review saving this exchange"),
+            )
+            .clicked()
+        {
+            if let (Some(turn), Some(scope)) = (exchange, scope.clone()) {
+                match self.dialogue_save.proposal(&turn, &context, scope) {
+                    Ok(change) => {
+                        self.memory_review = None;
+                        self.runtime.as_mut().unwrap().send(Request::MemoryPropose {
+                            context: context.clone(),
+                            change,
+                        });
+                        self.memory_status =
+                            "Review the full exchange and scope. Nothing has been saved yet."
+                                .into();
+                    }
+                    Err(reason) => self.memory_status = reason.into(),
+                }
+            }
+        }
         ui.label(if self.memory_managed_scope.is_some() {
             "Archived management only: changes below use the exact reviewed scope above, never model retrieval."
         } else if self.memory_global {
@@ -904,28 +1123,6 @@ mod tests {
         let decoded: crate::config::Config = toml::from_str(&serialized).unwrap();
         assert!(decoded.eva_companion_enabled);
     }
-    #[test]
-    fn native_hook_is_after_successful_buffer_submission() {
-        let glow = include_str!("../vendor/eframe/src/native/glow_integration.rs");
-        assert!(
-            glow.find("gl_surface.swap_buffers(context)?;").unwrap()
-                < glow.find("app.on_native_frame_presented").unwrap()
-        );
-        let wgpu = include_str!("../vendor/egui-wgpu/src/winit.rs");
-        assert!(
-            wgpu.find("self.last_presented_viewport = None;").unwrap()
-                < wgpu
-                    .find("render_state.queue.present(output_frame);")
-                    .unwrap()
-        );
-        assert!(
-            wgpu.find("render_state.queue.present(output_frame);")
-                .unwrap()
-                < wgpu
-                    .find("self.last_presented_viewport = Some(viewport_id);")
-                    .unwrap()
-        );
-        let integration = include_str!("../vendor/eframe/src/native/wgpu_integration.rs");
-        assert!(integration.contains("if painter.last_presented_viewport() == Some(viewport_id)"));
-    }
+    // Native ordering is exercised by tools/native-feedback-harness and the
+    // family X11 matrix; searching source text for a submit hook cannot prove it.
 }

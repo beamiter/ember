@@ -279,8 +279,13 @@ pub trait App {
     /// This function does not return a value. Any changes to the input should be made directly to `_raw_input`.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {}
 
-    /// Successful native buffer submission boundary. Not compositor scanout proof.
-    /// Never called for hidden/skipped/failed presentation.
+    /// Request exact producer publication and compositor scene evidence for a
+    /// native frame. Unsupported platforms/backends yield no callback.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn native_frame_feedback_required(&mut self, _viewport: egui::ViewportId, _pass: u64) -> bool { false }
+
+    /// Producer-confirmed X11 frame included in a successful compositor scene
+    /// swap. Carries the original submitted UI pass; not physical scanout proof.
     #[cfg(not(target_arch = "wasm32"))]
     fn on_native_frame_presented(&mut self, _viewport: egui::ViewportId, _pass: u64) {}
 

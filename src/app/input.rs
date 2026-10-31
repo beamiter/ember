@@ -1228,7 +1228,8 @@ impl TerminalApp {
     }
 
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
-        self.block_review.is_some()
+        self.organism.eva.close_dialog_owns_input()
+            || self.block_review.is_some()
             || self.agent_sessions.is_open
             || self.vim9_dialog_is_open()
             || (egui::Popup::is_any_open(ctx)
@@ -2658,6 +2659,37 @@ impl TerminalApp {
         ui_input_blocked: bool,
         terminal_input_blocked: bool,
     ) -> (bool, bool, bool) {
+        let closing_owned = self.organism.eva.close_dialog_owns_input();
+        if closing_owned {
+            // A held dialog Enter stays owned when Escape or a pointer keeps
+            // the window open. Its later repeats must not execute the prompt.
+            self.claim_enter_for_prompt_recall();
+        }
+        let ui_input_blocked = ui_input_blocked || closing_owned;
+        let focused = ctx.input(|i| i.focused)
+            && !self
+                .frame_events
+                .iter()
+                .any(|e| matches!(e, egui::Event::WindowFocused(false)));
+        let mut escape_claimed = false;
+        self.frame_events.retain(|event| {
+            let claimed = self.organism.eva.route_close_escape(event, ctx, focused);
+            escape_claimed |= claimed;
+            !claimed
+        });
+        if escape_claimed {
+            ctx.input_mut(|i| {
+                i.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            ..
+                        }
+                    )
+                })
+            });
+        }
         if !self.config.command_cards_enabled() && self.block_selection.is_some() {
             self.clear_block_selection();
         }
@@ -2665,7 +2697,10 @@ impl TerminalApp {
         // Do not fold chrome focus into terminal_input_blocked: main.rs also
         // uses that flag to suppress pointer input. Buttons would then disable
         // themselves and users could not click back into the terminal.
-        if !ui_input_blocked && self.block_chrome_owns_keyboard(ctx) {
+        if !self.organism.eva.close_dialog_owns_input()
+            && !ui_input_blocked
+            && self.block_chrome_owns_keyboard(ctx)
+        {
             if block_chrome_escape_requested(&self.frame_events) {
                 self.return_focus_to_terminal(ctx);
             }

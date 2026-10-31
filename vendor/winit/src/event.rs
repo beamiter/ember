@@ -435,6 +435,11 @@ pub enum WindowEvent {
     /// Winit will aggregate duplicate redraw requests into a single event, to
     /// help avoid duplicating rendering work.
     RedrawRequested,
+
+    /// Opt-in X11 scene feedback for an exact producer-confirmed native frame.
+    /// The serial belongs to the submitted frame, not the current UI pass.
+    /// No physical scanout guarantee is implied.
+    NativeFramePresented { serial: u64 },
 }
 
 /// Identifier of an input device.

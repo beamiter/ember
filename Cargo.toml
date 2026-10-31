@@ -10,6 +10,7 @@ keywords = ["terminal", "terminal-emulator", "egui", "wgpu"]
 categories = ["command-line-utilities", "gui"]
 
 [dependencies]
+companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 libc = "0.2"
 # Shared local core includes the family agent session catalog.
 jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "974ccad203375032fe87706caecab39ad516c238" }
@@ -74,11 +75,16 @@ codegen-units = 1
 opt-level = 3
 
 [patch.crates-io]
+wgpu-hal = { path = "vendor/wgpu-hal" }
 # X11 legacy wheel release must not emit a second scroll notch.
 winit = { path = "vendor/winit" }
 eframe = { path = "vendor/eframe" }
+
 egui-wgpu = { path = "vendor/egui-wgpu" }
 egui-winit = { path = "vendor/egui-winit" }
 
 # Preserve seat selection devices across virtual-keyboard hotplug.
 smithay-clipboard = { path = "vendor/smithay-clipboard" }
+[patch."https://github.com/beamiter/jcompanion.git"]
+companion-protocol = { path = "vendor/companion-protocol" }
+companion-client = { path = "vendor/companion-client" }

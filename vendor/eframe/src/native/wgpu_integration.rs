@@ -613,6 +613,15 @@ impl WgpuWinitRunning<'_> {
             return Ok(EventResult::Wait);
         };
 
+        if self.shared.borrow().viewports.get(&viewport_id)
+            .and_then(|viewport| viewport.window.as_ref())
+            .is_some_and(|window| window.defer_native_frame())
+        {
+            // Keep input and texture deltas queued. Completion requests one
+            // deferred repaint; receipt handling itself never spins an idle UI.
+            return Ok(EventResult::Wait);
+        }
+
         profiling::finish_frame!();
 
         let Self {
@@ -808,6 +817,12 @@ impl WgpuWinitRunning<'_> {
                     true
                 }
             });
+            // end_pass increments this counter; the shapes belong to the pass
+            // just ended, which is also the serial observed inside App::update.
+            let pass = egui_ctx.cumulative_pass_nr().saturating_sub(1);
+            let feedback = app.native_frame_feedback_required(viewport_id, pass)
+                || window.native_frame_feedback_requested();
+            painter.set_native_frame_feedback(feedback.then_some(pass));
             let vsync_secs = painter.paint_and_update_textures(
                 viewport_id,
                 pixels_per_point,
@@ -817,10 +832,6 @@ impl WgpuWinitRunning<'_> {
                 screenshot_commands,
                 window,
             );
-
-            if painter.last_presented_viewport() == Some(viewport_id) {
-                app.on_native_frame_presented(viewport_id, egui_ctx.cumulative_pass_nr());
-            }
 
             for action in viewport.actions_requested.drain(..) {
                 match action {
@@ -901,6 +912,11 @@ impl WgpuWinitRunning<'_> {
         let mut shared = shared.borrow_mut();
 
         let viewport_id = shared.viewport_from_window.get(&window_id).copied();
+
+        if let winit::event::WindowEvent::NativeFramePresented { serial } = event {
+            if let Some(viewport) = viewport_id { app.on_native_frame_presented(viewport, *serial); }
+            return EventResult::Wait;
+        }
 
         // On Windows, if a window is resized by the user, it should repaint synchronously, inside the
         // event handler. If this is not done, the compositor will assume that the window does not want

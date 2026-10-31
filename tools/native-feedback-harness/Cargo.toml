@@ -1,0 +1,12 @@
+[package]
+name = "ember-native-feedback-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+x11rb = { version = "=0.13.2", default-features = false, features = ["sync"] }
+x11-dl = "=2.21.0"
+tracing = "=0.1.44"

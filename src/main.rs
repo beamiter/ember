@@ -16,6 +16,8 @@ mod config;
 mod config_panel;
 mod debug;
 mod debug_panel;
+mod eva_companion;
+mod eva_glyphs;
 mod execution_journal;
 mod fold_preview;
 mod font_file;
@@ -35,8 +37,6 @@ mod layout;
 mod link;
 mod native_enter;
 mod organism;
-mod eva_companion;
-mod eva_glyphs;
 mod organism_ui;
 mod output_batch;
 mod pane_header;
@@ -3952,7 +3952,8 @@ impl TerminalApp {
                         if jterm_core::reference_conversation::fixture_enabled() {
                             self.render_reference_fixture_recent(ui);
                         } else {
-                            ui.spacing_mut().interact_size.y = crate::glass_shell::RECENT_ROW_HEIGHT;
+                            ui.spacing_mut().interact_size.y =
+                                crate::glass_shell::RECENT_ROW_HEIGHT;
                             self.render_sidebar_sessions(ui);
                         }
                     }
@@ -5804,8 +5805,13 @@ impl TerminalApp {
 }
 
 impl eframe::App for TerminalApp {
+    fn native_frame_feedback_required(&mut self, viewport: egui::ViewportId, pass: u64) -> bool {
+        viewport == egui::ViewportId::ROOT && self.organism.eva.native_frame_feedback_required(pass)
+    }
     fn on_native_frame_presented(&mut self, viewport: egui::ViewportId, pass: u64) {
-        if viewport == egui::ViewportId::ROOT { self.organism.eva.presented(pass); }
+        if viewport == egui::ViewportId::ROOT {
+            self.organism.eva.presented(pass);
+        }
     }
     fn on_native_key_event(
         &mut self,
@@ -5919,8 +5925,7 @@ impl eframe::App for TerminalApp {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_shell_vim(ctx);
-        self.guard_vim9_window_close(ctx);
-        if self.vim9_editors.is_empty() { self.organism.eva.guard_close(ctx); }
+        self.guard_window_close(ctx);
         self.observe_organism_visibility(ctx);
     }
 
@@ -5941,7 +5946,11 @@ impl eframe::App for TerminalApp {
         // 检查是否收到退出信号（SIGINT/SIGTERM）
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
             crate::debug_log!("[SIGNAL] Shutdown requested, exiting gracefully");
-            if self.organism.eva.can_close_now() { ctx.send_viewport_cmd(egui::ViewportCommand::Close); } else { ctx.request_repaint(); }
+            if self.organism.eva.can_close_now() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint();
+            }
             return;
         }
 
@@ -8429,7 +8438,11 @@ impl eframe::App for TerminalApp {
             } else {
                 // Close the window if this is the only session
                 crate::debug_log!("[SHELL EXIT] closing window");
-                if self.organism.eva.can_close_now() { ctx.send_viewport_cmd(egui::ViewportCommand::Close); } else { ctx.request_repaint(); }
+                if self.organism.eva.can_close_now() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    ctx.request_repaint();
+                }
             }
         }
 
