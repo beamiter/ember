@@ -319,13 +319,11 @@ impl super::TerminalState {
                             column: origin.col_start,
                         })
                     }) {
-                        // Reserve a comfortable editor without inventing PTY
-                        // rows: at least three editor rows plus one blank row
-                        // below all real input/completion content. Short viewports
-                        // retain history and toolbar space before this padding.
-                        let preferred_padding =
-                            3_usize.saturating_sub(input_rows).saturating_add(1);
-                        let padding_rows = preferred_padding.min(
+                        // Leave exactly two blank rows below the real input,
+                        // including multiline prompts and completion content.
+                        // Short viewports retain history and toolbar space
+                        // before adding this display-only padding.
+                        let padding_rows = 2_usize.min(
                             self.grid
                                 .rows()
                                 .saturating_sub(input_rows)

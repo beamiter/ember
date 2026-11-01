@@ -8773,7 +8773,7 @@ fn chat_projection_pins_real_prompt_and_left_aligns_command_without_fake_cells()
 }
 
 #[test]
-fn chat_docked_input_reserves_three_rows_and_spare_space_without_native_cells() {
+fn chat_docked_input_reserves_two_blank_rows_without_native_cells() {
     for bubbles in [false, true] {
         for input in [
             "",
@@ -8800,13 +8800,10 @@ fn chat_docked_input_reserves_three_rows_and_spare_space_without_native_cells() 
                     )
                 })
                 .expect("toolbar remains below the editor");
-            assert!(
-                footer - dock.start >= 4,
-                "three editor rows plus spare space"
-            );
-            assert!(
-                footer - dock.start > native_rows,
-                "spare row below real input"
+            assert_eq!(
+                footer - view.cursor().row,
+                3,
+                "the cursor row plus exactly two blank rows before the toolbar"
             );
             assert_eq!(view.application_cell(view.cursor()), Some(native_cursor));
             for row in dock.start + native_rows..footer {
