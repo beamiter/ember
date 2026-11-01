@@ -1229,6 +1229,7 @@ impl TerminalApp {
 
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
         self.organism.eva.close_dialog_owns_input()
+            || self.organism.eva.card_owns_input()
             || self.block_review.is_some()
             || self.agent_sessions.is_open
             || self.vim9_dialog_is_open()

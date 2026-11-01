@@ -6218,6 +6218,9 @@ impl eframe::App for TerminalApp {
         // Collect events once per frame to avoid multiple clones
         self.frame_events.clear();
         ctx.input(|i| self.frame_events.extend(i.events.iter().cloned()));
+        self.organism
+            .eva
+            .route_card_shortcut(ctx, &mut self.frame_events);
         self.discard_stale_frame_ime();
         self.advance_vim9_deferred_input(ctx);
         app::input::guard_prompt_fill_enter(

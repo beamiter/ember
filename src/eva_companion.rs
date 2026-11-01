@@ -145,6 +145,41 @@ impl Default for EvaHost {
     }
 }
 impl EvaHost {
+    /// Claim the complete shortcut batch before the terminal encodes it.
+    /// X11 can deliver the printable E separately from its modified key event.
+    pub(crate) fn route_card_shortcut(
+        &mut self,
+        ctx: &egui::Context,
+        events: &mut Vec<egui::Event>,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        let toggle = events.iter().any(|event| {
+            matches!(event,
+            egui::Event::Key { key: egui::Key::E, pressed: true, repeat: false, modifiers, .. }
+                if modifiers.alt && modifiers.shift && !modifiers.ctrl && !modifiers.command)
+        });
+        if toggle {
+            self.card = !self.card;
+            let claimed = |event: &egui::Event| {
+                matches!(event,
+                egui::Event::Key { key: egui::Key::E, modifiers, .. } if modifiers.alt && modifiers.shift)
+                    || matches!(event, egui::Event::Text(value) if value == "E" || value == "e")
+            };
+            events.retain(|event| !claimed(event));
+            ctx.input_mut(|input| input.events.retain(|event| !claimed(event)));
+        }
+    }
+
+    pub(crate) fn card_owns_input(&self) -> bool {
+        self.enabled() && self.card
+    }
+
+    pub(crate) fn toggle_card(&mut self) {
+        self.card = !self.card;
+    }
+
     pub fn reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
     }
@@ -489,11 +524,6 @@ impl EvaHost {
                 .unwrap()
                 .send(Request::Focus { focused });
         }
-        if ui.input_mut(|i| {
-            i.consume_key(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::E)
-        }) {
-            self.card = !self.card;
-        }
         if self.close_requested {
             let mut keep_open = false;
             let title = if self.close_paused_for_work {
@@ -540,18 +570,6 @@ impl EvaHost {
                 self.keep_window_open(ui.ctx());
             }
         }
-        // A text dock only: never another animated avatar or a top Tab strip.
-        egui::Area::new("eva-companion-dock".into())
-            .anchor(egui::Align2::RIGHT_TOP, [-16.0, 48.0])
-            .show(ui.ctx(), |ui| {
-                if ui
-                    .button("Eva")
-                    .on_hover_text("Eva companion card · Alt+Shift+E")
-                    .clicked()
-                {
-                    self.card = !self.card;
-                }
-            });
         if self.card {
             let old_appearance = (self.skin, self.motion);
             let mut open = true;
@@ -560,9 +578,13 @@ impl EvaHost {
                 .open(&mut open)
                 .resizable(false)
                 .default_width(440.0)
+                .max_width((ui.ctx().content_rect().width() - 32.0).max(120.0))
                 .vscroll(true)
                 .collapsible(false)
                 .show(ui.ctx(), |ui| {
+                    egui::ScrollArea::vertical()
+                    .max_height((ui.ctx().content_rect().height() - 96.0).max(120.0))
+                    .show(ui, |ui| {
                     ui.label(self.runtime.as_ref().unwrap().gate.status());
                     if let Some(error)=self.runtime.as_ref().unwrap().gate.operation_error(){ui.label(format!("Last operation error: {error}"));}
                     ui.label(format!(
@@ -654,6 +676,7 @@ impl EvaHost {
                     }
                     ui.collapsing("Conversation history · read-only", |ui| self.history_ui(ui));
                     ui.collapsing("Memory · inspect and explicitly review changes",|ui|self.memory_ui(ui));
+                    });
                 });
             if old_appearance != (self.skin, self.motion) {
                 self.runtime.as_mut().unwrap().send(Request::Appearance {
@@ -1247,6 +1270,28 @@ impl EvaHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn card_shortcut_claims_printable_text_before_shell_input() {
+        let ctx = egui::Context::default();
+        let mut host = EvaHost::default();
+        host.configure(true);
+        let mut events = vec![
+            egui::Event::Key {
+                key: egui::Key::E,
+                physical_key: Some(egui::Key::E),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT | egui::Modifiers::SHIFT,
+            },
+            egui::Event::Text("E".into()),
+            egui::Event::Text("unrelated".into()),
+        ];
+        host.route_card_shortcut(&ctx, &mut events);
+        assert!(host.card_owns_input());
+        assert_eq!(events, vec![egui::Event::Text("unrelated".into())]);
+        assert!(host.runtime.is_none());
+    }
+
     #[test]
     fn shared_mode_is_latched_until_window_restart() {
         let mut host = EvaHost::default();

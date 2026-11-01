@@ -818,7 +818,12 @@ impl TerminalApp {
                     }
                 }
                 let mode_width = shell::MODE_CONTROL_MIN_WIDTH * scale.max(1.0);
-                let settings_left = bounds.right() - 8.0 - 32.0 - 6.0 - 32.0;
+                let eva_reserve = if self.organism.eva.enabled() {
+                    38.0
+                } else {
+                    0.0
+                };
+                let settings_left = bounds.right() - 8.0 - 32.0 - 6.0 - 32.0 - eva_reserve;
                 let pair_left = settings_left - 8.0 - 2.0 * mode_width - 6.0;
                 let mode_left = if pair_left >= 104.0 {
                     pair_left
@@ -844,7 +849,30 @@ impl TerminalApp {
                     egui::vec2(toggle_w, button_h),
                 );
                 self.render_reference_inspector_toggle(ui, toggle);
-                let settings = toggle.translate(egui::vec2(-toggle_w - 6.0, 0.0));
+                if self.organism.eva.enabled() {
+                    let dock = toggle.translate(egui::vec2(-toggle_w - 6.0, 0.0));
+                    if ui
+                        .put(
+                            dock,
+                            egui::Button::new("")
+                                .fill(shell::rgba(shell::token::BUTTON))
+                                .stroke(Stroke::new(1.0, shell::rgba(shell::token::BORDER)))
+                                .corner_radius(shell::CONTROL_RADIUS),
+                        )
+                        .on_hover_text("Eva companion · Alt+Shift+E")
+                        .clicked()
+                    {
+                        self.organism.eva.toggle_card();
+                    }
+                    ui.painter().with_clip_rect(dock).text(
+                        dock.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Eva",
+                        FontId::proportional(10.0 * scale),
+                        shell::rgba(shell::token::TEXT),
+                    );
+                }
+                let settings = toggle.translate(egui::vec2(-toggle_w - 6.0 - eva_reserve, 0.0));
                 let response = ui.put(
                     settings,
                     egui::Button::new("")
