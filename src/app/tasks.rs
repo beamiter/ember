@@ -2859,7 +2859,7 @@ impl TerminalApp {
                                         .follow_up_drafts
                                         .entry(row.id)
                                         .or_default();
-                                    ui.add_enabled(
+                                    let follow_up = ui.add_enabled(
                                         native_ai_enabled,
                                         egui::TextEdit::multiline(draft)
                                             .desired_rows(3)
@@ -2871,6 +2871,7 @@ impl TerminalApp {
                                     .on_disabled_hover_text(
                                         "Enable AI features and command-context sharing before sending another cloud turn",
                                     );
+                                    let send_shortcut = crate::ai_chat_panel::composer_submit_gesture(ui, &follow_up);
                                     ui.add_space(ui.text_style_height(&egui::TextStyle::Body));
                                     let can_send = native_ai_enabled
                                         && native_follow_up_can_send(
@@ -2885,7 +2886,7 @@ impl TerminalApp {
                                         })
                                         .is_empty();
                                     ui.horizontal(|ui| {
-                                        if ui
+                                        if (ui
                                             .add_enabled(
                                                 can_send,
                                                 egui::Button::new("Send follow-up"),
@@ -2893,7 +2894,7 @@ impl TerminalApp {
                                             .on_disabled_hover_text(format!(
                                                 "Feedback must be non-empty, at most {NATIVE_AGENT_FOLLOW_UP_MAX_BYTES} UTF-8 bytes, and sent before the {CODEX_APP_SERVER_LIVE_TURN_MAX}-turn session limit",
                                             ))
-                                            .clicked()
+                                            .clicked() || send_shortcut) && can_send
                                         {
                                             pending = Some(TaskSidebarAction::FollowUp(
                                                 row.id,

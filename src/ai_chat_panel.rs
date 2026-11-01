@@ -53,6 +53,69 @@ const MAX_EVENTS_PER_TICK: usize = 64;
 const PERSIST_OUTCOME_QUEUE_CAPACITY: usize = 4;
 const RECENT_HISTORY_TURNS: usize = 5;
 
+/// IME confirmation and a held Return belong to the editor, including across
+/// frames. Only a fresh, explicit send gesture may start a provider request.
+#[derive(Clone, Default)]
+struct ComposerKeys {
+    composing: bool,
+    enter_held: bool,
+}
+
+impl ComposerKeys {
+    fn submit(&mut self, events: &[egui::Event], focused: bool, enter_sends: bool) -> bool {
+        let ime_batch = events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Ime(_)));
+        let mut submit = false;
+        for event in events {
+            match event {
+                egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                    self.composing = !text.is_empty();
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(_)) => self.composing = false,
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } => {
+                    if *pressed {
+                        let fresh = !self.enter_held && !repeat;
+                        self.enter_held = true;
+                        submit |= focused
+                            && fresh
+                            && !self.composing
+                            && !ime_batch
+                            && !modifiers.shift
+                            && !modifiers.alt
+                            && !modifiers.mac_cmd
+                            && (modifiers.ctrl || enter_sends);
+                    } else {
+                        self.enter_held = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !focused {
+            self.composing = false;
+        }
+        submit
+    }
+}
+
+pub(crate) fn composer_submit_gesture(ui: &egui::Ui, response: &egui::Response) -> bool {
+    let id = response.id.with("send-keys");
+    let mut keys = ui
+        .data_mut(|data| data.get_temp::<ComposerKeys>(id))
+        .unwrap_or_default();
+    let focused = response.has_focus();
+    let submit = ui.input(|input| keys.submit(&input.events, focused, false));
+    ui.data_mut(|data| data.insert_temp(id, keys));
+    submit
+}
+
 /// One worker-thread message. Deltas are best-effort UI hints; the `Done`
 /// payload is authoritative and replaces them (anvil's contract).
 #[derive(Debug)]
@@ -110,6 +173,7 @@ pub struct AiChatPanel {
     page: Page,
     /// egui-owned edit buffers mirrored into the store on change.
     composer: String,
+    composer_keys: ComposerKeys,
     title_edit: String,
     confirm_delete: bool,
     composer_focus_pending: bool,
@@ -158,6 +222,7 @@ impl AiChatPanel {
             include_recent: HashMap::new(),
             page: Page::Chat,
             composer: String::new(),
+            composer_keys: ComposerKeys::default(),
             title_edit: String::new(),
             confirm_delete: false,
             composer_focus_pending: false,
@@ -923,9 +988,14 @@ impl AiChatPanel {
                                 "Attach the last few commands as untrusted context. Sent only when command-context sharing is allowed.",
                             );
 
-                // Composer: Enter sends, Shift+Enter inserts a newline
-                // (anvil's composer contract). egui's `return_key`
-                // makes only Shift+Enter insert the newline.
+                let enter_sends = config.ai_chat_send_on_enter;
+                // Leave the send chord out of TextEdit's newline binding.
+                // Both plain/Shift+Enter insert newlines in the default mode.
+                let newline_modifiers = if enter_sends || ui.input(|input| input.modifiers.shift) {
+                    egui::Modifiers::SHIFT
+                } else {
+                    egui::Modifiers::NONE
+                };
                 let composer_response = ui.add(
                     egui::TextEdit::multiline(&mut self.composer)
                         .id(egui::Id::new((
@@ -937,11 +1007,13 @@ impl AiChatPanel {
                         .interactive(!archived)
                         .hint_text(if archived {
                             "Archived chat — unarchive to send"
-                        } else {
+                        } else if enter_sends {
                             "Message (Enter to send, Shift+Enter for a new line)"
+                        } else {
+                            "Message (Enter for a new line, Ctrl+Enter to send)"
                         })
                         .return_key(egui::KeyboardShortcut::new(
-                            egui::Modifiers::SHIFT,
+                            newline_modifiers,
                             egui::Key::Enter,
                         )),
                 );
@@ -955,11 +1027,11 @@ impl AiChatPanel {
                 {
                     self.mark_dirty();
                 }
-                if composer_response.has_focus()
-                    && ui.input(|input| {
-                        input.key_pressed(egui::Key::Enter) && !input.modifiers.shift
-                    })
-                {
+                let composer_focused = composer_response.has_focus();
+                if ui.input(|input| {
+                    self.composer_keys
+                        .submit(&input.events, composer_focused, enter_sends)
+                }) {
                     send = true;
                 }
 
@@ -1427,6 +1499,84 @@ fn persist_library_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn enter_event(pressed: bool, repeat: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed,
+            repeat,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn composer_requires_a_fresh_send_chord_and_keeps_plain_enter_for_newlines() {
+        let mut keys = ComposerKeys::default();
+        assert!(!keys.submit(
+            &[enter_event(true, false, egui::Modifiers::NONE)],
+            true,
+            false
+        ));
+        assert!(!keys.submit(
+            &[enter_event(false, false, egui::Modifiers::NONE)],
+            true,
+            false
+        ));
+        assert!(keys.submit(
+            &[enter_event(true, false, egui::Modifiers::CTRL)],
+            true,
+            false
+        ));
+        assert!(!keys.submit(
+            &[enter_event(true, true, egui::Modifiers::CTRL)],
+            true,
+            false
+        ));
+        keys.submit(
+            &[enter_event(false, false, egui::Modifiers::CTRL)],
+            true,
+            false,
+        );
+        assert!(!keys.submit(
+            &[enter_event(true, false, egui::Modifiers::CTRL)],
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn composer_ime_confirmation_and_its_held_enter_never_send() {
+        let mut keys = ComposerKeys::default();
+        let plain = egui::Modifiers::NONE;
+        keys.submit(
+            &[egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "中文".into(),
+                active_range_chars: None,
+            })],
+            true,
+            true,
+        );
+        assert!(!keys.submit(&[enter_event(true, false, plain)], true, true));
+        assert!(!keys.submit(
+            &[egui::Event::Ime(egui::ImeEvent::Commit("中文".into()))],
+            true,
+            true
+        ));
+        assert!(!keys.submit(&[enter_event(true, true, plain)], true, true));
+        keys.submit(&[enter_event(false, false, plain)], true, true);
+        assert!(keys.submit(&[enter_event(true, false, plain)], true, true));
+        keys.submit(&[enter_event(false, false, plain)], true, true);
+        // Even a backend delivering commit after Return in one frame is safe.
+        assert!(!keys.submit(
+            &[
+                enter_event(true, false, plain),
+                egui::Event::Ime(egui::ImeEvent::Commit("文".into())),
+            ],
+            true,
+            true
+        ));
+    }
     use crate::ai_chat_store::new_store;
 
     #[test]

@@ -16,9 +16,15 @@ Clicking a CLI conversation checks its native ID, provider home, history source 
 
 | Surface | Center | Input and lifetime |
 | --- | --- | --- |
-| API chat | Saved messages, current streamed response, earlier-message paging | Three editable lines plus a visual blank row. Enter sends; Shift+Enter adds a line. The HTTP request belongs to the initiating app process. |
+| API chat | Saved messages, current streamed response, earlier-message paging | Three editable lines plus a visual blank row. Enter adds a line; Ctrl+Enter sends. The HTTP request belongs to the initiating app process. |
 | Native task | Real provider events, tool activity, approvals, review and validation controls | Three-line follow-up editor at a supported idle review point. Native task runtime belongs to this app and closes with it. |
 | CLI conversation | The real provider TUI in a PTY | The TUI owns stdin and its prompts. No additional chat composer sends duplicate input. The shared host owns the PTY process. |
+
+Set `ai_chat_send_on_enter = true` to use Enter-to-send and Shift+Enter for a
+newline in API chats. Input-method confirmation and held Return never submit.
+Native task follow-up editors use Ctrl+Enter to send and Enter for a newline.
+The CLI **Needs you** filter requires a current managed runtime as well as a
+recorded waiting state; an old transcript alone cannot establish current need.
 
 API conversation IDs occupy a separate numeric range from legacy local caches. Each request carries its original conversation ID and request epoch. Switching to another conversation does not redirect old output, clear the new conversation's draft, or revoke an unrelated stream.
 

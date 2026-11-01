@@ -352,7 +352,11 @@ impl AgentSessionsState {
                     && self
                         .provider
                         .is_none_or(|provider| provider == session.provider)
-                    && self.status.is_none_or(|status| status == session.status)
+                    && self.status.is_none_or(|status| {
+                        status == session.status
+                            && (status != SessionStatus::Waiting
+                                || row.is_some_and(|row| row.runtime.is_live()))
+                    })
                     && (!self.live_only
                         || self
                             .workspace
@@ -2732,6 +2736,17 @@ mod tests {
             ..Default::default()
         });
         state
+    }
+
+    #[test]
+    fn historical_waiting_is_readable_without_becoming_current_attention() {
+        let mut recorded = session(SessionProvider::Codex, "old-waiting", "Saved approval");
+        recorded.status = SessionStatus::Waiting;
+        let mut state = state_with(vec![recorded]);
+        assert_eq!(state.workspace_visible().len(), 1);
+        state.status = Some(SessionStatus::Waiting);
+        state.filters_changed();
+        assert!(state.workspace_visible().is_empty());
     }
 
     fn load_private_library(state: &mut AgentSessionsState) -> PathBuf {

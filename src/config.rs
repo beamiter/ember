@@ -155,6 +155,11 @@ pub struct Config {
     #[serde(default)]
     pub ai_enabled: bool,
 
+    /// API composer: Enter inserts a newline by default; Ctrl+Enter sends.
+    /// Opt in to Enter-to-send (Shift+Enter keeps inserting a newline).
+    #[serde(default)]
+    pub ai_chat_send_on_enter: bool,
+
     /// AI provider: "anthropic", "openai-compatible", or "ollama".
     #[serde(default = "default_ai_provider")]
     pub ai_provider: String,
@@ -678,6 +683,7 @@ impl Default for Config {
             ascii_organism_motion: None,
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
+            ai_chat_send_on_enter: false,
             ai_provider: default_ai_provider(),
             ai_base_url: default_ai_base_url(),
             ai_model: default_ai_model(),
