@@ -213,7 +213,7 @@ pub struct Config {
     /// Show the provider-neutral Tasks dashboard. This is independent from
     /// cloud-AI consent because local Agent CLIs and task bookkeeping do not
     /// inherently send terminal context off-machine.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub experimental_task_sidebar: bool,
 
     /// Last / preferred Fix-with Agent CLI (`codex`, `claude`, `opencode`, `kimi`).
@@ -689,7 +689,7 @@ impl Default for Config {
             command_correction_enabled: false,
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),
-            experimental_task_sidebar: false,
+            experimental_task_sidebar: true,
             preferred_fix_provider: default_preferred_fix_provider(),
             remote_hosts: default_remote_hosts(),
             font_size: default_font_size(),
@@ -1906,13 +1906,13 @@ mod tests {
     }
 
     #[test]
-    fn experimental_task_sidebar_defaults_off_and_round_trips() {
+    fn experimental_task_sidebar_defaults_on_and_preserves_opt_out() {
         let defaults = Config::default();
-        assert!(!defaults.experimental_task_sidebar);
+        assert!(defaults.experimental_task_sidebar);
         assert_eq!(defaults.preferred_fix_provider, "codex");
 
         let omitted: Config = toml::from_str("").expect("empty config parses");
-        assert!(!omitted.experimental_task_sidebar);
+        assert!(omitted.experimental_task_sidebar);
         assert_eq!(omitted.preferred_fix_provider, "codex");
 
         let enabled: Config =
@@ -1921,6 +1921,8 @@ mod tests {
         let serialized = toml::to_string_pretty(&enabled).expect("config serializes");
         let reparsed: Config = toml::from_str(&serialized).expect("serialized config reparses");
         assert!(reparsed.experimental_task_sidebar);
+        let disabled: Config = toml::from_str("experimental_task_sidebar = false\n").unwrap();
+        assert!(!disabled.experimental_task_sidebar);
     }
 
     #[test]

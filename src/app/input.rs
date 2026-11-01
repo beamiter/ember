@@ -1232,6 +1232,9 @@ impl TerminalApp {
             || self.organism.eva.card_owns_input()
             || self.block_review.is_some()
             || self.agent_sessions.is_open
+            || self.agent_sessions.workspace_task.is_some()
+            || self.ai_chat_panel.is_open
+            || self.sidebar.view == crate::sidebar::SidebarView::Tasks
             || self.vim9_dialog_is_open()
             || (egui::Popup::is_any_open(ctx)
                 && self

@@ -1,11 +1,18 @@
 # Shared core source snapshot
 
-An isolated checkout needs the sibling `jterm_core` path dependency. Run
-`scripts/materialize-shared-core.sh` before Cargo commands to extract the
-SHA-256-verified source snapshot next to the application. Existing sibling
-checkouts are preserved, including deliberately checked-out upgrade candidates.
+The application pins `jterm_core` to an exact Git revision in `Cargo.toml` and
+`Cargo.lock`. `scripts/materialize-shared-core.sh` fetches that locked dependency
+for current builds without creating a sibling checkout.
+
+The SHA-256-verified archive retains a source snapshot of the same published
+revision. For path-based consumers, the helper extracts the snapshot next to the
+application and preserves existing sibling checkouts. `jterm-core-revision` and
+`jterm-core-origin.json` record the archive's published Git provenance.
 
 When shared core changes, regenerate the deterministic snapshot with
-`scripts/package-shared-core.sh /path/to/jterm_core` and commit both the archive
-and its `.sha256` file. The archive contains source/runtime/test assets only;
-it excludes Git history, build output, user sessions and credentials.
+`scripts/package-shared-core.sh /path/to/exact-published-core`. The source
+directory must contain the exact published commit without local edits. Commit
+the archive, its `.sha256` file, the revision, and the updated origin metadata
+together. The archive contains Cargo files, README, source, runtime, scripts,
+tests and assets; it excludes Git history, build output, user sessions and
+credentials.

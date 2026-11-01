@@ -2,6 +2,7 @@
 
 pub use jterm_core::char_width; // P5：字符宽度缓存（已抽取到 jterm_core）
 pub mod agent;
+mod agent_cli;
 pub mod block_mode;
 pub mod bottom_bar;
 pub mod clipboard;
@@ -23,7 +24,6 @@ pub mod organism;
 pub mod output_batch;
 pub mod pane_header;
 pub mod persistence_file;
-mod agent_cli;
 pub mod pty;
 pub mod remote_fs;
 pub mod remote_picker;

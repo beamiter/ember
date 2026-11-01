@@ -38,7 +38,7 @@ const MAX_NATIVE_FOLLOW_UP_CHARS: usize = NATIVE_AGENT_FOLLOW_UP_MAX_BYTES;
 /// Visible before starting a print-mode provider; a worktree is not containment.
 fn native_start_notice(provider: AgentProvider) -> Option<&'static str> {
     match provider {
-        AgentProvider::Claude => Some("Claude skips its own permission prompts and can automatically run tools with your user account's file access. This worktree is not a sandbox."),
+        AgentProvider::Claude => Some("Claude native turns keep the CLI permission checks. If a tool requires approval, open the task in Terminal to review it."),
         AgentProvider::Kimi => Some("Kimi uses automatic tool permission and can run tools with your user account's file access. This worktree is not a sandbox."),
         AgentProvider::Codex | AgentProvider::OpenCode => None,
     }
@@ -47,6 +47,7 @@ fn native_start_notice(provider: AgentProvider) -> Option<&'static str> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskSidebarAction {
     StartNative(TaskId),
+    LoadHistory(TaskId, bool),
     StartTerminal(TaskId),
     StopCodex(TaskId),
     FollowUp(TaskId, String),
@@ -70,6 +71,7 @@ fn native_action_needs_prompt_poll(action: &TaskSidebarAction) -> bool {
     matches!(
         action,
         TaskSidebarAction::StartNative(_)
+            | TaskSidebarAction::LoadHistory(..)
             | TaskSidebarAction::StopCodex(_)
             | TaskSidebarAction::FollowUp(..)
             | TaskSidebarAction::FinishCodex(_)
@@ -189,6 +191,16 @@ pub struct TaskSidebarState {
 }
 
 impl TaskSidebarState {
+    pub(crate) fn open_workspace_task(&mut self, id: TaskId) {
+        self.selected = Some(id);
+        self.show_hidden = false;
+        self.dashboard_query.clear();
+        self.dashboard_view = Default::default();
+        self.dashboard_provider = None;
+        self.dashboard_project = None;
+        self.dashboard_attention = None;
+        self.scroll_to_selected = true;
+    }
     /// Leave the Hidden list for the dashboard. Opening the dashboard and
     /// creating, registering or restoring a task all do this, so a task the
     /// user is about to act on is never out of sight in the Hidden list.
@@ -321,6 +333,7 @@ fn hide_task_blocked_reason(
 }
 
 /// Sidebar tab text, plus the hover explanation when tasks need attention.
+#[cfg(test)]
 pub(crate) fn tasks_tab_label(
     counts: jterm_core::agent_task::DashboardAttentionCounts,
 ) -> (String, Option<String>) {
@@ -1129,6 +1142,27 @@ fn render_native_codex_view(
                 );
             }
         });
+
+        if provider == AgentProvider::Codex {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Saved conversation history");
+                if ui.add_enabled(!view.history_loading, egui::Button::new("Refresh history")).clicked() {
+                    *pending = Some(TaskSidebarAction::LoadHistory(task_id, true));
+                }
+                if view.history_cursor.is_some() && ui.add_enabled(!view.history_loading, egui::Button::new("Load earlier")).clicked() {
+                    *pending = Some(TaskSidebarAction::LoadHistory(task_id, false));
+                }
+                if view.history_loading { ui.spinner(); }
+            });
+            for turn in view.persisted_history.iter() {
+                egui::CollapsingHeader::new(format!("Saved turn · {}", turn.status))
+                    .id_salt(("workspace-native-history", task_id, &turn.provider_turn_id))
+                    .default_open(true).show(ui, |ui| {
+                        if !turn.user_text.is_empty() { ui.weak("You"); ui.label(visible_bounded(&turn.user_text, 64 * 1024)); }
+                        if !turn.agent_text.is_empty() { ui.weak("Agent"); ui.label(visible_bounded(&turn.agent_text, 128 * 1024)); }
+                    });
+            }
+        }
 
         render_native_approvals(ui, task_id, view, approvals_enabled, pending, navigation);
 
@@ -2156,7 +2190,13 @@ impl TerminalApp {
             .task_manager
             .tasks()
             .iter()
-            .filter(|task| task.status != TaskStatus::Archived)
+            .filter(|task| {
+                task.status != TaskStatus::Archived
+                    && self
+                        .agent_sessions
+                        .workspace_task
+                        .is_none_or(|id| id == task.id)
+            })
             .map(|task| TaskRowSnapshot {
                 id: task.id,
                 title: visible_bounded(&task.title, MAX_TASK_TITLE_DISPLAY_BYTES),
@@ -2548,6 +2588,9 @@ impl TerminalApp {
                                 .is_some_and(|view| view.phase == CodexAppServerPhase::Ready);
                         task_action_scope(ui, row, manual_review, registration_pending, |ui| {
                         ui.horizontal_wrapped(|ui| {
+                            if self.agent_runtime.can_resume_codex(row.id) && ui.add_enabled(native_ai_enabled && !registration_pending, egui::Button::new("Resume native")).on_hover_text("Resume this task's exact saved Codex conversation and private profile").clicked() {
+                                pending = Some(TaskSidebarAction::StartNative(row.id));
+                            }
                             if row.status == TaskStatus::Created
                                 && row.runtime_kind == TaskRuntimeKind::Unassigned
                                 && !row.native_preparing
@@ -2559,7 +2602,7 @@ impl TerminalApp {
                                             "Start a native Codex app-server session. Review points can continue on the same loaded thread; finish the session before validation. Agent tool writes are restricted to this worktree, while the current Codex sandbox may read other host files."
                                         }
                                         AgentProvider::Claude => {
-                                            "Start a native Claude Code print/stream-json session with its permission prompts skipped. No private home or cgroup containment is provided; the worktree is not a sandbox."
+                                            "Start a native Claude conversation with permission checks. Continue tool approval requests in Terminal."
                                         }
                                         AgentProvider::Kimi => {
                                             "Start a native Kimi Code print/stream-json session with automatic tool permission. No private home or cgroup containment is provided; the worktree is not a sandbox."
@@ -2798,7 +2841,7 @@ impl TerminalApp {
                         if native_idle {
                             let provider_name = row.provider.display_name();
                             ui.group(|ui| {
-                                if row.provider == AgentProvider::Codex {
+                                if self.agent_runtime.can_prompt_native(row.id) {
                                     ui.label(
                                         egui::RichText::new("Review feedback")
                                             .small()
@@ -2828,6 +2871,7 @@ impl TerminalApp {
                                     .on_disabled_hover_text(
                                         "Enable AI features and command-context sharing before sending another cloud turn",
                                     );
+                                    ui.add_space(ui.text_style_height(&egui::TextStyle::Body));
                                     let can_send = native_ai_enabled
                                         && native_follow_up_can_send(
                                             draft.as_str(),
@@ -2970,6 +3014,13 @@ impl TerminalApp {
         }
         match action {
             TaskSidebarAction::StartNative(task_id) => self.start_task_native_agent(task_id),
+            TaskSidebarAction::LoadHistory(task_id, reset) => {
+                if self.task_sidebar.selected == Some(task_id) {
+                    if let Err(error) = self.agent_runtime.load_native_history(task_id, reset) {
+                        self.set_status_for(error.to_string(), Duration::from_secs(6));
+                    }
+                }
+            }
             TaskSidebarAction::StartTerminal(task_id) => self.start_task_agent_terminal(task_id),
             TaskSidebarAction::StopCodex(task_id) => match self.agent_runtime.cancel(task_id) {
                 Ok(()) => {
@@ -2993,7 +3044,7 @@ impl TerminalApp {
                 };
                 match self
                     .agent_runtime
-                    .prompt_codex(&self.task_manager, task_id, &text, policy)
+                    .prompt_native(&self.task_manager, task_id, &text, policy)
                 {
                     Ok(()) => {
                         clear_sent_follow_up(
@@ -3001,7 +3052,7 @@ impl TerminalApp {
                             task_id,
                             &text,
                         );
-                        self.set_status("Follow-up queued on the existing Codex thread…");
+                        self.set_status("Follow-up queued on the existing agent conversation…");
                     }
                     Err(error) => {
                         self.set_status_for(error.to_string(), Duration::from_secs(6));
@@ -3231,6 +3282,8 @@ impl TerminalApp {
 
     /// Reveal the Tasks dashboard and remember it as the sidebar view.
     pub(crate) fn open_tasks_view(&mut self) {
+        self.ai_chat_panel.close();
+        self.agent_sessions.workspace_task = None;
         self.task_sidebar.show_dashboard();
         self.sidebar.note_files_user_intent();
         self.sidebar.visible = true;
@@ -4582,13 +4635,12 @@ mod tests {
     fn print_provider_notice_discloses_permissions_without_promising_a_sandbox() {
         use super::{native_start_notice, AgentProvider};
         let claude = native_start_notice(AgentProvider::Claude).unwrap();
-        assert!(claude.contains("skips its own permission prompts"));
+        assert!(claude.contains("keep the CLI permission checks"));
+        assert!(claude.contains("Terminal"));
         let kimi = native_start_notice(AgentProvider::Kimi).unwrap();
         assert!(kimi.contains("automatic tool permission"));
-        for notice in [claude, kimi] {
-            assert!(notice.contains("user account's file access"));
-            assert!(notice.contains("not a sandbox"));
-        }
+        assert!(kimi.contains("user account's file access"));
+        assert!(kimi.contains("not a sandbox"));
         assert_eq!(native_start_notice(AgentProvider::Codex), None);
         assert_eq!(native_start_notice(AgentProvider::OpenCode), None);
     }
