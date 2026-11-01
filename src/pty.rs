@@ -566,6 +566,8 @@ mod unix_pty {
             command_argv: Option<&[String]>,
             pinned_cwd: Option<PinnedDirectory>,
         ) -> Result<Self> {
+            let inline_command = command_argv.map(crate::agent_cli::inline_argv);
+            let command_argv = inline_command.as_deref();
             // SAFETY: 这个 unsafe 块包含多个 libc 系统调用用于 PTY 创建和进程 fork。
             // 所有的 libc 调用都检查了返回值并正确处理错误。
             // 文件描述符的生命周期被正确管理（成功时存储在 PtySession 中，失败时关闭）。
@@ -763,6 +765,7 @@ mod unix_pty {
                     .collect();
                 let env_cstrings =
                     jterm_core::child_env::envp(&child_environment(), &extra_environment)
+                        .map(crate::agent_cli::environment)
                         .map_err(|error| anyhow!("Invalid child environment: {error}"))?;
                 let mut envp: Vec<*const libc::c_char> =
                     env_cstrings.iter().map(|c| c.as_ptr()).collect();

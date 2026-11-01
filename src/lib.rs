@@ -23,6 +23,7 @@ pub mod organism;
 pub mod output_batch;
 pub mod pane_header;
 pub mod persistence_file;
+mod agent_cli;
 pub mod pty;
 pub mod remote_fs;
 pub mod remote_picker;

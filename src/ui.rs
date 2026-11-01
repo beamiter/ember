@@ -1508,6 +1508,8 @@ pub struct TerminalRenderer {
     pub padding: f32,
     pub line_spacing: f32,
     pub dragging_scrollbar: bool,
+    scrollbar_grab_offset: f32,
+    scrollbar_terminal: Option<usize>,
     /// Stable terminal identity selected by a local primary-button press.
     /// This locks Shift bypass through release and prevents a renderer reused
     /// by another tab/pane from applying an in-flight drag to the new terminal.
@@ -1698,6 +1700,8 @@ impl TerminalRenderer {
             padding,
             line_spacing,
             dragging_scrollbar: false,
+            scrollbar_grab_offset: 0.0,
+            scrollbar_terminal: None,
             local_selection_terminal: None,
             scrollbar_visibility,
             theme,
@@ -5117,15 +5121,19 @@ impl TerminalRenderer {
                 None
             };
 
-        // Handle mouse events for text selection
-        // Track selection start on initial mouse down
-        // Scrollbar interaction: detect if drag started on thumb
-        if interaction_enabled && response.drag_started() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                if pos.x >= scrollbar_x {
+        // Capture the press itself: egui's drag threshold may already have
+        // moved the pointer outside a short thumb by drag_started().
+        if self.scrollbar_terminal != Some(rendered_terminal) {
+            self.dragging_scrollbar = false;
+        }
+        if interaction_enabled && primary_pressed {
+            if let Some(pos) = ctx.input(|i| i.pointer.press_origin()) {
+                if scrollbar_rect.contains(pos) {
                     if let Some((thumb_rect, ..)) = scrollbar_thumb_rect {
                         if thumb_rect.contains(pos) {
                             self.dragging_scrollbar = true;
+                            self.scrollbar_terminal = Some(rendered_terminal);
+                            self.scrollbar_grab_offset = pos.y - thumb_rect.top();
                         }
                     }
                 }
@@ -5133,7 +5141,8 @@ impl TerminalRenderer {
         }
 
         // Scrollbar drag: update scroll_offset while dragging thumb
-        if interaction_enabled && self.dragging_scrollbar && response.dragged() {
+        if interaction_enabled && self.dragging_scrollbar && ctx.input(|i| i.pointer.primary_down())
+        {
             if let Some(pos) = response.interact_pointer_pos() {
                 if let Some((_, scrollbar_height, thumb_height, scrollback_len_f)) =
                     scrollbar_thumb_rect
@@ -5141,8 +5150,9 @@ impl TerminalRenderer {
                     let track_height = scrollbar_height - thumb_height;
                     if track_height > 0.0 {
                         // 反转逻辑：向上拖动看历史（增大scroll_offset），向下拖动看最新（减小scroll_offset）
-                        let relative_y = (pos.y - scrollbar_rect.top() - thumb_height / 2.0)
-                            .clamp(0.0, track_height);
+                        let relative_y =
+                            (pos.y - scrollbar_rect.top() - self.scrollbar_grab_offset)
+                                .clamp(0.0, track_height);
                         let new_offset = (((track_height - relative_y) / track_height)
                             * scrollback_len_f)
                             .round() as usize;
@@ -5162,14 +5172,14 @@ impl TerminalRenderer {
         }
 
         // Reset dragging state when mouse released
-        if interaction_enabled && response.drag_stopped() {
+        if !ctx.input(|i| i.pointer.primary_down()) {
             self.dragging_scrollbar = false;
         }
 
         // Click in scrollbar track (not on thumb): page up/down
-        if interaction_enabled && response.drag_started() && !self.dragging_scrollbar {
+        if interaction_enabled && primary_pressed && !self.dragging_scrollbar {
             if let Some(pos) = response.interact_pointer_pos() {
-                if pos.x >= scrollbar_x && projected_scroll_range > 0 {
+                if scrollbar_rect.contains(pos) && projected_scroll_range > 0 {
                     if let Some((thumb_rect, ..)) = scrollbar_thumb_rect {
                         if pos.y < thumb_rect.top() {
                             // Click above thumb: scroll up (see older history)
@@ -10145,6 +10155,72 @@ mod tests {
         );
 
         assert_eq!((row, col), (19, 99));
+    }
+
+    #[test]
+    fn scrollbar_press_and_drag_keep_grab_point_with_mouse_reporting() {
+        let ctx = egui::Context::default();
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            4.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Always,
+            crate::theme::Theme::default(),
+        );
+        let mut terminal = TerminalState::new(80, 14);
+        for row in 0..120 {
+            terminal.process_input(format!("session row {row:03}\r\n").as_bytes());
+        }
+        terminal.process_input(b"\x1b[?1000h\x1b[?1006h");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 240.0));
+        let (_, track) = renderer.layout_rects(screen);
+        let grab = TerminalRenderer::MIN_THUMB_HEIGHT - 3.0;
+        let press = egui::pos2(track.center().x, track.bottom() - 3.0);
+        let oldest = egui::pos2(press.x, track.top() + grab);
+        for (phase, position) in [(0, press), (1, press), (2, oldest), (3, press), (4, press)] {
+            let mut events = vec![egui::Event::PointerMoved(position)];
+            if phase == 1 || phase == 4 {
+                events.push(egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: phase == 1,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    renderer.render_in_rect(
+                        ui,
+                        &mut terminal,
+                        true,
+                        true,
+                        true,
+                        &crate::search::SearchState::default(),
+                        &[],
+                        &None,
+                        screen,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            match phase {
+                1 => {
+                    assert!(renderer.dragging_scrollbar);
+                    assert_eq!(terminal.scroll_offset, 0, "press must not center the thumb");
+                }
+                2 => assert_eq!(terminal.scroll_offset, terminal.scrollback_len()),
+                3 => assert_eq!(terminal.scroll_offset, 0),
+                4 => assert!(!renderer.dragging_scrollbar),
+                _ => {}
+            }
+            assert!(!terminal.has_text_selection());
+            assert!(renderer.cursor_move_input.is_empty());
+        }
     }
 
     #[test]

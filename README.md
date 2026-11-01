@@ -1843,3 +1843,15 @@ call is needed.
 The configurable action is `agent:sessions`. The Tasks panel's **Conversation
 library** button opens or focuses the manager; it never closes it. The existing
 Agent and Tasks surfaces remain available.
+
+
+### Claude / Codex CLI 会话滚动
+
+本地终端默认让 Claude 使用 classic renderer，并让 Codex 使用
+`--no-alt-screen`，将会话输出保留在主屏历史中。可拖动右侧滑轨向上阅读、
+向下回到最新输出；滚动范围受终端的 scrollback 容量限制。
+新会话、任务终端和恢复的会话采用相同设置，不改写 CLI 配置文件。
+
+Codex 的兼容入口仅加入子进程 PATH；用户自己的 alias/function 仍有优先权。
+`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=0 claude` 可显式使用 Claude 全屏模式；
+用 `JTERM_AGENT_SCROLLBACK=0` 启动终端可关闭上述兼容默认值。

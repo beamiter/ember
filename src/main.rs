@@ -1,3 +1,4 @@
+mod agent_cli;
 pub mod agent;
 mod agent_panel;
 mod ai_chat_panel;
