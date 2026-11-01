@@ -6570,7 +6570,10 @@ impl TerminalRenderer {
             } else {
                 0.0
             },
-            _canvas_pad: [0.0; 2],
+            viewport_origin: [
+                (content_rect.min.x * ppp).round(),
+                (content_rect.min.y * ppp).round(),
+            ],
         };
 
         let foreground_uniforms = gpu::instance::GridUniforms {

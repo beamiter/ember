@@ -29,7 +29,7 @@ pub struct CellInstance {
     pub flags: u32,
     /// Horizontal offset within cell for glyph centering (physical pixels)
     pub glyph_offset_x: f32,
-    /// Vertical offset within cell for glyph centering (physical pixels)
+    /// Vertical offset from the shared row origin (physical pixels)
     pub glyph_offset_y: f32,
     pub _pad: u32,
 }
@@ -126,5 +126,6 @@ pub struct GridUniforms {
     /// First fixed Chat composer row, or -1 when the full surface flows.
     pub fixed_start_row: f32,
     pub fixed_pixel_offset: f32,
-    pub _canvas_pad: [f32; 2],
+    /// Rounded viewport origin in framebuffer pixels (for fragment coordinates).
+    pub viewport_origin: [f32; 2],
 }

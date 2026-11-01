@@ -9,7 +9,7 @@ struct Uniforms {
     scroll_pixel_offset: f32,
     fixed_start_row: f32,
     fixed_pixel_offset: f32,
-    canvas_pad: vec2<f32>,
+    viewport_origin: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -25,10 +25,9 @@ struct VertexOutput {
     @location(2) fg_color: vec4<f32>,
     @location(3) bg_color: vec4<f32>,
     @location(4) @interpolate(flat) flags: u32,
-    @location(5) cell_local_pos: vec2<f32>,
+    @location(5) @interpolate(flat) cell_rect: vec4<f32>,
     @location(6) @interpolate(flat) glyph_offset: vec2<f32>,
     @location(7) cell_px_pos: vec2<f32>,
-    @location(8) canvas_y: f32,
     @location(9) @interpolate(flat) fixed_row: u32,
 };
 
@@ -61,8 +60,29 @@ fn vs_main(
     let glyph_size = (glyph_uv1 - glyph_uv0) * vec2<f32>(u.atlas_width, u.atlas_height);
     let foreground_pass = u.render_phase >= 0.5;
 
+    let grid_origin = vec2<f32>(f32(col_row.x) * u.cell_width, f32(col_row.y) * u.cell_height);
+    let fixed = u.fixed_start_row >= 0.0 && f32(col_row.y) >= u.fixed_start_row;
+    let offset = select(u.scroll_pixel_offset, u.fixed_pixel_offset, fixed);
+    var cell_origin = grid_origin;
+    var cell_size = vec2<f32>(cell_w, u.cell_height);
+
+    // Snap shared cell edges, independently of ink bounds or has_glyph. This
+    // keeps the baseline common and decorations contiguous across spaces and
+    // ligature-covered cells. Rounding each glyph's origin instead changes
+    // half-pixel tie decisions with its bearing. Backgrounds retain the
+    // continuous grid; scrolling translates the entire foreground together.
+    if foreground_pass {
+        cell_origin = round(grid_origin);
+        // Derive the far edge from its grid index too, so adjacent cells use
+        // exactly the same float before rounding, even at half-pixel ties.
+        let end_col = col_row.x + select(1u, 2u, is_wide);
+        let grid_end = vec2<f32>(f32(end_col) * u.cell_width, f32(col_row.y + 1u) * u.cell_height);
+        cell_size = round(grid_end) - cell_origin;
+    }
+    cell_origin.y -= offset;
+
     var quad_min = vec2<f32>(0.0, 0.0);
-    var quad_max = vec2<f32>(cell_w, u.cell_height);
+    var quad_max = cell_size;
     if foreground_pass && has_glyph {
         quad_min = min(quad_min, glyph_offset);
         quad_max = max(quad_max, glyph_offset + glyph_size);
@@ -73,23 +93,9 @@ fn vs_main(
         mix(quad_min.y, quad_max.y, qy),
     );
 
-    // Snap the foreground glyph quad to the integer physical-pixel grid so the
-    // 1:1 atlas→screen sampling stays crisp (fractional cell origins otherwise get
-    // softened by the linear sampler). Snap is derived from the grid position only,
-    // excluding the smooth-scroll offset, so scrolling still translates continuously.
-    // Background fills are left unsnapped to keep cells tiling seamlessly.
-    var snap = vec2<f32>(0.0, 0.0);
-    if foreground_pass && has_glyph {
-        let origin_x = f32(col_row.x) * u.cell_width + glyph_offset.x;
-        let origin_y = f32(col_row.y) * u.cell_height + glyph_offset.y;
-        snap = vec2<f32>(round(origin_x) - origin_x, round(origin_y) - origin_y);
-    }
-
-    // Cell position in physical pixels relative to viewport origin (with smooth scroll offset)
-    let px = f32(col_row.x) * u.cell_width + px_in_cell.x + snap.x;
-    let fixed = u.fixed_start_row >= 0.0 && f32(col_row.y) >= u.fixed_start_row;
-    let offset = select(u.scroll_pixel_offset, u.fixed_pixel_offset, fixed);
-    let py = f32(col_row.y) * u.cell_height + px_in_cell.y - offset + snap.y;
+    // Cell position relative to the viewport, with continuous smooth scrolling.
+    let px = cell_origin.x + px_in_cell.x;
+    let py = cell_origin.y + px_in_cell.y;
 
     // Convert to NDC (viewport is set to content_rect by egui-wgpu)
     let ndc_x = (px / u.viewport_width) * 2.0 - 1.0;
@@ -102,10 +108,9 @@ fn vs_main(
     out.fg_color = fg_color;
     out.bg_color = bg_color;
     out.flags = flags;
-    out.cell_local_pos = px_in_cell / vec2<f32>(cell_w, u.cell_height);
+    out.cell_rect = vec4<f32>(u.viewport_origin + cell_origin, cell_size);
     out.glyph_offset = glyph_offset;
     out.cell_px_pos = px_in_cell;
-    out.canvas_y = py;
     out.fixed_row = select(0u, 1u, fixed);
 
     return out;
@@ -151,21 +156,43 @@ fn corrected_coverage(cov: vec3<f32>, fg_lin: vec3<f32>, bg_lin: vec3<f32>) -> v
     return clamp((target_lum - vec3<f32>(lum_bg)) / delta, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Derive decorations from framebuffer pixel centers and a flat cell origin.
+// Interpolating normalized coordinates across glyph-sized quads introduces
+// different errors for ascenders/descenders exactly at a line boundary: a
+// straight underline can otherwise jump one pixel between adjacent glyphs.
+// Both foreground blend paths use the same cell geometry and style rules.
+fn draws_decoration(in: VertexOutput) -> bool {
+    let local = (in.position.xy - in.cell_rect.xy) / in.cell_rect.zw;
+    if any(local < vec2<f32>(0.0)) || any(local >= vec2<f32>(1.0)) {
+        return false;
+    }
+
+    let underline_style = (in.flags >> 2u) & 7u;
+    let band = 1.0 - local.y;
+    var underline = false;
+    if underline_style == 1u {
+        underline = band < 0.08;
+    } else if underline_style == 2u {
+        underline = (band > 0.02 && band < 0.06) || (band > 0.09 && band < 0.13);
+    } else if underline_style == 3u {
+        let wave_y = 0.92 + sin(local.x * 6.283185) * 0.03;
+        underline = abs(local.y - wave_y) < 0.025;
+    } else if underline_style == 4u {
+        underline = band < 0.08 && fract(local.x * 4.0) < 0.5;
+    } else if underline_style == 5u {
+        underline = band < 0.08 && fract(local.x * 2.0) < 0.6;
+    }
+    let strikethrough = (in.flags & 32u) != 0u && abs(local.y - 0.5) < 0.04;
+    return underline || strikethrough;
+}
+
 // Compute final fragment color (shared by both entry points).
 // `linear_target` marks the sRGB-framebuffer entry point, whose translucent
 // output is alpha-blended by the hardware in linear space.
 fn compute_fragment_color(in: VertexOutput, linear_target: bool) -> vec4<f32> {
     let has_glyph = (in.flags & 1u) != 0u;
-    let underline_style = (in.flags >> 2u) & 7u; // bits 2-4: 0=none,1=single,2=double,3=curly,4=dotted,5=dashed
-    let has_strikethrough = (in.flags & 32u) != 0u;
     let is_color_glyph = (in.flags & 64u) != 0u;
     let background_pass = u.render_phase < 0.5;
-
-    let is_wide = (in.flags & 2u) != 0u;
-    var cell_w = u.cell_width;
-    if is_wide {
-        cell_w = u.cell_width * 2.0;
-    }
 
     // Background pass draws only cell fills. Foreground pass starts transparent.
     var color = select(vec4<f32>(0.0, 0.0, 0.0, 0.0), in.bg_color, background_pass);
@@ -221,47 +248,8 @@ fn compute_fragment_color(in: VertexOutput, linear_target: bool) -> vec4<f32> {
         }
     }
 
-    // Underline styles
-    let within_cell = in.cell_local_pos.x >= 0.0 && in.cell_local_pos.x <= 1.0
-        && in.cell_local_pos.y >= 0.0 && in.cell_local_pos.y <= 1.0;
-
-    if underline_style > 0u && within_cell {
-        let y_pos = in.cell_local_pos.y;
-        let x_pos = in.cell_local_pos.x;
-        var draw_underline = false;
-
-        if underline_style == 1u {
-            // Single: 1px line near bottom
-            draw_underline = (1.0 - y_pos) < 0.08;
-        } else if underline_style == 2u {
-            // Double: two lines
-            let band = 1.0 - y_pos;
-            draw_underline = (band > 0.02 && band < 0.06) || (band > 0.09 && band < 0.13);
-        } else if underline_style == 3u {
-            // Curly: sine wave at bottom
-            let wave_y = 0.92 + sin(x_pos * 6.283185) * 0.03;
-            draw_underline = abs(y_pos - wave_y) < 0.025;
-        } else if underline_style == 4u {
-            // Dotted: evenly spaced dots
-            let dot_phase = fract(x_pos * 4.0);
-            draw_underline = (1.0 - y_pos) < 0.08 && dot_phase < 0.5;
-        } else if underline_style == 5u {
-            // Dashed: longer segments
-            let dash_phase = fract(x_pos * 2.0);
-            draw_underline = (1.0 - y_pos) < 0.08 && dash_phase < 0.6;
-        }
-
-        if draw_underline {
-            color = vec4<f32>(in.fg_color.rgb, 1.0);
-        }
-    }
-
-    // Strikethrough: 1-2px line at middle of cell
-    if has_strikethrough && within_cell {
-        let mid = abs(in.cell_local_pos.y - 0.5);
-        if mid < 0.04 {
-            color = vec4<f32>(in.fg_color.rgb, 1.0);
-        }
+    if draws_decoration(in) {
+        color = vec4<f32>(in.fg_color.rgb, 1.0);
     }
 
     return color;
@@ -284,6 +272,7 @@ fn fs_main_linear(in: VertexOutput) -> @location(0) vec4<f32> {
 fn canvas_clip(in: VertexOutput) {
     if u.fixed_start_row >= 0.0 {
         let dock_top = u.fixed_start_row * u.cell_height - u.fixed_pixel_offset;
-        if (in.fixed_row == 0u && in.canvas_y >= dock_top) || (in.fixed_row == 1u && in.canvas_y < dock_top) { discard; }
+        let canvas_y = in.position.y - u.viewport_origin.y;
+        if (in.fixed_row == 0u && canvas_y >= dock_top) || (in.fixed_row == 1u && canvas_y < dock_top) { discard; }
     }
 }

@@ -20,8 +20,6 @@ struct DualSourceOutput {
 // gamma→linear conversion would distort the color).
 fn compute_fragment_dual(in: VertexOutput, linear_target: bool) -> DualSourceOutput {
     let has_glyph = (in.flags & 1u) != 0u;
-    let underline_style = (in.flags >> 2u) & 7u; // bits 2-4: 0=none,1=single,2=double,3=curly,4=dotted,5=dashed
-    let has_strikethrough = (in.flags & 32u) != 0u;
     let is_color_glyph = (in.flags & 64u) != 0u;
 
     var rgb = vec3<f32>(0.0);
@@ -75,42 +73,9 @@ fn compute_fragment_dual(in: VertexOutput, linear_target: bool) -> DualSourceOut
     }
 
     // Underline styles (same shapes as the single-source path)
-    let within_cell = in.cell_local_pos.x >= 0.0 && in.cell_local_pos.x <= 1.0
-        && in.cell_local_pos.y >= 0.0 && in.cell_local_pos.y <= 1.0;
-
-    if underline_style > 0u && within_cell {
-        let y_pos = in.cell_local_pos.y;
-        let x_pos = in.cell_local_pos.x;
-        var draw_underline = false;
-
-        if underline_style == 1u {
-            draw_underline = (1.0 - y_pos) < 0.08;
-        } else if underline_style == 2u {
-            let band = 1.0 - y_pos;
-            draw_underline = (band > 0.02 && band < 0.06) || (band > 0.09 && band < 0.13);
-        } else if underline_style == 3u {
-            let wave_y = 0.92 + sin(x_pos * 6.283185) * 0.03;
-            draw_underline = abs(y_pos - wave_y) < 0.025;
-        } else if underline_style == 4u {
-            let dot_phase = fract(x_pos * 4.0);
-            draw_underline = (1.0 - y_pos) < 0.08 && dot_phase < 0.5;
-        } else if underline_style == 5u {
-            let dash_phase = fract(x_pos * 2.0);
-            draw_underline = (1.0 - y_pos) < 0.08 && dash_phase < 0.6;
-        }
-
-        if draw_underline {
-            rgb = in.fg_color.rgb;
-            mask = vec3<f32>(1.0);
-        }
-    }
-
-    if has_strikethrough && within_cell {
-        let mid = abs(in.cell_local_pos.y - 0.5);
-        if mid < 0.04 {
-            rgb = in.fg_color.rgb;
-            mask = vec3<f32>(1.0);
-        }
+    if draws_decoration(in) {
+        rgb = in.fg_color.rgb;
+        mask = vec3<f32>(1.0);
     }
 
     var rgb_target = rgb;
