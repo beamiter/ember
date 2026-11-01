@@ -1,5 +1,7 @@
 # ember
 
+新版 Shared Eva 默认启用，由 JWM 随图形会话启动共享协调器。四端只连接同一协调器；设置 `eva_companion_enabled = false` 并重启窗口可关闭。旧本地 Organism 仅在显式关闭 Shared Eva 后使用。
+
 ember is a Linux terminal emulator written in Rust. It combines an egui
 desktop shell with a WGPU text pipeline, a built-in VTE/ANSI parser, tabs,
 split panes, searchable scrollback and Kitty protocol extensions.
@@ -150,7 +152,7 @@ cards use a small four-pixel edge gap at normal density, without reserving a
 full blank terminal row between commands. Metadata rows have no terminal copy, selection or
 application mouse origin.
 
-ASCII Organism is enabled by default; set `ascii_organism_enabled = false` to
+With Shared Eva explicitly disabled, the legacy ASCII Organism is enabled by default; set `ascii_organism_enabled = false` to
 disable it. One companion belongs to the window. Switching tabs or split panes
 moves that same companion and keeps its mood, personality, and story sequence.
 Block and Chat use only fully visible, proven empty space in the active card;

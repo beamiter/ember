@@ -118,6 +118,7 @@ ui_scale = {args.scale}
 terminal_mode = "{mode}"
 theme = "dark"
 shell = "/bin/bash"
+eva_companion_enabled = false
 ascii_organism_enabled = true
 """)
             (config / "config.toml").chmod(0o600)

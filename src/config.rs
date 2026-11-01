@@ -133,8 +133,8 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub ascii_organism_enabled: bool,
 
-    /// Shared Eva coordinator; explicit opt-in, applied on window restart.
-    #[serde(default)]
+    /// Shared Eva is enabled by default; changes apply on window restart.
+    #[serde(default = "default_true")]
     pub eva_companion_enabled: bool,
 
     /// Show the full companion body unless explicitly collapsed.
@@ -672,7 +672,7 @@ impl Default for Config {
         Config {
             vim9: jterm_core::vim9::Vim9UiConfig::default(),
             ascii_organism_enabled: true,
-            eva_companion_enabled: false,
+            eva_companion_enabled: true,
             ascii_organism_expanded: true,
             ascii_organism_care_enabled: false,
             ascii_organism_motion: None,

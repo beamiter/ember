@@ -1301,14 +1301,16 @@ mod tests {
         assert!(host.runtime.is_none());
     }
     #[test]
-    fn settings_roundtrip_is_opt_in() {
+    fn settings_default_to_shared_and_preserve_explicit_disable() {
         let default = crate::config::Config::default();
-        assert!(!default.eva_companion_enabled);
+        assert!(default.eva_companion_enabled);
+        let omitted: crate::config::Config = toml::from_str("").unwrap();
+        assert!(omitted.eva_companion_enabled);
         let mut enabled = default;
-        enabled.eva_companion_enabled = true;
+        enabled.eva_companion_enabled = false;
         let serialized = toml::to_string(&enabled).unwrap();
         let decoded: crate::config::Config = toml::from_str(&serialized).unwrap();
-        assert!(decoded.eva_companion_enabled);
+        assert!(!decoded.eva_companion_enabled);
     }
     // Native ordering is exercised by tools/native-feedback-harness and the
     // family X11 matrix; searching source text for a submit hook cannot prove it.

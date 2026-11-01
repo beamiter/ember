@@ -1,7 +1,10 @@
 # Shared Eva companion
 
+Shared Eva is enabled by default. JWM starts or reuses `jcompaniond` for the same local graphical session; terminals only connect. Set `eva_companion_enabled = false` and restart the window to disable it. Explicit saved values remain authoritative. The mode is fixed for each window lifetime, and a missing coordinator never revives the legacy organism. `EVA_COMPANION_SOCKET` selects an externally managed socket; JWM does not auto-start a coordinator for that override.
+
+
 Enable **Appearance → Shared Eva companion (save and restart)**. The persisted
-key is `eva_companion_enabled = true` (default false). The legacy local organism
+key is `eva_companion_enabled = true` (default true). The legacy local organism
 setting is retained but its rendering and animated preview are replaced while
 shared mode is active. Mode changes take effect only on window restart, not an
 unsafe in-place fallback. Disable legacy pets in older windows first.
@@ -116,7 +119,7 @@ commit `9aa569540091524d637a7115b64c587b9177a55b` (protocol 1).
 Release manifests and Cargo.lock use immutable Git sources; Cargo acquires them
 for source builds without an unversioned sibling companion checkout. Use
 `cargo build --locked` and preserve existing user configuration during upgrades.
-Coordinator installation and opt-in startup are documented in jcompanion's
+Coordinator installation and JWM session startup are documented in jcompanion's
 `docs/deployment.md`; native application installation does not silently enable it.
 Focused render/unit fixtures are not physical display, voice, or live API acceptance.
 

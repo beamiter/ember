@@ -11,7 +11,10 @@
 # An older config without ui_font_size inherits font_size once when loaded.
 # font_size = 14.0
 # ui_font_size = 14.0
-# ASCII organism is enabled by default; uncomment to turn it off.
+# Shared Eva is enabled by default; JWM starts the local coordinator.
+# Set false and restart to disable Shared Eva.
+eva_companion_enabled = true
+# Legacy local organism is only used with Shared Eva disabled.
 # ascii_organism_enabled = false
 # terminal_mode = "block"
 
