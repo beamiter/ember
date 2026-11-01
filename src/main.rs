@@ -1,5 +1,5 @@
-mod agent_cli;
 pub mod agent;
+mod agent_cli;
 mod agent_panel;
 mod ai_chat_panel;
 mod ai_chat_store;
@@ -71,6 +71,8 @@ mod watch_adapter;
 mod windows_compat;
 mod workflow_picker;
 mod workflows;
+mod workspace_chat_bridge;
+mod workspace_sessions_bridge;
 
 use crate::glass_shell::BoundedPanel as _;
 use crate::theme::ThemeExt as _;
@@ -732,6 +734,9 @@ fn apply_theme_visuals(ctx: &egui::Context, _theme: &theme::Theme) {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    if let Some(code) = jterm_core::agent_workspace::run_embedded_if_requested() {
+        std::process::exit(code);
+    }
     if let Some(result) =
         jterm_core::vim9::forward_shell_vim(&std::env::args_os().skip(1).collect::<Vec<_>>())
     {
@@ -3430,12 +3435,6 @@ impl TerminalApp {
         }
     }
 
-    /// 顶部水平 tab 栏是否应显示：Top 模式下始终显示。
-    /// 即便只有一个会话也保留，因为栏内含有侧边栏 toggle 控件。
-    fn show_top_tab_bar(&self) -> bool {
-        matches!(self.config.tab_bar_position, config::TabBarPosition::Top)
-    }
-
     /// 切换标签栏位置(顶部 ⇄ 侧边栏)，并同步侧边栏视图与配置。
     /// 由顶栏内的位置切换按钮调用(两种模式下均可触发)。
     fn toggle_tab_bar_position(&mut self) {
@@ -3955,11 +3954,11 @@ impl TerminalApp {
                         } else {
                             ui.spacing_mut().interact_size.y =
                                 crate::glass_shell::RECENT_ROW_HEIGHT;
-                            self.render_sidebar_sessions(ui);
+                            self.render_workspace_sessions(ui);
                         }
                     }
                     sidebar::SidebarView::Commands => self.render_sidebar_commands(ui),
-                    sidebar::SidebarView::Tasks => self.render_sidebar_tasks(ui),
+                    sidebar::SidebarView::Tasks => self.render_workspace_sessions(ui),
                     sidebar::SidebarView::Files => {
                         if self.sidebar.path_entry_open {
                             ui.horizontal_wrapped(|ui| {
@@ -5773,8 +5772,18 @@ impl TerminalApp {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
                     ui.set_clip_rect(content.intersect(ui.clip_rect()));
                     theme::configure_workspace_text(ui.style_mut(), self.config.font_size);
-                    self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);
-                    self.render_reference_rich_canvas(ui);
+                    if self.ai_chat_panel.is_open {
+                        self.ai_chat_panel.show_in_workspace(ui, &self.config);
+                    } else if self.agent_sessions.workspace_task.is_some()
+                        || self.sidebar.view == sidebar::SidebarView::Tasks
+                    {
+                        egui::ScrollArea::vertical()
+                            .id_salt("workspace-task-canvas")
+                            .show(ui, |ui| self.render_sidebar_tasks(ui));
+                    } else {
+                        self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);
+                        self.render_reference_rich_canvas(ui);
+                    }
                 });
                 content
             });

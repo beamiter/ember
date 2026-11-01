@@ -169,6 +169,7 @@ fn verified_session_directory(session: &crate::session::Session) -> Option<std::
     verified_local_directory(reported.as_deref(), process.as_deref())
 }
 
+#[cfg(test)]
 fn workspace_identity(
     private: bool,
     reported_cwd: Option<&str>,
@@ -303,105 +304,9 @@ pub(crate) fn chrome_style(ui: &mut egui::Ui, scale: f32) {
     }
 }
 
-fn nav_row(ui: &mut egui::Ui, label: &str, selected: bool, kind: Option<Icon>) -> egui::Response {
-    let font = egui::TextStyle::Body.resolve(ui.style());
-    let line_height = ui
-        .painter()
-        .layout_no_wrap("Ag".into(), font.clone(), rgb(color::CHROME_TEXT))
-        .size()
-        .y;
-    let height = shell::NAVIGATION_ROW_HEIGHT.max(line_height + 8.0);
-    let response = ui
-        .scope(|ui| {
-            ui.spacing_mut().interact_size.y = height;
-            ui.spacing_mut().button_padding = egui::Vec2::ZERO;
-            ui.add_sized(
-                [ui.available_width(), height],
-                egui::Button::new(RichText::new("").size(12.0))
-                    .selected(selected)
-                    .corner_radius(7)
-                    .frame(selected),
-            )
-        })
-        .inner;
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label)
-    });
-    let rect = response.rect;
-    let text_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            rect.left() + if kind.is_some() { 34.0 } else { 10.0 },
-            rect.top() + 4.0,
-        ),
-        egui::pos2(rect.right() - 10.0, rect.bottom() - 4.0),
-    );
-    let tint = rgb(if selected {
-        color::CHROME_TEXT
-    } else {
-        color::CHROME_MUTED
-    });
-    let mut job =
-        egui::text::LayoutJob::simple(label.to_owned(), font, tint, text_rect.width().max(0.0));
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-    ui.painter()
-        .with_clip_rect(text_rect.intersect(ui.clip_rect()))
-        .galley(
-            egui::pos2(text_rect.left(), rect.center().y - galley.size().y * 0.5),
-            galley,
-            tint,
-        );
-    if let Some(kind) = kind {
-        icon(
-            ui,
-            egui::Rect::from_center_size(
-                rect.left_center() + egui::vec2(16.5, 0.0),
-                egui::vec2(13.0, 13.0),
-            ),
-            kind,
-            tint,
-        );
-    }
-    if selected {
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(
-                egui::pos2(rect.right() - 2.0, rect.top() + 7.0),
-                egui::vec2(2.0, rect.height() - 14.0),
-            ),
-            1,
-            rgb(color::ACCENT),
-        );
-    }
-    response
-}
-
 impl TerminalApp {
     fn reference_private_title(&self) -> bool {
         self.tabs.flags(self.tabs.active_index()).private_title
-    }
-
-    fn reference_workspace_identity(&self) -> (String, String) {
-        let session = &self.session_manager.sessions()[self.session_manager.active_index()];
-        let reported = session.terminal.lock().current_working_dir.clone();
-        let local_foreground = local_shell_owns_foreground(session);
-        let process = local_foreground
-            .then(|| jterm_core::process::process_cwd(session.get_shell_pid()))
-            .flatten();
-        let label = session
-            .metadata
-            .custom_name
-            .as_deref()
-            .filter(|label| !label.is_empty())
-            .unwrap_or(&session.metadata.name);
-        workspace_identity(
-            self.reference_private_title(),
-            reported.as_deref(),
-            process.as_deref(),
-            local_foreground,
-            label,
-            self.config.ai_redact_secrets,
-        )
     }
 
     pub(crate) fn observe_reference_shell(&self, ctx: &egui::Context) {
@@ -1068,10 +973,6 @@ impl TerminalApp {
     }
 
     pub(crate) fn render_reference_optional_controls(&mut self, root: &mut egui::Ui) {
-        let tabs = root.ctx().data_mut(|data| {
-            data.get_temp::<bool>(egui::Id::new("reference:tabs"))
-                .unwrap_or(false)
-        });
         let status = root.ctx().data_mut(|data| {
             data.get_temp::<bool>(egui::Id::new("reference:status"))
                 .unwrap_or(false)
@@ -1080,16 +981,6 @@ impl TerminalApp {
             data.get_temp::<bool>(egui::Id::new("reference:shell-updates"))
                 .unwrap_or(false)
         });
-        if tabs {
-            egui::Panel::top("reference-session-controls").show(root, |ui| {
-                let ctx = ui.ctx().clone();
-                if self.show_top_tab_bar() {
-                    self.render_tab_bar(ui, &ctx);
-                } else {
-                    self.render_sidebar_mode_top_bar(ui, &ctx);
-                }
-            });
-        }
         if status {
             self.render_bottom_bar(root);
         }
@@ -1172,193 +1063,42 @@ impl TerminalApp {
     }
 
     pub(crate) fn render_reference_navigation(&mut self, ui: &mut egui::Ui) -> bool {
-        let scale = self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE;
         chrome_style(
             ui,
             self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE,
         );
-        ui.spacing_mut().item_spacing.y = shell::NAVIGATION_ROW_GAP;
-        ui.label(
-            RichText::new("WORKSPACE")
-                .size(9.0 * scale)
-                .color(rgb(color::CHROME_MUTED)),
-        );
-        let (workspace, workspace_detail) = self.reference_workspace_identity();
-        ui.add_space(8.0);
-        let selector = ui.add_sized(
-            [ui.available_width(), shell::WORKSPACE_SELECTOR_HEIGHT],
-            egui::Button::new("")
-                .fill(rgb(color::INSPECTOR_CARD))
-                .corner_radius(8),
-        );
-        icon(
-            ui,
-            egui::Rect::from_center_size(
-                selector.rect.left_center() + egui::vec2(17.0, 0.0),
-                egui::vec2(16.0, 16.0),
-            ),
-            Icon::Files,
-            rgb(color::CHROME_MUTED),
-        );
-        let name_rect = egui::Rect::from_min_max(
-            selector.rect.min + egui::vec2(32.0, 0.0),
-            selector.rect.max - egui::vec2(30.0, 0.0),
-        );
-        ui.painter().with_clip_rect(name_rect).text(
-            name_rect.left_center(),
-            egui::Align2::LEFT_CENTER,
-            workspace,
-            egui::FontId::proportional(10.0 * scale),
-            rgb(color::CHROME_TEXT),
-        );
-        icon(
-            ui,
-            egui::Rect::from_center_size(
-                selector.rect.right_center() - egui::vec2(12.0, 0.0),
-                egui::vec2(12.0, 12.0),
-            ),
-            Icon::ChevronDown,
-            rgb(color::CHROME_MUTED),
-        );
-        let selector = selector.on_hover_text(format!(
-            "Switch open workspace or browse Files\n{workspace_detail}"
-        ));
-        remember_inspector_control(ui, &selector);
-        // Resolve the chosen stable session after the popup, so tab reorders
-        // and background session exits cannot redirect a pending activation.
-        let workspaces: Vec<_> = (0..self.tabs.len())
-            .filter_map(|tab| {
-                let index = self.tab_display_session(tab)?;
-                let session = self.session_manager.sessions().get(index)?;
-                let private = self.tabs.flags(tab).private_title;
-                let cwd = (!private)
-                    .then(|| session.terminal.lock().current_working_dir.clone())
-                    .flatten();
-                Some((
-                    session.metadata.session_id.clone(),
-                    self.tab_title(tab),
-                    cwd,
-                    tab == self.tabs.active_index(),
-                ))
-            })
-            .collect();
-        let mut activate = None;
-        let popup_visible = egui::Popup::menu(&selector)
-            .style(crate::theme::configure_popup_style)
-            .show(|ui| {
-                ui.set_max_width(360.0);
-                ui.strong("Open workspaces");
-                for (id, title, cwd, selected) in &workspaces {
-                    let response = ui
-                        .push_id(("workspace-session", id), |ui| {
-                            ui.selectable_label(
-                                *selected,
-                                jterm_core::review_input::safe_inline_display(title, 256),
-                            )
-                        })
-                        .inner;
-                    let response = if let Some(cwd) = cwd {
-                        response.on_hover_text(inspector_context_text(
-                            cwd,
-                            false,
-                            self.config.ai_redact_secrets,
-                            4096,
-                        ))
-                    } else {
-                        response
-                    };
-                    remember_inspector_control(ui, &response);
-                    if response.clicked() {
-                        activate = Some(id.clone());
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                if inspector_button(ui, true, "New terminal session").clicked() {
-                    self.new_tab();
-                    ui.close();
-                }
-                if inspector_button(ui, true, "Open directory in Files…").clicked() {
-                    self.sidebar.open_path_entry();
-                    self.reference_request_sidebar_view(sidebar::SidebarView::Files, ui.ctx());
-                    ui.close();
-                }
-            })
-            .is_some();
-        crate::ui::remember_reference_chrome_scope(
-            ui.ctx(),
-            selector.id.with("popup-scope"),
-            selector.rect,
-            popup_visible,
-        );
-        if let Some(index) = activate
-            .as_deref()
-            .and_then(|id| self.session_manager.index_of(id))
-        {
-            self.activate_session(index);
-            self.return_focus_to_terminal(ui.ctx());
-        }
-        ui.add_space(8.0);
-        let (task_label, task_attention) =
-            crate::app::tasks::tasks_tab_label(self.task_manager.attention_counts());
-        for (key, label) in conversation::NAVIGATION {
-            let label = if key == "conversation" {
-                if self.config.chat_mode_enabled() {
-                    "Chat"
-                } else {
-                    "Block"
-                }
-            } else {
-                label
-            };
-            let selected = match key {
-                "conversation" => self.sidebar.view == sidebar::SidebarView::Sessions,
-                "folder" => self.sidebar.view == sidebar::SidebarView::Files,
-                "agent" => self.sidebar.view == sidebar::SidebarView::Tasks,
-                _ => false,
-            };
-            let attention = (key == "agent" && !conversation::fixture_enabled())
-                .then_some(task_attention.as_deref())
-                .flatten();
-            let label = if attention.is_some() {
-                format!("{label} · {task_label}")
-            } else {
-                label.to_owned()
-            };
-            let response = nav_row(ui, &label, selected, Some(Icon::from_key(key)));
-            let response = if let Some(summary) = attention {
-                response.on_hover_text(format!(
-                    "{label}\n{summary}\nOpen the Agent Tasks dashboard"
-                ))
-            } else {
-                response.on_hover_text(&label)
-            };
-            if response.clicked() {
-                match key {
-                    "settings" => self.config_panel.open(&self.config),
-                    "folder" => {
-                        self.reference_request_sidebar_view(sidebar::SidebarView::Files, ui.ctx());
-                    }
-                    "agent" => {
-                        self.reference_request_sidebar_view(sidebar::SidebarView::Tasks, ui.ctx());
-                    }
-                    _ => {
-                        self.reference_request_sidebar_view(
-                            sidebar::SidebarView::Sessions,
-                            ui.ctx(),
-                        );
-                    }
-                }
+        ui.horizontal(|ui| {
+            ui.strong("Agent Workspace");
+            if ui
+                .small_button("＋")
+                .on_hover_text("New API conversation")
+                .clicked()
+            {
+                self.agent_sessions.workspace_task = None;
+                self.ai_chat_panel.open_workspace_chat(None, &self.config);
             }
-        }
-        ui.add_space(18.0);
-        let heading = ui.label(
-            RichText::new("RECENT")
-                .size(9.0 * scale)
-                .color(rgb(color::CHROME_MUTED)),
-        );
-        ui.add_space((heading.rect.bottom() + shell::METADATA_GAP - ui.cursor().top()).max(0.0));
-        false // Navigation ownership changes are applied before next frame's panels.
+        });
+        ui.horizontal(|ui| {
+            if ui.small_button("Terminal").clicked() {
+                self.ai_chat_panel.close();
+                self.agent_sessions.workspace_task = None;
+                self.new_tab();
+            }
+            if ui.small_button("Tasks").clicked() {
+                self.open_tasks_view();
+            }
+            if ui.small_button("Files").clicked() {
+                self.reference_request_sidebar_view(sidebar::SidebarView::Files, ui.ctx());
+            }
+            if ui
+                .small_button("⋯")
+                .on_hover_text("Session details and organization")
+                .clicked()
+            {
+                self.open_agent_sessions();
+            }
+        });
+        false
     }
 
     pub(crate) fn render_reference_fixture_recent(&mut self, ui: &mut egui::Ui) {
@@ -1597,17 +1337,7 @@ impl TerminalApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             self.render_reference_navigation(ui);
-                            let tabs: Vec<_> = (0..self.tabs.len())
-                                .map(|i| (i, self.tab_title(i)))
-                                .collect();
-                            for (index, title) in tabs {
-                                if nav_row(ui, &title, self.tabs.active_index() == index, None)
-                                    .on_hover_text(&title)
-                                    .clicked()
-                                {
-                                    self.activate_tab(index);
-                                }
-                            }
+                            self.render_workspace_sessions(ui);
                             self.render_reference_spaces(ui);
                         });
                 });
@@ -2081,6 +1811,52 @@ impl TerminalApp {
     }
 
     pub(crate) fn render_reference_canvas_header(&mut self, ui: &mut egui::Ui) {
+        if self.ai_chat_panel.is_open || self.agent_sessions.workspace_task.is_some() {
+            let (title, subtitle) = if self.ai_chat_panel.is_open {
+                (
+                    self.ai_chat_panel.workspace_title().to_owned(),
+                    "API conversation".to_owned(),
+                )
+            } else {
+                self.agent_sessions
+                    .workspace_task
+                    .and_then(|id| self.task_manager.get(id))
+                    .map(|task| {
+                        (
+                            task.title.clone(),
+                            format!("{} · {}", task.provider.display_name(), task.status.label()),
+                        )
+                    })
+                    .unwrap_or_else(|| ("Agent task".into(), String::new()))
+            };
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(
+                    ui.available_width(),
+                    self.reference_layout(ui.ctx()).header.height,
+                ),
+                egui::Sense::hover(),
+            );
+            shell::bounded_ui_at(ui, rect.shrink2(egui::vec2(22.0, 7.0)), |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.strong(crate::review_text::visible_bounded(&title, 160));
+                        ui.weak(subtitle);
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Context").clicked() {
+                            self.reference_inspector.pending = Some(
+                                ReferenceInspectorRequest::Tab(ReferenceInspectorTab::Context),
+                            );
+                        }
+                        if self.ai_chat_panel.is_open && ui.button("New").clicked() {
+                            self.ai_chat_panel.open_workspace_chat(None, &self.config);
+                        }
+                    });
+                });
+            });
+            ui.advance_cursor_after_rect(rect);
+            return;
+        }
         let scale = self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE;
         let title = if conversation::fixture_enabled() {
             conversation::acceptance_fixture().title
@@ -2185,7 +1961,6 @@ impl TerminalApp {
                                         ui.close();
                                     }
                                     for (key, label) in [
-                                        ("reference:tabs", "Session tab strip"),
                                         ("reference:status", "Session status bar"),
                                         ("reference:shell-updates", "Shell updates"),
                                     ] {

@@ -47,7 +47,6 @@ const CHAT_LIBRARY_FILE_BUDGET: usize = 4 * 1024 * 1024;
 const _: () =
     assert!(CHAT_LIBRARY_FILE_BUDGET < jterm_core::ai::MAX_CONVERSATION_SNAPSHOT_JSON_BYTES);
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(400);
-const MAX_SEARCH_CHARS: usize = 1_024;
 const AI_DELTA_QUEUE_CAPACITY: usize = 256;
 const MAX_AI_DELTA_BYTES: usize = 64 * 1024;
 const MAX_EVENTS_PER_TICK: usize = 64;
@@ -94,6 +93,7 @@ enum PersistState {
 pub struct AiChatPanel {
     pub is_open: bool,
     store: ChatStore,
+    pub(crate) workspace: crate::workspace_chat_bridge::WorkspaceChats,
     provider_label: String,
     /// One-line panel feedback for preflight failures and withheld context;
     /// rendered only while the store has no live status to show.
@@ -107,13 +107,13 @@ pub struct AiChatPanel {
     /// `conversation_systems`).
     conversation_systems: HashMap<u64, String>,
     include_recent: HashMap<u64, bool>,
-    search: String,
     page: Page,
     /// egui-owned edit buffers mirrored into the store on change.
     composer: String,
     title_edit: String,
     confirm_delete: bool,
     composer_focus_pending: bool,
+    read_restore: Option<(u64, Option<f32>)>,
     redact_secrets: bool,
     /// Only the instance-lock holder writes the shared library file (ember's
     /// session-snapshot ownership rule); secondary windows browse and chat
@@ -147,6 +147,7 @@ impl AiChatPanel {
         Self {
             is_open: false,
             store: new_store(),
+            workspace: Default::default(),
             provider_label: String::new(),
             notice: String::new(),
             requests: HashMap::new(),
@@ -155,12 +156,12 @@ impl AiChatPanel {
             retry_payloads: HashMap::new(),
             conversation_systems: HashMap::new(),
             include_recent: HashMap::new(),
-            search: String::new(),
             page: Page::Chat,
             composer: String::new(),
             title_edit: String::new(),
             confirm_delete: false,
             composer_focus_pending: false,
+            read_restore: None,
             redact_secrets: true,
             persistence_owner,
             persist_state: PersistState::Unloaded,
@@ -218,6 +219,7 @@ impl AiChatPanel {
     /// sources keep the component mounted); `drive` keeps harvesting them and
     /// the completed library is persisted.
     pub fn close(&mut self) {
+        self.workspace.leave();
         self.is_open = false;
         self.confirm_delete = false;
         self.persist();
@@ -384,6 +386,12 @@ impl AiChatPanel {
                 }
                 match result {
                     Ok(answer) => {
+                        let durable = if self.redact_secrets {
+                            jterm_core::redact::redact_secrets(answer.trim())
+                        } else {
+                            answer.trim().to_owned()
+                        };
+                        self.workspace.complete(token, &durable);
                         if self
                             .store
                             .complete_success(token, answer.trim().to_string())
@@ -393,6 +401,7 @@ impl AiChatPanel {
                         }
                     }
                     Err(error) => {
+                        self.workspace.cancel(token);
                         let error = jterm_core::review_input::safe_inline_display(&error, 2 * 1024);
                         let _ = self
                             .store
@@ -410,6 +419,7 @@ impl AiChatPanel {
     }
 
     fn mark_dirty(&mut self) {
+        self.workspace.changed(&self.store);
         self.dirty_since = Some(Instant::now());
     }
 
@@ -581,23 +591,27 @@ impl AiChatPanel {
             return;
         };
         cancellation.cancel();
+        self.workspace.cancel(token);
         let _ = self.store.cancel_request(token, STOPPED_STATUS.to_string());
         self.composer = self.store.active_draft().to_string();
         self.mark_dirty();
     }
 
-    fn retry_active(&mut self, config: &Config) {
+    fn retry_active(&mut self, _config: &Config) {
         let id = self.store.active_id();
         let Some(payload) = self.retry_payloads.get(&id).cloned() else {
             return;
         };
-        let remaining = draft_without_retry_message(&payload.user_text, self.store.active_draft());
-        let original = self.store.active_draft().to_string();
-        self.store.set_active_draft(remaining);
-        if !self.start_request(config, payload) {
-            self.store.set_active_draft(original);
+        let draft = self.store.active_draft();
+        if !draft.trim().is_empty() && draft.trim() != payload.user_text.trim() {
+            self.notice =
+                "Your newer draft was kept. Send or clear it before retrying the failed message."
+                    .into();
+            return;
         }
-        self.composer = self.store.active_draft().to_string();
+        self.store.set_active_draft(payload.user_text.clone());
+        self.composer = payload.user_text.clone();
+        self.workspace.submit(&self.store, payload.user_text);
     }
 
     fn recent_context(&self, config: &Config) -> Option<String> {
@@ -606,12 +620,126 @@ impl AiChatPanel {
         format_recent_context(&records)
     }
 
-    /// Render the panel while open.
-    pub fn show(&mut self, ctx: &egui::Context, config: &Config) {
-        if !self.is_open {
+    pub(crate) fn workspace_title(&self) -> &str {
+        self.store.active_title()
+    }
+
+    pub(crate) fn workspace_active_id(
+        &self,
+    ) -> Option<jterm_core::agent_workspace::ConversationId> {
+        self.workspace.id_for(self.store.active_id()).cloned()
+    }
+
+    pub(crate) fn workspace_summaries(
+        &mut self,
+        redact: bool,
+    ) -> Vec<jterm_core::agent_workspace::WorkspaceRow> {
+        self.restore_once();
+        self.redact_secrets = redact;
+        self.workspace.start(
+            &mut self.store,
+            &format!(
+                "ember:{}",
+                chats_path()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ),
+            self.redact_secrets,
+        );
+        self.workspace.rows.clone()
+    }
+
+    pub(crate) fn open_workspace_chat(
+        &mut self,
+        id: Option<jterm_core::agent_workspace::ConversationId>,
+        config: &Config,
+    ) {
+        self.open(config);
+        self.workspace_summaries(config.ai_redact_secrets);
+        match id {
+            Some(id) => self.workspace.open(id),
+            None => self.workspace.create(),
+        }
+    }
+
+    pub(crate) fn drive_workspace(&mut self, ctx: &egui::Context, config: &Config) {
+        for effect in self.workspace.drive(&mut self.store, self.redact_secrets) {
+            match effect {
+                crate::workspace_chat_bridge::Effect::SyncDraft(id) => {
+                    if self.store.active_id() == id {
+                        self.composer = self.store.active_draft().to_owned();
+                    }
+                }
+                crate::workspace_chat_bridge::Effect::Activate(id) => {
+                    self.store.select_chat(id);
+                    self.read_restore = Some((id, None));
+                    self.sync_edit_buffers();
+                    self.is_open = true;
+                    self.composer_focus_pending = true;
+                }
+                crate::workspace_chat_bridge::Effect::Submit {
+                    chat_id,
+                    text,
+                    clear_draft,
+                } => {
+                    let visible = self.store.active_id();
+                    self.store.select_chat(chat_id);
+                    let started = self.start_request(
+                        config,
+                        RequestPayload {
+                            user_text: text,
+                            restore_pending_as_draft: true,
+                        },
+                    );
+                    if started {
+                        if let Some(token) = self.store.active_request_token() {
+                            self.workspace.bind(token, clear_draft);
+                        }
+                        if clear_draft {
+                            self.store.set_active_draft(String::new());
+                        }
+                    } else {
+                        self.workspace.refuse_dispatch(chat_id);
+                    }
+                    self.store.select_chat(visible);
+                    self.sync_edit_buffers();
+                }
+            }
+        }
+        if self.workspace.has_work() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    pub(crate) fn show_in_workspace(&mut self, ui: &mut egui::Ui, config: &Config) {
+        let reference = self.workspace.reference(self.store.active_id());
+        ui.push_id(("workspace-api", reference), |ui| {
+            if self.workspace.accepts(reference, self.store.active_id()) {
+                self.draw_workspace_chat(ui, config);
+            } else {
+                ui.spinner();
+                ui.label("Loading shared conversation…");
+            }
+        });
+    }
+
+    fn draw_workspace_chat(&mut self, ui: &mut egui::Ui, config: &Config) {
+        if let Some(notice) = &self.workspace.notice {
+            ui.colored_label(ui.visuals().warn_fg_color, notice);
+            if let Some(id) = self.workspace.id_for(self.store.active_id()).cloned() {
+                if ui.button("Keep my draft · reload shared history").clicked() {
+                    self.workspace.reload_keep_local(id.clone());
+                }
+                if ui.button("Use shared draft").clicked() {
+                    self.workspace.reload_shared_draft(id);
+                }
+            }
+        }
+        if self.workspace.opening() {
+            ui.spinner();
+            ui.label("Loading shared conversation…");
             return;
         }
-        let mut open = self.is_open;
         let mut send = false;
         let mut stop = false;
         let mut retry = false;
@@ -620,140 +748,128 @@ impl AiChatPanel {
         let mut delete = false;
         let mut delete_confirmed = false;
         let mut delete_cancelled = false;
-        let mut select_chat: Option<u64> = None;
+        let mut select_chat: Option<jterm_core::agent_workspace::ConversationId> = None;
         let mut show_library = false;
         let mut show_chat = false;
 
-        egui::Window::new("AI Chats")
-            .id(egui::Id::new("ai_chat_panel"))
-            .open(&mut open)
-            .default_width(420.0)
-            .default_height(520.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                // Header: library toggle, rename entry, new chat, close.
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(self.page == Page::Library, "Chats")
-                        .on_hover_text("Browse saved and archived chats")
-                        .clicked()
-                    {
-                        show_library = true;
-                    }
-                    // The store renames chats on its own — `begin_turn`
-                    // derives a title from the first message of a still-"New
-                    // chat" conversation — so the rename buffer is refreshed
-                    // from the store whenever the user is not typing in it.
-                    // Left stale, the buffer's next `changed()` writes the
-                    // pre-derivation title back over the derived one, and the
-                    // chat becomes unfindable by its own content.
-                    let title_id = egui::Id::new("ai_chat_title_edit");
-                    if !ui.memory(|memory| memory.has_focus(title_id)) {
-                        self.title_edit = self.store.active_title().to_string();
-                    }
-                    let title_response = ui.add(
-                        egui::TextEdit::singleline(&mut self.title_edit)
-                            .id(title_id)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Rename this chat"),
-                    );
-                    if title_response.changed() && self.store.rename_active(&self.title_edit) {
-                        self.mark_dirty();
-                    }
-                    if ui
-                        .button("＋")
-                        .on_hover_text("New chat")
-                        .clicked()
-                    {
-                        new_chat = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if self.provider_label.is_empty() {
-                        ui.label(egui::RichText::new("AI is not configured").weak().small());
-                    } else {
-                        ui.label(
-                            egui::RichText::new(format!("{} · library is review-only; nothing here runs commands", self.provider_label))
-                                .weak()
-                                .small(),
-                        );
-                    }
-                });
-                // A window that will never write the library says so up front.
-                // Saying it only in a stderr line at startup means the user
-                // learns it by losing a conversation they watched complete.
-                if let Some(reason) = read_only_reason(self.persistence_owner, &self.persist_state)
-                {
-                    ui.colored_label(
-                        ui.visuals().warn_fg_color,
-                        egui::RichText::new(reason).small(),
-                    );
-                }
-                ui.separator();
+        // Header: library toggle, rename entry, new chat, close.
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.page == Page::Library, "Chats")
+                .on_hover_text("Browse saved and archived chats")
+                .clicked()
+            {
+                show_library = true;
+            }
+            // The store renames chats on its own — `begin_turn`
+            // derives a title from the first message of a still-"New
+            // chat" conversation — so the rename buffer is refreshed
+            // from the store whenever the user is not typing in it.
+            // Left stale, the buffer's next `changed()` writes the
+            // pre-derivation title back over the derived one, and the
+            // chat becomes unfindable by its own content.
+            let title_id = egui::Id::new((
+                "ai_chat_title_edit",
+                self.workspace.reference(self.store.active_id()),
+            ));
+            if !ui.memory(|memory| memory.has_focus(title_id)) {
+                self.title_edit = self.store.active_title().to_string();
+            }
+            let title_response = ui.add(
+                egui::TextEdit::singleline(&mut self.title_edit)
+                    .id(title_id)
+                    .desired_width((ui.available_width() - 38.0).max(50.0))
+                    .hint_text("Rename this chat"),
+            );
+            if title_response.changed() && self.store.rename_active(&self.title_edit) {
+                self.mark_dirty();
+            }
+            if ui.button("＋").on_hover_text("New chat").clicked() {
+                new_chat = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            if self.provider_label.is_empty() {
+                ui.label(egui::RichText::new("AI is not configured").weak().small());
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · library is review-only; nothing here runs commands",
+                        self.provider_label
+                    ))
+                    .weak()
+                    .small(),
+                );
+            }
+        });
+        // A window that will never write the library says so up front.
+        // Saying it only in a stderr line at startup means the user
+        // learns it by losing a conversation they watched complete.
+        if let Some(reason) = (!self.workspace.is_shared(self.store.active_id()))
+            .then(|| read_only_reason(self.persistence_owner, &self.persist_state))
+            .flatten()
+        {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                egui::RichText::new(reason).small(),
+            );
+        }
+        ui.separator();
 
-                match self.page {
-                    Page::Library => {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button("←")
-                                .on_hover_text("Back to conversation")
-                                .clicked()
-                            {
-                                show_chat = true;
-                            }
-                            let search_response = ui.add(
-                                egui::TextEdit::singleline(&mut self.search)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("Search chats"),
-                            );
-                            if search_response.changed()
-                                && self.search.chars().count() > MAX_SEARCH_CHARS
-                            {
-                                self.search = self.search.chars().take(MAX_SEARCH_CHARS).collect();
-                            }
-                        });
-                        let summaries = self.store.summaries_filtered(&self.search);
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for summary in &summaries {
-                                let mut title = summary.title.clone();
-                                if summary.archived {
-                                    title.push_str(" (archived)");
-                                }
-                                let mut meta = summary.preview.clone();
-                                if summary.busy {
-                                    meta.push_str(" · Thinking…");
-                                } else if summary.error {
-                                    meta.push_str(" · Error");
-                                } else if summary.unread {
-                                    meta.push_str(" · New reply");
-                                } else if summary.history_truncated {
-                                    // The core store trims live history and
-                                    // persistence trims the document; say so
-                                    // rather than letting a chat look complete.
-                                    meta.push_str(" · Some local content omitted");
-                                }
-                                let response = ui
-                                    .selectable_label(summary.active, title)
-                                    .on_hover_text(&meta);
-                                ui.label(egui::RichText::new(meta).weak().small());
-                                if response.clicked() {
-                                    select_chat = Some(summary.id);
-                                }
-                                ui.separator();
-                            }
-                            if summaries.is_empty() {
-                                ui.label(egui::RichText::new("No chats match").weak());
-                            }
-                        });
+        match self.page {
+            Page::Library => {
+                if ui.button("← Conversation").clicked() {
+                    show_chat = true;
+                }
+                for row in &self.workspace.rows {
+                    if ui.selectable_label(false, &row.title).clicked() {
+                        select_chat = Some(row.id.clone());
                     }
-                    Page::Chat => {
-                        let busy = self.store.is_active_busy();
-                        let archived = self.store.active_archived();
-                        let history_len = self.store.active_history().len();
-                        egui::ScrollArea::vertical()
-                            .max_height((ui.available_height() - 170.0).max(120.0))
-                            .stick_to_bottom(true)
+                }
+            }
+            Page::Chat => {
+                let busy = self.store.is_active_busy()
+                    || self.workspace.is_pending(self.store.active_id());
+                let archived = self.store.active_archived();
+                let chat_id = self.store.active_id();
+                if self.workspace.can_load_history(chat_id)
+                    && ui
+                        .add_enabled(
+                            !self.workspace.history_loading(chat_id),
+                            egui::Button::new("Load earlier messages"),
+                        )
+                        .clicked()
+                {
+                    self.workspace.load_history(chat_id);
+                }
+                if self.workspace.history_loading(chat_id) {
+                    ui.spinner();
+                }
+                let history_len = self.store.active_history().len();
+                let restore = self
+                    .read_restore
+                    .filter(|(id, _)| *id == self.store.active_id());
+                let composer_budget = ui.text_style_height(&egui::TextStyle::Body) * 7.0
+                    + ui.spacing().interact_size.y * 2.0
+                    + 64.0;
+                let mut scroll = egui::ScrollArea::vertical()
+                    .id_salt(("workspace-api-transcript", self.store.active_id()))
+                    .max_height((ui.available_height() - composer_budget).max(80.0))
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(
+                        self.workspace
+                            .read_position(self.store.active_id())
+                            .is_none_or(|position| position >= 0.999),
+                    );
+                if let Some((_, Some(pixels))) = restore {
+                    scroll = scroll.vertical_scroll_offset(pixels);
+                }
+                let output = scroll
                             .show(ui, |ui| {
+                                for message in self.workspace.older_messages(self.store.active_id()) {
+                                    ui.weak(if message.role == "user" { "You" } else { "Assistant" });
+                                    ui.label(&message.text); ui.add_space(12.0);
+                                }
                                 for turn in self.store.active_history() {
                                     let user = turn.role == Role::User;
                                     let message = jterm_core::reference_conversation::Message {
@@ -781,139 +897,160 @@ impl AiChatPanel {
                                 }
                             });
 
-                        let include_recent = self
-                            .include_recent
-                            .entry(self.store.active_id())
-                            .or_insert(true);
-                        ui.checkbox(include_recent, "Include recent shell context")
+                let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
+                match restore {
+                    Some((id, None)) => {
+                        self.read_restore = self
+                            .workspace
+                            .read_position(id)
+                            .map(|position| (id, Some(max_offset * position as f32)));
+                        ui.ctx().request_repaint();
+                    }
+                    Some((_, Some(_))) => self.read_restore = None,
+                    None if max_offset > 0.0 => self.workspace.remember_read(
+                        self.store.active_id(),
+                        (output.state.offset.y / max_offset) as f64,
+                    ),
+                    None => {}
+                }
+
+                let include_recent = self
+                    .include_recent
+                    .entry(self.store.active_id())
+                    .or_insert(true);
+                ui.checkbox(include_recent, "Include recent shell context")
                             .on_hover_text(
                                 "Attach the last few commands as untrusted context. Sent only when command-context sharing is allowed.",
                             );
 
-                        // Composer: Enter sends, Shift+Enter inserts a newline
-                        // (anvil's composer contract). egui's `return_key`
-                        // makes only Shift+Enter insert the newline.
-                        let composer_response = ui.add(
-                            egui::TextEdit::multiline(&mut self.composer)
-                                .id(egui::Id::new("ai_chat_composer"))
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(3)
-                                .interactive(!archived)
-                                .hint_text(if archived {
-                                    "Archived chat — unarchive to send"
-                                } else {
-                                    "Message (Enter to send, Shift+Enter for a new line)"
-                                })
-                                .return_key(egui::KeyboardShortcut::new(
-                                    egui::Modifiers::SHIFT,
-                                    egui::Key::Enter,
-                                )),
-                        );
-                        if self.composer_focus_pending {
-                            composer_response.request_focus();
-                            self.composer_focus_pending = false;
-                        }
-                        if composer_response.changed()
-                            && self.store.set_active_draft(self.composer.clone())
-                        {
-                            self.mark_dirty();
-                        }
-                        if composer_response.has_focus()
-                            && ui.input(|input| {
-                                input.key_pressed(egui::Key::Enter) && !input.modifiers.shift
-                            })
-                        {
-                            send = true;
-                        }
+                // Composer: Enter sends, Shift+Enter inserts a newline
+                // (anvil's composer contract). egui's `return_key`
+                // makes only Shift+Enter insert the newline.
+                let composer_response = ui.add(
+                    egui::TextEdit::multiline(&mut self.composer)
+                        .id(egui::Id::new((
+                            "ai_chat_composer",
+                            self.workspace.reference(self.store.active_id()),
+                        )))
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(3)
+                        .interactive(!archived)
+                        .hint_text(if archived {
+                            "Archived chat — unarchive to send"
+                        } else {
+                            "Message (Enter to send, Shift+Enter for a new line)"
+                        })
+                        .return_key(egui::KeyboardShortcut::new(
+                            egui::Modifiers::SHIFT,
+                            egui::Key::Enter,
+                        )),
+                );
+                // Three editable rows and one visual breathing row.
+                ui.add_space(ui.text_style_height(&egui::TextStyle::Body));
+                if self.composer_focus_pending {
+                    composer_response.request_focus();
+                    self.composer_focus_pending = false;
+                }
+                if composer_response.changed() && self.store.set_active_draft(self.composer.clone())
+                {
+                    self.mark_dirty();
+                }
+                if composer_response.has_focus()
+                    && ui.input(|input| {
+                        input.key_pressed(egui::Key::Enter) && !input.modifiers.shift
+                    })
+                {
+                    send = true;
+                }
 
-                        ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    if busy {
+                        ui.spinner();
+                    }
+                    let (status_text, is_error) = match self.store.active_status() {
+                        // A library that stopped saving outranks every
+                        // idle message: everything the user types from
+                        // here is being lost.
+                        ChatStatus::Idle
+                            if !self.persist_error.is_empty()
+                                && !self.workspace.is_shared(self.store.active_id()) =>
+                        {
+                            (self.persist_error.as_str(), true)
+                        }
+                        ChatStatus::Idle if !self.notice.is_empty() => {
+                            (self.notice.as_str(), false)
+                        }
+                        // Only when there is nothing more urgent to
+                        // say: a trimmed chat is missing turns the
+                        // model will no longer be told about.
+                        ChatStatus::Idle if self.store.active_history_truncated() => {
+                            (TRUNCATED_STATUS, false)
+                        }
+                        ChatStatus::Idle => ("", false),
+                        ChatStatus::Thinking(text) | ChatStatus::Info(text) => {
+                            (text.as_str(), false)
+                        }
+                        ChatStatus::Error(text) => (text.as_str(), true),
+                    };
+                    if !status_text.is_empty() {
+                        let text = egui::RichText::new(status_text).small();
+                        if is_error {
+                            ui.colored_label(ui.visuals().error_fg_color, text);
+                        } else {
+                            ui.label(text.weak());
+                        }
+                    }
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
                             if busy {
-                                ui.spinner();
-                            }
-                            let (status_text, is_error) = match self.store.active_status() {
-                                // A library that stopped saving outranks every
-                                // idle message: everything the user types from
-                                // here is being lost.
-                                ChatStatus::Idle if !self.persist_error.is_empty() => {
-                                    (self.persist_error.as_str(), true)
+                                if ui.button("Stop").clicked() {
+                                    stop = true;
                                 }
-                                ChatStatus::Idle if !self.notice.is_empty() => {
-                                    (self.notice.as_str(), false)
-                                }
-                                // Only when there is nothing more urgent to
-                                // say: a trimmed chat is missing turns the
-                                // model will no longer be told about.
-                                ChatStatus::Idle if self.store.active_history_truncated() => {
-                                    (TRUNCATED_STATUS, false)
-                                }
-                                ChatStatus::Idle => ("", false),
-                                ChatStatus::Thinking(text) | ChatStatus::Info(text) => {
-                                    (text.as_str(), false)
-                                }
-                                ChatStatus::Error(text) => (text.as_str(), true),
-                            };
-                            if !status_text.is_empty() {
-                                let text = egui::RichText::new(status_text).small();
-                                if is_error {
-                                    ui.colored_label(ui.visuals().error_fg_color, text);
-                                } else {
-                                    ui.label(text.weak());
-                                }
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if busy {
-                                        if ui.button("Stop").clicked() {
-                                            stop = true;
-                                        }
-                                    } else {
-                                        if ui
-                                            .add_enabled(!archived, egui::Button::new("Send"))
-                                            .clicked()
-                                        {
-                                            send = true;
-                                        }
-                                        if self
-                                            .retry_payloads
-                                            .contains_key(&self.store.active_id())
-                                            && ui.button("Retry").clicked()
-                                        {
-                                            retry = true;
-                                        }
-                                    }
-                                },
-                            );
-                        });
-
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button(if archived { "Unarchive" } else { "Archive" })
-                                .clicked()
-                            {
-                                toggle_archive = true;
-                            }
-                            if self.confirm_delete {
-                                ui.label(egui::RichText::new("Delete this chat?").small());
+                            } else {
                                 if ui
-                                    .button(egui::RichText::new("Confirm delete").color(ui.visuals().error_fg_color))
+                                    .add_enabled(!archived, egui::Button::new("Send"))
                                     .clicked()
                                 {
-                                    delete_confirmed = true;
+                                    send = true;
                                 }
-                                if ui.button("Cancel").clicked() {
-                                    delete_cancelled = true;
+                                if self.retry_payloads.contains_key(&self.store.active_id())
+                                    && ui.button("Retry").clicked()
+                                {
+                                    retry = true;
                                 }
-                            } else if ui.button("Delete").clicked() {
-                                delete = true;
                             }
-                        });
-                    }
-                }
-            });
+                        },
+                    );
+                });
 
-        if !open {
-            self.close();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if archived { "Unarchive" } else { "Archive" })
+                        .clicked()
+                    {
+                        toggle_archive = true;
+                    }
+                    if self.confirm_delete {
+                        ui.label(egui::RichText::new("Delete this chat?").small());
+                        if ui
+                            .button(
+                                egui::RichText::new("Confirm delete")
+                                    .color(ui.visuals().error_fg_color),
+                            )
+                            .clicked()
+                        {
+                            delete_confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            delete_cancelled = true;
+                        }
+                    } else if ui.button("Delete").clicked() {
+                        delete = true;
+                    }
+                });
+            }
         }
 
         if show_library {
@@ -923,32 +1060,29 @@ impl AiChatPanel {
             self.page = Page::Chat;
         }
         if let Some(id) = select_chat {
-            if self.store.select_chat(id) {
-                self.confirm_delete = false;
-                self.sync_edit_buffers();
-                self.mark_dirty();
-            }
+            self.workspace.open(id);
             self.page = Page::Chat;
         }
         if new_chat {
-            match self.store.new_chat() {
-                Ok(_) => {
-                    self.page = Page::Chat;
-                    self.confirm_delete = false;
-                    self.sync_edit_buffers();
-                    self.composer_focus_pending = true;
-                    self.mark_dirty();
-                }
-                Err(ChatStoreError::LimitReached) => {
-                    self.notice = "50 chats are already saved. Delete one before creating another."
-                        .to_string();
-                }
-                Err(_) => {}
-            }
+            self.workspace.create();
+            self.page = Page::Chat;
         }
-        if toggle_archive {
+        if toggle_archive && !self.workspace.is_pending(self.store.active_id()) {
+            let archived_id = self.store.active_id();
             match self.store.toggle_archive_active() {
                 Ok(_) => {
+                    self.workspace.changed_id(&self.store, archived_id);
+                    if self.workspace.is_shared(archived_id)
+                        && !self.workspace.is_shared(self.store.active_id())
+                    {
+                        if let Some(next) = self.workspace.rows.iter().find(|row| {
+                            !row.archived && self.workspace.id_for(archived_id) != Some(&row.id)
+                        }) {
+                            self.workspace.open(next.id.clone());
+                        } else {
+                            self.workspace.create();
+                        }
+                    }
                     self.confirm_delete = false;
                     self.sync_edit_buffers();
                     self.mark_dirty();
@@ -973,7 +1107,10 @@ impl AiChatPanel {
         if delete_cancelled {
             self.confirm_delete = false;
         }
-        if delete_confirmed {
+        if delete_confirmed && self.workspace.is_shared(self.store.active_id()) {
+            self.workspace.delete(self.store.active_id());
+            self.confirm_delete = false;
+        } else if delete_confirmed {
             match self.store.delete_active() {
                 Ok(outcome) => {
                     let id = outcome.deleted_chat_id;
@@ -991,24 +1128,15 @@ impl AiChatPanel {
                 Err(_) => self.confirm_delete = false,
             }
         }
-        if stop {
+        if stop && !self.workspace.cancel_queued(self.store.active_id()) {
             self.stop_active();
         }
         if retry {
             self.retry_active(config);
         }
         if send && !self.store.is_active_busy() {
-            let text = self.composer.trim().to_string();
-            if self.start_request(
-                config,
-                RequestPayload {
-                    user_text: text,
-                    restore_pending_as_draft: true,
-                },
-            ) {
-                self.composer.clear();
-                let _ = self.store.set_active_draft(String::new());
-            }
+            self.workspace
+                .submit(&self.store, self.composer.trim().to_owned());
         }
     }
 
@@ -1104,6 +1232,7 @@ fn chat_prompt(
 /// space in the draft — and the next failure's rollback then merges the
 /// message in front of itself, showing the question twice (and again on every
 /// further retry cycle).
+#[cfg(test)]
 fn draft_without_retry_message(retry: &str, draft: &str) -> String {
     let retry = retry.trim();
     if retry.is_empty() {
@@ -1519,10 +1648,10 @@ mod tests {
         assert_ne!(derived, jterm_core::ai::DEFAULT_CHAT_TITLE);
         let _ = panel.store.cancel_request(token, "stopped".into());
 
-        ctx.begin_pass(egui::RawInput::default());
-        panel.show(&ctx, &config);
-        let mut output = ctx.end_pass();
-        output.textures_delta.clear();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            panel.show_in_workspace(ui, &config);
+        });
+        output.drop_without_applying_deltas();
 
         assert_eq!(
             panel.title_edit, derived,

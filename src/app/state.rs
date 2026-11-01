@@ -175,7 +175,7 @@ impl Default for ReferenceInspectorState {
     fn default() -> Self {
         Self {
             sidebar_resize: Default::default(),
-            open: true,
+            open: false,
             narrow_drawer: false,
             selected_tab: ReferenceInspectorTab::Agent,
             pending: None,

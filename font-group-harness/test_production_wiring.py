@@ -2,7 +2,7 @@
 """Positive and adversarial integration-source cases for Files font ownership."""
 from pathlib import Path
 import unittest
-from production_wiring import verify_files_font_group_wiring
+from production_wiring import verify_files_font_group_wiring, verify_workspace_font_group_wiring
 
 ROOT = Path(__file__).resolve().parent.parent
 MAIN = (ROOT / 'src/main.rs').read_text()
@@ -57,6 +57,52 @@ class FilesFontWiring(unittest.TestCase):
 
     def test_missing_drawer_owner_rejected(self):
         self.rejected(MAIN.replace('reference_workspace::show_inspector_drawer(', 'reference_workspace::other_helper('))
+
+
+class WorkspaceFontWiring(unittest.TestCase):
+    def rejected(self, source):
+        self.assertNotEqual(source, MAIN, 'Mutation must change production source')
+        with self.assertRaises(AssertionError):
+            verify_workspace_font_group_wiring(source)
+
+    def test_actual_three_mode_workspace(self):
+        actual = verify_workspace_font_group_wiring(MAIN)
+        self.assertEqual(actual['routes'], ('api', 'task', 'terminal'))
+        self.assertEqual(actual['font_group'], 'Main')
+        self.assertTrue(actual['exclusive'])
+
+    def test_comments_and_whitespace_keep_same_semantics(self):
+        source = MAIN.replace('self.render_reference_rich_canvas(ui);',
+                              '/* canvas */ self . render_reference_rich_canvas ( ui ) ;')
+        self.assertTrue(verify_workspace_font_group_wiring(source)['exclusive'])
+
+    def test_ui_font_cannot_replace_main_font(self):
+        self.rejected(MAIN.replace('theme::configure_workspace_text(ui.style_mut(), self.config.font_size);',
+                                   'theme::configure_workspace_text(ui.style_mut(), self.config.effective_ui_font_size());'))
+
+    def test_unclipped_content_rejected(self):
+        self.rejected(MAIN.replace('ui.set_clip_rect(content.intersect(ui.clip_rect()));',
+                                   'ui.set_clip_rect(ui.clip_rect());'))
+
+    def test_wrong_api_surface_rejected(self):
+        self.rejected(MAIN.replace('self.ai_chat_panel.show_in_workspace(ui, &self.config);',
+                                   'self.ai_chat_panel.show_floating(ui, &self.config);'))
+
+    def test_missing_task_render_rejected(self):
+        self.rejected(MAIN.replace('.show(ui, |ui| self.render_sidebar_tasks(ui));',
+                                   '.show(ui, |ui| {});'))
+
+    def test_terminal_cannot_render_into_api_view(self):
+        self.rejected(MAIN.replace('self.ai_chat_panel.show_in_workspace(ui, &self.config);',
+                                   'self.ai_chat_panel.show_in_workspace(ui, &self.config); self.render_reference_rich_canvas(ui);'))
+
+    def test_canvas_in_comment_cannot_satisfy_guard(self):
+        self.rejected(MAIN.replace('self.render_reference_rich_canvas(ui);',
+                                   '/* self.render_reference_rich_canvas(ui); */'))
+
+    def test_content_must_be_registered_after_render(self):
+        self.rejected(MAIN.replace('.register_workspace(workspace_rect, main_panel.inner, root_ui.layer_id());',
+                                   '.register_workspace(workspace_rect, workspace_rect, root_ui.layer_id());'))
 
 
 if __name__ == '__main__':

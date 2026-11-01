@@ -78,6 +78,45 @@ def _top_level(code, match):
     return prefix.count('{') == prefix.count('}')
 
 
+def verify_workspace_font_group_wiring(main):
+    """All three center modes share the measured, clipped main-font surface."""
+    render = _function(main, 'render_ui')
+    scopes = list(re.finditer(
+        r'ui \. scope_builder \( egui :: UiBuilder :: new \( \) '
+        r'\. max_rect \( content \) , \| ui \| \{', render))
+    assert len(scopes) == 1, 'One measured center content scope required'
+    start = scopes[0].end()
+    depth = 1
+    end = start
+    while depth and end < len(render):
+        depth += (render[end] == '{') - (render[end] == '}')
+        end += 1
+    assert depth == 0, 'Unclosed center content scope'
+    body = render[start:end - 1].strip()
+    expected = _code('''
+        ui.set_clip_rect(content.intersect(ui.clip_rect()));
+        theme::configure_workspace_text(ui.style_mut(), self.config.font_size);
+        if self.ai_chat_panel.is_open {
+            self.ai_chat_panel.show_in_workspace(ui, &self.config);
+        } else if self.agent_sessions.workspace_task.is_some()
+            || self.sidebar.view == sidebar::SidebarView::Tasks {
+            egui::ScrollArea::vertical()
+                .id_salt("workspace-task-canvas")
+                .show(ui, |ui| self.render_sidebar_tasks(ui));
+        } else {
+            self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);
+            self.render_reference_rich_canvas(ui);
+        }
+    ''')
+    assert body == expected, 'API, Task and terminal must exclusively render inside the clipped main-font scope'
+    assert render[end:].startswith(' ) ; content } ) ;'), 'Center must return its measured content rectangle'
+    registration = _code('''self.font_zoom.register_workspace(
+        workspace_rect, main_panel.inner, root_ui.layer_id());''')
+    assert render.count(registration) == 1 and render.index(registration) > end, 'Register the already-rendered workspace with its measured center'
+    return {'routes': ('api', 'task', 'terminal'), 'font_group': 'Main',
+            'rectangle': 'content', 'exclusive': True}
+
+
 def verify_files_font_group_wiring(main, workspace):
     sidebar = _function(main, 'render_sidebar')
     choices = list(re.finditer(
@@ -96,7 +135,7 @@ def verify_files_font_group_wiring(main, workspace):
     dock = re.fullmatch(
         r'\w+ \. resizable \( false \) \. exact_size \( \w+ \) '
         r'\. show_separator_line \( false \) \. frame \( ' + re.escape(frame) +
-        r' \) \. show \( ' + re.escape(root) + r' , & mut ' + re.escape(renderer) + r' \)',
+        r' \) \. show_bounded \( ' + re.escape(root) + r' , & mut ' + re.escape(renderer) + r' \)',
         choice[5].strip())
     assert dock, 'Dock and drawer must call the same single renderer'
     renderers = list(re.finditer(r'let mut ' + re.escape(renderer) + r' = \| ui : & mut egui :: Ui \| \{', sidebar))

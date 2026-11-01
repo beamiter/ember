@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-from production_wiring import verify_files_font_group_wiring
+from production_wiring import verify_files_font_group_wiring, verify_workspace_font_group_wiring
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -29,7 +29,7 @@ assert ".register_workspace(workspace_rect, main_panel.inner, root_ui.layer_id()
 assert "self.render_reference_canvas_header(ui);" in main
 assert "ui.advance_cursor_after_rect(rect);" in workspace
 assert "                    self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);" in main
-assert re.search(r"self\.render_reference_rich_canvas\(ui\);\s*}\);\s*content\s*}\);", main)
+verify_workspace_font_group_wiring(main)
 # Files moves between a background dock and a modeless Area. Its measured
 # response, not the old root layer, owns the current-frame UI font region.
 verify_files_font_group_wiring(main, workspace)

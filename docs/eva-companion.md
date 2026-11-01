@@ -123,9 +123,9 @@ Coordinator installation and JWM session startup are documented in jcompanion's
 `docs/deployment.md`; native application installation does not silently enable it.
 Focused render/unit fixtures are not physical display, voice, or live API acceptance.
 
-Shared terminal core is pinned to `beamiter/jterm_core` commit `974ccad203375032fe87706caecab39ad516c238`; normal and dev/fixture dependency identities are aligned.
+Shared terminal core is pinned to `beamiter/jterm_core` commit `589a26658f548ec96ff60a53ea65804901ed5c7b`; normal and dev/fixture dependency identities are aligned.
 
-Final immutable-pin validation: `cargo check --tests --locked --offline` passed against public core `974ccad203375032fe87706caecab39ad516c238` and companion `9aa569540091524d637a7115b64c587b9177a55b`; the focused renderer harness passed **4/4**, covering 104 skin/pose shape fixtures. Native frame submission is still not physical scanout evidence.
+Earlier immutable-pin validation: `cargo check --tests --locked --offline` passed against public core `974ccad203375032fe87706caecab39ad516c238` and companion `9aa569540091524d637a7115b64c587b9177a55b`; the focused renderer harness passed **4/4**, covering 104 skin/pose shape fixtures. Native frame submission is still not physical scanout evidence.
 
 ## Local native continuation, 2026-10-30
 

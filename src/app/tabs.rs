@@ -708,6 +708,8 @@ impl TerminalApp {
     /// 在侧边栏内以垂直列表渲染会话标签(Sidebar tab 模式)。
     /// 与顶部 tab bar 行为对齐:支持按住 5px 阈值后竖向拖拽重排,松开时插入到目标行位置。
     /// 右键任意一行打开标签页操作菜单(与 anvil/forge 的侧边栏标签右键菜单同款)。
+    // Retained for legacy layout restoration and its interaction regression suite.
+    #[allow(dead_code)]
     pub fn render_sidebar_sessions(&mut self, ui: &mut egui::Ui) {
         self.refresh_unseen_flags_for_visible_panes();
         let menu_snapshot = self.tab_menu_snapshot();
@@ -1371,6 +1373,8 @@ impl TerminalApp {
         }
     }
 
+    // Retained for legacy layout restoration and its interaction regression suite.
+    #[allow(dead_code)]
     pub fn render_sidebar_mode_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let font_size = self.config.effective_ui_font_size();
         let tab_height = crate::theme::workspace_control_height(font_size) + 10.0;
@@ -1579,6 +1583,8 @@ impl TerminalApp {
         }
     }
 
+    // Retained for legacy layout restoration and its interaction regression suite.
+    #[allow(dead_code)]
     pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
         self.refresh_unseen_flags_for_visible_panes();
         let menu_snapshot = self.tab_menu_snapshot();

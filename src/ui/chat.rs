@@ -816,6 +816,9 @@ impl TerminalRenderer {
         ui: &mut egui::Ui,
         terminal: &TerminalState,
     ) {
+        if terminal.is_alt_buffer_active() || terminal.chat_native_takeover() {
+            return;
+        }
         let Some(rect) = self.foreground_footer_rect else {
             return;
         };

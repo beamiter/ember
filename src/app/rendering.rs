@@ -4819,9 +4819,7 @@ impl TerminalApp {
         // AI chats library panel: harvest streaming replies every frame (also
         // while hidden, so background chats complete and persist), then render.
         self.ai_chat_panel.drive(ctx);
-        if self.ai_chat_panel.is_open {
-            self.ai_chat_panel.show(ctx, &self.config);
-        }
+        self.ai_chat_panel.drive_workspace(ctx, &self.config);
         self.sync_organism_agent();
         // Palette `?` AI command suggestion: harvest the reply, render the
         // review card for its bound session, and apply an accept through the

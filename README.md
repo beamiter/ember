@@ -10,6 +10,12 @@ The project is under active development. It is useful as a daily terminal for
 testing, but compatibility with every TUI and escape sequence is not yet
 claimed.
 
+## Agent Workspace
+
+左侧常驻会话导航统一列出 CLI 会话、共享 API 对话、任务和普通终端。点击后在中央打开对应的真实终端或原生对话；API 草稿、历史、置顶和阅读位置由共享存储管理。CLI 会话可用 **Ctrl+]** 脱离，并在另一终端界面重新连接同一受管 PTY。任务视图默认开启，显式关闭配置仍保留。
+
+Codex 任务提供受来源校验的 **Resume native** 和历史分页；Claude 原生任务支持同一 provider session 的多轮继续。原生任务仍由当前 app 进程管理，终端 fallback 不声明转移同一原生会话。完整边界、冲突处理与验证方法见 [Agent Workspace guide](docs/agent-workspace.md)。
+
 ## Native Vim9 IDE
 
 Run `ember --ide /path/to/project` (or `ember --ide file.rs`) to open a real
@@ -491,7 +497,7 @@ ai_share_command_context = false
 command_correction_enabled = false
 
 # Experimental local task dashboard. Independent from cloud-context consent.
-experimental_task_sidebar = false
+experimental_task_sidebar = true
 
 # Host clipboard policy. Reading is more sensitive than writing.
 osc52_clipboard_write = true
@@ -820,9 +826,9 @@ authority through bounded-history eviction. Every later turn reuses the same pin
 cwd, writable root, disabled network/environment settings, private Codex home,
 and non-accepting approval policy. A new turn invalidates any older validation
 result. Validation remains locked until **Finish Codex** has stopped the full
-containment scope and reaped the provider. The native session itself is still
-single-use: once stopped, it cannot be resumed or replaced with a second native
-session for that task; cross-process `thread/resume` is not enabled.
+containment scope and reaped the provider. After a clean Finish, **Resume native** can reopen the exact saved thread and
+private profile while the current app runtime retains its provenance. It does
+not promise recovery after restarting the app; see the Agent Workspace guide.
 The native response, command, and file cards keep the current/latest turn plus
 an oldest-evicting, byte-budgeted history of compact completed-turn summaries.
 Each history entry retains its Ember-local turn identity; follow-up turns also
@@ -830,9 +836,8 @@ retain the reviewed feedback that caused them, while approval authority remains
 confined to the active turn. This is a bounded review aid rather than a durable
 transcript; the Git diff remains cumulative from the task's immutable base commit.
 
-**Start Claude skips Claude's own permission prompts; Start Kimi uses automatic
-tool permission.** Both print-mode providers can run tools automatically with
-your user account's file access. Their separate Git worktree is not a security
+**Start Claude retains Claude's permission checks; denied tools require interactive Terminal handling. Start Kimi uses automatic tool permission.** Kimi can run tools automatically with your user account's file access; Claude
+runs permitted tools and reports denied operations for interactive recovery. Their separate Git worktree is not a security
 sandbox and does not restrict file access to that directory. The task card
 shows this warning beside the start actions. Neither mode has Codex-style
 private-home or cgroup containment. **Terminal fallback** delegates interactive
@@ -1800,9 +1805,10 @@ Search normalization is shared with the other terminals and unchanged discovery
 snapshots reuse the existing index and projection.
 
 Pin a conversation with **☆ Pin session** in its details; a star marks pinned
-rows. Pins and successful resume history persist across all four terminals and
-app restarts. **Pinned only**, **Previously resumed**, and **Recently resumed**
-sorting help you return to ongoing work. Pins lead the empty **Best match** list;
+rows. Pins now use the shared source-qualified workspace database and persist
+across frontends and app restarts. **Previously resumed** and **Recently resumed**
+retain the legacy recorded resume history for migration; new workspace activity
+is reflected in the sidebar's recent conversations and managed runtime state. Pins lead the empty **Best match** list;
 search text and explicit sorting retain their usual ordering. Saving and syncing
 run in a worker, and an error is shown if a durable update fails. Organize controls
 pause only while your own change is saving, not during the periodic reload from
