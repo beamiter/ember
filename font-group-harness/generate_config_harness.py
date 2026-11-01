@@ -18,6 +18,7 @@ sidebar = (ROOT / 'src/sidebar.rs').read_text()
 terminal = (ROOT / 'src/terminal/mod.rs').read_text()
 input_source = (ROOT / 'src/app/input.rs').read_text()
 theme_source = (ROOT / 'src/theme.rs').read_text()
+glass_source = (ROOT / 'src/glass_shell.rs').read_text()
 manifest = []
 
 def block(text, marker, indent='', source='src/config_panel.rs'):
@@ -48,6 +49,14 @@ manifest.append({'source': 'src/config_panel.rs', 'marker': 'font group regressi
 sidebar_type = '#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]\n#[serde(rename_all = "snake_case")]\n' + block(sidebar, 'pub enum SidebarView {', source='src/sidebar.rs')
 terminal_clamp = block(terminal, 'pub fn clamp_terminal_dimensions(', source='src/terminal/mod.rs')
 terminal_constants = '\n'.join(line for line in terminal.splitlines() if line.startswith(('pub const MAX_TERMINAL_COLS:', 'pub const MAX_TERMINAL_ROWS:')))
+panel_width_names = ('NAVIGATION_MIN_WIDTH', 'NAVIGATION_MAX_WIDTH',
+                     'INSPECTOR_MIN_WIDTH', 'INSPECTOR_MAX_WIDTH')
+panel_width_lines = [line for line in glass_source.splitlines()
+                     if any(line.startswith(f'pub const {name}:') for name in panel_width_names)]
+assert len(panel_width_lines) == len(panel_width_names), 'All production panel width bounds required'
+panel_widths = '\n'.join(panel_width_lines)
+manifest.append({'source': 'src/glass_shell.rs', 'marker': 'panel width bounds',
+                 'sha256': hashlib.sha256(panel_widths.encode()).hexdigest()})
 for name in ['src/config.rs', 'src/persistence_file.rs']:
     manifest.append({'source': name, 'included_whole': True,
                      'sha256': hashlib.sha256((ROOT / name).read_bytes()).hexdigest()})
@@ -114,6 +123,8 @@ pub mod agent {
     }
 }
 mod theme { #[derive(Clone, Debug)] pub struct Theme; __PRODUCTION_THEME_FUNCTIONS__ }
+// Configuration normalization uses the exact production layout bounds.
+mod glass_shell { __PRODUCTION_PANEL_WIDTHS__ }
 mod organism_ui { #[derive(Default)] pub struct PreviewUi; }
 #[path = "../src/persistence_file.rs"] mod persistence_file;
 #[path = "../src/config.rs"] mod config;
@@ -121,6 +132,7 @@ mod organism_ui { #[derive(Default)] pub struct PreviewUi; }
 '''
 
 stubs = stubs.replace('__PRODUCTION_THEME_FUNCTIONS__', theme_functions)
+stubs = stubs.replace('__PRODUCTION_PANEL_WIDTHS__', panel_widths)
 
 consumer_tests = r'''
     use crate::{config, font_zoom::{FontGroup, FontZoom}};

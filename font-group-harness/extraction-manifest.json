@@ -19,12 +19,12 @@
     {
       "source": "src/config_panel.rs",
       "marker": "pub struct ConfigPanel {",
-      "sha256": "0bf8ca92f36c1271dd4a89664abc032d06d70acf0c7aabd69e4152bcf7e33da8"
+      "sha256": "61a91532e85606ecab16758ec7c54269fad7dab7459084527db3a3ecb8b12ed1"
     },
     {
       "source": "src/config_panel.rs",
       "marker": "    pub fn new() -> Self {",
-      "sha256": "31bc56beda4933e7b46fd92fc85e491bd60900eb7f8f2e5d9298f191f3324bae"
+      "sha256": "c5d92b105e81d66106f80354554e13da9ef807ecde4ea695015e3d45a967a391"
     },
     {
       "source": "src/config_panel.rs",
@@ -34,7 +34,7 @@
     {
       "source": "src/config_panel.rs",
       "marker": "    pub fn sync_from_config(",
-      "sha256": "fded215fa42b6e619e4f14cd2b8c155a2ade50503a329c07432b023e91956e5c"
+      "sha256": "5a022b14484b17d8d96582040e4dff53999fbd34b1b2346a9cb5762ff910b825"
     },
     {
       "source": "src/config_panel.rs",
@@ -44,7 +44,7 @@
     {
       "source": "src/config_panel.rs",
       "marker": "    pub fn apply_to_config(",
-      "sha256": "cb01feef45db398221263d68a05e29ed4e5df44206759d797645c628e294bb0c"
+      "sha256": "414621eded80c5ee24cd0e00028a436e3b3fcbb95f279f4671a367210d0bcac0"
     },
     {
       "source": "src/config_panel.rs",
@@ -72,9 +72,14 @@
       "sha256": "c02dbee2796fbd4b0aaa0c648100c4b459f3e230906e0075830ac10843f7c570"
     },
     {
+      "source": "src/glass_shell.rs",
+      "marker": "panel width bounds",
+      "sha256": "8de4c184ce8be1ad3431b718e73b6b41a20e828e2eb651c76992f353a7981f76"
+    },
+    {
       "source": "src/config.rs",
       "included_whole": true,
-      "sha256": "04412c030989eb9d1e6ded70a7bcddfc954f2b212650f21d8f5b053164b2128f"
+      "sha256": "88362da20409bda679c5b28d96f30f0249bf74eb9e6d0acd1a16b20b839e8d15"
     },
     {
       "source": "src/persistence_file.rs",
