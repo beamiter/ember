@@ -3,12 +3,18 @@
 pub(crate) struct ScrollBookmark {
     offset: f32,
     restore: bool,
+    last_visible: Option<bool>,
 }
 impl ScrollBookmark {
     pub fn toggled(&mut self, visible: bool) {
         self.restore = visible;
+        self.last_visible = Some(visible);
     }
     pub fn restore_offset(&mut self, visible: bool) -> Option<f32> {
+        if visible && self.last_visible == Some(false) {
+            self.restore = true;
+        }
+        self.last_visible = Some(visible);
         if visible && std::mem::take(&mut self.restore) {
             Some(self.offset)
         } else {
@@ -35,5 +41,14 @@ mod tests {
         state.record(false, true, 0.0); // a delayed collapsed-frame callback
         assert_eq!(state.restore_offset(true), Some(240.0));
         assert_eq!(state.restore_offset(true), None);
+    }
+    #[test]
+    fn settings_visibility_changes_restore_the_same_navigation_scroll() {
+        let mut state = ScrollBookmark::default();
+        assert_eq!(state.restore_offset(true), None);
+        state.record(true, true, 312.0);
+        assert_eq!(state.restore_offset(false), None);
+        state.record(false, false, 0.0);
+        assert_eq!(state.restore_offset(true), Some(312.0));
     }
 }
