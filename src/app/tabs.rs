@@ -708,8 +708,7 @@ impl TerminalApp {
     /// 在侧边栏内以垂直列表渲染会话标签(Sidebar tab 模式)。
     /// 与顶部 tab bar 行为对齐:支持按住 5px 阈值后竖向拖拽重排,松开时插入到目标行位置。
     /// 右键任意一行打开标签页操作菜单(与 anvil/forge 的侧边栏标签右键菜单同款)。
-    // Retained for legacy layout restoration and its interaction regression suite.
-    #[allow(dead_code)]
+    // Used when Agent Workspace navigation is disabled.
     pub fn render_sidebar_sessions(&mut self, ui: &mut egui::Ui) {
         self.refresh_unseen_flags_for_visible_panes();
         let menu_snapshot = self.tab_menu_snapshot();
@@ -1018,6 +1017,9 @@ impl TerminalApp {
             self.schedule_session_save();
         }
         if let Some(i) = switch_to {
+            self.ai_chat_panel.close();
+            self.agent_sessions.workspace_task = None;
+            self.sidebar.view = crate::sidebar::SidebarView::Sessions;
             self.activate_tab(i);
         }
         if let Some(i) = close_idx {
@@ -1026,6 +1028,9 @@ impl TerminalApp {
             }
         }
         if new_session {
+            self.ai_chat_panel.close();
+            self.agent_sessions.workspace_task = None;
+            self.sidebar.view = crate::sidebar::SidebarView::Sessions;
             self.new_tab();
         }
         // 右键菜单的操作在渲染闭包外统一执行。重命名走列表内的行内编辑器,

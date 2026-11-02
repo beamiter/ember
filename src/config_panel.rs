@@ -126,6 +126,7 @@ pub struct ConfigPanel {
     edit_font_family: String,
     edit_theme: String,
     edit_restore_session: bool,
+    edit_agent_workspace_enabled: bool,
     edit_opacity: f32,
     pub edit_debug_overlay: bool,
     edit_gpu_rendering: bool,
@@ -208,6 +209,7 @@ impl ConfigPanel {
             edit_font_family: String::new(),
             edit_theme: "dark".to_string(),
             edit_restore_session: false,
+            edit_agent_workspace_enabled: true,
             edit_debug_overlay: false,
             edit_gpu_rendering: true,
             edit_app_renderer: AppRendererType::Glow,
@@ -338,6 +340,7 @@ impl ConfigPanel {
         self.edit_font_family = config.font_family.clone();
         self.edit_theme = config.theme.clone();
         self.edit_restore_session = config.restore_session;
+        self.edit_agent_workspace_enabled = config.agent_workspace_enabled;
         self.edit_opacity = config.opacity;
         self.edit_gpu_rendering = config.gpu_rendering;
         self.edit_app_renderer = config.app_renderer;
@@ -406,6 +409,7 @@ impl ConfigPanel {
         config.font_family = self.edit_font_family.clone();
         config.theme = self.edit_theme.clone();
         config.restore_session = self.edit_restore_session;
+        config.agent_workspace_enabled = self.edit_agent_workspace_enabled;
         config.opacity = self.edit_opacity;
         config.gpu_rendering = self.edit_gpu_rendering;
         config.app_renderer = self.edit_app_renderer;
@@ -1613,6 +1617,17 @@ impl ConfigPanel {
 
     fn render_advanced_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ConfigAction>) {
         ui.label(RichText::new("Advanced Settings").strong().size(14.0));
+        ui.separator();
+        if ui
+            .checkbox(
+                &mut self.edit_agent_workspace_enabled,
+                "Show Agent Workspace in sidebar",
+            )
+            .on_hover_text("Turn off to keep a compact terminal tab list")
+            .changed()
+        {
+            self.has_changes = true;
+        }
         ui.separator();
 
         ui.horizontal(|ui| {

@@ -166,6 +166,8 @@ pub enum Command {
 
     // === 侧边栏 ===
     SidebarToggle,
+    /// Switch the sidebar between Agent Workspace and terminal tabs.
+    AgentWorkspaceToggle,
     /// Agent 面板（按命令逐条批准后才执行）。默认 `ctrl+alt+g`——与
     /// anvil/forge/frost 的 `OpenAgent` 同键位。此前 ember 把它放在
     /// Ctrl+Shift+Alt+A 上，而那个键位在其余三个终端都是 AI 聊天面板：
@@ -301,6 +303,7 @@ impl std::fmt::Display for Command {
             Command::ConfigToggle => write!(f, "config:toggle"),
             Command::DebugToggle => write!(f, "debug:toggle"),
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
+            Command::AgentWorkspaceToggle => write!(f, "agent_workspace:toggle"),
             Command::AgentToggle => write!(f, "agent:toggle"),
             Command::AgentSessions => write!(f, "agent:sessions"),
             Command::TaskToggle => write!(f, "task:toggle"),
@@ -416,6 +419,7 @@ impl std::str::FromStr for Command {
             "config:toggle" => Ok(Command::ConfigToggle),
             "debug:toggle" => Ok(Command::DebugToggle),
             "sidebar:toggle" => Ok(Command::SidebarToggle),
+            "agent_workspace:toggle" => Ok(Command::AgentWorkspaceToggle),
             "agent:toggle" => Ok(Command::AgentToggle),
             "agent:sessions" => Ok(Command::AgentSessions),
             "task:toggle" => Ok(Command::TaskToggle),
@@ -1195,6 +1199,7 @@ mod tests {
             Command::WorkflowPickerToggle,
             Command::AiChatToggle,
             Command::TaskToggle,
+            Command::AgentWorkspaceToggle,
         ] {
             assert_eq!(command.to_string().parse::<Command>().unwrap(), command);
         }

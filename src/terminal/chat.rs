@@ -306,7 +306,6 @@ impl super::TerminalState {
                 .and_then(|(absolute, _)| self.raw_row_id_at_absolute(absolute))
                 .and_then(|row_id| plan.raw_cell_document_row(RawCellAnchor { row_id, column: 0 }));
             if let Some(start) = plan.chat_dock_start {
-                let input_rows = plan.document_rows().saturating_sub(start);
                 if plan
                     .document_rows()
                     .saturating_sub(start)
@@ -319,25 +318,9 @@ impl super::TerminalState {
                             column: origin.col_start,
                         })
                     }) {
-                        // Leave exactly two blank rows below the real input,
-                        // including multiline prompts and completion content.
-                        // Short viewports retain history and toolbar space
-                        // before adding this display-only padding.
-                        let padding_rows = 2_usize.min(
-                            self.grid
-                                .rows()
-                                .saturating_sub(input_rows)
-                                .saturating_sub(footer_rows)
-                                .saturating_sub(1),
-                        );
-                        for _ in 0..padding_rows {
-                            plan.rows.push_back(ProjectionPlanRow {
-                                raw_slices: SmallVec::new(),
-                                row_source: None,
-                                wrapped: false,
-                                kind: ProjectedRowKind::Padding,
-                            });
-                        }
+                        // The footer already reserves the controls and their
+                        // pixel gap. Extra terminal rows here leave a large
+                        // empty band below multiline input.
                         for index in 0..footer_rows {
                             plan.rows.push_back(ProjectionPlanRow {
                                 raw_slices: SmallVec::new(),

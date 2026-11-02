@@ -1884,6 +1884,11 @@ impl TerminalApp {
             },
         ));
 
+        if !self.config.agent_workspace_enabled {
+            self.render_sidebar_sessions(ui);
+            return;
+        }
+
         let old_filter = self.agent_sessions.filter_key();
         let search = ui.add(
             egui::TextEdit::singleline(&mut self.agent_sessions.query)
