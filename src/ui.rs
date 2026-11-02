@@ -462,6 +462,22 @@ fn key_to_terminal_sequence(
 /// Each arm also spells out its unmodified bytes verbatim. That redundancy is
 /// deliberate: applications look these up through terminfo, so an unmodified
 /// press (SS3 form under DECCKM included) must stay byte-identical.
+/// Main-screen Page keys belong exclusively to the host reading viewport.
+/// Alternate-screen applications retain plain Page keys; Shift is the explicit
+/// scrollback override. Modified application shortcuts never move both owners.
+pub(crate) fn viewport_owns_page_key(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+    alt_screen: bool,
+) -> bool {
+    matches!(key, egui::Key::PageUp | egui::Key::PageDown)
+        && !modifiers.ctrl
+        && !modifiers.alt
+        && !modifiers.command
+        && !modifiers.mac_cmd
+        && (!alt_screen || modifiers.shift)
+}
+
 fn legacy_function_key_sequence(
     key: egui::Key,
     modifiers: egui::Modifiers,
@@ -471,11 +487,9 @@ fn legacy_function_key_sequence(
     // 1 is the "no modifier" parameter value; xterm omits it entirely.
     let modified = modifier > 1;
 
-    // Shift+PageUp/PageDown belong to the scrollback, as in xterm and in
-    // frost, so the viewport is their only handler. `viewport_scroll_delta`
-    // scrolls on every non-ctrl Page press, and this path used to also send a
-    // sequence for the shifted form — the pane and a full-screen app both moved
-    // on one keystroke.
+    // Shift+PageUp/PageDown explicitly belong to host scrollback. The full
+    // event encoder additionally withholds plain main-screen Page keys before
+    // Kitty or modifyOtherKeys encoding can forward them to the application.
     if modifiers.shift
         && !modifiers.ctrl
         && !modifiers.alt
@@ -940,9 +954,9 @@ fn stable_summary_activation(
         .then(|| press.record_id.clone())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ProjectedScrollRequest {
-    SetOffset(usize),
+    SetPixelOffset(f64),
     Delta(isize),
 }
 
@@ -1510,6 +1524,7 @@ pub struct TerminalRenderer {
     pub dragging_scrollbar: bool,
     scrollbar_grab_offset: f32,
     scrollbar_terminal: Option<usize>,
+    scrollbar_input_frame: Option<(usize, f64)>,
     /// Stable terminal identity selected by a local primary-button press.
     /// This locks Shift bypass through release and prevents a renderer reused
     /// by another tab/pane from applying an in-flight drag to the new terminal.
@@ -1702,6 +1717,7 @@ impl TerminalRenderer {
             dragging_scrollbar: false,
             scrollbar_grab_offset: 0.0,
             scrollbar_terminal: None,
+            scrollbar_input_frame: None,
             local_selection_terminal: None,
             scrollbar_visibility,
             theme,
@@ -1908,6 +1924,27 @@ impl TerminalRenderer {
         policy: &crate::terminal::ProjectionPolicy,
         view_state: &mut crate::terminal::ProjectionViewState,
     ) -> ProjectedViewport {
+        // A main-screen CLI may own cursor/redraw/input while its retained
+        // output still belongs to one continuous reading document. Use the raw
+        // identity plan, with no Chat composer or synthetic command rows.
+        // Alternate screens, graphics and native Vim keep their native path.
+        if self.block_mode
+            && policy.chat_mode()
+            && terminal.chat_native_takeover()
+            && !terminal.is_alt_buffer_active()
+            && terminal.kitty_graphics.get_placements().is_empty()
+            && self.native_vim9_identity.is_none()
+        {
+            let mut raw = crate::terminal::ProjectionPolicy::new();
+            raw.set_retain_identity_canvas(true);
+            return terminal.projected_viewport_with_rows(
+                self.history_projection,
+                true,
+                &raw,
+                view_state,
+                None,
+            );
+        }
         terminal.projected_viewport_with_rows(
             self.history_projection,
             self.block_mode,
@@ -2087,6 +2124,194 @@ impl TerminalRenderer {
         self.requested_collapsed_zone_ids.clear();
         self.requested_collapsed_zone_ids
             .extend(policy.collapsed_zone_ids());
+    }
+
+    /// Admit an absolute drag before canvas presentation, exactly as wheel and
+    /// keyboard input are admitted before drawing their destination. A request
+    /// applied after drawing otherwise leaves the held thumb one frame behind
+    /// and can stay stale when no subsequent pointer event arrives.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_canvas_scrollbar(
+        &mut self,
+        terminal: &mut TerminalState,
+        policy: &crate::terminal::ProjectionPolicy,
+        state: &mut crate::terminal::ProjectionViewState,
+        canvas: &mut crate::transcript_canvas::TranscriptCanvas,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        interaction_enabled: bool,
+        focus_enabled: bool,
+    ) {
+        if !self.dragging_scrollbar
+            && !ctx.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
+        {
+            return;
+        }
+        let viewport = self.projected_viewport_with_state(terminal, policy, state);
+        // While captured, the pointer owns the presented coordinate even if a
+        // queued wheel/page destination was admitted before this frame.
+        if self.dragging_scrollbar {
+            canvas.stop();
+        }
+        if let Some(request) = self.scrollbar_input(
+            ctx,
+            terminal as *const TerminalState as usize,
+            &viewport,
+            rect,
+            interaction_enabled,
+            focus_enabled,
+        ) {
+            match request {
+                ProjectedScrollRequest::SetPixelOffset(pixels) => {
+                    if !canvas.seek_pixels(pixels) {
+                        let row = (pixels / f64::from(self.line_height.max(1.0))).round() as usize;
+                        if viewport.is_transformed() {
+                            state.set_offset(row, &viewport);
+                        } else {
+                            terminal.scroll_offset = row.min(viewport.max_scroll_offset());
+                        }
+                    }
+                }
+                ProjectedScrollRequest::Delta(rows) => {
+                    if !canvas.page(rows, self.line_height) {
+                        if viewport.is_transformed() {
+                            state.scroll(rows, &viewport);
+                        } else {
+                            terminal.scroll(rows);
+                        }
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn scrollbar_track(
+        &self,
+        viewport: &ProjectedViewport,
+        rect: egui::Rect,
+    ) -> (egui::Rect, egui::Rect) {
+        let (content, mut track) = self.layout_rects(rect);
+        if let Some(composer) = viewport.chat_composer_rows() {
+            track.max.y = track
+                .max
+                .y
+                .min(self.shared_composer_rect(content, composer).top());
+        }
+        // Include the empty gap and right padding, never real terminal cells.
+        let hit = egui::Rect::from_min_max(
+            egui::pos2(content.right(), track.top()),
+            egui::pos2(rect.right(), track.bottom()),
+        );
+        (track, hit)
+    }
+
+    fn scrollbar_geometry(
+        &self,
+        viewport: &ProjectedViewport,
+        track: egui::Rect,
+    ) -> Option<(egui::Rect, f32, f32, f32)> {
+        let range = viewport.max_scroll_offset();
+        if range == 0 || viewport.document_rows() <= viewport.visible_rows() {
+            return None;
+        }
+        let height = track.height();
+        let thumb_height =
+            Self::scrollbar_thumb_height(viewport.visible_rows(), viewport.document_rows(), height);
+        let offset = (viewport.scroll_offset() as f32
+            - self.canvas_geometry.translation / self.line_height.max(1.0))
+        .clamp(0.0, range as f32);
+        let y = height - thumb_height - offset / range as f32 * (height - thumb_height);
+        Some((
+            egui::Rect::from_min_size(
+                egui::pos2(track.left(), track.top() + y),
+                egui::vec2(track.width(), thumb_height),
+            ),
+            height,
+            thumb_height,
+            range as f32,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scrollbar_input(
+        &mut self,
+        ctx: &egui::Context,
+        terminal: usize,
+        viewport: &ProjectedViewport,
+        rect: egui::Rect,
+        interaction_enabled: bool,
+        focus_enabled: bool,
+    ) -> Option<ProjectedScrollRequest> {
+        let frame = (terminal, ctx.input(|input| input.time));
+        if self.scrollbar_input_frame == Some(frame) {
+            return None;
+        }
+        self.scrollbar_input_frame = Some(frame);
+        if !interaction_enabled || !focus_enabled {
+            self.dragging_scrollbar = false;
+            return None;
+        }
+        if self.scrollbar_terminal != Some(terminal) {
+            self.dragging_scrollbar = false;
+        }
+        let (track, hit) = self.scrollbar_track(viewport, rect);
+        let Some((thumb, height, thumb_height, range)) = self.scrollbar_geometry(viewport, track)
+        else {
+            self.dragging_scrollbar = false;
+            return None;
+        };
+        let pressed = ctx.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+        let released =
+            ctx.input(|input| input.pointer.button_released(egui::PointerButton::Primary));
+        let mut grabbed = false;
+        if pressed {
+            if let Some(pos) = ctx
+                .input(|input| input.pointer.press_origin())
+                .filter(|pos| hit.contains(*pos))
+            {
+                if pos.y >= thumb.top() && pos.y <= thumb.bottom() {
+                    self.dragging_scrollbar = true;
+                    grabbed = true;
+                    self.scrollbar_terminal = Some(terminal);
+                    self.scrollbar_grab_offset = pos.y - thumb.top();
+                } else {
+                    let page = viewport.visible_rows().saturating_sub(2).max(1) as isize;
+                    return Some(ProjectedScrollRequest::Delta(if pos.y < thumb.top() {
+                        page
+                    } else {
+                        -page
+                    }));
+                }
+            }
+        }
+        let held = ctx.input(|input| input.pointer.primary_down());
+        let request = if self.dragging_scrollbar && (held || released) {
+            // The scrollbar owns the entire gesture once pressed. Its pointer
+            // remains authoritative outside the six-pixel rail or pane bounds.
+            ctx.input(|input| input.pointer.interact_pos())
+                .and_then(|pos| {
+                    let usable = height - thumb_height;
+                    if usable <= 0.0 {
+                        return None;
+                    }
+                    let y = (pos.y - track.top() - self.scrollbar_grab_offset).clamp(0.0, usable);
+                    let rows = (usable - y) / usable * range;
+                    let presented = viewport.scroll_offset() as f32
+                        - self.canvas_geometry.translation / self.line_height.max(1.0);
+                    (grabbed || (rows - presented).abs() > 0.0001).then_some(
+                        ProjectedScrollRequest::SetPixelOffset(f64::from(
+                            rows * self.line_height.max(1.0),
+                        )),
+                    )
+                })
+        } else {
+            None
+        };
+        if !held {
+            self.dragging_scrollbar = false;
+        }
+        request
     }
 
     pub fn take_projected_scroll_request(&mut self) -> Option<ProjectedScrollRequest> {
@@ -5088,119 +5313,28 @@ impl TerminalRenderer {
         }
         let local_selection_enabled = self.local_selection_terminal == Some(rendered_terminal);
 
-        // Compute thumb rect and related values for interaction
-        let scrollbar_thumb_rect: Option<(egui::Rect, f32, f32, f32)> =
-            if projected_scroll_range > 0 {
-                let total_lines = viewport.document_rows();
-                let visible_lines = viewport.visible_rows();
-                if total_lines > visible_lines {
-                    let scrollbar_height = scrollbar_rect.height();
-                    let thumb_height =
-                        Self::scrollbar_thumb_height(visible_lines, total_lines, scrollbar_height);
-                    // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
-                    let thumb_y = scrollbar_height
-                        - thumb_height
-                        - ((viewport.scroll_offset() as f32
-                            - self.canvas_geometry.translation / line_height)
-                            / projected_scroll_range as f32)
-                            * (scrollbar_height - thumb_height);
-                    let thumb_rect = egui::Rect::from_min_size(
-                        egui::pos2(scrollbar_x, scrollbar_rect.top() + thumb_y),
-                        egui::vec2(scrollbar_width, thumb_height),
-                    );
-                    Some((
-                        thumb_rect,
-                        scrollbar_height,
-                        thumb_height,
-                        projected_scroll_range as f32,
-                    ))
-                } else {
-                    None
-                }
+        let scrollbar_thumb_rect = self.scrollbar_geometry(&viewport, scrollbar_rect);
+        if let Some(request) = self.scrollbar_input(
+            ctx,
+            rendered_terminal,
+            &viewport,
+            rect,
+            interaction_enabled,
+            focus_enabled,
+        ) {
+            if viewport.is_transformed() {
+                self.projected_scroll_request = Some(request);
             } else {
-                None
-            };
-
-        // Capture the press itself: egui's drag threshold may already have
-        // moved the pointer outside a short thumb by drag_started().
-        if self.scrollbar_terminal != Some(rendered_terminal) {
-            self.dragging_scrollbar = false;
-        }
-        if interaction_enabled && primary_pressed {
-            if let Some(pos) = ctx.input(|i| i.pointer.press_origin()) {
-                if scrollbar_rect.contains(pos) {
-                    if let Some((thumb_rect, ..)) = scrollbar_thumb_rect {
-                        if thumb_rect.contains(pos) {
-                            self.dragging_scrollbar = true;
-                            self.scrollbar_terminal = Some(rendered_terminal);
-                            self.scrollbar_grab_offset = pos.y - thumb_rect.top();
-                        }
+                match request {
+                    ProjectedScrollRequest::SetPixelOffset(pixels) => {
+                        terminal.scroll_offset =
+                            ((pixels / f64::from(line_height.max(1.0))).round() as usize)
+                                .min(projected_scroll_range);
                     }
+                    ProjectedScrollRequest::Delta(rows) => terminal.scroll(rows),
                 }
             }
-        }
-
-        // Scrollbar drag: update scroll_offset while dragging thumb
-        if interaction_enabled && self.dragging_scrollbar && ctx.input(|i| i.pointer.primary_down())
-        {
-            if let Some(pos) = response.interact_pointer_pos() {
-                if let Some((_, scrollbar_height, thumb_height, scrollback_len_f)) =
-                    scrollbar_thumb_rect
-                {
-                    let track_height = scrollbar_height - thumb_height;
-                    if track_height > 0.0 {
-                        // 反转逻辑：向上拖动看历史（增大scroll_offset），向下拖动看最新（减小scroll_offset）
-                        let relative_y =
-                            (pos.y - scrollbar_rect.top() - self.scrollbar_grab_offset)
-                                .clamp(0.0, track_height);
-                        let new_offset = (((track_height - relative_y) / track_height)
-                            * scrollback_len_f)
-                            .round() as usize;
-                        let new_offset = new_offset.min(projected_scroll_range);
-                        // Like wheel scrolling, dragging the scrollbar only
-                        // moves the viewport. Selection endpoints are anchored
-                        // in absolute buffer coordinates and remain valid.
-                        if viewport.is_transformed() {
-                            self.projected_scroll_request =
-                                Some(ProjectedScrollRequest::SetOffset(new_offset));
-                        } else {
-                            terminal.scroll_offset = new_offset;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Reset dragging state when mouse released
-        if !ctx.input(|i| i.pointer.primary_down()) {
-            self.dragging_scrollbar = false;
-        }
-
-        // Click in scrollbar track (not on thumb): page up/down
-        if interaction_enabled && primary_pressed && !self.dragging_scrollbar {
-            if let Some(pos) = response.interact_pointer_pos() {
-                if scrollbar_rect.contains(pos) && projected_scroll_range > 0 {
-                    if let Some((thumb_rect, ..)) = scrollbar_thumb_rect {
-                        if pos.y < thumb_rect.top() {
-                            // Click above thumb: scroll up (see older history)
-                            if viewport.is_transformed() {
-                                self.projected_scroll_request =
-                                    Some(ProjectedScrollRequest::Delta(rows as isize));
-                            } else {
-                                terminal.scroll(rows as isize);
-                            }
-                        } else if pos.y > thumb_rect.bottom() {
-                            // Click below thumb: scroll down (see newest content)
-                            if viewport.is_transformed() {
-                                self.projected_scroll_request =
-                                    Some(ProjectedScrollRequest::Delta(-(rows as isize)));
-                            } else {
-                                terminal.scroll(-(rows as isize));
-                            }
-                        }
-                    }
-                }
-            }
+            ctx.request_repaint();
         }
 
         // Resolve the finished-card hit before any terminal selection/cursor
@@ -5208,7 +5342,7 @@ impl TerminalRenderer {
         // encoding, so a historical card and a live mouse-reporting app never
         // both consume the same edge.
         let click_pos = response.interact_pointer_pos();
-        let pointer_in_content = click_pos.is_some_and(|pos| pos.x < scrollbar_x);
+        let pointer_in_content = click_pos.is_some_and(|pos| content_rect.contains(pos));
         let block_hit = click_pos.and_then(|pos| {
             self.finished_block_at_position(
                 block_chrome.as_deref()?,
@@ -5950,7 +6084,9 @@ impl TerminalRenderer {
                 // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
                 let thumb_y = scrollbar_height
                     - thumb_height
-                    - (viewport.scroll_offset() as f32 / scrollback_len_f)
+                    - ((viewport.scroll_offset() as f32
+                        - self.canvas_geometry.translation / line_height)
+                        / scrollback_len_f)
                         * (scrollbar_height - thumb_height);
                 let thumb_rect = egui::Rect::from_min_size(
                     egui::pos2(scrollbar_x, scrollbar_rect.top() + thumb_y),
@@ -7242,7 +7378,7 @@ impl TerminalRenderer {
         xterm_modify_other_keys: u16,
         xterm_format_other_keys: u16,
         application_cursor_keys: bool,
-        _alt_screen: bool,
+        alt_screen: bool,
         meta_sends_escape: bool,
         alt_held: bool,
         events: &[egui::Event],
@@ -7294,7 +7430,9 @@ impl TerminalRenderer {
                     modifiers,
                     ..
                 } => {
-                    if is_modifier_only_key(*key) {
+                    if is_modifier_only_key(*key)
+                        || viewport_owns_page_key(*key, *modifiers, alt_screen)
+                    {
                         continue;
                     }
                     let consumed_name = consumed_key_name(*key, *modifiers);
@@ -9305,6 +9443,62 @@ mod tests {
             .as_deref(),
             Some("\x1b[Z")
         );
+    }
+
+    #[test]
+    fn host_page_keys_never_reach_cli_keyboard_protocols() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        for key in [egui::Key::PageUp, egui::Key::PageDown] {
+            for alt_screen in [false, true] {
+                for modifiers in [
+                    egui::Modifiers::NONE,
+                    egui::Modifiers::SHIFT,
+                    egui::Modifiers::CTRL,
+                    egui::Modifiers::ALT,
+                    egui::Modifiers::COMMAND,
+                ] {
+                    for flags in [0, 1, 8, 9] {
+                        let event = egui::Event::Key {
+                            key,
+                            physical_key: Some(key),
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                        };
+                        let mut bytes = Vec::new();
+                        renderer.handle_keyboard_input(
+                            &egui::Context::default(),
+                            &mut bytes,
+                            &std::collections::HashSet::new(),
+                            false,
+                            flags,
+                            false,
+                            0,
+                            0,
+                            false,
+                            alt_screen,
+                            true,
+                            modifiers.alt,
+                            std::slice::from_ref(&event),
+                        );
+                        if viewport_owns_page_key(key, modifiers, alt_screen) {
+                            assert!(
+                                bytes.is_empty(),
+                                "host key leaked: {key:?} {modifiers:?} flags={flags}"
+                            );
+                        } else if !modifiers.command {
+                            assert!(!bytes.is_empty(), "application page key swallowed");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -11998,6 +12192,135 @@ mod transcript_canvas_tests {
                     == text
             })
             .expect("visible fixture text")
+    }
+
+    #[test]
+    fn transcript_canvas_scrollbar_drag_is_presented_in_the_same_frame_and_keeps_capture() {
+        let (mut renderer, _, policy) = fixture(true);
+        let mut terminal = TerminalState::new(40, 16);
+        for index in 0..180 {
+            terminal.process_input(format!("resumed CLI row {index:03}\r\n").as_bytes());
+        }
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 360.0));
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let initial =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        let (track, hit) = renderer.scrollbar_track(&initial, screen);
+        let (thumb, height, thumb_height, range) =
+            renderer.scrollbar_geometry(&initial, track).unwrap();
+        let grab = thumb_height * 0.75;
+        // The real rail is six pixels wide; its empty right padding belongs to
+        // the same affordance, while real terminal cells remain untouched.
+        let press = egui::pos2(hit.right() - 1.0, thumb.top() + grab);
+        let moved = egui::pos2(screen.right() + 25.0, track.top() + 90.0 + grab);
+        let released = egui::pos2(screen.right() + 25.0, track.top() + 60.0 + grab);
+        let expected_rows = |point: egui::Pos2| {
+            let usable = height - thumb_height;
+            (usable - (point.y - track.top() - grab).clamp(0.0, usable)) / usable * range
+        };
+        let mut held_anchor = None;
+        for (step, point) in [
+            (0, press),
+            (1, press),
+            (2, moved),
+            (3, moved),
+            (4, released),
+            (5, released),
+        ] {
+            let mut events = if step == 3 || step == 5 {
+                Vec::new()
+            } else {
+                vec![egui::Event::PointerMoved(point)]
+            };
+            if step == 1 || step == 4 {
+                events.push(egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: step == 1,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(screen), time: Some(1.0 + step as f64 / 60.0), events,
+                ..Default::default()
+            }, |ui| {
+                if step == 1 || step == 3 {
+                    assert!(canvas.page(30, renderer.line_height));
+                }
+                renderer.prepare_canvas_scrollbar(
+                    &mut terminal, &policy, &mut state, &mut canvas, &ctx, screen, true, true,
+                );
+                if step == 1 || step == 3 {
+                    // A stationary grab/hold must retire an older wheel/page
+                    // destination without waiting for a pixel of drag.
+                    let held = canvas.present(state.offset_from_bottom(), initial.document_rows(),
+                        initial.plan_revision().unwrap_or(0), initial.visible_rows(), initial.columns(),
+                        state.follows_bottom(), renderer.line_height, 1.0 + step as f64 / 60.0, false);
+                    assert!(!held.animating);
+                }
+                let viewport = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+                if step >= 2 {
+                    let presented = viewport.scroll_offset() as f32
+                        - renderer.canvas_geometry.translation / renderer.line_height;
+                    let expected = expected_rows(if step < 4 { moved } else { released });
+                    assert!((presented - expected).abs() < 0.001,
+                        "drag must appear before this frame is painted: step={step}, {presented} != {expected}");
+                    assert!(!state.follows_bottom());
+                    if step == 2 { held_anchor = viewport.first_raw_anchor_in_row(0); }
+                    if step == 3 { assert_eq!(viewport.first_raw_anchor_in_row(0), held_anchor); }
+                }
+                renderer.set_projection_frame(&terminal, viewport, &policy);
+                renderer.render_in_rect(ui, &mut terminal, true, true, true,
+                    &crate::search::SearchState::default(), &[], &None, screen);
+                assert!(renderer.take_projected_scroll_request().is_none(),
+                    "prepaint drag must not leave another mutation after painting");
+            });
+            output.textures_delta.clear();
+            if step == 1 || step == 2 || step == 3 {
+                assert!(renderer.dragging_scrollbar);
+            }
+            if step >= 4 {
+                assert!(!renderer.dragging_scrollbar);
+            }
+            assert!(!terminal.has_text_selection());
+            assert!(renderer.cursor_move_input.is_empty());
+        }
+    }
+
+    #[test]
+    fn transcript_canvas_main_screen_cli_retains_native_cells_and_reading_anchor() {
+        let (mut renderer, _, policy) = fixture(true);
+        let mut terminal = TerminalState::new(40, 16);
+        for n in 0..100 {
+            terminal.process_input(format!("CLI output {n:03}\r\n").as_bytes());
+        }
+        assert!(terminal.chat_native_takeover());
+        let raw = terminal.projected_viewport(renderer.history_projection, false);
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let live = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(live.is_transformed());
+        assert!(live.chat_composer_rows().is_none());
+        assert_native_cells_equal(live.cells(), raw.cells());
+        assert_eq!(live.cursor(), raw.cursor());
+        canvas.scroll(87.25, true);
+        let held = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        let anchor = held.first_raw_anchor_in_row(0);
+        let translation = renderer.canvas_geometry.translation;
+        assert!(translation > 0.0);
+        terminal.process_input(b"new streaming output\r\nmore output\r\n");
+        let after = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(after.first_raw_anchor_in_row(0), anchor);
+        assert_eq!(renderer.canvas_geometry.translation, translation);
+        assert!(!state.follows_bottom());
+        assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 16));
+        terminal.process_input(b"\x1b[?1049h");
+        let alt = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(!alt.is_transformed());
+        assert_eq!(renderer.canvas_geometry.translation, 0.0);
     }
 
     #[test]

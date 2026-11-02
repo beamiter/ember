@@ -566,7 +566,25 @@ mod unix_pty {
             command_argv: Option<&[String]>,
             pinned_cwd: Option<PinnedDirectory>,
         ) -> Result<Self> {
-            let inline_command = command_argv.map(crate::agent_cli::inline_argv);
+            // A configured CLI is an application, not a login shell. Preserve
+            // its executable argv[0] and apply the same inline renderer defaults
+            // used by direct task/resume launches. Real shells keep their
+            // existing discovery, login flags and integration path.
+            let configured_agent = command_argv
+                .is_none()
+                .then(|| {
+                    configured_shell
+                        .filter(|program| {
+                            Path::new(program).file_name().is_some_and(|name| {
+                                name == "codex" || name == "codex.js" || name == "claude"
+                            })
+                        })
+                        .map(|program| vec![program.to_owned()])
+                })
+                .flatten();
+            let inline_command = command_argv
+                .or(configured_agent.as_deref())
+                .map(crate::agent_cli::inline_argv);
             let command_argv = inline_command.as_deref();
             // SAFETY: 这个 unsafe 块包含多个 libc 系统调用用于 PTY 创建和进程 fork。
             // 所有的 libc 调用都检查了返回值并正确处理错误。
@@ -2272,6 +2290,54 @@ mod tests {
             seen.contains("arg=payload"),
             "remaining arguments must reach the child: {seen:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_agent_program_receives_inline_argv_without_login_shell_wrapping() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = ShellTestDir::new("configured-agent");
+        for name in ["codex", "claude"] {
+            let program = root.0.join(name);
+            std::fs::write(
+                &program,
+                "#!/bin/sh\nprintf 'program=%s\\n' \"$0\"\nprintf 'argument=%s\\n' \"$@\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut pty =
+                super::Pty::new_with_cwd(80, 24, Some("/tmp"), None, program.to_str(), None)
+                    .expect("configured agent must spawn directly");
+            let mut seen = String::new();
+            let mut buf = [0u8; 1024];
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                match pty.read(&mut buf) {
+                    Ok(super::ReadOutcome::Data(n)) => {
+                        seen.push_str(&String::from_utf8_lossy(&buf[..n]))
+                    }
+                    Ok(super::ReadOutcome::WouldBlock) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5))
+                    }
+                    Ok(_) | Err(_) => break,
+                }
+            }
+            assert!(
+                seen.contains(&format!("program={}", program.display())),
+                "{seen:?}"
+            );
+            let enabled = std::env::var_os("JTERM_AGENT_SCROLLBACK").as_deref()
+                != Some(std::ffi::OsStr::new("0"));
+            assert_eq!(
+                seen.contains("argument=--no-alt-screen"),
+                name == "codex" && enabled,
+                "{seen:?}"
+            );
+            assert!(
+                !seen.contains("argument=-l"),
+                "application must not receive shell login flags"
+            );
+        }
     }
 
     /// A one-shot command is its own executable and must not depend on the

@@ -7262,34 +7262,39 @@ impl eframe::App for TerminalApp {
 
         // Step 9: 滚动处理
         // 优化：批量处理键盘滚动，只获取一次锁
-        let page_scroll_key = (!ui_input_blocked)
-            .then(|| {
-                ctx.input(|i| {
-                    if i.key_pressed(egui::Key::PageUp) {
-                        Some((egui::Key::PageUp, i.modifiers))
-                    } else if i.key_pressed(egui::Key::PageDown) {
-                        Some((egui::Key::PageDown, i.modifiers))
-                    } else {
-                        None
+        if !ui_input_blocked {
+            for event in &terminal_keyboard_events {
+                let egui::Event::Key {
+                    key,
+                    modifiers,
+                    pressed: true,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                let (rows, alt_screen) = {
+                    let terminal = session.terminal.lock();
+                    (terminal.get_dimensions().1, terminal.is_alt_buffer_active())
+                };
+                if !crate::ui::viewport_owns_page_key(*key, *modifiers, alt_screen) {
+                    continue;
+                }
+                let Some(amount) = app::input::viewport_scroll_delta(*key, *modifiers, rows) else {
+                    continue;
+                };
+                let renderer = active_pane_renderer_idx
+                    .and_then(|index| self.pane_renderers.get(index))
+                    .unwrap_or(&self.renderer);
+                let viewport = projected_viewport_for_session(session, renderer);
+                if viewport.is_transformed() {
+                    if !session.transcript_canvas.page(amount, renderer.line_height) {
+                        session.projection_view_state.scroll(amount, &viewport);
                     }
-                })
-            })
-            .flatten();
-        let scroll_amount = page_scroll_key.and_then(|(key, modifiers)| {
-            let terminal = session.terminal.lock();
-            let (_, rows) = terminal.get_dimensions();
-            app::input::viewport_scroll_delta(key, modifiers, rows)
-        });
-
-        if let Some(amount) = scroll_amount {
-            let renderer = active_pane_renderer_idx
-                .and_then(|index| self.pane_renderers.get(index))
-                .unwrap_or(&self.renderer);
-            let viewport = projected_viewport_for_session(session, renderer);
-            if viewport.is_transformed() {
-                session.projection_view_state.scroll(amount, &viewport);
-            } else {
-                session.terminal.lock().scroll(amount);
+                } else {
+                    session.terminal.lock().scroll(amount);
+                }
+                ctx.request_repaint();
             }
         }
 

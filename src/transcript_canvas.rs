@@ -59,6 +59,25 @@ impl TranscriptCanvas {
         self.follows_live = self.motion.target() <= 0.0;
     }
 
+    /// Direct scrollbar control preserves fractional rows and cancels momentum.
+    /// False means this surface has no canvas and needs its native fallback.
+    pub fn seek_pixels(&mut self, pixels: f64) -> bool {
+        if !self.initialized || !pixels.is_finite() {
+            return false;
+        }
+        self.motion.jump_to(pixels);
+        self.follows_live = self.motion.position() <= 0.0;
+        true
+    }
+
+    pub fn page(&mut self, rows: isize, line_height: f32) -> bool {
+        if !self.initialized {
+            return false;
+        }
+        self.scroll(rows as f64 * f64::from(line_height.max(1.0)), false);
+        true
+    }
+
     /// Rebase against the terminal's stable reading anchor before advancing.
     /// A streaming append follows gently only while the user owns the tail.
     #[allow(clippy::too_many_arguments)]
@@ -224,6 +243,28 @@ mod tests {
         t: f64,
     ) -> CanvasPresentation {
         canvas.present(offset, rows, rows as u64, 20, 80, follow, 20.0, t, false)
+    }
+
+    #[test]
+    fn paging_animates_and_scrollbar_seeks_keep_fractional_pixels() {
+        let mut canvas = TranscriptCanvas::default();
+        assert!(!canvas.page(18, 20.0));
+        assert!(!canvas.seek_pixels(23.5));
+        present(&mut canvas, 0, 200, true, 0.0);
+        assert!(canvas.page(18, 20.0));
+        let moving = present(&mut canvas, 0, 200, true, 0.016);
+        assert!(moving.animating);
+        assert!(moving.offset_rows > 0 && moving.offset_rows < 18);
+        assert!(!moving.follows_live);
+        assert!(canvas.seek_pixels(183.25));
+        let seek = present(&mut canvas, moving.offset_rows, 200, false, 0.032);
+        assert_eq!(seek.offset_rows, 10);
+        assert_eq!(seek.translation, 16.75);
+        assert!(!seek.animating);
+        assert!(canvas.seek_pixels(0.0));
+        let live = present(&mut canvas, 10, 200, false, 0.048);
+        assert_eq!(live.offset_rows, 0);
+        assert!(live.follows_live);
     }
 
     #[test]

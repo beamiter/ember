@@ -851,9 +851,14 @@ pub(crate) fn viewport_scroll_delta(
     modifiers: egui::Modifiers,
     rows: usize,
 ) -> Option<isize> {
+    if !crate::ui::viewport_owns_page_key(key, modifiers, false) {
+        return None;
+    }
+    // Retain context across pages, including very small split panes.
+    let page = rows.saturating_sub(2).max(1).min(isize::MAX as usize) as isize;
     match key {
-        egui::Key::PageUp if !modifiers.ctrl => Some(rows as isize),
-        egui::Key::PageDown if !modifiers.ctrl => Some(-(rows as isize)),
+        egui::Key::PageUp => Some(page),
+        egui::Key::PageDown => Some(-page),
         _ => None,
     }
 }
@@ -4764,12 +4769,32 @@ mod tests {
 
         assert_eq!(
             viewport_scroll_delta(egui::Key::PageUp, egui::Modifiers::NONE, 24),
-            Some(24)
+            Some(22)
         );
         assert_eq!(
             viewport_scroll_delta(egui::Key::PageDown, egui::Modifiers::NONE, 24),
-            Some(-24)
+            Some(-22)
         );
+    }
+
+    #[test]
+    fn viewport_pages_keep_overlap_and_modified_shortcuts_native() {
+        for rows in [0, 1, 2, 3, 24] {
+            assert_eq!(
+                viewport_scroll_delta(egui::Key::PageUp, egui::Modifiers::NONE, rows),
+                Some(rows.saturating_sub(2).max(1) as isize)
+            );
+        }
+        for modifiers in [
+            egui::Modifiers::ALT,
+            egui::Modifiers::CTRL,
+            egui::Modifiers::COMMAND,
+        ] {
+            assert_eq!(
+                viewport_scroll_delta(egui::Key::PageDown, modifiers, 24),
+                None
+            );
+        }
     }
 
     #[test]

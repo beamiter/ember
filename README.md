@@ -1862,6 +1862,12 @@ Agent and Tasks surfaces remain available.
 向下回到最新输出；滚动范围受终端的 scrollback 容量限制。
 新会话、任务终端和恢复的会话采用相同设置，不改写 CLI 配置文件。
 
+Block / Chat 中，主屏 CLI 的原生会话沿用连续画布：滚轮平滑移动，
+触控板和滑轨保留不足一行的像素位置。`PageUp` / `PageDown` 平滑翻页并保留两行上下文，
+翻页键由阅读视口独占，不会同时传给 CLI。上翻阅读时，新输出保留当前阅读位置；
+拖动滑轨到底部恢复跟随。备用屏幕应用保留普通翻页键，`Shift+PageUp/PageDown`
+仍用于终端历史；`Ctrl` / `Alt` 组合保留给应用和配置的快捷键。
+
 Codex 的兼容入口仅加入子进程 PATH；用户自己的 alias/function 仍有优先权。
 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=0 claude` 可显式使用 Claude 全屏模式；
 用 `JTERM_AGENT_SCROLLBACK=0` 启动终端可关闭上述兼容默认值。

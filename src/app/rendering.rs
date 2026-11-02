@@ -2839,6 +2839,16 @@ impl TerminalApp {
                         .shell
                         .foreground_pgid()
                         .map(|foreground| (session.shell.get_child_pid(), foreground));
+                    renderer.prepare_canvas_scrollbar(
+                        &mut terminal_guard,
+                        projection_policy,
+                        projection_view_state,
+                        &mut session.transcript_canvas,
+                        ctx,
+                        content_rect,
+                        terminal_interaction_enabled,
+                        terminal_interaction_enabled && pane.focused,
+                    );
                     let viewport = renderer.canvas_viewport(
                         &mut terminal_guard,
                         projection_policy,
@@ -2919,11 +2929,19 @@ impl TerminalApp {
                             companion_surface = None;
                         }
                         match request {
-                            crate::ui::ProjectedScrollRequest::SetOffset(offset) => {
-                                projection_view_state.set_offset(offset, &viewport);
+                            crate::ui::ProjectedScrollRequest::SetPixelOffset(pixels) => {
+                                if !session.transcript_canvas.seek_pixels(pixels) {
+                                    projection_view_state.set_offset(
+                                        (pixels / f64::from(renderer.line_height.max(1.0))).round()
+                                            as usize,
+                                        &viewport,
+                                    );
+                                }
                             }
                             crate::ui::ProjectedScrollRequest::Delta(lines) => {
-                                projection_view_state.scroll(lines, &viewport);
+                                if !session.transcript_canvas.page(lines, renderer.line_height) {
+                                    projection_view_state.scroll(lines, &viewport);
+                                }
                             }
                         }
                     }
@@ -3121,6 +3139,16 @@ impl TerminalApp {
                 let projection_view_state = &mut session.projection_view_state;
 
                 // 获取链接列表用于渲染（使用缓存）
+                self.renderer.prepare_canvas_scrollbar(
+                    &mut terminal_guard,
+                    projection_policy,
+                    projection_view_state,
+                    &mut session.transcript_canvas,
+                    ctx,
+                    single_presentation_rect,
+                    terminal_interaction_enabled,
+                    terminal_interaction_enabled,
+                );
                 let viewport = self.renderer.canvas_viewport(
                     &mut terminal_guard,
                     projection_policy,
@@ -3170,11 +3198,22 @@ impl TerminalApp {
                 if let Some(request) = self.renderer.take_projected_scroll_request() {
                     companion_surface = None;
                     match request {
-                        crate::ui::ProjectedScrollRequest::SetOffset(offset) => {
-                            projection_view_state.set_offset(offset, &viewport);
+                        crate::ui::ProjectedScrollRequest::SetPixelOffset(pixels) => {
+                            if !session.transcript_canvas.seek_pixels(pixels) {
+                                projection_view_state.set_offset(
+                                    (pixels / f64::from(self.renderer.line_height.max(1.0))).round()
+                                        as usize,
+                                    &viewport,
+                                );
+                            }
                         }
                         crate::ui::ProjectedScrollRequest::Delta(lines) => {
-                            projection_view_state.scroll(lines, &viewport);
+                            if !session
+                                .transcript_canvas
+                                .page(lines, self.renderer.line_height)
+                            {
+                                projection_view_state.scroll(lines, &viewport);
+                            }
                         }
                     }
                 }
