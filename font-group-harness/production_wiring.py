@@ -78,6 +78,17 @@ def _top_level(code, match):
     return prefix.count('{') == prefix.count('}')
 
 
+def _block_end(code, opening):
+    assert code[opening] == '{', 'Expected a Rust block'
+    depth = 1
+    end = opening + 1
+    while depth and end < len(code):
+        depth += (code[end] == '{') - (code[end] == '}')
+        end += 1
+    assert depth == 0, 'Unclosed Rust owner block'
+    return end - 1
+
+
 def verify_workspace_font_group_wiring(main):
     """All three center modes share the measured, clipped main-font surface."""
     render = _function(main, 'render_ui')
@@ -119,16 +130,30 @@ def verify_workspace_font_group_wiring(main):
 
 def verify_files_font_group_wiring(main, workspace):
     sidebar = _function(main, 'render_sidebar')
-    choices = list(re.finditer(
+    owners = list(re.finditer(
         r'let (\w+) = if let Some \( (\w+) \) = (\w+) '
-        r'\{ ([^{}]+) \} else \{ ([^{}]+) \} ;', sidebar))
-    choices = [m for m in choices if ':: show_inspector_drawer (' in m[4]]
-    assert len(choices) == 1 and _top_level(sidebar, choices[0]), 'One live Files dock/drawer owner required'
-    choice = choices[0]
-    response, drawer_rect = choice[1], choice[2]
+        r'\{', sidebar))
+    choices = []
+    for owner in owners:
+        drawer_end = _block_end(sidebar, owner.end() - 1)
+        otherwise = re.match(r' else \{', sidebar[drawer_end + 1:])
+        if otherwise is None:
+            continue
+        dock_start = drawer_end + 1 + otherwise.end() - 1
+        dock_end = _block_end(sidebar, dock_start)
+        drawer_body = sidebar[owner.end():drawer_end].strip()
+        if ':: show_inspector_drawer (' in drawer_body:
+            assert sidebar[dock_end + 1:].startswith(' ;'), 'Owner response must be one expression'
+            choices.append((owner, drawer_body, sidebar[dock_start + 1:dock_end].strip(), dock_end + 2))
+    assert len(choices) == 1 and _top_level(sidebar, choices[0][0]), 'One live Files dock/drawer owner required'
+    owner, drawer_body, dock_body, choice_end = choices[0]
+    response, drawer_rect = owner[1], owner[2]
+    # Files and navigation choose distinct stable IDs but retain the same
+    # measured renderer/response. The literal bodies remain opaque tokens.
+    drawer_id = r'(?:LITERAL|if files_inspector \{ LITERAL \} else \{ LITERAL \})'
     drawer = re.fullmatch(
         r'(\w+) :: show_inspector_drawer \( (\w+) , ' + re.escape(drawer_rect) +
-        r' , LITERAL , (\w+) , & mut (\w+) ,? \)', choice[4].strip())
+        r' , ' + drawer_id + r' , (\w+) , & mut (\w+) ,? \)', drawer_body)
     assert drawer, 'Drawer must call the shared renderer on its actual rectangle'
     namespace, root, frame, renderer = drawer.groups()
     assert namespace == 'reference_workspace', 'Drawer must use the registered native helper'
@@ -136,7 +161,7 @@ def verify_files_font_group_wiring(main, workspace):
         r'\w+ \. resizable \( false \) \. exact_size \( \w+ \) '
         r'\. show_separator_line \( false \) \. frame \( ' + re.escape(frame) +
         r' \) \. show_bounded \( ' + re.escape(root) + r' , & mut ' + re.escape(renderer) + r' \)',
-        choice[5].strip())
+        dock_body)
     assert dock, 'Dock and drawer must call the same single renderer'
     renderers = list(re.finditer(r'let mut ' + re.escape(renderer) + r' = \| ui : & mut egui :: Ui \| \{', sidebar))
     assert len(renderers) == 1 and _top_level(sidebar, renderers[0]), 'Shared renderer must be one live closure'
@@ -147,7 +172,7 @@ def verify_files_font_group_wiring(main, workspace):
         r'self \. font_zoom \. register \( ' + re.escape(rect) + r' , ' +
         re.escape(response) + r' \. response \. layer_id , font_zoom :: FontGroup :: Ui ,? \) ;', sidebar))
     assert len(registrations) == 1 and _top_level(sidebar, registrations[0]), 'Files must register its actual response layer as UI'
-    assert choice.end() < rects[0].start() < registrations[0].start(), 'Register the current, already-rendered surface'
+    assert choice_end < rects[0].start() < registrations[0].start(), 'Register the current, already-rendered surface'
     helper = _function(workspace, 'show_inspector_drawer')
     assert '. order ( egui :: Order :: Middle )' in helper, 'Drawer must retain its actual modeless layer'
     assert '. show ( & ctx , | ui | {' in helper, 'Drawer must return its Area response, not the parent layer'

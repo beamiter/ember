@@ -72,8 +72,8 @@ pub(crate) fn workspace_font_size(ui: &egui::Ui) -> f32 {
     egui::TextStyle::Body.resolve(ui.style()).size
 } }
 // Configuration normalization uses the exact production layout bounds.
-mod glass_shell { pub const NAVIGATION_MIN_WIDTH: f32 = 180.0;
-pub const NAVIGATION_MAX_WIDTH: f32 = 480.0;
+mod glass_shell { pub const NAVIGATION_MIN_WIDTH: f32 = 240.0;
+pub const NAVIGATION_MAX_WIDTH: f32 = 360.0;
 pub const INSPECTOR_MIN_WIDTH: f32 = 260.0;
 pub const INSPECTOR_MAX_WIDTH: f32 = 520.0; }
 mod organism_ui { #[derive(Default)] pub struct PreviewUi; }
@@ -186,6 +186,7 @@ pub struct ConfigPanel {
     edit_font_family: String,
     edit_theme: String,
     edit_restore_session: bool,
+    edit_agent_workspace_enabled: bool,
     edit_opacity: f32,
     pub edit_debug_overlay: bool,
     edit_gpu_rendering: bool,
@@ -267,6 +268,7 @@ impl ConfigPanel {
             edit_font_family: String::new(),
             edit_theme: "dark".to_string(),
             edit_restore_session: false,
+            edit_agent_workspace_enabled: true,
             edit_debug_overlay: false,
             edit_gpu_rendering: true,
             edit_app_renderer: AppRendererType::Glow,
@@ -342,6 +344,7 @@ impl ConfigPanel {
         self.edit_font_family = config.font_family.clone();
         self.edit_theme = config.theme.clone();
         self.edit_restore_session = config.restore_session;
+        self.edit_agent_workspace_enabled = config.agent_workspace_enabled;
         self.edit_opacity = config.opacity;
         self.edit_gpu_rendering = config.gpu_rendering;
         self.edit_app_renderer = config.app_renderer;
@@ -407,6 +410,7 @@ impl ConfigPanel {
         config.font_family = self.edit_font_family.clone();
         config.theme = self.edit_theme.clone();
         config.restore_session = self.edit_restore_session;
+        config.agent_workspace_enabled = self.edit_agent_workspace_enabled;
         config.opacity = self.edit_opacity;
         config.gpu_rendering = self.edit_gpu_rendering;
         config.app_renderer = self.edit_app_renderer;

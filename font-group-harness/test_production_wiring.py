@@ -16,6 +16,7 @@ REGISTRATION = '''self.font_zoom.register(
 
 class FilesFontWiring(unittest.TestCase):
     def rejected(self, main=MAIN, workspace=WORKSPACE):
+        self.assertTrue(main != MAIN or workspace != WORKSPACE, 'Mutation must change production source')
         with self.assertRaises(AssertionError):
             verify_files_font_group_wiring(main, workspace)
 
@@ -38,7 +39,15 @@ class FilesFontWiring(unittest.TestCase):
         self.rejected(MAIN.replace('let panel_rect = panel_response.response.rect;', 'let panel_rect = root_ui.max_rect();'))
 
     def test_different_drawer_renderer_rejected(self):
-        self.rejected(MAIN.replace('"reference-files-inspector-drawer",\n                frame,\n                &mut render_body,', '"reference-files-inspector-drawer",\n                frame,\n                &mut other_body,'))
+        self.rejected(MAIN.replace('frame,\n                &mut render_body,', 'frame,\n                &mut other_body,'))
+
+    def test_nested_drawer_id_cannot_hide_a_different_renderer(self):
+        self.rejected(MAIN.replace('"reference-navigation-drawer"', '{ other_body(); "reference-navigation-drawer" }', 1))
+
+    def test_nested_dead_owner_cannot_satisfy_guard(self):
+        source = MAIN.replace('let panel_response = if let Some(rect) = drawer {', 'if false { let panel_response = if let Some(rect) = drawer {', 1)
+        source = source.replace('// File-browser shortcuts require', '} // File-browser shortcuts require', 1)
+        self.rejected(source)
 
     def test_comment_registration_is_not_executable_wiring(self):
         self.rejected(MAIN.replace(REGISTRATION, '/* ' + REGISTRATION + ' */'))
