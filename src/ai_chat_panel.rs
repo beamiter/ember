@@ -714,6 +714,12 @@ impl AiChatPanel {
         }
     }
 
+    pub(crate) fn open_workspace_draft(&mut self, config: &Config, title: String, body: String) {
+        self.open(config);
+        self.workspace_summaries(config.ai_redact_secrets);
+        self.workspace.create_with_draft(title, body);
+    }
+
     pub(crate) fn drive_workspace(&mut self, ctx: &egui::Context, config: &Config) {
         for effect in self.workspace.drive(&mut self.store, self.redact_secrets) {
             match effect {

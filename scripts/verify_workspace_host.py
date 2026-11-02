@@ -59,7 +59,7 @@ def main():
             with socket.socket(socket.AF_UNIX) as stream:
                 stream.settimeout(10)
                 stream.connect(str(endpoint))
-                stream.sendall((json.dumps({"Command": {"version": 1, "command": command}}) + "\n").encode())
+                stream.sendall((json.dumps({"Command": {"version": 2, "command": command}}) + "\n").encode())
                 value = json.loads(stream.makefile("rb").readline())
             reply = value.get("Reply", {})
             if error:

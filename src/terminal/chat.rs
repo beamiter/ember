@@ -1,6 +1,12 @@
 // Chat is a presentation of the same PTY-owned cells, never a second editor.
 // Projection construction shares state.rs raw-source and selection-plan machinery.
 use super::*;
+
+/// Display-only space. Growing real input consumes the editable-row floor;
+/// the final caret keeps one further row before the toolbar.
+fn chat_input_padding(native_rows: usize) -> usize {
+    3usize.saturating_sub(native_rows) + 1
+}
 impl super::TerminalState {
     pub fn chat_surface(&self) -> jterm_core::chat_mode::ChatSurface {
         use jterm_core::chat_mode::{resolve_surface, ChatSessionState};
@@ -306,10 +312,12 @@ impl super::TerminalState {
                 .and_then(|(absolute, _)| self.raw_row_id_at_absolute(absolute))
                 .and_then(|row_id| plan.raw_cell_document_row(RawCellAnchor { row_id, column: 0 }));
             if let Some(start) = plan.chat_dock_start {
+                let input_rows = plan.document_rows().saturating_sub(start);
+                let decorated_rows = footer_rows.saturating_add(chat_input_padding(input_rows));
                 if plan
                     .document_rows()
                     .saturating_sub(start)
-                    .saturating_add(footer_rows)
+                    .saturating_add(decorated_rows)
                     < self.grid.rows()
                 {
                     if let Some(before) = plan.rows[start].raw_slices.first().and_then(|slice| {
@@ -318,10 +326,10 @@ impl super::TerminalState {
                             column: origin.col_start,
                         })
                     }) {
-                        // The footer already reserves the controls and their
-                        // pixel gap. Extra terminal rows here leave a large
-                        // empty band below multiline input.
-                        for index in 0..footer_rows {
+                        // These rows have no PTY cells or copy/selection
+                        // provenance. Real multiline input grows above them;
+                        // no whitespace is added to a command or draft.
+                        for index in 0..decorated_rows {
                             plan.rows.push_back(ProjectionPlanRow {
                                 raw_slices: SmallVec::new(),
                                 row_source: None,
@@ -329,7 +337,7 @@ impl super::TerminalState {
                                 kind: ProjectedRowKind::CompanionStatus {
                                     before,
                                     index,
-                                    total: footer_rows,
+                                    total: decorated_rows,
                                 },
                             });
                             plan.chrome_row_count += 1;
@@ -561,5 +569,45 @@ impl super::TerminalState {
         if let ChatInputAction::Submit { sequence } = action {
             self.chat_pending_submit = Some(sequence);
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_composer_tests {
+    use super::*;
+    #[test]
+    fn workspace_composer_space_is_visual_and_tracks_real_multiline_input() {
+        for native_rows in 1usize..10 {
+            assert_eq!(
+                native_rows + chat_input_padding(native_rows),
+                native_rows.max(3) + 1
+            );
+        }
+        let mut terminal = TerminalState::new(50, 30);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07fixture");
+        let mut policy = ProjectionPolicy::new();
+        policy.set_chat_mode(true);
+        policy.set_chat_footer_rows(2);
+        let view = terminal.projected_viewport_with_state(
+            HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut ProjectionViewState::new(),
+        );
+        let dock = view.chat_composer_rows().expect("native prompt docks");
+        assert!(
+            dock.len() >= 6,
+            "three input rows, caret clearance and two toolbar rows"
+        );
+        let copied = view.cells()[dock.clone()]
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.character).collect::<String>())
+            .collect::<String>();
+        assert_eq!(copied.trim(), "$ fixture");
+        assert_eq!(
+            terminal.native_prompt_input_rows(),
+            Some(1),
+            "presentation did not synthesize native input"
+        );
     }
 }

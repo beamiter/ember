@@ -276,6 +276,11 @@ impl SessionDetailsDraft {
 
 #[derive(Default)]
 pub(crate) struct AgentSessionsState {
+    pub(crate) context: crate::workspace_context::ContextEditor,
+    pub(crate) review: crate::workspace_review::WorkspaceReview,
+    pub(crate) remote: crate::workspace_remote_ui::RemotePanel,
+    pub(crate) workspace_menu_ids: Vec<egui::Id>,
+    pub(crate) tools: crate::workspace_tools::WorkspaceTools,
     pub(crate) workspace_scroll: crate::workspace_visibility::ScrollBookmark,
     pub(crate) is_open: bool,
     /// Sidebar activation is nonmodal. Only a conflict opens the full manager.
@@ -332,10 +337,58 @@ pub(crate) struct AgentSessionsState {
 }
 
 impl AgentSessionsState {
+    fn workspace_filter(&self) -> jterm_core::agent_workspace::WorkspaceFilter {
+        let mut query = self.query.clone();
+        if let Some(provider) = self.provider {
+            query.push_str(&format!(
+                " provider:{}",
+                provider.label().to_ascii_lowercase()
+            ));
+        }
+        if self.status == Some(SessionStatus::Waiting) {
+            query.push_str(" is:attention");
+        }
+        if self.pinned_only {
+            query.push_str(" is:pinned");
+        }
+        if self.archive == SessionArchiveFilter::Archived {
+            query.push_str(" is:archived");
+        }
+        if let Some(project) = self.filter_project() {
+            let quoted = serde_json::to_string(&project.to_string_lossy()).unwrap_or_default();
+            query.push_str(&format!(" project:{quoted}"));
+        }
+        jterm_core::agent_workspace::WorkspaceFilter {
+            query,
+            live_only: self.live_only,
+            include_archived: self.archive != SessionArchiveFilter::Active,
+            ..Default::default()
+        }
+    }
+
+    fn workspace_search_query(&self) -> String {
+        if self.query.trim().is_empty() {
+            return String::new();
+        }
+        let mut query = self.workspace_filter().query;
+        if self.live_only {
+            query.push_str(" is:live");
+        }
+        query
+    }
+
     fn workspace_visible(&self) -> Vec<usize> {
-        if SessionSearchIndex::query_error(&self.query).is_some() {
+        let filter = self.workspace_filter();
+        if filter.query_error().is_some() {
             return Vec::new();
         }
+        let query_archived = jterm_core::agent_workspace::WorkspaceQuery::parse(&filter.query)
+            .is_ok_and(|query| query.includes_archived());
+        let matching: HashSet<_> = filter
+            .project(&self.workspace.rows.values().cloned().collect::<Vec<_>>())
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
         let mut result: Vec<_> = self
             .catalog
             .sessions
@@ -345,7 +398,7 @@ impl AgentSessionsState {
                 let row = self.workspace.row(session);
                 let archived = session.archived || row.is_some_and(|row| row.archived);
                 let archive = match self.archive {
-                    SessionArchiveFilter::Active => !archived,
+                    SessionArchiveFilter::Active => !archived || query_archived,
                     SessionArchiveFilter::Archived => archived,
                     SessionArchiveFilter::All => true,
                 };
@@ -354,9 +407,11 @@ impl AgentSessionsState {
                         .provider
                         .is_none_or(|provider| provider == session.provider)
                     && self.status.is_none_or(|status| {
-                        status == session.status
-                            && (status != SessionStatus::Waiting
-                                || row.is_some_and(|row| row.runtime.is_live()))
+                        if status == SessionStatus::Waiting {
+                            row.is_some_and(|row| row.attention().is_some())
+                        } else {
+                            status == session.status
+                        }
                     })
                     && (!self.live_only
                         || self
@@ -374,7 +429,7 @@ impl AgentSessionsState {
                         .is_none_or(|project| session.cwd.starts_with(project))
                     && row.map_or_else(
                         || session.matches_query(&self.query),
-                        |row| row.matches(&self.query),
+                        |row| matching.contains(&row.id),
                     )
             })
             .map(|(index, _)| index)
@@ -515,6 +570,10 @@ impl AgentSessionsState {
     }
 
     fn poll_library(&mut self) {
+        self.context.poll();
+        self.review.poll();
+        self.remote.reader.poll();
+        self.tools.poll();
         if self.library.poll() {
             self.replace_library(
                 self.workspace
@@ -1851,7 +1910,186 @@ fn workspace_reference_current(
             .any(|&index| same_launch_target(&state.catalog.sessions[index], &reference.session))
 }
 
+pub(crate) fn workspace_task_namespace() -> String {
+    format!(
+        "ember:{}",
+        crate::config::Config::config_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "default".into())
+    )
+}
+
 impl TerminalApp {
+    /// Preserve the host's factual task, validation and ownership projection.
+    /// Unhosted local tasks reuse the same core dashboard classification.
+    pub(crate) fn workspace_task_rows(
+        &self,
+    ) -> Vec<(
+        jterm_core::agent_task::TaskId,
+        jterm_core::agent_workspace::WorkspaceRow,
+    )> {
+        let namespace = workspace_task_namespace();
+        self.task_manager
+            .tasks()
+            .iter()
+            .filter_map(|task| {
+                let row = self.agent_runtime.workspace_row(task.id).or_else(|| {
+                    jterm_core::agent_workspace::WorkspaceRow::from_task(
+                        &namespace,
+                        task,
+                        jterm_core::agent_task::DashboardActivity {
+                            has_agent_terminal: self
+                                .agent_runtime
+                                .hosted_terminal(task.id)
+                                .is_some(),
+                            has_validation_terminal: self
+                                .agent_runtime
+                                .hosted_validation_terminal(task.id)
+                                .is_some(),
+                            has_active_agent_stream: self
+                                .task_manager
+                                .has_active_agent_event_stream(task.id),
+                            native_preparing: self.agent_runtime.has_preparing(task.id),
+                        },
+                    )
+                    .ok()
+                })?;
+                Some((task.id, row))
+            })
+            .collect()
+    }
+
+    /// The current conversation, never the last terminal hidden behind a chat.
+    pub(crate) fn workspace_selected_row(
+        &self,
+    ) -> Option<jterm_core::agent_workspace::WorkspaceRow> {
+        if self.ai_chat_panel.is_open {
+            let id = self.ai_chat_panel.workspace_active_id()?;
+            return self
+                .ai_chat_panel
+                .workspace
+                .rows
+                .iter()
+                .find(|row| row.id == id)
+                .cloned();
+        }
+        if let Some(id) = self.agent_sessions.workspace_task {
+            return self
+                .workspace_task_rows()
+                .into_iter()
+                .find(|(task, _)| *task == id)
+                .map(|(_, row)| row);
+        }
+        let active = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())?;
+        let session = self
+            .agent_sessions
+            .catalog
+            .sessions
+            .iter()
+            .find(|session| {
+                self.agent_sessions.opened.get(&open_session_key(session))
+                    == Some(&active.metadata.session_id)
+            })?;
+        self.agent_sessions.workspace.row(session).cloned()
+    }
+
+    pub(crate) fn workspace_has_conversation(&self) -> bool {
+        self.ai_chat_panel.is_open
+            || self.agent_sessions.workspace_task.is_some()
+            || self.workspace_selected_row().is_some()
+    }
+
+    pub(crate) fn workspace_evidence_can_open(&self) -> bool {
+        use jterm_core::agent_workspace::{ConversationKind, SearchSource};
+        let tools = &self.agent_sessions.tools;
+        let (Some(hit), Some(document)) = (&tools.selected_hit, &tools.document) else {
+            return false;
+        };
+        if hit.source == SearchSource::ImportedHistory
+            || document.conversation != hit.row.id
+            || document.event_id != hit.anchor.event_id
+            || document.revision != hit.anchor.revision
+        {
+            return false;
+        }
+        match hit.row.kind {
+            ConversationKind::Api => true,
+            ConversationKind::Task => {
+                self.config.experimental_task_sidebar
+                    && self
+                        .workspace_task_rows()
+                        .iter()
+                        .any(|(_, row)| row.id == hit.row.id)
+            }
+            ConversationKind::Cli => self.agent_sessions.catalog.sessions.iter().any(|session| {
+                self.agent_sessions
+                    .workspace
+                    .row(session)
+                    .is_some_and(|row| row.id == hit.row.id)
+            }),
+        }
+    }
+
+    pub(crate) fn workspace_open_evidence(&mut self, ctx: &egui::Context) {
+        if !self.workspace_evidence_can_open() {
+            return;
+        }
+        let hit = self.agent_sessions.tools.selected_hit.clone().unwrap();
+        match hit.row.kind {
+            jterm_core::agent_workspace::ConversationKind::Api => {
+                self.agent_sessions.workspace_task = None;
+                self.agent_sessions.cancel_resume();
+                self.ai_chat_panel
+                    .open_workspace_chat(Some(hit.row.id), &self.config);
+                self.reference_navigation_entered_canvas(ctx);
+            }
+            jterm_core::agent_workspace::ConversationKind::Task => {
+                let Some((id, _)) = self
+                    .workspace_task_rows()
+                    .into_iter()
+                    .find(|(_, row)| row.id == hit.row.id)
+                else {
+                    return;
+                };
+                self.agent_runtime.select_hosted_view(Some(id));
+                self.ai_chat_panel.close();
+                self.agent_sessions.cancel_resume();
+                self.agent_sessions.workspace_task = Some(id);
+                self.task_sidebar.open_workspace_task(id);
+                self.reference_navigation_entered_canvas(ctx);
+            }
+            jterm_core::agent_workspace::ConversationKind::Cli => {
+                let Some(session) = self
+                    .agent_sessions
+                    .catalog
+                    .sessions
+                    .iter()
+                    .find(|session| {
+                        self.agent_sessions
+                            .workspace
+                            .row(session)
+                            .is_some_and(|row| row.id == hit.row.id)
+                    })
+                    .cloned()
+                else {
+                    return;
+                };
+                self.agent_sessions.clear_filters();
+                self.activate_workspace_session(
+                    WorkspaceSessionRef {
+                        epoch: self.agent_sessions.catalog_epoch,
+                        session,
+                    },
+                    ctx,
+                );
+            }
+        }
+        self.agent_sessions.tools.close_document();
+    }
+
     /// Constant navigation backed by provider history, live terminals, API chats and tasks.
     /// A row captures its source and catalog epoch; a refresh cannot retarget a release.
     pub(crate) fn render_workspace_sessions(&mut self, ui: &mut egui::Ui) {
@@ -1890,16 +2128,46 @@ impl TerminalApp {
             return;
         }
 
+        let chats = self
+            .ai_chat_panel
+            .workspace_summaries(self.config.ai_redact_secrets);
+        self.agent_sessions.review.start();
+        let task_rows = self.workspace_task_rows();
+        let needs_count = self
+            .agent_sessions
+            .workspace
+            .rows
+            .values()
+            .chain(chats.iter())
+            .filter(|row| row.attention().is_some())
+            .count()
+            + if self.config.experimental_task_sidebar {
+                task_rows
+                    .iter()
+                    .filter(|(_, row)| row.attention().is_some())
+                    .count()
+            } else {
+                0
+            };
         let old_filter = self.agent_sessions.filter_key();
         let search = ui.add(
             egui::TextEdit::singleline(&mut self.agent_sessions.query)
                 .id_salt("workspace-session-search")
                 .char_limit(editor_char_limit(SESSION_QUERY_MAX_BYTES))
-                .hint_text("Search conversations…")
+                .hint_text("Search · provider:codex status:review")
                 .desired_width(f32::INFINITY),
         );
         if search.changed() {
             self.agent_sessions.filters_changed();
+        }
+        let search_query = self.agent_sessions.workspace_search_query();
+        self.agent_sessions.tools.set_search(
+            &search_query,
+            None,
+            self.agent_sessions.archive != SessionArchiveFilter::Active,
+        );
+        if self.agent_sessions.tools.searching() || self.agent_sessions.tools.document_loading {
+            ctx.request_repaint_after(Duration::from_millis(180));
         }
         let selected_project = self
             .agent_sessions
@@ -1952,10 +2220,10 @@ impl TerminalApp {
             if ui
                 .selectable_label(
                     self.agent_sessions.status == Some(SessionStatus::Waiting),
-                    "Needs you",
+                    format!("Needs you · {needs_count}"),
                 )
                 .on_hover_text(
-                    "Latest provider event recorded as waiting; open to inspect current state",
+                    "Current requests, validation, review and unresolved execution outcomes",
                 )
                 .clicked()
             {
@@ -1966,8 +2234,8 @@ impl TerminalApp {
         if !self.agent_sessions.filter_matches(&old_filter) {
             self.agent_sessions.filters_changed();
         }
-        if let Some(error) = self.agent_sessions.query_error() {
-            ui.small(error);
+        if let Some(error) = self.agent_sessions.workspace_filter().query_error() {
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
         if let Some(error) = self.agent_sessions.error.as_ref().or(self
             .agent_sessions
@@ -1982,6 +2250,69 @@ impl TerminalApp {
                 ui.spinner();
                 ui.small("Checking conversation…");
             });
+        }
+
+        if !self.agent_sessions.tools.query().is_empty() {
+            ui.add_space(8.0);
+            ui.weak("HISTORY MATCHES");
+            if self.agent_sessions.tools.searching() {
+                ui.spinner();
+            }
+            if let Some(error) = &self.agent_sessions.tools.notice {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            let mut evidence = None;
+            for hit in &self.agent_sessions.tools.page.hits {
+                ui.push_id(
+                    (
+                        "workspace-evidence",
+                        &hit.row.id.0,
+                        &hit.anchor.event_id,
+                        &hit.anchor.revision,
+                    ),
+                    |ui| {
+                        let response = ui.add(
+                            egui::Button::new(format!(
+                                "{}\n{}\n{}",
+                                crate::review_text::visible_bounded(&hit.row.title, 100),
+                                hit.source.label(),
+                                crate::review_text::visible_bounded(&hit.snippet, 220),
+                            ))
+                            .wrap(),
+                        );
+                        if response
+                            .on_hover_text("Read this exact saved event; no provider starts")
+                            .clicked()
+                        {
+                            evidence = Some(hit.clone());
+                        }
+                    },
+                );
+            }
+            if !self.agent_sessions.tools.searching() {
+                ui.small(self.agent_sessions.tools.page.coverage.label());
+                if self.agent_sessions.tools.page.hits.is_empty() {
+                    ui.weak("No indexed history matches this query.");
+                }
+            }
+            if self.agent_sessions.tools.page.next_before.is_some()
+                && ui
+                    .add_enabled(
+                        !self.agent_sessions.tools.search_loading,
+                        egui::Button::new("More history matches"),
+                    )
+                    .clicked()
+            {
+                self.agent_sessions.tools.load_more();
+            }
+            if let Some(hit) = evidence {
+                self.agent_sessions.tools.open_hit(hit);
+                self.reference_request_inspector_tab(
+                    crate::app::state::ReferenceInspectorTab::Context,
+                    &ctx,
+                );
+            }
+            ui.separator();
         }
 
         let epoch = self.agent_sessions.catalog_epoch;
@@ -2006,6 +2337,15 @@ impl TerminalApp {
         let mut pin = None;
         let mut group = None;
         for (session, title, pinned, terminal) in &rows {
+            let presentation = self
+                .agent_sessions
+                .workspace
+                .row(session)
+                .map(|row| row.presentation());
+            let status_label = presentation
+                .as_ref()
+                .map(|p| p.status_label.as_str())
+                .unwrap_or("Indexing history");
             if group != Some(*pinned) {
                 ui.add_space(8.0);
                 ui.weak(if *pinned {
@@ -2020,7 +2360,10 @@ impl TerminalApp {
                 && terminal.as_ref().is_some_and(|id| {
                     self.session_manager.index_of(id) == Some(self.session_manager.active_index())
                 });
-            let id = egui::Id::new(("workspace-cli", open_session_key(session), epoch));
+            // Widget identity follows the source, not the scanner generation.
+            // The click still carries `epoch` below, so stale releases cannot
+            // launch a replacement while an unchanged row keeps focus.
+            let id = egui::Id::new(("workspace-cli", open_session_key(session)));
             ui.push_id(id, |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -2037,11 +2380,7 @@ impl TerminalApp {
                                 "{}\n{} · {}",
                                 crate::review_text::visible_bounded(title, 70),
                                 session.provider.label(),
-                                if terminal.is_some() {
-                                    "Open terminal"
-                                } else {
-                                    "Ready to resume"
-                                }
+                                status_label
                             ))
                             .selected(selected),
                         )
@@ -2078,56 +2417,48 @@ impl TerminalApp {
             self.activate_workspace_session(reference, &ctx);
         }
 
-        let query = self.agent_sessions.query.trim().to_lowercase();
-        let chats = self
-            .ai_chat_panel
-            .workspace_summaries(self.config.ai_redact_secrets);
+        let filter = self.agent_sessions.workspace_filter();
+        let api_rows = filter.project(&chats);
         let mut api_choice = None;
         let mut api_pin = None;
         ui.add_space(8.0);
         ui.weak("API CONVERSATIONS");
-        for chat in chats.iter().filter(|chat| {
-            !chat.archived
-                && (!self.agent_sessions.live_only || chat.runtime.is_live())
+        for chat in api_rows.iter().filter(|chat| {
+            true && (!self.agent_sessions.live_only || chat.runtime.is_live())
                 && (self.agent_sessions.status != Some(SessionStatus::Waiting)
-                    || matches!(
-                        chat.runtime,
-                        jterm_core::agent_workspace::RuntimeState::Failed
-                            | jterm_core::agent_workspace::RuntimeState::Conflict
-                    ))
+                    || chat.attention().is_some())
                 && self
                     .agent_sessions
                     .filter_project()
                     .is_none_or(|project| std::path::Path::new(&chat.cwd).starts_with(project))
-                && (query.is_empty()
-                    || format!("{} {}", chat.title, chat.preview)
-                        .to_lowercase()
-                        .contains(&query))
         }) {
             let selected = self.ai_chat_panel.is_open
                 && self.ai_chat_panel.workspace_active_id().as_ref() == Some(&chat.id);
-            let status = chat.runtime.label();
-            ui.horizontal(|ui| {
-                if ui
-                    .small_button(if chat.pinned { "★" } else { "☆" })
-                    .on_hover_text("Pin conversation")
-                    .clicked()
-                {
-                    api_pin = Some((chat.id.clone(), !chat.pinned));
-                }
-                if ui
-                    .selectable_label(
-                        selected,
-                        format!(
-                            "{}\n{}",
-                            crate::review_text::visible_bounded(&chat.title, 70),
-                            status
-                        ),
-                    )
-                    .clicked()
-                {
-                    api_choice = Some(chat.id.clone());
-                }
+            let presentation = chat.presentation();
+            let status = &presentation.status_label;
+            ui.push_id(("workspace-api", &chat.id.0), |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(if chat.pinned { "★" } else { "☆" })
+                        .on_hover_text("Pin conversation")
+                        .clicked()
+                    {
+                        api_pin = Some((chat.id.clone(), !chat.pinned));
+                    }
+                    if ui
+                        .selectable_label(
+                            selected,
+                            format!(
+                                "{}\n{}",
+                                crate::review_text::visible_bounded(&chat.title, 70),
+                                status
+                            ),
+                        )
+                        .clicked()
+                    {
+                        api_choice = Some(chat.id.clone());
+                    }
+                })
             });
         }
         if let Some((id, pinned)) = api_pin {
@@ -2146,49 +2477,41 @@ impl TerminalApp {
             ui.add_space(8.0);
             ui.weak("TASK CONVERSATIONS");
             let mut task_choice = None;
-            for task in self.task_manager.tasks().iter().filter(|task| {
-                use jterm_core::agent_task::TaskStatus;
-                task.status != TaskStatus::Archived
-                    && (!self.agent_sessions.live_only
-                        || matches!(
-                            task.status,
-                            TaskStatus::Starting
-                                | TaskStatus::Working
-                                | TaskStatus::WaitingForApproval
-                        ))
+            let projected_tasks = filter.project(
+                &task_rows
+                    .iter()
+                    .map(|(_, row)| row.clone())
+                    .collect::<Vec<_>>(),
+            );
+            for row in projected_tasks.iter().filter(|row| {
+                true && (!self.agent_sessions.live_only || row.runtime.is_live())
                     && (self.agent_sessions.status != Some(SessionStatus::Waiting)
-                        || matches!(
-                            task.status,
-                            TaskStatus::WaitingForApproval
-                                | TaskStatus::WaitingForHuman
-                                | TaskStatus::ReadyForReview
-                                | TaskStatus::Failed
-                        ))
+                        || row.attention().is_some())
+                    && self
+                        .agent_sessions
+                        .filter_project()
+                        .is_none_or(|project| std::path::Path::new(&row.cwd).starts_with(project))
             }) {
-                if !query.is_empty() && !task.title.to_lowercase().contains(&query) {
+                let Some(task_id) = row.facts.task_id else {
                     continue;
-                }
-                if self
-                    .agent_sessions
-                    .project_filter
-                    .as_ref()
-                    .is_some_and(|project| project != &task.repo_root)
-                {
-                    continue;
-                }
-                if ui
-                    .selectable_label(
-                        self.agent_sessions.workspace_task == Some(task.id),
-                        format!(
-                            "{}\n{} · {}",
-                            crate::review_text::visible_bounded(&task.title, 70),
-                            task.provider.display_name(),
-                            task.status.label()
-                        ),
-                    )
-                    .clicked()
-                {
-                    task_choice = Some(task.id);
+                };
+                let presentation = row.presentation();
+                let response = ui
+                    .push_id(("workspace-task", &row.id.0), |ui| {
+                        ui.selectable_label(
+                            self.agent_sessions.workspace_task == Some(task_id),
+                            format!(
+                                "{}\n{} · {}",
+                                crate::review_text::visible_bounded(&row.title, 70),
+                                row.provider,
+                                presentation.status_label
+                            ),
+                        )
+                        .on_hover_text(presentation.primary_action.label())
+                    })
+                    .inner;
+                if response.clicked() {
+                    task_choice = Some(task_id);
                 }
             }
             if let Some(id) = task_choice {
@@ -2203,6 +2526,33 @@ impl TerminalApp {
                 self.agent_sessions.workspace_task = Some(id);
                 self.task_sidebar.open_workspace_task(id);
                 self.reference_navigation_entered_canvas(&ctx);
+                if let Some(row) = task_rows
+                    .iter()
+                    .find(|(task, _)| *task == id)
+                    .map(|(_, row)| row)
+                {
+                    use jterm_core::agent_workspace::WorkspaceAttention as Attention;
+                    match row.attention() {
+                        Some(Attention::Approval) => {
+                            self.task_sidebar.attention_navigation =
+                                self.agent_runtime.shared_snapshot(id).and_then(|view| {
+                                    view.pending_approvals
+                                        .first()
+                                        .map(|approval| (id, approval.id))
+                                });
+                            self.reference_inspector.narrow_drawer = false;
+                        }
+                        Some(Attention::Review) => self.reference_request_inspector_tab(
+                            super::state::ReferenceInspectorTab::Changes,
+                            &ctx,
+                        ),
+                        Some(_) => self.reference_request_inspector_tab(
+                            super::state::ReferenceInspectorTab::Run,
+                            &ctx,
+                        ),
+                        None => {}
+                    }
+                }
             }
         }
         ui.add_space(8.0);
@@ -2310,6 +2660,12 @@ impl TerminalApp {
     /// Own the complete key batch, including the frame that closes or resumes.
     /// PTY pumping and app persistence continue in the main event loop.
     pub(crate) fn handle_agent_sessions_input(&mut self, ctx: &egui::Context) -> bool {
+        let tasks: Vec<_> = self
+            .workspace_task_rows()
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
+        self.agent_sessions.review.index_tasks(&tasks);
         let previous_selection = self.agent_sessions.selected.clone();
         let previous_library_error = self.agent_sessions.library.error().map(str::to_owned);
         self.agent_sessions.poll_library();

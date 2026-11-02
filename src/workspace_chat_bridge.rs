@@ -40,6 +40,7 @@ enum Pending {
     Open {
         selection: u64,
         keep_local: bool,
+        prefill: Option<String>,
     },
     Save {
         chat_id: u64,
@@ -200,6 +201,7 @@ impl WorkspaceChats {
             Pending::Open {
                 selection: self.selection,
                 keep_local: false,
+                prefill: None,
             },
         );
     }
@@ -224,6 +226,7 @@ impl WorkspaceChats {
             Pending::Open {
                 selection: self.selection,
                 keep_local: true,
+                prefill: None,
             },
         );
     }
@@ -237,6 +240,25 @@ impl WorkspaceChats {
             Pending::Open {
                 selection: self.selection,
                 keep_local: false,
+                prefill: None,
+            },
+        );
+    }
+
+    /// The reviewed packet is bound to the exact creation acknowledgement.
+    /// It is a draft only, even if selection changes while the host replies.
+    pub(crate) fn create_with_draft(&mut self, title: String, body: String) {
+        if body.len() > 16 * 1024 {
+            self.notice = Some("Handoff exceeds 16 KiB. The saved source context was kept.".into());
+            return;
+        }
+        self.selection = self.selection.wrapping_add(1);
+        self.send(
+            Command::CreateChat { title },
+            Pending::Open {
+                selection: self.selection,
+                keep_local: false,
+                prefill: Some(body),
             },
         );
     }
@@ -562,6 +584,7 @@ impl WorkspaceChats {
                 Pending::Open {
                     selection,
                     keep_local,
+                    prefill,
                 },
                 WorkspaceReply::Chat { chat },
             ) => {
@@ -657,6 +680,16 @@ impl WorkspaceChats {
                                 self.notice = Some(
                                     "Shared history refreshed; your local draft was kept.".into(),
                                 );
+                            }
+                        }
+                        if let Some(body) = prefill {
+                            if store.chat_draft(id).is_some_and(str::is_empty) {
+                                store.set_chat_draft(id, body);
+                                self.changed_id(store, id);
+                                effects.push(Effect::SyncDraft(id));
+                                self.notice = Some("Handoff opened as a new API draft. Review it and choose Send to run it.".into());
+                            } else {
+                                self.notice = Some("The new conversation already has a draft. It was kept; your handoff remains in the source context.".into());
                             }
                         }
                         if let Some(job) = hosted_job {
@@ -1070,6 +1103,7 @@ mod tests {
                 pinned: false,
                 tags: vec![],
                 runtime: RuntimeState::Idle,
+                facts: Default::default(),
             },
             revision: 3,
             draft_revision: 2,
@@ -1098,6 +1132,7 @@ mod tests {
             Pending::Open {
                 selection: 1,
                 keep_local: false,
+                prefill: None,
             },
         );
         let effects = bridge.handle_reply(
@@ -1111,6 +1146,67 @@ mod tests {
         assert!(matches!(effects.as_slice(), [Effect::Activate(found)] if *found == id));
         assert!(store.select_chat(id));
         (bridge, store, id)
+    }
+
+    #[test]
+    fn handoff_receipt_only_prefills_the_created_chat_after_selection_changes() {
+        let (mut bridge, mut store, original) = loaded();
+        let created = original + 10;
+        bridge.pending.insert(
+            901,
+            Pending::Open {
+                selection: bridge.selection,
+                keep_local: false,
+                prefill: Some("Reviewed handoff package".into()),
+            },
+        );
+        bridge.selection += 1;
+        let effects = bridge.handle_reply(
+            &mut store,
+            901,
+            Ok(WorkspaceReply::Chat {
+                chat: stored(created, "jterm:api:new-handoff", ""),
+            }),
+            false,
+        );
+        assert_eq!(store.chat_draft(created), Some("Reviewed handoff package"));
+        assert_eq!(store.active_id(), original);
+        assert_eq!(store.chat_draft(original), Some("Question"));
+        assert!(effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::Activate(_) | Effect::Submit { .. })));
+        assert!(bridge.known[&created].dirty);
+    }
+
+    #[test]
+    fn handoff_never_overwrites_a_nonempty_created_draft() {
+        let (mut bridge, mut store, original) = loaded();
+        let created = original + 11;
+        bridge.pending.insert(
+            902,
+            Pending::Open {
+                selection: bridge.selection,
+                keep_local: false,
+                prefill: Some("Handoff package".into()),
+            },
+        );
+        let effects = bridge.handle_reply(
+            &mut store,
+            902,
+            Ok(WorkspaceReply::Chat {
+                chat: stored(created, "jterm:api:already-written", "Other window draft"),
+            }),
+            false,
+        );
+        assert_eq!(store.chat_draft(created), Some("Other window draft"));
+        assert!(effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::Submit { .. })));
+        assert!(bridge
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("already has a draft"));
     }
 
     fn acknowledge_save(bridge: &mut WorkspaceChats, store: &mut ChatStore, id: u64) -> u64 {
@@ -1266,6 +1362,7 @@ mod tests {
             Pending::Open {
                 selection: bridge.selection,
                 keep_local: true,
+                prefill: None,
             },
         );
         bridge.leave();
@@ -1298,6 +1395,7 @@ mod tests {
             Pending::Open {
                 selection: bridge.selection,
                 keep_local: true,
+                prefill: None,
             },
         );
         bridge.handle_reply(

@@ -73,7 +73,13 @@ mod windows_compat;
 mod workflow_picker;
 mod workflows;
 mod workspace_chat_bridge;
+mod workspace_context;
+mod workspace_inspector;
+mod workspace_remote;
+mod workspace_remote_ui;
+mod workspace_review;
 mod workspace_sessions_bridge;
+mod workspace_tools;
 mod workspace_visibility;
 
 use crate::glass_shell::BoundedPanel as _;
@@ -2912,12 +2918,9 @@ impl TerminalApp {
             ai_command_suggestion: None,
             agent_diff: agent::AgentDiffPanel::new(),
             task_manager: agent::TaskManager::new(),
-            agent_runtime: agent::AgentRuntimeManager::hosted(format!(
-                "ember:{}",
-                crate::config::Config::config_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "default".into())
-            )),
+            agent_runtime: agent::AgentRuntimeManager::hosted(
+                app::agent_sessions::workspace_task_namespace(),
+            ),
             jsh_notice: jsh_ui::JshNotice::default(),
             config: cfg.clone(),
             config_save_pending: false,

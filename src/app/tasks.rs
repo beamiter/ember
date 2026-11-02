@@ -158,6 +158,7 @@ fn registration_may_autostart(
 
 #[derive(Default)]
 pub struct TaskSidebarState {
+    pub(crate) attention_navigation: Option<(TaskId, ApprovalId)>,
     pub selected: Option<TaskId>,
     pub pending_action: Option<TaskSidebarAction>,
     dashboard_query: String,
@@ -202,7 +203,9 @@ impl TaskSidebarState {
         self.dashboard_provider = None;
         self.dashboard_project = None;
         self.dashboard_attention = None;
-        self.scroll_to_selected = true;
+        // The central task view keeps its own reading position by task ID.
+        // Explicit attention navigation still targets the exact request.
+        self.scroll_to_selected = false;
     }
     /// Leave the Hidden list for the dashboard. Opening the dashboard and
     /// creating, registering or restoring a task all do this, so a task the
@@ -1672,6 +1675,39 @@ impl TerminalApp {
         draft.open = true;
     }
 
+    pub(crate) fn open_task_handoff(
+        &mut self,
+        packet: &jterm_core::agent_workspace::WorkspaceHandoff,
+    ) -> Result<(), String> {
+        if !self.config.experimental_task_sidebar {
+            return Err("Enable Tasks in Settings before creating a task draft.".into());
+        }
+        if self.task_sidebar.pending_creation.is_some() || self.task_sidebar.recovery_job.is_some()
+        {
+            return Err(
+                "Wait for the current task creation to finish. The handoff is retained.".into(),
+            );
+        }
+        let provider = AgentProvider::from_config_value(&packet.target_provider)
+            .ok_or_else(|| "This target has no native task adapter.".to_string())?;
+        if packet.body.len() > 16 * 1024 {
+            return Err("The handoff must fit within 16 KiB.".into());
+        }
+        let draft = &self.task_sidebar.composer;
+        if !draft.title.trim().is_empty() || !draft.goal.trim().is_empty() || draft.with_validation
+        {
+            return Err("An existing task draft is retained. Finish or discard it before creating this handoff.".into());
+        }
+        self.open_task_composer();
+        let draft = &mut self.task_sidebar.composer;
+        draft.project = packet.cwd.clone();
+        draft.title = packet.title.clone();
+        draft.goal = packet.body.clone();
+        draft.provider = provider;
+        draft.error = None;
+        Ok(())
+    }
+
     pub(crate) fn begin_command_worktree_task(
         &mut self,
         context: crate::agent::SemanticCommandContext,
@@ -2533,12 +2569,15 @@ impl TerminalApp {
                     .shared_snapshot(id)
                     .map(|view| (id, view))
             });
-        let mut approval_navigation = selected_native_view
-            .as_ref()
-            .and_then(|(id, view)| native_approval_navigation(ui, *id, view));
+        let mut approval_navigation = self.task_sidebar.attention_navigation.take().or_else(|| {
+            selected_native_view
+                .as_ref()
+                .and_then(|(id, view)| native_approval_navigation(ui, *id, view))
+        });
         let mut pending = None;
         let native_ai_enabled = self.config.ai_enabled && self.config.ai_share_command_context;
         egui::ScrollArea::vertical()
+            .id_salt(("task-workspace-reading", self.agent_sessions.workspace_task))
             // An explicit approval jump must not leave an animated numeric
             // target that can outlive its exact task/request identity.
             .animated(approval_navigation.is_none())

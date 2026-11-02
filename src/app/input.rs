@@ -1238,6 +1238,12 @@ impl TerminalApp {
             || self.organism.eva.card_owns_input()
             || self.block_review.is_some()
             || self.agent_sessions.is_open
+            || self.agent_sessions.remote.open
+            || self
+                .agent_sessions
+                .workspace_menu_ids
+                .iter()
+                .any(|id| egui::Popup::is_id_open(ctx, *id))
             || self.agent_sessions.workspace_task.is_some()
             || self.ai_chat_panel.is_open
             || self.sidebar.view == crate::sidebar::SidebarView::Tasks

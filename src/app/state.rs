@@ -145,6 +145,8 @@ pub(crate) enum ReferenceInspectorTab {
     Agent,
     Context,
     Files,
+    Changes,
+    Run,
 }
 
 #[derive(Clone, Debug)]

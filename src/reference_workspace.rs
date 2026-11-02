@@ -572,6 +572,12 @@ impl TerminalApp {
     pub(crate) fn reference_selected_inspector_tab(&self) -> ReferenceInspectorTab {
         if self.sidebar.view == sidebar::SidebarView::Files {
             ReferenceInspectorTab::Files
+        } else if self.workspace_inspector_active() {
+            match self.reference_inspector.selected_tab {
+                ReferenceInspectorTab::Agent => ReferenceInspectorTab::Run,
+                ReferenceInspectorTab::Files => ReferenceInspectorTab::Changes,
+                tab => tab,
+            }
         } else if self.reference_inspector.selected_tab == ReferenceInspectorTab::Files {
             ReferenceInspectorTab::Agent
         } else {
@@ -591,6 +597,11 @@ impl TerminalApp {
                 self.sidebar.view = sidebar::SidebarView::Tasks;
             }
             ReferenceInspectorTab::Context if self.sidebar.view == sidebar::SidebarView::Files => {
+                self.sidebar.view = sidebar::SidebarView::Sessions;
+            }
+            ReferenceInspectorTab::Changes | ReferenceInspectorTab::Run
+                if self.sidebar.view == sidebar::SidebarView::Files =>
+            {
                 self.sidebar.view = sidebar::SidebarView::Sessions;
             }
             _ => {}
@@ -1178,47 +1189,86 @@ impl TerminalApp {
             ui,
             self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE,
         );
-        let mut enabled = self.config.agent_workspace_enabled;
-        ui.horizontal(|ui| {
+        let enabled = self.config.agent_workspace_enabled;
+        let mut menu_ids = Vec::new();
+        ui.horizontal_wrapped(|ui| {
             if ui
-                .checkbox(&mut enabled, "Agent Workspace")
-                .on_hover_text("Show conversations, projects and tasks in the sidebar; turn off for terminal tabs")
-                .changed()
-            {
-                self.set_agent_workspace_enabled(ui.ctx(), enabled);
-            }
-            if enabled && ui
-                .small_button("＋")
-                .on_hover_text("New API conversation")
+                .selectable_label(
+                    enabled,
+                    if enabled {
+                        "▾ Agent Workspace"
+                    } else {
+                        "▸ Agent Workspace"
+                    },
+                )
+                .on_hover_text(
+                    "Collapse the conversation list; background work and drafts continue",
+                )
                 .clicked()
             {
-                self.agent_sessions.workspace_task = None;
-                self.ai_chat_panel.open_workspace_chat(None, &self.config);
-                self.reference_navigation_entered_canvas(ui.ctx());
+                self.set_agent_workspace_enabled(ui.ctx(), !enabled);
             }
-        });
-        ui.horizontal(|ui| {
-            if ui.small_button("Terminal").clicked() {
-                self.ai_chat_panel.close();
-                self.agent_sessions.workspace_task = None;
-                if self.new_tab().is_some() {
-                    self.reference_navigation_entered_canvas(ui.ctx());
+            let new_menu = ui.menu_button("New", |ui| {
+                if ui
+                    .button(jterm_core::agent_workspace::WorkspaceAction::NewTerminal.label())
+                    .clicked()
+                {
+                    self.ai_chat_panel.close();
+                    self.agent_sessions.workspace_task = None;
+                    if self.new_tab().is_some() {
+                        self.reference_navigation_entered_canvas(ui.ctx());
+                    }
+                    ui.close();
                 }
-            }
-            if ui.small_button("Tasks").clicked() {
-                self.open_tasks_view();
-            }
-            if ui.small_button("Files").clicked() {
-                self.reference_request_sidebar_view(sidebar::SidebarView::Files, ui.ctx());
-            }
-            if ui
-                .small_button("⋯")
-                .on_hover_text("Session details and organization")
-                .clicked()
-            {
-                self.open_agent_sessions();
-            }
+                if enabled
+                    && ui
+                        .button(jterm_core::agent_workspace::WorkspaceAction::NewApiChat.label())
+                        .clicked()
+                {
+                    self.agent_sessions.workspace_task = None;
+                    self.ai_chat_panel.open_workspace_chat(None, &self.config);
+                    self.reference_navigation_entered_canvas(ui.ctx());
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.config.experimental_task_sidebar,
+                        egui::Button::new(
+                            jterm_core::agent_workspace::WorkspaceAction::NewTask.label(),
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.open_task_composer();
+                    ui.close();
+                }
+            });
+            menu_ids.push(egui::Popup::default_response_id(&new_menu.response));
+            let more_menu = ui.menu_button("More", |ui| {
+                if ui.button("Overview and queue").clicked() {
+                    self.reference_request_inspector_tab(ReferenceInspectorTab::Run, ui.ctx());
+                    ui.close();
+                }
+                if ui.button("Task dashboard").clicked() {
+                    self.open_tasks_view();
+                    ui.close();
+                }
+                if ui.button("Project files").clicked() {
+                    self.reference_request_sidebar_view(sidebar::SidebarView::Files, ui.ctx());
+                    ui.close();
+                }
+                if ui.button("Session details").clicked() {
+                    self.open_agent_sessions();
+                    ui.close();
+                }
+                if ui.button("Remote workspace (read-only)").clicked() {
+                    self.agent_sessions.remote.open = true;
+                    ui.close();
+                }
+            });
+            menu_ids.push(egui::Popup::default_response_id(&more_menu.response));
         });
+        self.agent_sessions.workspace_menu_ids = menu_ids;
         false
     }
 
@@ -1495,6 +1545,7 @@ impl TerminalApp {
     }
 
     pub(crate) fn render_reference_inspector(&mut self, root: &mut egui::Ui) {
+        self.render_workspace_remote(root.ctx());
         if !self.reference_inspector_visible(root.ctx())
             || self.sidebar.view == sidebar::SidebarView::Files
         {
@@ -1545,15 +1596,28 @@ impl TerminalApp {
                     self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE,
                 );
                 let tab = self.reference_selected_inspector_tab();
+                let tabs = if self.workspace_inspector_active()
+                    || matches!(
+                        tab,
+                        ReferenceInspectorTab::Changes | ReferenceInspectorTab::Run
+                    ) {
+                    [
+                        (ReferenceInspectorTab::Changes, "Changes"),
+                        (ReferenceInspectorTab::Context, "Context"),
+                        (ReferenceInspectorTab::Run, "Run"),
+                    ]
+                } else {
+                    [
+                        (ReferenceInspectorTab::Agent, "Agent"),
+                        (ReferenceInspectorTab::Context, "Context"),
+                        (ReferenceInspectorTab::Files, "Files"),
+                    ]
+                };
                 ui.horizontal_wrapped(|ui| {
                     ui.visuals_mut().selection.bg_fill = shell::rgba(shell::token::SELECTED_NAV);
                     ui.visuals_mut().selection.stroke =
                         Stroke::new(1.0, shell::rgba(shell::token::BORDER));
-                    for (candidate, label) in [
-                        (ReferenceInspectorTab::Agent, "Agent"),
-                        (ReferenceInspectorTab::Context, "Context"),
-                        (ReferenceInspectorTab::Files, "Files"),
-                    ] {
+                    for (candidate, label) in tabs {
                         let response = ui.add_sized(
                             [shell::INSPECTOR_TAB_WIDTH, 26.0],
                             egui::Button::selectable(tab == candidate, label)
@@ -1566,10 +1630,25 @@ impl TerminalApp {
                     }
                 });
                 ui.add_space(10.0);
+                let evidence = self.agent_sessions.tools.selected_hit.as_ref().map(|hit| {
+                    (
+                        hit.row.id.0.clone(),
+                        hit.anchor.event_id.clone(),
+                        hit.anchor.revision.clone(),
+                    )
+                });
+                let conversation = self.workspace_selected_row().map(|row| row.id);
                 egui::ScrollArea::vertical()
-                    .id_salt(("reference-inspector-scroll", tab))
+                    .id_salt(("reference-inspector-scroll", tab, conversation, evidence))
                     .show(ui, |ui| {
-                        if tab == ReferenceInspectorTab::Context {
+                        if self.workspace_inspector_active()
+                            || matches!(
+                                tab,
+                                ReferenceInspectorTab::Changes | ReferenceInspectorTab::Run
+                            )
+                        {
+                            self.render_workspace_inspector(ui, tab);
+                        } else if tab == ReferenceInspectorTab::Context {
                             self.render_reference_context(ui);
                         } else {
                             self.render_reference_agent(ui);
@@ -1985,22 +2064,53 @@ impl TerminalApp {
                 ),
                 egui::Sense::hover(),
             );
-            shell::bounded_ui_at(ui, rect.shrink2(egui::vec2(22.0, 7.0)), |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.strong(crate::review_text::visible_bounded(&title, 160));
-                        ui.weak(subtitle);
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Context").clicked() {
-                            self.reference_inspector.pending = Some(
-                                ReferenceInspectorRequest::Tab(ReferenceInspectorTab::Context),
-                            );
-                        }
-                        if self.ai_chat_panel.is_open && ui.button("New").clicked() {
-                            self.ai_chat_panel.open_workspace_chat(None, &self.config);
-                        }
-                    });
+            let content = rect.shrink2(egui::vec2(22.0, 7.0));
+            let button_width = |label: &str| {
+                ui.painter()
+                    .layout_no_wrap(
+                        label.to_owned(),
+                        egui::TextStyle::Button.resolve(ui.style()),
+                        ui.visuals().text_color(),
+                    )
+                    .size()
+                    .x
+                    + 2.0 * ui.spacing().button_padding.x
+            };
+            let actions_width = (button_width("Context")
+                + if self.ai_chat_panel.is_open {
+                    ui.spacing().item_spacing.x + button_width("New")
+                } else {
+                    0.0
+                })
+            .min(content.width());
+            let actions = egui::Rect::from_min_max(
+                egui::pos2(content.right() - actions_width, content.top()),
+                content.max,
+            );
+            let heading = egui::Rect::from_min_max(
+                content.min,
+                egui::pos2((actions.left() - 8.0).max(content.left()), content.bottom()),
+            );
+            shell::bounded_ui_at(ui, heading, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(crate::review_text::visible_bounded(&title, 160))
+                            .strong(),
+                    )
+                    .truncate(),
+                );
+                ui.add(egui::Label::new(egui::RichText::new(subtitle).weak()).truncate());
+            });
+            shell::bounded_ui_at(ui, actions, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Context").clicked() {
+                        self.reference_inspector.pending = Some(ReferenceInspectorRequest::Tab(
+                            ReferenceInspectorTab::Context,
+                        ));
+                    }
+                    if self.ai_chat_panel.is_open && ui.button("New").clicked() {
+                        self.ai_chat_panel.open_workspace_chat(None, &self.config);
+                    }
                 });
             });
             ui.advance_cursor_after_rect(rect);
