@@ -172,6 +172,7 @@ pub struct TaskSidebarState {
     follow_up_drafts: HashMap<TaskId, String>,
     follow_up_versions: HashMap<TaskId, u64>,
     hosted_followups: HashMap<String, (TaskId, u64, String)>,
+    owned_validation_tabs: HashMap<String, String>,
     recovery_loaded: bool,
     recovery_records: Vec<crate::agent::recovery::Record>,
     recovery_error: Option<String>,
@@ -1112,8 +1113,16 @@ fn clear_sent_follow_up(
     }
 }
 
-fn clear_follow_up_version(drafts:&mut HashMap<TaskId,String>,versions:&HashMap<TaskId,u64>,task:TaskId,text:&str,version:u64) {
-    if versions.get(&task).copied().unwrap_or(0)==version {clear_sent_follow_up(drafts,task,text);}
+fn clear_follow_up_version(
+    drafts: &mut HashMap<TaskId, String>,
+    versions: &HashMap<TaskId, u64>,
+    task: TaskId,
+    text: &str,
+    version: u64,
+) {
+    if versions.get(&task).copied().unwrap_or(0) == version {
+        clear_sent_follow_up(drafts, task, text);
+    }
 }
 
 fn render_native_codex_view(
@@ -3021,6 +3030,23 @@ impl TerminalApp {
                 Some(Instant::now() + NATIVE_ACTION_FAST_POLL);
             ctx.request_repaint();
         }
+        use jterm_core::agent_workspace::NativeTaskMutation as Mutation;
+        let mutation = match &action {
+            TaskSidebarAction::Complete(id) => Some((*id, Mutation::Complete)),
+            TaskSidebarAction::AcceptReviewed(id) => Some((*id, Mutation::AcceptReviewed)),
+            TaskSidebarAction::Archive(id) => Some((*id, Mutation::Archive)),
+            TaskSidebarAction::Restore(id) => Some((*id, Mutation::Restore)),
+            _ => None,
+        };
+        if let Some((id, mutation)) = mutation {
+            if self.agent_runtime.conversation_id(id).is_some() {
+                match self.agent_runtime.mutate_hosted_task(id, mutation) {
+                    Ok(()) => self.set_status("Task update queued for the session host"),
+                    Err(error) => self.set_status(error.to_string()),
+                }
+                return;
+            }
+        }
         match action {
             TaskSidebarAction::StartNative(task_id) => self.start_task_native_agent(task_id),
             TaskSidebarAction::LoadHistory(task_id, reset) => {
@@ -3136,6 +3162,14 @@ impl TerminalApp {
                 }
             }
             TaskSidebarAction::FocusValidation(task_id) => {
+                if let Some(terminal) = self
+                    .agent_runtime
+                    .hosted_validation_terminal(task_id)
+                    .cloned()
+                {
+                    self.open_owned_validation_terminal(terminal);
+                    return;
+                }
                 let session_id = self
                     .task_manager
                     .get(task_id)
@@ -3468,8 +3502,19 @@ impl TerminalApp {
             if let Some((task_id, version, text)) =
                 self.task_sidebar.hosted_followups.remove(&outcome.receipt)
             {
-                if outcome.result.is_ok() {clear_follow_up_version(&mut self.task_sidebar.follow_up_drafts,&self.task_sidebar.follow_up_versions,task_id,&text,version);}
+                if outcome.result.is_ok() {
+                    clear_follow_up_version(
+                        &mut self.task_sidebar.follow_up_drafts,
+                        &self.task_sidebar.follow_up_versions,
+                        task_id,
+                        &text,
+                        version,
+                    );
+                }
             }
+        }
+        for (_, terminal) in self.agent_runtime.take_owned_terminal_launches() {
+            self.open_owned_validation_terminal(terminal);
         }
         for (_, session) in self.agent_runtime.take_terminal_handoffs() {
             self.open_hosted_native_terminal(session, ctx);
@@ -3740,7 +3785,64 @@ impl TerminalApp {
         handled
     }
 
+    fn open_owned_validation_terminal(
+        &mut self,
+        terminal: jterm_core::agent_workspace::OwnedTerminalDescriptor,
+    ) {
+        let key = format!("{}:{}", terminal.id.0, terminal.epoch);
+        if let Some(index) = self
+            .task_sidebar
+            .owned_validation_tabs
+            .get(&key)
+            .and_then(|id| self.session_manager.index_of(id))
+        {
+            self.activate_session(index);
+            self.agent_sessions.workspace_task = None;
+            self.ai_chat_panel.close();
+            return;
+        }
+        let launch = match jterm_core::agent_workspace::owned_terminal_launch(&terminal) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.set_status(error);
+                return;
+            }
+        };
+        let argv = std::iter::once(launch.program).chain(launch.args).collect();
+        let (cols, rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
+        match self.session_manager.new_command_session_in_cwd(
+            terminal.label,
+            argv,
+            &launch.cwd,
+            cols,
+            rows,
+            self.config.scrollback_lines,
+        ) {
+            Ok(created) => {
+                // This tab only displays an existing host PTY. Its exit is
+                // never bound to the task's authoritative validation reducer.
+                self.task_sidebar
+                    .owned_validation_tabs
+                    .insert(key, created.session_id);
+                self.tabs.on_session_inserted(created.session_index);
+                self.tabs.insert_tab_after_active(created.session_index);
+                self.activate_session(created.session_index);
+                self.agent_sessions.workspace_task = None;
+                self.ai_chat_panel.close();
+                self.schedule_session_save();
+            }
+            Err(error) => self.set_status(error),
+        }
+    }
+
     fn start_task_validation(&mut self, task_id: TaskId) {
+        if self.agent_runtime.conversation_id(task_id).is_some() {
+            match self.agent_runtime.start_hosted_validation(task_id) {
+                Ok(()) => self.set_status("Validation queued in the background session host"),
+                Err(error) => self.set_status(error.to_string()),
+            }
+            return;
+        }
         let next_attempt = match self.task_manager.next_validation_attempt(task_id) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -6191,9 +6293,13 @@ mod hosted_follow_up_version_tests {
     use super::*;
     #[test]
     fn late_host_ack_preserves_an_edited_back_draft() {
-        let task=TaskId::new();let mut drafts=HashMap::from([(task,"same".into())]);let mut versions=HashMap::from([(task,0)]);
-        versions.insert(task,2); // User edited a value and returned to the same text.
-        clear_follow_up_version(&mut drafts,&versions,task,"same",0);assert_eq!(drafts[&task],"same");
-        clear_follow_up_version(&mut drafts,&versions,task,"same",2);assert!(!drafts.contains_key(&task));
+        let task = TaskId::new();
+        let mut drafts = HashMap::from([(task, "same".into())]);
+        let mut versions = HashMap::from([(task, 0)]);
+        versions.insert(task, 2); // User edited a value and returned to the same text.
+        clear_follow_up_version(&mut drafts, &versions, task, "same", 0);
+        assert_eq!(drafts[&task], "same");
+        clear_follow_up_version(&mut drafts, &versions, task, "same", 2);
+        assert!(!drafts.contains_key(&task));
     }
 }
