@@ -1015,7 +1015,7 @@ mod tests {
                 l.center.x,
                 l.inspector.unwrap().x
             ),
-            (0.0, 48.0, 266.0, 1324.0)
+            (0.0, 48.0, 330.0, 1324.0)
         );
         assert_eq!(
             (
@@ -1024,7 +1024,7 @@ mod tests {
                 l.composer.width,
                 l.composer.height
             ),
-            (294.0, 930.0, 1000.0, 36.0)
+            (358.0, 930.0, 936.0, 36.0)
         );
         let hidden = l.without_inspector();
         assert_eq!(hidden.center.width - l.center.width, 290.0);
@@ -1053,7 +1053,7 @@ mod tests {
                 assert!(layout.composer.y >= layout.header.y + layout.header.height);
                 assert!(layout.center.width >= CENTER_MIN_WIDTH);
                 assert_eq!(layout.rail.width, 48.0);
-                assert_eq!(layout.navigation.unwrap().width, 216.0);
+                assert_eq!(layout.navigation.unwrap().width, 280.0);
                 assert_eq!(layout.inspector.unwrap().width, 288.0);
                 assert_eq!(
                     layout.composer.y + layout.composer.height,
