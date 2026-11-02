@@ -16,6 +16,7 @@ mod font_zoom;
 pub mod glass_shell;
 pub mod glass_shell_tokens;
 pub mod gpu;
+mod immersive_command;
 pub mod keybindings;
 pub mod kitty_graphics;
 pub mod layout;

@@ -720,6 +720,8 @@ pub struct TerminalState {
     chat_pending_submit: Option<u64>,
     // A main-screen takeover stays native for this foreground command.
     chat_native_takeover_sequence: Option<u64>,
+    inline_cli_launch_floor: Option<u64>,
+    inline_cli_command_scope: Option<(u64, u64)>,
     pub row_versions: Vec<u64>, // 每行的修改版本号
 
     // Cached visible cells to avoid per-frame cloning

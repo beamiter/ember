@@ -91,6 +91,7 @@ pub struct ProjectionPolicy {
     collapsed: BTreeSet<u64>,
     block_spacing: bool,
     retain_identity_canvas: bool,
+    inline_scope_floor: Option<u64>,
     block_headers: bool,
     companion_status_rows: usize,
     chat_mode: bool,
@@ -105,6 +106,7 @@ impl Default for ProjectionPolicy {
             collapsed: BTreeSet::new(),
             block_spacing: false,
             retain_identity_canvas: false,
+            inline_scope_floor: None,
             block_headers: false,
             companion_status_rows: 0,
             chat_mode: false,
@@ -134,6 +136,17 @@ impl ProjectionPolicy {
 
     /// Keep the raw identity plan in the existing anchor/fractional canvas.
     /// No synthetic row or terminal cell is inserted by this presentation flag.
+    pub fn inline_scope_floor(&self) -> Option<u64> {
+        self.inline_scope_floor
+    }
+
+    pub fn set_inline_scope_floor(&mut self, floor: Option<u64>) {
+        if self.inline_scope_floor != floor {
+            self.inline_scope_floor = floor;
+            self.revision = self.revision.saturating_add(1);
+        }
+    }
+
     pub fn retain_identity_canvas(&self) -> bool {
         self.retain_identity_canvas
     }
@@ -448,6 +461,7 @@ pub(super) struct ProjectionPlanCacheKey {
     pub(super) policy_ids: SmallVec<[u64; 4]>,
     pub(super) block_spacing: bool,
     pub(super) retain_identity_canvas: bool,
+    pub(super) inline_scope_floor: Option<u64>,
     pub(super) block_headers: bool,
     pub(super) companion_status_rows: usize,
     pub(super) chrome_tail_keep: usize,
@@ -935,6 +949,26 @@ impl ProjectionPlan {
             });
             logical_offset = end;
         }
+    }
+
+    /// Trim presentation rows, preserving the dense source index and every
+    /// surviving raw identity. Omitted rows retain no display placement.
+    pub(super) fn retain_source_suffix(&mut self, floor: u64) {
+        for row in &mut self.rows {
+            row.raw_slices
+                .retain(|slice| slice.source.absolute_row as u64 >= floor);
+            row.row_source = row
+                .row_source
+                .filter(|source| source.raw_absolute_row as u64 >= floor);
+        }
+        while self
+            .rows
+            .front()
+            .is_some_and(|row| row.raw_slices.is_empty() && row.row_source.is_none())
+        {
+            self.rows.pop_front();
+        }
+        self.rebuild_raw_row_placements();
     }
 
     pub(super) fn rebuild_raw_row_placements(&mut self) {
@@ -2310,7 +2344,11 @@ impl ProjectedViewport {
             row_kinds: Arc::new(vec![ProjectedRowKind::Raw; key.rows]),
             row_sources: Arc::new(row_sources),
             cursor,
-            document_rows: key.scrollback_len.saturating_add(key.rows),
+            document_rows: if key.alt_screen {
+                key.rows
+            } else {
+                key.scrollback_len.saturating_add(key.rows)
+            },
             document_start: key.scrollback_len.saturating_sub(key.scroll_offset),
             top_padding: 0,
             effective_collapsed: Arc::new(BTreeSet::new()),

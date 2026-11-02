@@ -625,6 +625,15 @@ impl SessionManager {
         repaint_ctx: egui::Context,
         configured_shell: Option<String>,
     ) -> Self {
+        // The first session is constructed by the app before this manager;
+        // arm configured direct CLIs here just as later tabs are armed in
+        // new_terminal_state, before any queued PTY output is ingested.
+        if configured_shell
+            .as_deref()
+            .is_some_and(|program| crate::agent_cli::is_inline_launch(&[program.to_owned()]))
+        {
+            first_session.terminal.lock().set_inline_cli_launch(true);
+        }
         let protocol_responses = vec![ProtocolResponseSender::new(repaint_ctx.clone())];
         SessionManager {
             sessions: vec![first_session],
@@ -653,6 +662,11 @@ impl SessionManager {
 
     fn new_terminal_state(&self, cols: usize, rows: usize) -> TerminalState {
         let mut terminal = TerminalState::new(cols, rows);
+        terminal.set_inline_cli_launch(
+            self.configured_shell
+                .as_deref()
+                .is_some_and(|program| crate::agent_cli::is_inline_launch(&[program.to_owned()])),
+        );
         if let Some(colors) = self.terminal_default_colors {
             terminal.set_default_colors(colors);
         }
@@ -1097,6 +1111,9 @@ impl SessionManager {
             self.repaint_ctx.clone(),
         )?;
         let mut terminal = self.new_terminal_state(cols, rows);
+        if let Some(argv) = command_argv.as_deref() {
+            terminal.set_inline_cli_launch(crate::agent_cli::is_inline_launch(argv));
+        }
         terminal.set_max_scrollback(scrollback_lines);
         let terminal = Arc::new(ParkingMutex::new(terminal));
         let mut session =

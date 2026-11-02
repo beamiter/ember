@@ -90,6 +90,16 @@ fn prepare(mut block: Vec<CString>, directory: Option<&Path>) -> Vec<CString> {
     block
 }
 
+pub(crate) fn is_inline_session(command: &str) -> bool {
+    std::env::var_os("JTERM_AGENT_SCROLLBACK").as_deref() != Some(OsStr::new("0"))
+        && crate::immersive_command::reading_agent_command(command)
+}
+
+pub(crate) fn is_inline_launch(argv: &[String]) -> bool {
+    std::env::var_os("JTERM_AGENT_SCROLLBACK").as_deref() != Some(OsStr::new("0"))
+        && crate::immersive_command::reading_agent_argv(argv)
+}
+
 /// Absolute launchers (task tabs and session resume) bypass PATH shims.
 pub(crate) fn inline_argv(argv: &[String]) -> Vec<String> {
     let mut argv = argv.to_vec();

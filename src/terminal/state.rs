@@ -398,6 +398,8 @@ impl super::TerminalState {
             row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
             chat_pending_submit: None,
             chat_native_takeover_sequence: None,
+            inline_cli_launch_floor: None,
+            inline_cli_command_scope: None,
             visible_cells_cache: None,
             projected_viewport_cache: None,
             projection_plan_cache: None,
@@ -1335,6 +1337,11 @@ impl super::TerminalState {
         allow_alt_buffer: bool,
         dedupe_snapshot: bool,
     ) {
+        // A CLI redraw replaces its native screen; only real scroll-region
+        // transfers belong to its transcript, never copied composer frames.
+        if self.inline_cli_owner_active() {
+            return;
+        }
         if (self.use_alt_buffer && !allow_alt_buffer) || self.grid.rows() == 0 {
             return;
         }
@@ -1599,7 +1606,8 @@ impl super::TerminalState {
 
         // Compress the removed line directly from the grid slice before mutating,
         // avoiding a per-line Vec allocation from get_row.
-        let allow_alt_scrollback = self.use_alt_buffer && self.sync_output_active;
+        let allow_alt_scrollback =
+            self.use_alt_buffer && self.sync_output_active && !self.inline_cli_owner_active();
         let scrollback_line = if scrolls_off_screen_top
             && (!self.use_alt_buffer || allow_alt_scrollback)
         {
@@ -1907,6 +1915,7 @@ impl super::TerminalState {
         let next_raw_row_id = self.next_raw_row_id;
         let row_identity_revision = self.row_identity_revision;
         let next_command_sequence = self.next_command_sequence;
+        let direct_inline_cli = self.inline_cli_launch_floor.is_some();
         self.watch.prompt();
         let watch = std::mem::take(&mut self.watch);
         *self = Self::new(cols, rows);
@@ -1919,6 +1928,7 @@ impl super::TerminalState {
         self.next_raw_row_id = next_raw_row_id;
         self.row_identity_revision = row_identity_revision;
         self.next_command_sequence = next_command_sequence;
+        self.set_inline_cli_launch(direct_inline_cli);
         self.grid.row_ids.fill(RawRowId::UNTRACKED);
         self.alt_grid.row_ids.fill(RawRowId::UNTRACKED);
         self.fill_untracked_grid_row_ids();
@@ -1926,6 +1936,52 @@ impl super::TerminalState {
         self.set_max_scrollback(max_scrollback);
         self.kitty_graphics
             .set_cell_size_pixels(cell_size.0, cell_size.1);
+    }
+
+    /// Arm direct launches before the first PTY byte is parsed. An OSC shell
+    /// execution independently owns its scope by command sequence.
+    pub fn set_inline_cli_launch(&mut self, enabled: bool) {
+        self.inline_cli_launch_floor = enabled.then_some(self.total_lines_scrolled);
+    }
+
+    /// Execution ownership survives a temporary native transcript/alternate
+    /// screen even though that screen owns its own input and has no host rail.
+    pub(super) fn inline_cli_owner_active(&self) -> bool {
+        self.inline_cli_owner_floor().is_some()
+    }
+
+    pub fn inline_cli_scope_floor(&self) -> Option<u64> {
+        if self.use_alt_buffer {
+            None
+        } else {
+            self.inline_cli_owner_floor()
+        }
+    }
+
+    fn inline_cli_owner_floor(&self) -> Option<u64> {
+        if let Some(record) = self
+            .command_records
+            .back()
+            .filter(|record| !record.complete && record.state == CommandState::Running)
+        {
+            return self
+                .inline_cli_command_scope
+                .filter(|(sequence, _)| *sequence == record.sequence)
+                .map(|(_, floor)| floor);
+        }
+        self.inline_cli_launch_floor
+    }
+
+    pub(super) fn inline_cli_screen_erased(&mut self) {
+        if self.inline_cli_scope_floor().is_none() {
+            return;
+        }
+        if let Some((_, floor)) = &mut self.inline_cli_command_scope {
+            *floor = (*floor).min(self.total_lines_scrolled);
+        }
+        if let Some(floor) = &mut self.inline_cli_launch_floor {
+            *floor = (*floor).min(self.total_lines_scrolled);
+        }
     }
 
     pub fn max_scrollback(&self) -> usize {
@@ -3053,6 +3109,16 @@ impl super::TerminalState {
                 .get_or_insert_with(std::time::Instant::now);
         }
         if initialize_provenance {
+            self.inline_cli_command_scope = self
+                .command_records
+                .get(index)
+                .filter(|record| {
+                    record
+                        .command
+                        .as_deref()
+                        .is_some_and(crate::agent_cli::is_inline_session)
+                })
+                .map(|record| (record.sequence, anchor.line_id));
             self.active_output_provenance = self.command_records.get(index).and_then(|record| {
                 let (absolute_row, _) = self.buffer_anchor_to_absolute(anchor)?;
                 let (start_row_id, _) = self.retained_raw_row(absolute_row)?;
@@ -5222,6 +5288,7 @@ impl super::TerminalState {
             policy_ids: policy.ids(),
             block_spacing: policy.block_spacing(),
             retain_identity_canvas: policy.retain_identity_canvas(),
+            inline_scope_floor: policy.inline_scope_floor(),
             block_headers: policy.block_headers(),
             companion_status_rows: policy.companion_status_rows(),
             chrome_tail_keep: self.block_chrome_tail_keep(policy),
@@ -5308,6 +5375,10 @@ impl super::TerminalState {
         let mut plan = self
             .identity_projection_plan(cols)
             .splice_collapses(&resolved, policy.revision());
+        if let Some(floor) = policy.inline_scope_floor() {
+            plan.retain_source_suffix(floor);
+        }
+
         if policy.block_spacing() {
             let prompts = self.block_spacing_prompts();
             plan = plan.splice_block_spacing(&prompts);
@@ -5346,6 +5417,9 @@ impl super::TerminalState {
         new_key: &ProjectionPlanCacheKey,
         plan: &mut ProjectionPlan,
     ) -> bool {
+        if old_key.inline_scope_floor.is_some() || new_key.inline_scope_floor.is_some() {
+            return false;
+        }
         let Some(appended) = new_key
             .total_lines_scrolled
             .checked_sub(old_key.total_lines_scrolled)
@@ -6026,6 +6100,11 @@ impl super::TerminalState {
     }
 
     pub fn get_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
+        // The alternate screen owns one native viewport. A stale host rail
+        // offset must never make primary-shell history visible inside it.
+        if self.use_alt_buffer {
+            self.scroll_offset = 0;
+        }
         if let Some((cached_version, cached_offset, ref cells)) = self.visible_cells_cache {
             if cached_version == self.grid_version && cached_offset == self.scroll_offset {
                 return std::sync::Arc::clone(cells);
@@ -6344,6 +6423,9 @@ impl super::TerminalState {
         block_mode: bool,
     ) -> ProjectedViewport {
         self.leave_transformed_selection_space();
+        if self.use_alt_buffer {
+            self.scroll_offset = 0;
+        }
         let rows = self.grid.rows();
         let columns = self.grid.row_len();
         let mode = if !block_mode || self.use_alt_buffer {

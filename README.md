@@ -1862,6 +1862,12 @@ Agent and Tasks surfaces remain available.
 向下回到最新输出；滚动范围受终端的 scrollback 容量限制。
 新会话、任务终端和恢复的会话采用相同设置，不改写 CLI 配置文件。
 
+运行中的阅读范围从当前 CLI 的启动边界开始，滑轨顶部不会跨回此前的 shell 命令。
+Codex 的完整主屏回放可统一设为全局偏好：在 `~/.codex/config.toml` 的 `[tui]` 中设置
+`alternate_screen = "never"` 和 `terminal_resize_reflow_max_rows = 0`，恢复时无需额外回放参数。
+主屏重绘会替换当前画面，旧输入框和状态栏不会被另存为历史帧。
+显式使用备用屏幕的应用保留自身翻页，宿主不显示会跨入 shell 历史的滑轨。
+
 Block / Chat 中，主屏 CLI 的原生会话沿用连续画布：滚轮平滑移动，
 触控板和滑轨保留不足一行的像素位置。`PageUp` / `PageDown` 平滑翻页并保留两行上下文，
 翻页键由阅读视口独占，不会同时传给 CLI。上翻阅读时，新输出保留当前阅读位置；

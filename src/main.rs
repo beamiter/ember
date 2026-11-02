@@ -7323,7 +7323,8 @@ impl eframe::App for TerminalApp {
         // ownership decisions for this frame. A wheel event admitted below is
         // intentionally applied on the next frame, so no viewport mutation can
         // split one pointer batch across two projection snapshots.
-        let canvas_scroll = self.config.command_cards_enabled()
+        let inline_cli_reading = session.terminal.lock().inline_cli_scope_floor().is_some();
+        let canvas_scroll = (self.config.command_cards_enabled() || inline_cli_reading)
             && mouse_projection_viewport.is_transformed()
             && session
                 .terminal
@@ -7336,6 +7337,7 @@ impl eframe::App for TerminalApp {
                 .unwrap_or(&self.renderer)
                 .native_vim9_identity
                 .is_none();
+        let inline_cli_host_wheel = inline_cli_reading && canvas_scroll;
         if canvas_scroll {
             if !terminal_pointer_input_blocked
                 && pointer_over_active_terminal
@@ -7537,7 +7539,10 @@ impl eframe::App for TerminalApp {
             && pointer_over_active_terminal
             && scroll_delta != 0.0
             && !ctrl_scroll_this_frame
-            && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
+            && (inline_cli_host_wheel
+                || !mouse_enabled
+                || shift_mouse_bypass
+                || !pointer_app_mouse_eligible)
             && !alternate_scroll_owns_wheel
         {
             if canvas_scroll {
@@ -7928,7 +7933,7 @@ impl eframe::App for TerminalApp {
                                 ..
                             } = event
                             {
-                                if modifiers.ctrl {
+                                if modifiers.ctrl || inline_cli_host_wheel {
                                     continue;
                                 }
                                 match unit {

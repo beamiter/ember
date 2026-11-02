@@ -1519,6 +1519,9 @@ impl super::TerminalState {
                 let selective = private_prefix == Some(b'?');
                 match params.first().copied().unwrap_or(0) {
                     0 => {
+                        if !selective && self.cursor_row == 0 && self.cursor_col == 0 {
+                            self.inline_cli_screen_erased();
+                        }
                         // Clear from cursor to end of display
                         // ClearRight cancels wrap even if the tail is protected.
                         self.pending_wrap = false;
@@ -1558,6 +1561,7 @@ impl super::TerminalState {
                         } else {
                             self.archive_visible_screen_to_scrollback();
                         }
+                        self.inline_cli_screen_erased();
                         self.erase_screen();
                     }
                     3 => {

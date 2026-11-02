@@ -1928,15 +1928,16 @@ impl TerminalRenderer {
         // output still belongs to one continuous reading document. Use the raw
         // identity plan, with no Chat composer or synthetic command rows.
         // Alternate screens, graphics and native Vim keep their native path.
-        if self.block_mode
-            && policy.chat_mode()
-            && terminal.chat_native_takeover()
+        let inline_floor = terminal.inline_cli_scope_floor();
+        if (inline_floor.is_some()
+            || (self.block_mode && policy.chat_mode() && terminal.chat_native_takeover()))
             && !terminal.is_alt_buffer_active()
             && terminal.kitty_graphics.get_placements().is_empty()
             && self.native_vim9_identity.is_none()
         {
             let mut raw = crate::terminal::ProjectionPolicy::new();
             raw.set_retain_identity_canvas(true);
+            raw.set_inline_scope_floor(inline_floor);
             return terminal.projected_viewport_with_rows(
                 self.history_projection,
                 true,
@@ -2046,7 +2047,7 @@ impl TerminalRenderer {
         ctx: &egui::Context,
     ) -> ProjectedViewport {
         let viewport = self.projected_viewport_with_state(terminal, policy, state);
-        if !self.block_mode
+        if (!self.block_mode && terminal.inline_cli_scope_floor().is_none())
             || !viewport.is_transformed()
             || self.native_vim9_identity.is_some()
             || !terminal.kitty_graphics.get_placements().is_empty()
@@ -12192,6 +12193,176 @@ mod transcript_canvas_tests {
                     == text
             })
             .expect("visible fixture text")
+    }
+
+    #[test]
+    fn inline_cli_canvas_is_only_the_running_session_and_redraws_are_not_history() {
+        let (mut renderer, _, policy) = fixture(true);
+        let mut terminal = TerminalState::new(40, 12);
+        terminal.set_max_scrollback(200);
+        for _ in 0..20 {
+            terminal.process_input(b"OUTSIDE_SHELL_SENTINEL\r\n");
+        }
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07codex resume\r\n\x1b]133;C;id=active;cmdline_url=codex%20resume\x07");
+        assert!(terminal.inline_cli_scope_floor().is_some());
+        // Codex may move the native grid origin when taking over the screen.
+        terminal.process_input(b"\x1b[2J\x1b[H");
+        for index in 0..60 {
+            terminal.process_input(format!("SESSION_{index:03}\r\n").as_bytes());
+        }
+        let genuine_rows = terminal.scrollback_len();
+        terminal.process_input(
+            b"\x1b[12;1HOLD_COMPOSER\x1b[?2026h\x1b[2J\x1b[HNEW_LIVE_VIEW\x1b[?2026l",
+        );
+        assert_eq!(
+            terminal.scrollback_len(),
+            genuine_rows,
+            "redraws are replacements, not transcript rows"
+        );
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let live = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        state.set_offset(live.max_scroll_offset(), &live);
+        let first = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(first
+            .cells()
+            .iter()
+            .flatten()
+            .any(|cell| cell.character == 'S'));
+        let lines = first
+            .cells()
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.character).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(lines[0].starts_with("SESSION_000"), "{lines:?}");
+        assert!(!lines
+            .iter()
+            .any(|line| line.contains("OUTSIDE_SHELL") || line.contains("OLD_COMPOSER")));
+        assert!(first.first_raw_anchor_in_row(0).is_some());
+        // The exact same source coordinates remain valid after width reflow.
+        terminal.on_resize(24, 12);
+        let resized =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(!resized
+            .cells()
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.character).collect::<String>())
+            .any(|line| line.contains("OUTSIDE_SHELL")));
+        terminal.process_input(b"\x1b[?1049h");
+        assert!(terminal.inline_cli_scope_floor().is_none());
+        terminal.scroll_offset = terminal.scrollback_len();
+        let alt = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(
+            alt.max_scroll_offset(),
+            0,
+            "alternate apps have no host history rail"
+        );
+        assert!(!alt
+            .cells()
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.character).collect::<String>())
+            .any(|line| line.contains("OUTSIDE_SHELL")));
+        terminal
+            .process_input(b"\x1b[?1049l\x1b]133;D;0;id=active\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(terminal.inline_cli_scope_floor().is_none());
+        assert!(
+            terminal.scrollback.iter().any(|row| row
+                .decompress()
+                .iter()
+                .map(|cell| cell.character)
+                .collect::<String>()
+                .contains("OUTSIDE_SHELL")),
+            "old shell history remains globally retained"
+        );
+    }
+
+    #[test]
+    fn inline_cli_alternate_transcript_never_appends_frames_or_scrolled_rows() {
+        for direct in [false, true] {
+            let mut terminal = TerminalState::new(40, 8);
+            terminal.set_max_scrollback(100);
+            if direct {
+                terminal.set_inline_cli_launch(true);
+            } else {
+                terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07codex resume\r\n\x1b]133;C;id=active;cmdline_url=codex%20resume\x07");
+            }
+            for index in 0..20 {
+                terminal.process_input(format!("CURRENT_{index:03}\r\n").as_bytes());
+            }
+            let history = |terminal: &TerminalState| {
+                terminal
+                    .scrollback
+                    .iter()
+                    .map(|line| {
+                        line.decompress()
+                            .iter()
+                            .map(|cell| cell.character)
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = history(&terminal);
+            let floor = terminal.inline_cli_scope_floor();
+            assert!(floor.is_some());
+            terminal.process_input(b"\x1b[?1049h\x1b[?2026hALT_COMPOSER_SENTINEL\x1b[?2026l");
+            assert!(terminal.inline_cli_scope_floor().is_none());
+            assert_eq!(
+                history(&terminal),
+                before,
+                "temporary synchronized frames stay in their own screen"
+            );
+            let alt =
+                terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), true);
+            assert_eq!(alt.max_scroll_offset(), 0);
+            terminal.process_input(b"\x1b[?2026h");
+            for _ in 0..20 {
+                terminal.process_input(b"ALT_SCROLL_SENTINEL\r\n");
+            }
+            terminal.process_input(b"\x1b[2JALT_REDRAW_SENTINEL\x1b[?2026l\x1b[?1049l");
+            assert_eq!(terminal.inline_cli_scope_floor(), floor);
+            assert_eq!(
+                history(&terminal),
+                before,
+                "neither alternate row transfers nor redraws may enter primary CLI history"
+            );
+        }
+        // Existing terminal compatibility for unrelated full-screen programs
+        // is independent from the positively identified CLI execution owner.
+        let mut ordinary = TerminalState::new(40, 8);
+        ordinary.process_input(b"\x1b[?1049h\x1b[?2026hGENERIC_ALT_SNAPSHOT\x1b[?2026l\x1b[?1049l");
+        assert!(ordinary.scrollback.iter().any(|line| line
+            .decompress()
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>()
+            .contains("GENERIC_ALT_SNAPSHOT")));
+    }
+
+    #[test]
+    fn inline_cli_scope_survives_history_eviction_and_direct_launch_resets() {
+        let (mut renderer, _, policy) = fixture(true);
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.set_max_scrollback(12);
+        terminal.process_input(b"OUTSIDE_SHELL\r\n");
+        terminal.set_inline_cli_launch(true);
+        terminal.process_input(b"\x1b[H\x1b[J");
+        for index in 0..70 {
+            terminal.process_input(format!("CURRENT_{index:03}\r\n").as_bytes());
+        }
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let live = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        state.set_offset(live.max_scroll_offset(), &live);
+        let first = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(first.cells()[0]
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>()
+            .starts_with("CURRENT_"));
+        terminal.process_input(b"\x1bc");
+        assert_eq!(terminal.inline_cli_scope_floor(), Some(0));
     }
 
     #[test]

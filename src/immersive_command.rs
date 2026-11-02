@@ -2,6 +2,25 @@
 //! Keep in sync between Ember and Frost. No subprocesses or shell evaluation.
 
 pub(crate) fn immersive_block_command(command: &str) -> bool {
+    classify(command, false)
+}
+
+pub(crate) fn reading_agent_command(command: &str) -> bool {
+    classify(command, true)
+}
+
+/// Preserve exact argument boundaries when a task launches a CLI directly.
+/// No shell evaluation occurs; quoting only adapts argv to our bounded parser.
+pub(crate) fn reading_agent_argv(argv: &[String]) -> bool {
+    let command = argv
+        .iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    reading_agent_command(&command)
+}
+
+fn classify(command: &str, reading_agent_only: bool) -> bool {
     let Some(words) = shell_words(command) else {
         return false;
     };
@@ -135,6 +154,9 @@ pub(crate) fn immersive_block_command(command: &str) -> bool {
                 return false;
             }
         }
+    }
+    if reading_agent_only {
+        return matches!(name, "codex" | "claude");
     }
     matches!(
         name,
@@ -280,6 +302,61 @@ mod tests {
             "codex 'unfinished",
         ] {
             assert!(!tui(command), "{command}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::reading_agent_command as reads;
+    #[test]
+    fn direct_argv_preserves_quoted_arguments_and_excludes_batch_launches() {
+        for argv in [
+            vec!["/opt/bin/codex", "resume", "a'b c"],
+            vec!["/opt/bin/claude", "--resume", "a'b c"],
+            vec![
+                "env",
+                "CODEX_HOME=/tmp/a b",
+                "/opt/bin/codex",
+                "resume",
+                "abc",
+            ],
+        ] {
+            assert!(super::reading_agent_argv(
+                &argv.into_iter().map(String::from).collect::<Vec<_>>()
+            ));
+        }
+        for argv in [
+            vec!["/opt/bin/codex", "exec", "claude"],
+            vec!["/opt/bin/claude", "--print", "codex"],
+            vec!["echo", "codex"],
+        ] {
+            assert!(!super::reading_agent_argv(
+                &argv.into_iter().map(String::from).collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    #[test]
+    fn only_interactive_agent_executables_own_session_paging() {
+        for command in [
+            "codex --no-alt-screen",
+            "claude",
+            "env FOO=bar npx -y @anthropic-ai/claude-code",
+            "command /opt/bin/codex resume abc",
+        ] {
+            assert!(reads(command), "{command}");
+        }
+        for command in [
+            "echo codex",
+            "vim codex",
+            "less claude",
+            "codex exec task",
+            "claude --print test",
+            "claude --help",
+            "ssh host codex",
+        ] {
+            assert!(!reads(command), "{command}");
         }
     }
 }
