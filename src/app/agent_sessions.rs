@@ -2139,6 +2139,7 @@ impl TerminalApp {
             self.agent_sessions.workspace_task = None;
             self.ai_chat_panel
                 .open_workspace_chat(Some(id), &self.config);
+            self.reference_navigation_entered_canvas(&ctx);
         }
 
         if self.config.experimental_task_sidebar {
@@ -2201,6 +2202,7 @@ impl TerminalApp {
                 self.agent_sessions.workspace_pending = false;
                 self.agent_sessions.workspace_task = Some(id);
                 self.task_sidebar.open_workspace_task(id);
+                self.reference_navigation_entered_canvas(&ctx);
             }
         }
         ui.add_space(8.0);
@@ -2235,7 +2237,9 @@ impl TerminalApp {
             self.agent_sessions.workspace_pending = false;
             self.agent_sessions.cancel_resume();
             self.sidebar.view = crate::sidebar::SidebarView::Sessions;
-            self.activate_session(index);
+            if self.activate_session(index) {
+                self.reference_navigation_entered_canvas(&ctx);
+            }
             self.return_focus_to_terminal(&ctx);
         }
     }
@@ -2456,6 +2460,7 @@ impl TerminalApp {
                 self.agent_sessions.workspace_task = None;
                 self.sidebar.view = crate::sidebar::SidebarView::Sessions;
                 self.ai_chat_panel.close();
+                self.reference_navigation_entered_canvas(ctx);
                 self.return_focus_to_terminal(ctx);
                 self.set_status(format!(
                     "Switched to the open {} conversation",
@@ -2506,9 +2511,12 @@ impl TerminalApp {
                 .iter()
                 .position(|terminal| &terminal.metadata.session_id == bound)
             {
-                self.activate_session(index);
+                let activated = self.activate_session(index);
                 self.agent_sessions.workspace_task = None;
                 self.ai_chat_panel.close();
+                if activated {
+                    self.reference_navigation_entered_canvas(ctx);
+                }
                 self.return_focus_to_terminal(ctx);
                 return;
             }
@@ -2564,7 +2572,7 @@ impl TerminalApp {
                     .insert(key, created.session_id.clone());
                 self.tabs.on_session_inserted(created.session_index);
                 self.tabs.insert_tab_after_active(created.session_index);
-                self.activate_session(created.session_index);
+                let activated = self.activate_session(created.session_index);
                 self.schedule_session_save();
                 self.claim_enter_for_prompt_recall();
                 self.agent_sessions.is_open = false;
@@ -2574,6 +2582,9 @@ impl TerminalApp {
                 self.ai_chat_panel.close();
                 self.agent_sessions.cancel_resume();
                 self.agent_sessions.error = None;
+                if activated {
+                    self.reference_navigation_entered_canvas(ctx);
+                }
                 self.return_focus_to_terminal(ctx);
                 self.set_status(format!(
                     "Resuming {} conversation in a new tab",

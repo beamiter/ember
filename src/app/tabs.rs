@@ -1020,7 +1020,9 @@ impl TerminalApp {
             self.ai_chat_panel.close();
             self.agent_sessions.workspace_task = None;
             self.sidebar.view = crate::sidebar::SidebarView::Sessions;
-            self.activate_tab(i);
+            if self.activate_tab(i) {
+                self.reference_navigation_entered_canvas(ui.ctx());
+            }
         }
         if let Some(i) = close_idx {
             if self.close_tab_synced(i) {
@@ -1031,7 +1033,9 @@ impl TerminalApp {
             self.ai_chat_panel.close();
             self.agent_sessions.workspace_task = None;
             self.sidebar.view = crate::sidebar::SidebarView::Sessions;
-            self.new_tab();
+            if self.new_tab().is_some() {
+                self.reference_navigation_entered_canvas(ui.ctx());
+            }
         }
         // 右键菜单的操作在渲染闭包外统一执行。重命名走列表内的行内编辑器,
         // 因此只是把它转成本帧的 begin_rename。

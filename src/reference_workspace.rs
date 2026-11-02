@@ -455,6 +455,19 @@ impl TerminalApp {
             || self.reference_navigation_drawer_rect(ctx).is_some()
     }
 
+    /// Call only after an explicit navigation has successfully entered its canvas.
+    pub(crate) fn reference_navigation_entered_canvas(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.reference_inspector.navigation_drawer) {
+            crate::ui::remember_reference_chrome_scope(
+                ctx,
+                egui::Id::new("reference-navigation-drawer-input"),
+                ctx.viewport_rect(),
+                true,
+            );
+            ctx.request_repaint();
+        }
+    }
+
     pub(crate) fn toggle_reference_navigation_drawer(&mut self, ctx: &egui::Context) -> bool {
         if !self.reference_navigation_is_compact(ctx) {
             return false;
@@ -1181,13 +1194,16 @@ impl TerminalApp {
             {
                 self.agent_sessions.workspace_task = None;
                 self.ai_chat_panel.open_workspace_chat(None, &self.config);
+                self.reference_navigation_entered_canvas(ui.ctx());
             }
         });
         ui.horizontal(|ui| {
             if ui.small_button("Terminal").clicked() {
                 self.ai_chat_panel.close();
                 self.agent_sessions.workspace_task = None;
-                self.new_tab();
+                if self.new_tab().is_some() {
+                    self.reference_navigation_entered_canvas(ui.ctx());
+                }
             }
             if ui.small_button("Tasks").clicked() {
                 self.open_tasks_view();
