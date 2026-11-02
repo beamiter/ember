@@ -8773,7 +8773,59 @@ fn chat_projection_pins_real_prompt_and_left_aligns_command_without_fake_cells()
 }
 
 #[test]
-fn chat_docked_input_reserves_two_blank_rows_without_native_cells() {
+fn chat_multiline_prompt_stays_with_wrapped_input_after_shell_redraw() {
+    for bubbles in [false, true] {
+        let mut terminal = TerminalState::new(100, 40);
+        let mut policy = chat_policy();
+        policy.set_chat_command_bubbles(bubbles);
+        let mut state = ProjectionViewState::new();
+        let prompt = "user@host ~/repo/project (main)\r\n❯ ";
+        terminal.process_input(b"older output\r\n");
+        terminal.process_input(format!("\x1b]133;A\x07{prompt}\x1b]133;B\x07").as_bytes());
+        // Shell redraws at an exact 100-column boundary, immediately after
+        // it, across several rows, then back to a short draft. CRLF realizes
+        // the pending wrap before the shell positions its caret at column 0.
+        for (up, input, caret) in [
+            (0, String::new(), ""),
+            (1, "l".repeat(98), "\r\n\x1b[1G"),
+            (2, "l".repeat(99), "\x1b[2G"),
+            (2, "l".repeat(650), "\x1b[53G"),
+            (7, "draft".to_string(), "\x1b[8G"),
+        ] {
+            if !input.is_empty() {
+                terminal.process_input(
+                    format!("\x1b[1G\x1b[{up}A\x1b[J{prompt}{input}{caret}").as_bytes(),
+                );
+            }
+            let view = spaced_view(&mut terminal, &policy, &mut state);
+            let dock = view.chat_composer_rows().unwrap();
+            assert_eq!(
+                view.cells()[dock.start]
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end(),
+                "user@host ~/repo/project (main)",
+                "the path is the first row inside the dock"
+            );
+            assert!(
+                view.cells()[..dock.start].iter().all(|row| !row
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .contains("user@host")),
+                "the prompt must not appear in history"
+            );
+            assert_eq!(
+                view.application_cell(view.cursor()),
+                Some(terminal.get_cursor_pos())
+            );
+        }
+    }
+}
+
+#[test]
+fn chat_docked_input_places_footer_directly_after_native_rows() {
     for bubbles in [false, true] {
         for input in [
             "",
@@ -8802,12 +8854,12 @@ fn chat_docked_input_reserves_two_blank_rows_without_native_cells() {
                 .expect("toolbar remains below the editor");
             assert_eq!(
                 footer - view.cursor().row,
-                3,
-                "the cursor row plus exactly two blank rows before the toolbar"
+                1,
+                "the footer follows the last real input row without extra blank lines"
             );
             assert_eq!(view.application_cell(view.cursor()), Some(native_cursor));
-            for row in dock.start + native_rows..footer {
-                assert_eq!(view.row_kind(row), Some(ProjectedRowKind::Padding));
+            assert_eq!(dock.start + native_rows, footer);
+            for row in footer..dock.end {
                 assert!(view.cells()[row].iter().all(|cell| cell.character == ' '));
                 for column in 0..view.columns() {
                     assert_eq!(view.raw_anchor_at(DisplayPoint::new(row, column)), None);
