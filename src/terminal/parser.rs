@@ -1564,6 +1564,10 @@ impl super::TerminalState {
                         self.inline_cli_screen_erased();
                         self.erase_screen();
                     }
+                    3 if self.use_alt_buffer && self.inline_cli_owner_active() => {
+                        // A temporary CLI screen cannot erase its primary
+                        // conversation's saved lines.
+                    }
                     3 => {
                         // Clear scrollback buffer (xterm extension)
                         self.clear_scrollback_with_projection_provenance();

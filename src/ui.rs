@@ -12305,7 +12305,8 @@ mod transcript_canvas_tests {
             let before = history(&terminal);
             let floor = terminal.inline_cli_scope_floor();
             assert!(floor.is_some());
-            terminal.process_input(b"\x1b[?1049h\x1b[?2026hALT_COMPOSER_SENTINEL\x1b[?2026l");
+            terminal
+                .process_input(b"\x1b[?1049h\x1b[?2026hALT_COMPOSER_SENTINEL\x1b[3J\x1b[?2026l");
             assert!(terminal.inline_cli_scope_floor().is_none());
             assert_eq!(
                 history(&terminal),
@@ -12319,12 +12320,18 @@ mod transcript_canvas_tests {
             for _ in 0..20 {
                 terminal.process_input(b"ALT_SCROLL_SENTINEL\r\n");
             }
-            terminal.process_input(b"\x1b[2JALT_REDRAW_SENTINEL\x1b[?2026l\x1b[?1049l");
+            terminal.process_input(b"\x1b[3J\x1b[2JALT_REDRAW_SENTINEL\x1b[?2026l\x1b[?1049l");
             assert_eq!(terminal.inline_cli_scope_floor(), floor);
             assert_eq!(
                 history(&terminal),
                 before,
-                "neither alternate row transfers nor redraws may enter primary CLI history"
+                "alternate redraws, row transfers and saved-line clears must leave primary CLI history unchanged"
+            );
+            terminal.process_input(b"\x1b[3J");
+            assert_eq!(
+                terminal.scrollback_len(),
+                0,
+                "primary-screen ED3 retains its normal meaning"
             );
         }
         // Existing terminal compatibility for unrelated full-screen programs
@@ -12337,6 +12344,12 @@ mod transcript_canvas_tests {
             .map(|cell| cell.character)
             .collect::<String>()
             .contains("GENERIC_ALT_SNAPSHOT")));
+        ordinary.process_input(b"\x1b[?1049h\x1b[3J\x1b[?1049l");
+        assert_eq!(
+            ordinary.scrollback_len(),
+            0,
+            "unrelated alternate applications retain ED3 behavior"
+        );
     }
 
     #[test]
