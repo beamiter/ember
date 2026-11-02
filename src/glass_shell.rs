@@ -253,8 +253,8 @@ pub fn chrome_control_height(font_size: f32) -> f32 {
         .max(token::TOOL_BUTTON_HEIGHT)
 }
 
-pub const NAVIGATION_MIN_WIDTH: f32 = 180.0;
-pub const NAVIGATION_MAX_WIDTH: f32 = 480.0;
+pub const NAVIGATION_MIN_WIDTH: f32 = 240.0;
+pub const NAVIGATION_MAX_WIDTH: f32 = 360.0;
 pub const INSPECTOR_MIN_WIDTH: f32 = 260.0;
 pub const INSPECTOR_MAX_WIDTH: f32 = 520.0;
 pub const CENTER_MIN_WIDTH: f32 = 300.0;
@@ -791,10 +791,10 @@ mod tests {
             }
         }
         let wide = Layout::with_sidebar_widths(1612.0, 850.0, requested);
-        assert_eq!(wide.navigation.unwrap().width, 480.0);
+        assert_eq!(wide.navigation.unwrap().width, 360.0);
         assert_eq!(wide.inspector.unwrap().width, 520.0);
         assert!(wide.without_navigation().navigation.is_none());
-        assert_eq!(wide.without_inspector().navigation.unwrap().width, 480.0);
+        assert_eq!(wide.without_inspector().navigation.unwrap().width, 360.0);
         assert_eq!(wide.requested, requested);
     }
 

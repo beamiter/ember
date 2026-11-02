@@ -2910,7 +2910,12 @@ impl TerminalApp {
             ai_command_suggestion: None,
             agent_diff: agent::AgentDiffPanel::new(),
             task_manager: agent::TaskManager::new(),
-            agent_runtime: agent::AgentRuntimeManager::new(),
+            agent_runtime: agent::AgentRuntimeManager::hosted(format!(
+                "ember:{}",
+                crate::config::Config::config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "default".into())
+            )),
             jsh_notice: jsh_ui::JshNotice::default(),
             config: cfg.clone(),
             config_save_pending: false,

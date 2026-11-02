@@ -50,7 +50,7 @@ pub enum TaskSidebarAction {
     LoadHistory(TaskId, bool),
     StartTerminal(TaskId),
     StopCodex(TaskId),
-    FollowUp(TaskId, String),
+    FollowUp(TaskId, String, u64),
     FinishCodex(TaskId),
     Approve(TaskId, ApprovalId),
     Deny(TaskId, ApprovalId),
@@ -170,6 +170,8 @@ pub struct TaskSidebarState {
     pending_creation: Option<PendingTaskCreation>,
     composer: TaskComposer,
     follow_up_drafts: HashMap<TaskId, String>,
+    follow_up_versions: HashMap<TaskId, u64>,
+    hosted_followups: HashMap<String, (TaskId, u64, String)>,
     recovery_loaded: bool,
     recovery_records: Vec<crate::agent::recovery::Record>,
     recovery_error: Option<String>,
@@ -1108,6 +1110,10 @@ fn clear_sent_follow_up(
     {
         drafts.remove(&task_id);
     }
+}
+
+fn clear_follow_up_version(drafts:&mut HashMap<TaskId,String>,versions:&HashMap<TaskId,u64>,task:TaskId,text:&str,version:u64) {
+    if versions.get(&task).copied().unwrap_or(0)==version {clear_sent_follow_up(drafts,task,text);}
 }
 
 fn render_native_codex_view(
@@ -2871,6 +2877,7 @@ impl TerminalApp {
                                     .on_disabled_hover_text(
                                         "Enable AI features and command-context sharing before sending another cloud turn",
                                     );
+                                    if follow_up.changed() {let revision=self.task_sidebar.follow_up_versions.entry(row.id).or_default();*revision=revision.wrapping_add(1);}
                                     let send_shortcut = crate::ai_chat_panel::composer_submit_gesture(ui, &follow_up);
                                     ui.add_space(ui.text_style_height(&egui::TextStyle::Body));
                                     let can_send = native_ai_enabled
@@ -2899,6 +2906,7 @@ impl TerminalApp {
                                             pending = Some(TaskSidebarAction::FollowUp(
                                                 row.id,
                                                 draft.clone(),
+                                                *self.task_sidebar.follow_up_versions.get(&row.id).unwrap_or(&0),
                                             ));
                                         }
                                         if ui
@@ -3037,23 +3045,52 @@ impl TerminalApp {
                     self.set_status_for(error.to_string(), Duration::from_secs(6));
                 }
             },
-            TaskSidebarAction::FollowUp(task_id, text) => {
+            TaskSidebarAction::FollowUp(task_id, text, version) => {
+                if self
+                    .task_sidebar
+                    .follow_up_versions
+                    .get(&task_id)
+                    .copied()
+                    .unwrap_or(0)
+                    != version
+                    || self.task_sidebar.follow_up_drafts.get(&task_id) != Some(&text)
+                {
+                    return;
+                }
+                if self
+                    .task_sidebar
+                    .hosted_followups
+                    .values()
+                    .any(|(id, _, _)| *id == task_id)
+                {
+                    return;
+                }
+                let receipt = uuid::Uuid::new_v4().to_string();
                 let policy = NativePromptPolicy {
                     share_command_context: self.config.ai_enabled
                         && self.config.ai_share_command_context,
                     redact_secrets: self.config.ai_redact_secrets,
                 };
-                match self
-                    .agent_runtime
-                    .prompt_native(&self.task_manager, task_id, &text, policy)
-                {
+                match self.agent_runtime.prompt_native_tracked(
+                    &self.task_manager,
+                    task_id,
+                    &text,
+                    policy,
+                    receipt.clone(),
+                ) {
                     Ok(()) => {
-                        clear_sent_follow_up(
-                            &mut self.task_sidebar.follow_up_drafts,
-                            task_id,
-                            &text,
-                        );
-                        self.set_status("Follow-up queued on the existing agent conversation…");
+                        if self.agent_runtime.needs_host_poll() {
+                            self.task_sidebar
+                                .hosted_followups
+                                .insert(receipt, (task_id, version, text));
+                        } else {
+                            clear_sent_follow_up(
+                                &mut self.task_sidebar.follow_up_drafts,
+                                task_id,
+                                &text,
+                            );
+                        }
+                        self.set_status("Sending feedback to the existing agent conversation…");
                     }
                     Err(error) => {
                         self.set_status_for(error.to_string(), Duration::from_secs(6));
@@ -3414,9 +3451,29 @@ impl TerminalApp {
             share_command_context: self.config.ai_enabled && self.config.ai_share_command_context,
             redact_secrets: self.config.ai_redact_secrets,
         };
+        let selected = if self.ai_chat_panel.is_open {
+            None
+        } else {
+            self.agent_sessions.workspace_task.or_else(|| {
+                (self.sidebar.visible && self.sidebar.view == crate::sidebar::SidebarView::Tasks)
+                    .then_some(self.task_sidebar.selected)
+                    .flatten()
+            })
+        };
+        self.agent_runtime.select_hosted_view(selected);
         let report = self
             .agent_runtime
             .poll(&mut self.task_manager, current_policy);
+        for outcome in self.agent_runtime.take_prompt_outcomes() {
+            if let Some((task_id, version, text)) =
+                self.task_sidebar.hosted_followups.remove(&outcome.receipt)
+            {
+                if outcome.result.is_ok() {clear_follow_up_version(&mut self.task_sidebar.follow_up_drafts,&self.task_sidebar.follow_up_versions,task_id,&text,version);}
+            }
+        }
+        for (_, session) in self.agent_runtime.take_terminal_handoffs() {
+            self.open_hosted_native_terminal(session, ctx);
+        }
         if let Some(issue) = report.issues.last() {
             self.set_status_for(
                 format!("Native Agent issue: {}", issue.detail),
@@ -3456,12 +3513,23 @@ impl TerminalApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.agent_runtime.has_any_activity() {
             ctx.request_repaint_after(Duration::from_millis(250));
+        } else if self.agent_runtime.needs_host_poll() {
+            ctx.request_repaint_after(Duration::from_millis(500));
         } else if report.made_progress() {
             ctx.request_repaint();
         }
     }
 
     fn start_task_agent_terminal(&mut self, task_id: TaskId) {
+        if self.agent_runtime.conversation_id(task_id).is_some()
+            && self.agent_runtime.can_continue_in_terminal(task_id)
+        {
+            if let Err(error) = self.agent_runtime.handoff_to_terminal(task_id) {
+                self.set_status(error.to_string());
+            }
+            return;
+        }
+
         if self.agent_runtime.has_preparing(task_id) {
             self.set_status("Cancel native Codex preparation before starting a terminal");
             return;
@@ -6021,7 +6089,7 @@ mod hidden_and_attention_tests {
         for action in [
             TaskSidebarAction::StartNative(task),
             TaskSidebarAction::StopCodex(task),
-            TaskSidebarAction::FollowUp(task, "next".into()),
+            TaskSidebarAction::FollowUp(task, "next".into(), 0),
             TaskSidebarAction::FinishCodex(task),
             TaskSidebarAction::Approve(task, approval),
             TaskSidebarAction::Deny(task, approval),
@@ -6115,5 +6183,17 @@ mod hidden_and_attention_tests {
             Some(false),
             "an unknown prior state is never guessed"
         );
+    }
+}
+
+#[cfg(test)]
+mod hosted_follow_up_version_tests {
+    use super::*;
+    #[test]
+    fn late_host_ack_preserves_an_edited_back_draft() {
+        let task=TaskId::new();let mut drafts=HashMap::from([(task,"same".into())]);let mut versions=HashMap::from([(task,0)]);
+        versions.insert(task,2); // User edited a value and returned to the same text.
+        clear_follow_up_version(&mut drafts,&versions,task,"same",0);assert_eq!(drafts[&task],"same");
+        clear_follow_up_version(&mut drafts,&versions,task,"same",2);assert!(!drafts.contains_key(&task));
     }
 }

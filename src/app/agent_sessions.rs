@@ -2185,6 +2185,11 @@ impl TerminalApp {
                 }
             }
             if let Some(id) = task_choice {
+                self.agent_runtime.select_hosted_view(Some(id));
+                if let Some(session) = self.agent_runtime.hosted_terminal(id).cloned() {
+                    self.open_hosted_native_terminal(session, &ctx);
+                    return;
+                }
                 self.ai_chat_panel.close();
                 self.agent_sessions.cancel_resume();
                 self.agent_sessions.workspace_pending = false;
@@ -2479,6 +2484,32 @@ impl TerminalApp {
                 let (session, launch) = *ready;
                 self.spawn_ready_agent_session(session, launch, ctx)
             }
+        }
+    }
+
+    pub(crate) fn open_hosted_native_terminal(
+        &mut self,
+        session: AgentSession,
+        ctx: &egui::Context,
+    ) {
+        let key = open_session_key(&session);
+        if let Some(bound) = self.agent_sessions.opened.get(&key) {
+            if let Some(index) = self
+                .session_manager
+                .sessions()
+                .iter()
+                .position(|terminal| &terminal.metadata.session_id == bound)
+            {
+                self.activate_session(index);
+                self.agent_sessions.workspace_task = None;
+                self.ai_chat_panel.close();
+                self.return_focus_to_terminal(ctx);
+                return;
+            }
+        }
+        match jterm_core::agent_workspace::managed_launch(&session) {
+            Ok(launch) => self.spawn_ready_agent_session(session, launch, ctx),
+            Err(error) => self.set_status(error),
         }
     }
 
