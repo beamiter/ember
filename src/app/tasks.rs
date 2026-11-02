@@ -2201,59 +2201,62 @@ impl TerminalApp {
             self.render_hidden_tasks(ui);
             return;
         }
-        let rows: Vec<_> = self
-            .task_manager
-            .tasks()
-            .iter()
-            .filter(|task| {
-                task.status != TaskStatus::Archived
-                    && self
-                        .agent_sessions
-                        .workspace_task
-                        .is_none_or(|id| id == task.id)
-            })
-            .map(|task| TaskRowSnapshot {
-                id: task.id,
-                title: visible_bounded(&task.title, MAX_TASK_TITLE_DISPLAY_BYTES),
-                provider: task.provider,
-                status: task.status,
-                runtime_kind: task.runtime_kind,
-                branch: visible_bounded(&task.branch, MAX_TASK_BRANCH_DISPLAY_BYTES),
-                project: visible_bounded(&task.repo_root.to_string_lossy(), 320),
-                has_agent_terminal: task
-                    .terminal_session_id
-                    .as_deref()
-                    .is_some_and(|session_id| self.session_manager.index_of(session_id).is_some()),
-                has_validation_terminal: self.agent_runtime.hosted_validation_terminal(task.id).is_some() || task
-                    .validation
-                    .terminal_session_id
-                    .as_deref()
-                    .is_some_and(|session_id| self.session_manager.index_of(session_id).is_some()),
-                has_active_agent_stream: self.task_manager.has_active_agent_event_stream(task.id),
-                native_preparing: self.agent_runtime.has_preparing(task.id),
-                terminal_retry_available: self
-                    .task_manager
-                    .terminal_retry_session_id(task.id)
-                    .is_ok(),
-                native_terminal_fallback_available: self
-                    .task_manager
-                    .native_terminal_fallback_eligible(task.id)
-                    .is_ok()
-                    && self.agent_runtime.can_continue_in_terminal(task.id),
-                validation_status: task.validation.status,
-                validation_attempt: task.validation.attempt,
-                validation_detail: task
-                    .validation
-                    .status_detail
-                    .as_deref()
-                    .map(|detail| visible_bounded(detail, MAX_TASK_DETAIL_DISPLAY_BYTES)),
-                needs_attention: self.task_manager.task_needs_attention(task.id),
-                status_detail: task
-                    .status_detail
-                    .as_deref()
-                    .map(|detail| visible_bounded(detail, MAX_TASK_DETAIL_DISPLAY_BYTES)),
-            })
-            .collect();
+        let rows: Vec<_> =
+            self.task_manager
+                .tasks()
+                .iter()
+                .filter(|task| {
+                    task.status != TaskStatus::Archived
+                        && self
+                            .agent_sessions
+                            .workspace_task
+                            .is_none_or(|id| id == task.id)
+                })
+                .map(|task| TaskRowSnapshot {
+                    id: task.id,
+                    title: visible_bounded(&task.title, MAX_TASK_TITLE_DISPLAY_BYTES),
+                    provider: task.provider,
+                    status: task.status,
+                    runtime_kind: task.runtime_kind,
+                    branch: visible_bounded(&task.branch, MAX_TASK_BRANCH_DISPLAY_BYTES),
+                    project: visible_bounded(&task.repo_root.to_string_lossy(), 320),
+                    has_agent_terminal: task.terminal_session_id.as_deref().is_some_and(
+                        |session_id| self.session_manager.index_of(session_id).is_some(),
+                    ),
+                    has_validation_terminal: self
+                        .agent_runtime
+                        .hosted_validation_terminal(task.id)
+                        .is_some()
+                        || task.validation.terminal_session_id.as_deref().is_some_and(
+                            |session_id| self.session_manager.index_of(session_id).is_some(),
+                        ),
+                    has_active_agent_stream: self
+                        .task_manager
+                        .has_active_agent_event_stream(task.id),
+                    native_preparing: self.agent_runtime.has_preparing(task.id),
+                    terminal_retry_available: self
+                        .task_manager
+                        .terminal_retry_session_id(task.id)
+                        .is_ok(),
+                    native_terminal_fallback_available: self
+                        .task_manager
+                        .native_terminal_fallback_eligible(task.id)
+                        .is_ok()
+                        && self.agent_runtime.can_continue_in_terminal(task.id),
+                    validation_status: task.validation.status,
+                    validation_attempt: task.validation.attempt,
+                    validation_detail: task
+                        .validation
+                        .status_detail
+                        .as_deref()
+                        .map(|detail| visible_bounded(detail, MAX_TASK_DETAIL_DISPLAY_BYTES)),
+                    needs_attention: self.task_manager.task_needs_attention(task.id),
+                    status_detail: task
+                        .status_detail
+                        .as_deref()
+                        .map(|detail| visible_bounded(detail, MAX_TASK_DETAIL_DISPLAY_BYTES)),
+                })
+                .collect();
         let has_tasks = !rows.is_empty();
         let open_result = dashboard_search(
             ui,
@@ -2567,7 +2570,7 @@ impl TerminalApp {
                         ui.push_id(("selected_task_card", row.id), |ui| {
                         let task = self.task_manager.get(row.id);
                         let authored_task = task.is_some_and(|task| task.brief.is_some());
-                        let manual_review = task.is_some_and(|task| task.requires_manual_review());
+                        let manual_review = self.agent_runtime.hosted_manual_review(row.id).unwrap_or_else(|| task.is_some_and(|task| task.requires_manual_review()));
                         let has_input = task.is_some_and(|task| task.brief.is_some() || task.source_context.is_some());
                         let has_validation = if self.agent_runtime.conversation_id(row.id).is_some() { self.agent_runtime.can_start_hosted_validation(row.id) } else { task.is_some_and(|task| task.validation_command().is_some()) };
                         let registration_pending = self.task_sidebar.unconfirmed_registrations.contains(&row.id);
@@ -2979,6 +2982,17 @@ impl TerminalApp {
                                     }
                                 }
                             });
+                        }
+                        if let Some(validation) = self.agent_runtime.hosted_validation_snapshot(row.id) {
+                            if !validation.output.is_empty() {
+                                egui::CollapsingHeader::new("Validation output history")
+                                    .id_salt(("hosted_validation_output", row.id))
+                                    .show(ui, |ui| {
+                                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                                            ui.monospace(&validation.output);
+                                        });
+                                    });
+                            }
                         }
                         if row.validation_attempt > 0 {
                             let validation_color =
@@ -3514,10 +3528,14 @@ impl TerminalApp {
             }
         }
         for (task_id, terminal) in self.agent_runtime.take_owned_terminal_launches() {
-            if selected == Some(task_id) { self.open_owned_validation_terminal(terminal); }
+            if selected == Some(task_id) {
+                self.open_owned_validation_terminal(terminal);
+            }
         }
-        for (_, session) in self.agent_runtime.take_terminal_handoffs() {
-            self.open_hosted_native_terminal(session, ctx);
+        for (task_id, session) in self.agent_runtime.take_terminal_handoffs() {
+            if selected == Some(task_id) {
+                self.open_hosted_native_terminal(session, ctx);
+            }
         }
         if let Some(issue) = report.issues.last() {
             self.set_status_for(
