@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "gui"]
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 libc = "0.2"
 # Shared local core includes the family agent session catalog.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "589a26658f548ec96ff60a53ea65804901ed5c7b" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "13b3dcfa3ab630497a6348a0540b4757a19c15be" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -52,7 +52,7 @@ mundy = { version = "=0.2.3", default-features = false, features = ["async-io", 
 harfrust = "0.14.0"
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "589a26658f548ec96ff60a53ea65804901ed5c7b" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "13b3dcfa3ab630497a6348a0540b4757a19c15be" }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]

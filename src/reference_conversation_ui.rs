@@ -381,7 +381,7 @@ fn draw_date_separator(ui: &mut egui::Ui, label: &str, initial_clip_inset: f32) 
 pub(crate) fn draw_message(ui: &mut egui::Ui, message: &model::Message) {
     let scale = content_scale(ui);
     if message.role == model::Role::User {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
             ui.spacing_mut().interact_size.y =
                 crate::theme::workspace_control_height(shell::type_size::BODY * scale);
             ui.spacing_mut().item_spacing.x = 0.0;

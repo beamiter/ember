@@ -16,6 +16,10 @@ pub(crate) struct ChatRef {
 
 pub(crate) enum Effect {
     Activate(u64),
+    Observe {
+        chat_id: u64,
+        job: jterm_core::agent_workspace::ApiSnapshot,
+    },
     SyncDraft(u64),
     Submit {
         chat_id: u64,
@@ -423,6 +427,10 @@ impl WorkspaceChats {
         true
     }
 
+    pub(crate) fn launch_receipt(&self, chat_id: u64) -> Option<SubmissionReceipt> {
+        self.awaiting_dispatch.get(&chat_id).cloned()
+    }
+
     pub(crate) fn bind(&mut self, token: RequestToken, clear_draft: bool) {
         if let Some(receipt) = self.awaiting_dispatch.remove(&token.chat_id) {
             if let Some(chat) = self.known.get_mut(&token.chat_id) {
@@ -449,26 +457,22 @@ impl WorkspaceChats {
             );
         }
     }
-    pub(crate) fn complete(&mut self, token: RequestToken, text: &str) {
-        if let Some(receipt) = self.receipts.remove(&token) {
-            self.send(
-                Command::CompleteSubmission {
-                    receipt,
-                    text: text.to_owned(),
-                },
-                Pending::Finish {
-                    chat_id: token.chat_id,
-                },
-            );
-        }
+    pub(crate) fn complete(&mut self, token: RequestToken, _text: &str) {
+        self.refresh_finished(token);
     }
     pub(crate) fn cancel(&mut self, token: RequestToken) {
-        if let Some(receipt) = self.receipts.remove(&token) {
+        self.refresh_finished(token);
+    }
+    fn refresh_finished(&mut self, token: RequestToken) {
+        self.receipts.remove(&token);
+        if let Some(id) = self
+            .known
+            .get(&token.chat_id)
+            .map(|chat| chat.stored.row.id.clone())
+        {
+            // Completion is committed by the host, including uncertain outcomes.
             self.send(
-                Command::CancelSubmission {
-                    receipt,
-                    restore_draft: true,
-                },
+                Command::LoadChat { id },
                 Pending::Finish {
                     chat_id: token.chat_id,
                 },
@@ -529,6 +533,8 @@ impl WorkspaceChats {
                 });
             }
             (Pending::Import { snapshots }, WorkspaceReply::Imported { mappings }) => {
+                let active_before = store.active_id();
+                let mut open_imported = None;
                 // Import ACK plus exact snapshot equality is the proof required
                 // before retiring a legacy GUI cache row. A later draft survives.
                 for mapping in mappings {
@@ -540,9 +546,15 @@ impl WorkspaceChats {
                             })
                             .and_then(|snapshot| snapshot.to_json().ok());
                         if now.as_ref() == Some(before) {
+                            if mapping.legacy_id == active_before && self.selection == 0 {
+                                open_imported = Some(mapping.id.clone());
+                            }
                             let _ = store.evict_imported_legacy_chat(mapping.legacy_id);
                         }
                     }
+                }
+                if let Some(id) = open_imported {
+                    self.open(id);
                 }
                 self.refresh();
             }
@@ -601,6 +613,11 @@ impl WorkspaceChats {
                         }
                     }
                 }
+                let hosted_job = chat
+                    .api_job
+                    .clone()
+                    .filter(|job| job.state.is_live())
+                    .map(|job| *job);
                 match store.upsert_persisted_chat(row.clone()) {
                     Ok(_) => {
                         self.known.insert(
@@ -642,6 +659,9 @@ impl WorkspaceChats {
                                 );
                             }
                         }
+                        if let Some(job) = hosted_job {
+                            effects.push(Effect::Observe { chat_id: id, job });
+                        }
                         if selection == self.selection {
                             effects.push(Effect::Activate(id));
                         }
@@ -667,6 +687,10 @@ impl WorkspaceChats {
                         known.dirty = false;
                         known.submit = None;
                         if let Some(text) = submit {
+                            if !chat.background_api_supported {
+                                self.notice = Some("This session host needs an update before sending API chats. Finish its running tasks and restart it, then reopen the conversation. Your draft is kept.".into());
+                                return effects;
+                            }
                             begin = Some((
                                 Command::BeginSubmission {
                                     id: chat.row.id.clone(),
@@ -841,6 +865,15 @@ impl WorkspaceChats {
                     known.saving = false;
                     return effects;
                 }
+                let baseline = ConversationSnapshot::from_json(&known.stored.snapshot_json)
+                    .ok()
+                    .and_then(|snapshot| snapshot.active_chat().map(|row| row.draft().to_owned()));
+                let same_draft_revision = known.stored.draft_revision == chat.draft_revision;
+                let own_submission_clear = chat.api_job.as_ref().is_some_and(|job| {
+                    job.state == jterm_core::agent_workspace::ApiState::Completed
+                        && chat.draft_revision == job.submitted_draft_revision.saturating_add(1)
+                        && known.stored.draft_revision <= job.submitted_draft_revision
+                });
                 known.saving = false;
                 known.stored = chat;
                 let (Some(remote), Some(local)) = (remote_draft, local_draft) else {
@@ -853,7 +886,10 @@ impl WorkspaceChats {
                 } else {
                     local.clone()
                 };
-                if !local.is_empty() && comparable != remote {
+                let unchanged_remote = (same_draft_revision
+                    && baseline.as_deref() == Some(remote.as_str()))
+                    || (own_submission_clear && remote.is_empty());
+                if !local.is_empty() && comparable != remote && !unchanged_remote {
                     // A newer draft may have been authored in another window.
                     // Never bless our old local text with the returned revision.
                     known.blocked = true;
@@ -905,7 +941,11 @@ impl WorkspaceChats {
             let Some(snapshot) = store.snapshot_chat_for_persistence(id, redact) else {
                 continue;
             };
-            let is_busy = self.receipts.keys().any(|token| token.chat_id == id);
+            let is_busy = self.receipts.keys().any(|token| token.chat_id == id)
+                || store
+                    .in_flight_tokens()
+                    .iter()
+                    .any(|token| token.chat_id == id);
             let known = self.known.get_mut(&id).unwrap();
             let generation = known.generation;
             let (command, pending) = if is_busy {
@@ -1016,6 +1056,8 @@ mod tests {
             draft,
         );
         StoredChat {
+            api_job: None,
+            background_api_supported: true,
             row: WorkspaceRow {
                 id: ConversationId(remote.into()),
                 kind: ConversationKind::Api,
@@ -1350,5 +1392,107 @@ mod tests {
         let old = bridge.reference(id);
         bridge.leave();
         assert!(!bridge.accepts(old, store.active_id()));
+    }
+    #[test]
+    fn reattached_request_saves_new_draft_without_a_dispatch_receipt() {
+        let (mut bridge, mut store, id) = loaded();
+        store.observe_turn(id, "already submitted".into()).unwrap();
+        store.set_active_draft("independent next draft".into());
+        bridge.changed(&store);
+        bridge.known.get_mut(&id).unwrap().changed = Instant::now() - Duration::from_secs(1);
+        bridge.drive(&mut store, false);
+        assert!(bridge.receipts.is_empty());
+        assert!(bridge
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Draft { chat_id, .. } if *chat_id==id)));
+        assert!(!bridge
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Save { chat_id, .. } if *chat_id==id)));
+        assert_eq!(store.active_draft(), "independent next draft");
+    }
+
+    #[test]
+    fn host_completion_keeps_a_local_draft_that_has_not_reached_its_debounce() {
+        let (mut bridge, mut store, id) = loaded();
+        store.set_active_draft("new pending local draft".into());
+        bridge.changed(&store);
+        let before = bridge.known[&id].stored.draft_revision;
+        let mut finished = stored(id, "jterm:api:original", "");
+        finished.draft_revision = before + 1;
+        finished.api_job = Some(Box::new(jterm_core::agent_workspace::ApiSnapshot {
+            id: finished.row.id.clone(),
+            epoch: 1,
+            sequence: 3,
+            state: jterm_core::agent_workspace::ApiState::Completed,
+            user_text: "Question".into(),
+            submitted_draft_revision: before,
+            preview: "answer".into(),
+            result: Some("answer".into()),
+            error: None,
+        }));
+        bridge.pending.insert(900, Pending::Finish { chat_id: id });
+        bridge.handle_reply(
+            &mut store,
+            900,
+            Ok(WorkspaceReply::Chat { chat: finished }),
+            false,
+        );
+        assert_eq!(store.active_draft(), "new pending local draft");
+        assert!(!bridge.known[&id].blocked);
+        assert!(bridge.known[&id].dirty);
+    }
+
+    #[test]
+    fn import_ack_opens_only_an_unchanged_active_placeholder() {
+        for (edited, moved) in [(false, false), (true, false), (false, true)] {
+            let mut store = ChatStore::default();
+            let old = store.active_id();
+            let before = ConversationSnapshot::from_chats(
+                old,
+                vec![store.snapshot_chat_for_persistence(old, false).unwrap()],
+            )
+            .unwrap()
+            .to_json()
+            .unwrap();
+            let mut bridge = WorkspaceChats {
+                client: WorkspaceClient::for_state_dir(
+                    std::env::temp_dir().join(format!("bridge-import-{}", uuid::Uuid::new_v4())),
+                ),
+                ..Default::default()
+            };
+            bridge.pending.insert(
+                950,
+                Pending::Import {
+                    snapshots: HashMap::from([(old, before)]),
+                },
+            );
+            if edited {
+                store.set_active_draft("typed during migration".into());
+            }
+            if moved {
+                bridge.leave();
+            }
+            bridge.handle_reply(
+                &mut store,
+                950,
+                Ok(WorkspaceReply::Imported {
+                    mappings: vec![jterm_core::agent_workspace::LegacyChatMapping {
+                        legacy_id: old,
+                        id: ConversationId("jterm:api:imported-fixture".into()),
+                    }],
+                }),
+                false,
+            );
+            let opening = bridge
+                .pending
+                .values()
+                .any(|p| matches!(p, Pending::Open { .. }));
+            assert_eq!(opening, !edited && !moved);
+            if edited {
+                assert_eq!(store.active_draft(), "typed during migration");
+            }
+        }
     }
 }

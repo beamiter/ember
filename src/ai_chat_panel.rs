@@ -28,7 +28,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use jterm_core::ai::{AiCancellationToken, ConversationSnapshot, Role};
+use jterm_core::agent_workspace::{ApiLaunch, ApiObservation, ApiRequest, HostedApiClient};
+use jterm_core::ai::{ConversationSnapshot, Role};
 
 use crate::ai_chat_store::{
     new_store, restore_store, ChatStatus, ChatStore, ChatStoreError, RequestToken,
@@ -36,7 +37,6 @@ use crate::ai_chat_store::{
 };
 use crate::config::Config;
 
-const STOPPED_STATUS: &str = "Response stopped. You can retry when ready.";
 /// Shown while a chat is otherwise idle: the store's live budgets or a
 /// persistence pass dropped older turns, and the model no longer sees them.
 const TRUNCATED_STATUS: &str =
@@ -48,7 +48,6 @@ const _: () =
     assert!(CHAT_LIBRARY_FILE_BUDGET < jterm_core::ai::MAX_CONVERSATION_SNAPSHOT_JSON_BYTES);
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(400);
 const AI_DELTA_QUEUE_CAPACITY: usize = 256;
-const MAX_AI_DELTA_BYTES: usize = 64 * 1024;
 const MAX_EVENTS_PER_TICK: usize = 64;
 const PERSIST_OUTCOME_QUEUE_CAPACITY: usize = 4;
 const RECENT_HISTORY_TURNS: usize = 5;
@@ -161,7 +160,7 @@ pub struct AiChatPanel {
     /// One-line panel feedback for preflight failures and withheld context;
     /// rendered only while the store has no live status to show.
     notice: String,
-    requests: HashMap<RequestToken, AiCancellationToken>,
+    requests: HashMap<RequestToken, ApiObservation>,
     worker_tx: mpsc::SyncSender<ChatWorkerEvent>,
     worker_rx: mpsc::Receiver<ChatWorkerEvent>,
     retry_payloads: HashMap<u64, RequestPayload>,
@@ -441,7 +440,7 @@ impl AiChatPanel {
     fn handle_worker_event(&mut self, event: ChatWorkerEvent) {
         match event {
             ChatWorkerEvent::Delta { token, text } => {
-                let _ = self.store.push_delta(token, &text);
+                let _ = self.store.replace_partial(token, &text);
             }
             ChatWorkerEvent::Done { token, result } => {
                 // A Stop/restore already removed the token: the reply is stale
@@ -457,11 +456,7 @@ impl AiChatPanel {
                             answer.trim().to_owned()
                         };
                         self.workspace.complete(token, &durable);
-                        if self
-                            .store
-                            .complete_success(token, answer.trim().to_string())
-                            .is_some()
-                        {
+                        if self.store.complete_success(token, answer).is_some() {
                             self.retry_payloads.remove(&token.chat_id);
                         }
                     }
@@ -590,76 +585,68 @@ impl AiChatPanel {
         let token = start.token;
         self.retry_payloads.insert(token.chat_id, payload);
 
-        let cancellation = AiCancellationToken::new();
-        let worker_token = cancellation.clone();
-        let tx = self.worker_tx.clone();
-        // Deltas are a live preview only — `Done` carries the full answer either
-        // way — so the blocking path just skips them. Without this branch an
-        // endpoint that cannot stream leaves the panel with no way to get a
-        // reply at all, which is what the other three terminals let a user fix.
-        let stream = config.ai_stream;
-        let spawn = std::thread::Builder::new()
-            .name("ember-ai-chat".to_string())
-            .spawn(move || {
-                let result = if stream {
-                    client.send_turns_streaming_cancellable(
-                        Some(&system),
-                        &request_history,
-                        &worker_token,
-                        &mut |fragment| {
-                            if fragment.len() <= MAX_AI_DELTA_BYTES {
-                                let _ = tx.try_send(ChatWorkerEvent::Delta {
-                                    token,
-                                    text: fragment.to_string(),
-                                });
-                            }
-                        },
-                    )
-                } else {
-                    client.send_turns_blocking_cancellable(
-                        Some(&system),
-                        &request_history,
-                        &worker_token,
-                    )
-                }
-                .map_err(|error| error.to_string());
-                if worker_token.is_cancelled() {
-                    return;
-                }
-                // Blocking send is safe: the UI drains while any request is
-                // alive, and a dropped receiver reports Err immediately.
-                let _ = tx.send(ChatWorkerEvent::Done { token, result });
-            });
-        match spawn {
-            Ok(_) => {
-                self.requests.insert(token, cancellation);
-            }
+        let Some(receipt) = self.workspace.launch_receipt(token.chat_id) else {
+            let _ = self
+                .store
+                .complete_error(token, "Wait for shared submission authorization".into());
+            return false;
+        };
+        let launch = match ApiLaunch::new(
+            receipt,
+            &client,
+            Some(system),
+            &request_history,
+            config.ai_stream,
+        ) {
+            Ok(launch) => launch,
             Err(error) => {
-                // The rollback restored the message as a draft; returning
-                // false keeps the composer text in place too.
-                let _ = self
-                    .store
-                    .complete_error(token, format!("could not start AI worker: {error}"));
-                self.mark_dirty();
+                let _ = self.store.complete_error(token, error);
                 return false;
             }
+        };
+        if !self.spawn_hosted(token, ApiRequest::Start(launch)) {
+            return false;
         }
         self.mark_dirty();
         true
     }
 
+    fn spawn_hosted(&mut self, token: RequestToken, request: ApiRequest) -> bool {
+        let observation = ApiObservation::default();
+        let observer = observation.token();
+        let tx = self.worker_tx.clone();
+        let spawn = std::thread::Builder::new()
+            .name("ember-hosted-chat".into())
+            .spawn(move || {
+                let result = HostedApiClient::new().execute(request, &observer, &mut |preview| {
+                    let _ = tx.try_send(ChatWorkerEvent::Delta {
+                        token,
+                        text: preview.to_owned(),
+                    });
+                });
+                let _ = tx.send(ChatWorkerEvent::Done { token, result });
+            });
+        match spawn {
+            Ok(_) => {
+                self.requests.insert(token, observation);
+                true
+            }
+            Err(error) => {
+                let _ = self
+                    .store
+                    .complete_error(token, format!("Could not observe API host: {error}"));
+                false
+            }
+        }
+    }
+
     fn stop_active(&mut self) {
-        let Some(token) = self.store.active_request_token() else {
-            return;
-        };
-        let Some(cancellation) = self.requests.remove(&token) else {
-            return;
-        };
-        cancellation.cancel();
-        self.workspace.cancel(token);
-        let _ = self.store.cancel_request(token, STOPPED_STATUS.to_string());
-        self.composer = self.store.active_draft().to_string();
-        self.mark_dirty();
+        if let Some(token) = self.store.active_request_token() {
+            if let Some(observation) = self.requests.get(&token) {
+                observation.cancel();
+                self.notice = "Stopping the background response…".into();
+            }
+        }
     }
 
     fn retry_active(&mut self, _config: &Config) {
@@ -741,6 +728,25 @@ impl AiChatPanel {
                     self.sync_edit_buffers();
                     self.is_open = true;
                     self.composer_focus_pending = true;
+                }
+                crate::workspace_chat_bridge::Effect::Observe { chat_id, job } => {
+                    self.retry_payloads.insert(
+                        chat_id,
+                        RequestPayload {
+                            user_text: job.user_text.clone(),
+                            restore_pending_as_draft: true,
+                        },
+                    );
+                    if let Ok(token) = self.store.observe_turn(chat_id, job.user_text) {
+                        self.spawn_hosted(
+                            token,
+                            ApiRequest::Observe {
+                                id: job.id,
+                                epoch: job.epoch,
+                                view: uuid::Uuid::new_v4().to_string(),
+                            },
+                        );
+                    }
                 }
                 crate::workspace_chat_bridge::Effect::Submit {
                     chat_id,
@@ -1227,11 +1233,8 @@ impl AiChatPanel {
 
 impl Drop for AiChatPanel {
     fn drop(&mut self) {
-        // Releasing a cancellation token does not cancel; do it explicitly so
-        // a dying window kills its curl transports instead of detaching them.
-        for (_, cancellation) in self.requests.drain() {
-            cancellation.cancel();
-        }
+        // Dropping observations detaches views; the host retains API work.
+        self.requests.clear();
         // Let an in-flight save finish its atomic replace rather than leaving
         // its temp file behind when the process goes away.
         if let Some(handle) = self.persist_thread.take() {
