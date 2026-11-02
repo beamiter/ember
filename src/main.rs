@@ -73,6 +73,7 @@ mod workflow_picker;
 mod workflows;
 mod workspace_chat_bridge;
 mod workspace_sessions_bridge;
+mod workspace_visibility;
 
 use crate::glass_shell::BoundedPanel as _;
 use crate::theme::ThemeExt as _;

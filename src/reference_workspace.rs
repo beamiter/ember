@@ -1063,6 +1063,7 @@ impl TerminalApp {
     }
 
     pub(crate) fn set_agent_workspace_enabled(&mut self, ctx: &egui::Context, enabled: bool) {
+        self.agent_sessions.workspace_scroll.toggled(enabled);
         self.config.agent_workspace_enabled = enabled;
         self.config_panel.sync_from_config(&self.config);
         self.schedule_config_save();
@@ -1348,16 +1349,29 @@ impl TerminalApp {
                 let body =
                     egui::Rect::from_min_max(bounds.min, egui::pos2(bounds.right(), status.top()));
                 ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
-                    egui::ScrollArea::vertical()
+                    let was_expanded = self.config.agent_workspace_enabled;
+                    let mut scroll = egui::ScrollArea::vertical()
                         .id_salt("glass-files-navigation-body")
                         .min_scrolled_height(0.0)
                         .max_height(body.height())
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            self.render_reference_navigation(ui);
-                            self.render_workspace_sessions(ui);
-                            self.render_reference_spaces(ui);
-                        });
+                        .auto_shrink([false, false]);
+                    if let Some(offset) = self
+                        .agent_sessions
+                        .workspace_scroll
+                        .restore_offset(was_expanded)
+                    {
+                        scroll = scroll.vertical_scroll_offset(offset);
+                    }
+                    let output = scroll.show(ui, |ui| {
+                        self.render_reference_navigation(ui);
+                        self.render_workspace_sessions(ui);
+                        self.render_reference_spaces(ui);
+                    });
+                    self.agent_sessions.workspace_scroll.record(
+                        was_expanded,
+                        self.config.agent_workspace_enabled,
+                        output.state.offset.y,
+                    );
                 });
                 self.render_reference_status(ui, status);
             });

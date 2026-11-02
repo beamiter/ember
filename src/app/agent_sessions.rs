@@ -276,6 +276,7 @@ impl SessionDetailsDraft {
 
 #[derive(Default)]
 pub(crate) struct AgentSessionsState {
+    pub(crate) workspace_scroll: crate::workspace_visibility::ScrollBookmark,
     pub(crate) is_open: bool,
     /// Sidebar activation is nonmodal. Only a conflict opens the full manager.
     workspace_pending: bool,
