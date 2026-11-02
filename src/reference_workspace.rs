@@ -422,11 +422,93 @@ impl TerminalApp {
         outcome.pointer_claimed
     }
 
+    pub(crate) fn reference_navigation_is_compact(&self, ctx: &egui::Context) -> bool {
+        let size = ctx.viewport_rect().size();
+        shell::Layout::with_sidebar_widths(size.x, size.y, self.reference_sidebar_widths())
+            .navigation
+            .is_none()
+    }
+
+    pub(crate) fn reference_navigation_drawer_rect(
+        &self,
+        ctx: &egui::Context,
+    ) -> Option<egui::Rect> {
+        if !self.reference_inspector.navigation_drawer || !self.reference_navigation_is_compact(ctx)
+        {
+            return None;
+        }
+        let screen = ctx.viewport_rect();
+        let layout = self.reference_layout(ctx);
+        let left = layout.rail.x + layout.rail.width;
+        let width = self
+            .reference_sidebar_widths()
+            .navigation
+            .filter(|width| width.is_finite())
+            .unwrap_or(shell::NAVIGATION_WIDTH)
+            .clamp(shell::NAVIGATION_MIN_WIDTH, shell::NAVIGATION_MAX_WIDTH)
+            .min((screen.right() - left - 24.0).max(0.0));
+        crate::navigation_drawer::geometry(screen, left, layout.center.y, width)
+    }
+
+    pub(crate) fn reference_navigation_visible(&self, ctx: &egui::Context) -> bool {
+        (self.sidebar.visible && self.reference_layout(ctx).navigation.is_some())
+            || self.reference_navigation_drawer_rect(ctx).is_some()
+    }
+
+    pub(crate) fn toggle_reference_navigation_drawer(&mut self, ctx: &egui::Context) -> bool {
+        if !self.reference_navigation_is_compact(ctx) {
+            return false;
+        }
+        self.reference_inspector.navigation_drawer = !self.reference_inspector.navigation_drawer;
+        // This is chrome only: provider/task/selection state is untouched.
+        crate::ui::remember_reference_chrome_scope(
+            ctx,
+            egui::Id::new("reference-navigation-drawer-input"),
+            ctx.viewport_rect(),
+            true,
+        );
+        ctx.request_repaint();
+        true
+    }
+
+    pub(crate) fn render_reference_navigation_scrim(&mut self, root: &mut egui::Ui) {
+        let Some(rect) = self.reference_navigation_drawer_rect(root.ctx()) else {
+            return;
+        };
+        let screen = root.ctx().viewport_rect();
+        let cover = egui::Rect::from_min_max(egui::pos2(rect.right(), rect.top()), screen.max);
+        crate::ui::remember_reference_chrome_scope(
+            root.ctx(),
+            egui::Id::new("reference-navigation-drawer-input"),
+            cover,
+            true,
+        );
+        let response = egui::Area::new(egui::Id::new("reference-navigation-dismiss"))
+            .order(egui::Order::Middle)
+            .fixed_pos(cover.min)
+            .movable(false)
+            .show(root.ctx(), |ui| {
+                ui.set_min_size(cover.size());
+                ui.set_max_size(cover.size());
+                ui.painter()
+                    .rect_filled(cover, 0.0, Color32::from_rgba_unmultiplied(2, 4, 9, 48));
+                ui.allocate_rect(cover, egui::Sense::click())
+            });
+        if response.inner.clicked() {
+            self.reference_inspector.navigation_drawer = false;
+            self.return_focus_to_terminal(root.ctx());
+            root.ctx().request_repaint();
+        }
+    }
+
     pub(crate) fn reference_inspector_drawer_rect(
         &self,
         ctx: &egui::Context,
     ) -> Option<egui::Rect> {
-        if !self.reference_inspector.open || !self.reference_inspector.narrow_drawer {
+        if self.reference_navigation_drawer_rect(ctx).is_some()
+            || !self.reference_inspector.open
+            || !self.reference_inspector.narrow_drawer
+        {
             return None;
         }
         let screen = ctx.viewport_rect();
@@ -455,11 +537,15 @@ impl TerminalApp {
     }
 
     pub(crate) fn reference_inspector_visible(&self, ctx: &egui::Context) -> bool {
+        if self.reference_navigation_drawer_rect(ctx).is_some() {
+            return false;
+        }
         self.reference_layout(ctx).inspector.is_some()
             || self.reference_inspector_drawer_rect(ctx).is_some()
     }
 
     pub(crate) fn reference_open_inspector(&mut self, ctx: &egui::Context) {
+        self.reference_inspector.navigation_drawer = false;
         self.reference_inspector.open = true;
         let screen = ctx.viewport_rect();
         if shell::Layout::for_size(screen.width(), screen.height())
@@ -597,6 +683,9 @@ impl TerminalApp {
     }
 
     pub(crate) fn render_reference_topbar(&mut self, root: &mut egui::Ui) {
+        if !self.reference_navigation_is_compact(root.ctx()) {
+            self.reference_inspector.navigation_drawer = false;
+        }
         if let Some(request) = self.reference_inspector.pending.take() {
             match request {
                 ReferenceInspectorRequest::Tab(tab) => {
@@ -1006,7 +1095,7 @@ impl TerminalApp {
                 chrome_style(ui, scale);
                 for (key, hint) in conversation::RAIL_NAVIGATION {
                     let hint = if key == "workspace" {
-                        if self.sidebar.visible {
+                        if self.reference_navigation_visible(ui.ctx()) {
                             "Hide left sidebar"
                         } else {
                             "Show left sidebar"
@@ -1318,63 +1407,75 @@ impl TerminalApp {
 
     pub(crate) fn render_reference_files_navigation(&mut self, root: &mut egui::Ui) {
         if self.sidebar.view != sidebar::SidebarView::Files
-            || !self.sidebar.visible
-            || self.reference_layout(root.ctx()).navigation.is_none()
+            || !self.reference_navigation_visible(root.ctx())
         {
             return;
         }
-        egui::Panel::left("reference-files-navigation")
-            .exact_size(
-                self.reference_layout(root.ctx())
-                    .navigation
-                    .map_or(0.0, |r| r.width),
-            )
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
-                left: 10,
-                right: 10,
-                top: 10,
-                bottom: shell::token::NAVIGATION_BOTTOM_GAP as i8,
-            }))
-            .show_bounded(root, |ui| {
-                let bounds = ui.available_rect_before_wrap();
-                let status = egui::Rect::from_min_max(
-                    egui::pos2(
-                        bounds.left(),
-                        (bounds.bottom() - shell::NAVIGATION_STATUS_HEIGHT).max(bounds.top()),
-                    ),
-                    bounds.max,
-                );
-                let body =
-                    egui::Rect::from_min_max(bounds.min, egui::pos2(bounds.right(), status.top()));
-                ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
-                    let was_expanded = self.config.agent_workspace_enabled;
-                    let mut scroll = egui::ScrollArea::vertical()
-                        .id_salt("glass-files-navigation-body")
-                        .min_scrolled_height(0.0)
-                        .max_height(body.height())
-                        .auto_shrink([false, false]);
-                    if let Some(offset) = self
-                        .agent_sessions
-                        .workspace_scroll
-                        .restore_offset(was_expanded)
-                    {
-                        scroll = scroll.vertical_scroll_offset(offset);
-                    }
-                    let output = scroll.show(ui, |ui| {
-                        self.render_reference_navigation(ui);
-                        self.render_workspace_sessions(ui);
-                        self.render_reference_spaces(ui);
-                    });
-                    self.agent_sessions.workspace_scroll.record(
-                        was_expanded,
-                        self.config.agent_workspace_enabled,
-                        output.state.offset.y,
-                    );
+        let drawer = self.reference_navigation_drawer_rect(root.ctx());
+        let width = self
+            .reference_layout(root.ctx())
+            .navigation
+            .map_or_else(|| drawer.map_or(0.0, |r| r.width()), |r| r.width);
+        let frame = egui::Frame::NONE.inner_margin(egui::Margin {
+            left: 10,
+            right: 10,
+            top: 10,
+            bottom: shell::token::NAVIGATION_BOTTOM_GAP as i8,
+        });
+        let mut render = |ui: &mut egui::Ui| {
+            let bounds = ui.available_rect_before_wrap();
+            let status = egui::Rect::from_min_max(
+                egui::pos2(
+                    bounds.left(),
+                    (bounds.bottom() - shell::NAVIGATION_STATUS_HEIGHT).max(bounds.top()),
+                ),
+                bounds.max,
+            );
+            let body =
+                egui::Rect::from_min_max(bounds.min, egui::pos2(bounds.right(), status.top()));
+            crate::navigation_drawer::body(ui, body, |ui| {
+                let was_expanded = self.config.agent_workspace_enabled;
+                let mut scroll = egui::ScrollArea::vertical()
+                    .id_salt("reference-navigation-scroll")
+                    .min_scrolled_height(0.0)
+                    .max_height(body.height())
+                    .auto_shrink([false, false]);
+                if let Some(offset) = self
+                    .agent_sessions
+                    .workspace_scroll
+                    .restore_offset(was_expanded)
+                {
+                    scroll = scroll.vertical_scroll_offset(offset);
+                }
+                let output = scroll.show(ui, |ui| {
+                    self.render_reference_navigation(ui);
+                    self.render_workspace_sessions(ui);
+                    self.render_reference_spaces(ui);
                 });
-                self.render_reference_status(ui, status);
+                self.agent_sessions.workspace_scroll.record(
+                    was_expanded,
+                    self.config.agent_workspace_enabled,
+                    output.state.offset.y,
+                );
             });
+            self.render_reference_status(ui, status);
+        };
+        if let Some(rect) = drawer {
+            show_inspector_drawer(
+                root,
+                rect,
+                "reference-navigation-drawer",
+                frame,
+                &mut render,
+            );
+        } else {
+            egui::Panel::left("reference-files-navigation")
+                .exact_size(width)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(frame)
+                .show_bounded(root, &mut render);
+        }
     }
 
     pub(crate) fn render_reference_inspector(&mut self, root: &mut egui::Ui) {

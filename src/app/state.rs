@@ -166,6 +166,8 @@ pub(crate) struct ReferenceInspectorState {
     /// the terminal's minimum center width. Automatic compact collapse stays
     /// reversible when the window becomes wide again.
     pub narrow_drawer: bool,
+    /// Temporary left overlay; responsive presentation never rewrites preferences.
+    pub navigation_drawer: bool,
     pub selected_tab: ReferenceInspectorTab,
     /// Apply panel ownership changes before any panel is allocated next frame.
     pub pending: Option<ReferenceInspectorRequest>,
@@ -177,6 +179,7 @@ impl Default for ReferenceInspectorState {
             sidebar_resize: Default::default(),
             open: false,
             narrow_drawer: false,
+            navigation_drawer: false,
             selected_tab: ReferenceInspectorTab::Agent,
             pending: None,
         }

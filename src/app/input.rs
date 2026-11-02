@@ -1229,6 +1229,7 @@ impl TerminalApp {
 
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
         self.organism.eva.close_dialog_owns_input()
+            || self.reference_navigation_drawer_rect(ctx).is_some()
             || self.organism.eva.card_owns_input()
             || self.block_review.is_some()
             || self.agent_sessions.is_open
@@ -1754,6 +1755,9 @@ impl TerminalApp {
                 self.set_status("Debug overlay toggled");
             }
             keybindings::Command::SidebarToggle => {
+                if self.toggle_reference_navigation_drawer(ctx) {
+                    return true;
+                }
                 self.sidebar.note_files_user_intent();
                 self.sidebar.visible = !self.sidebar.visible;
                 if self.sidebar.visible && self.sidebar.view == crate::sidebar::SidebarView::Files {

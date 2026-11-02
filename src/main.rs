@@ -37,6 +37,7 @@ mod kitty_graphics;
 mod layout;
 mod link;
 mod native_enter;
+mod navigation_drawer;
 mod organism;
 mod organism_ui;
 mod output_batch;
@@ -3504,9 +3505,7 @@ impl TerminalApp {
         }
         let files_selected = self.sidebar.view == sidebar::SidebarView::Files;
         if (files_selected && !self.reference_inspector_visible(root_ui.ctx()))
-            || (!files_selected
-                && (!self.sidebar.visible
-                    || self.reference_layout(root_ui.ctx()).navigation.is_none()))
+            || (!files_selected && !self.reference_navigation_visible(root_ui.ctx()))
         {
             // 展开按钮统一由顶部栏内的 ☰ 负责(Top 模式在 tab 栏，Sidebar 模式在精简顶部栏)，
             // 不再使用浮动按钮，避免覆盖终端内容。后台结果仍需在上方收割，
@@ -3634,9 +3633,11 @@ impl TerminalApp {
 
         let files_inspector = self.sidebar.view == sidebar::SidebarView::Files
             && self.reference_inspector_visible(root_ui.ctx());
-        let drawer = files_inspector
-            .then(|| self.reference_inspector_drawer_rect(root_ui.ctx()))
-            .flatten();
+        let drawer = if files_inspector {
+            self.reference_inspector_drawer_rect(root_ui.ctx())
+        } else {
+            self.reference_navigation_drawer_rect(root_ui.ctx())
+        };
         let panel = if files_inspector {
             egui::Panel::right("file_tree")
         } else {
@@ -3657,7 +3658,9 @@ impl TerminalApp {
             ) + crate::glass_shell::token::INSPECTOR_GAP
                 + crate::glass_shell::token::OUTER_RIGHT
         } else {
-            glass_layout.navigation.map_or(0.0, |r| r.width)
+            glass_layout
+                .navigation
+                .map_or_else(|| drawer.map_or(0.0, |r| r.width()), |r| r.width)
         };
         let frame = egui::Frame::NONE.inner_margin(if files_inspector {
             egui::Margin {
@@ -3675,6 +3678,14 @@ impl TerminalApp {
             }
         });
         let mut render_body = |ui: &mut egui::Ui| {
+            let expanded = self.config.agent_workspace_enabled;
+            let restored_scroll = if files_inspector {
+                None
+            } else {
+                self.agent_sessions
+                    .workspace_scroll
+                    .restore_offset(expanded)
+            };
             let mut contents = |ui: &mut egui::Ui| {
                 reference_workspace::chrome_style(
                     ui,
@@ -4292,14 +4303,22 @@ impl TerminalApp {
                 );
                 let body =
                     egui::Rect::from_min_max(bounds.min, egui::pos2(bounds.right(), status.top()));
-                ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("glass-navigation-body")
+                let output = crate::navigation_drawer::body(ui, body, |ui| {
+                    let mut scroll = egui::ScrollArea::vertical()
+                        .id_salt("reference-navigation-scroll")
                         .min_scrolled_height(0.0)
                         .max_height(body.height())
-                        .auto_shrink([false, false])
-                        .show(ui, &mut contents);
+                        .auto_shrink([false, false]);
+                    if let Some(offset) = restored_scroll {
+                        scroll = scroll.vertical_scroll_offset(offset);
+                    }
+                    scroll.show(ui, &mut contents).state.offset.y
                 });
+                self.agent_sessions.workspace_scroll.record(
+                    expanded,
+                    self.config.agent_workspace_enabled,
+                    output.inner,
+                );
                 self.render_reference_status(ui, status);
             }
         };
@@ -4307,7 +4326,11 @@ impl TerminalApp {
             reference_workspace::show_inspector_drawer(
                 root_ui,
                 rect,
-                "reference-files-inspector-drawer",
+                if files_inspector {
+                    "reference-files-inspector-drawer"
+                } else {
+                    "reference-navigation-drawer"
+                },
                 frame,
                 &mut render_body,
             )
@@ -5738,6 +5761,7 @@ impl TerminalApp {
         self.render_reference_topbar(root_ui);
         self.render_reference_optional_controls(root_ui);
         self.render_reference_rail(root_ui);
+        self.render_reference_navigation_scrim(root_ui);
         self.render_reference_inspector(root_ui);
         self.render_reference_files_navigation(root_ui);
         self.render_sidebar(root_ui);
