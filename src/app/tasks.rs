@@ -2224,7 +2224,7 @@ impl TerminalApp {
                     .terminal_session_id
                     .as_deref()
                     .is_some_and(|session_id| self.session_manager.index_of(session_id).is_some()),
-                has_validation_terminal: task
+                has_validation_terminal: self.agent_runtime.hosted_validation_terminal(task.id).is_some() || task
                     .validation
                     .terminal_session_id
                     .as_deref()
@@ -2569,7 +2569,7 @@ impl TerminalApp {
                         let authored_task = task.is_some_and(|task| task.brief.is_some());
                         let manual_review = task.is_some_and(|task| task.requires_manual_review());
                         let has_input = task.is_some_and(|task| task.brief.is_some() || task.source_context.is_some());
-                        let has_validation = task.is_some_and(|task| task.validation_command().is_some());
+                        let has_validation = if self.agent_runtime.conversation_id(row.id).is_some() { self.agent_runtime.can_start_hosted_validation(row.id) } else { task.is_some_and(|task| task.validation_command().is_some()) };
                         let registration_pending = self.task_sidebar.unconfirmed_registrations.contains(&row.id);
                         // Only a settled, successful record load can prove that
                         // no record is left to confirm this registration.
@@ -3513,8 +3513,8 @@ impl TerminalApp {
                 }
             }
         }
-        for (_, terminal) in self.agent_runtime.take_owned_terminal_launches() {
-            self.open_owned_validation_terminal(terminal);
+        for (task_id, terminal) in self.agent_runtime.take_owned_terminal_launches() {
+            if selected == Some(task_id) { self.open_owned_validation_terminal(terminal); }
         }
         for (_, session) in self.agent_runtime.take_terminal_handoffs() {
             self.open_hosted_native_terminal(session, ctx);
