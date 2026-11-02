@@ -1765,6 +1765,9 @@ impl TerminalApp {
                 self.return_focus_to_terminal(ctx);
                 ctx.request_repaint();
             }
+            keybindings::Command::AgentWorkspaceToggle => {
+                self.set_agent_workspace_enabled(ctx, !self.config.agent_workspace_enabled);
+            }
             keybindings::Command::JshInstall => {
                 self.install_or_update_jsh();
             }

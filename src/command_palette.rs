@@ -650,6 +650,12 @@ impl CommandPalette {
                 crate::keybindings::Command::SidebarToggle,
             ),
             CommandInfo::new(
+                "Toggle Agent Workspace",
+                CommandCategory::Window,
+                "Switch the sidebar between conversations and terminal tabs (also in Settings > Advanced)",
+                crate::keybindings::Command::AgentWorkspaceToggle,
+            ),
+            CommandInfo::new(
                 "Toggle AI Agent",
                 CommandCategory::Window,
                 "Open/close the AI agent panel (per-command approval)",
@@ -1654,6 +1660,7 @@ mod tests {
             Command::ConfigToggle,
             Command::DebugToggle,
             Command::SidebarToggle,
+            Command::AgentWorkspaceToggle,
             Command::AgentToggle,
             Command::AgentSessions,
             Command::TaskToggle,

@@ -3949,7 +3949,9 @@ impl TerminalApp {
 
                 match self.sidebar.view {
                     sidebar::SidebarView::Sessions => {
-                        if jterm_core::reference_conversation::fixture_enabled() {
+                        if self.config.agent_workspace_enabled
+                            && jterm_core::reference_conversation::fixture_enabled()
+                        {
                             self.render_reference_fixture_recent(ui);
                         } else {
                             ui.spacing_mut().interact_size.y =

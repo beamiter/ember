@@ -14,6 +14,8 @@ claimed.
 
 左侧常驻会话导航统一列出 CLI 会话、共享 API 对话、任务和普通终端。点击后在中央打开对应的真实终端或原生对话；API 草稿、历史、置顶和阅读位置由共享存储管理。CLI 会话可用 **Ctrl+]** 脱离，并在另一终端界面重新连接同一受管 PTY。任务视图默认开启，显式关闭配置仍保留。
 
+侧栏顶部的 **Agent Workspace** 开关可切回精简终端标签列表，并记住选择；也可在 **Settings → Advanced**、命令面板 **Toggle Agent Workspace** 或配置 `agent_workspace_enabled = false` 中切换。收起整个左侧栏仍使用左侧首个图标或 **Ctrl+\\**。
+
 Codex 任务提供受来源校验的 **Resume native** 和历史分页；Claude 原生任务支持同一 provider session 的多轮继续。原生任务仍由当前 app 进程管理，终端 fallback 不声明转移同一原生会话。完整边界、冲突处理与验证方法见 [Agent Workspace guide](docs/agent-workspace.md)。
 
 ## Native Vim9 IDE

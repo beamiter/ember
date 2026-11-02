@@ -1062,14 +1062,29 @@ impl TerminalApp {
             });
     }
 
+    pub(crate) fn set_agent_workspace_enabled(&mut self, ctx: &egui::Context, enabled: bool) {
+        self.config.agent_workspace_enabled = enabled;
+        self.config_panel.sync_from_config(&self.config);
+        self.schedule_config_save();
+        self.return_focus_to_terminal(ctx);
+        ctx.request_repaint();
+    }
+
     pub(crate) fn render_reference_navigation(&mut self, ui: &mut egui::Ui) -> bool {
         chrome_style(
             ui,
             self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE,
         );
+        let mut enabled = self.config.agent_workspace_enabled;
         ui.horizontal(|ui| {
-            ui.strong("Agent Workspace");
             if ui
+                .checkbox(&mut enabled, "Agent Workspace")
+                .on_hover_text("Show conversations, projects and tasks in the sidebar; turn off for terminal tabs")
+                .changed()
+            {
+                self.set_agent_workspace_enabled(ui.ctx(), enabled);
+            }
+            if enabled && ui
                 .small_button("＋")
                 .on_hover_text("New API conversation")
                 .clicked()
@@ -1186,6 +1201,9 @@ impl TerminalApp {
     }
 
     pub(crate) fn render_reference_spaces(&mut self, ui: &mut egui::Ui) {
+        if !self.config.agent_workspace_enabled {
+            return;
+        }
         let scale = self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE;
         let row_height = shell::SPACES_ROW_HEIGHT.max(24.0 * scale + 4.0);
         let height = 16.0 * scale + shell::METADATA_GAP + 4.0 * row_height;

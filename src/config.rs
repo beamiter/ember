@@ -221,6 +221,10 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub experimental_task_sidebar: bool,
 
+    /// Unified Agent Workspace navigation; disabled keeps the terminal tab list.
+    #[serde(default = "default_true")]
+    pub agent_workspace_enabled: bool,
+
     /// Last / preferred Fix-with Agent CLI (`codex`, `claude`, `opencode`, `kimi`).
     #[serde(default = "default_preferred_fix_provider")]
     pub preferred_fix_provider: String,
@@ -696,6 +700,7 @@ impl Default for Config {
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),
             experimental_task_sidebar: true,
+            agent_workspace_enabled: true,
             preferred_fix_provider: default_preferred_fix_provider(),
             remote_hosts: default_remote_hosts(),
             font_size: default_font_size(),
