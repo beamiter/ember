@@ -2506,10 +2506,16 @@ mod tests {
         let source = Config::default();
         let mut panel = ConfigPanel::new();
         panel.sync_from_config(&source);
+        assert!(panel.edit_experimental_task_sidebar);
+
+        panel.edit_experimental_task_sidebar = false;
+        let mut applied = source;
+        panel.apply_to_config(&mut applied);
+        assert!(!applied.experimental_task_sidebar);
+        panel.sync_from_config(&applied);
         assert!(!panel.edit_experimental_task_sidebar);
 
         panel.edit_experimental_task_sidebar = true;
-        let mut applied = source;
         panel.apply_to_config(&mut applied);
         assert!(applied.experimental_task_sidebar);
     }
