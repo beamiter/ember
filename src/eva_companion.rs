@@ -618,6 +618,42 @@ impl EvaHost {
                             }
                         });
                     }
+                    // Eva's proposals (negotiated only): the exact change is shown and
+                    // nothing happens unless the user approves it here.
+                    if let Some(proposal) = self.runtime.as_ref().unwrap().proposals.latest().cloned() {
+                        ui.group(|ui| {
+                            ui.label(host::proposal::card_text(&proposal));
+                            ui.horizontal(|ui| {
+                                if ui.button("Approve").clicked() {
+                                    self.runtime.as_mut().unwrap().approve_proposal(&proposal.proposal_id);
+                                }
+                                if ui.button("Decline").clicked() {
+                                    self.runtime.as_mut().unwrap().decline_proposal(&proposal.proposal_id);
+                                }
+                            });
+                        });
+                    }
+                    let can_watch = self.runtime.as_ref().unwrap().gate.proposals_supported()
+                        && self.context.as_ref().is_some_and(|c| c.task_id.is_some());
+                    if ui.add_enabled(can_watch, egui::Button::new("Tell me when this task finishes")).clicked() {
+                        if let Some(context) = self.context.clone() {
+                            if let Err(reason) = self.runtime.as_mut().unwrap().watch_task(&context) {
+                                self.runtime.as_mut().unwrap().proposals.local_status(reason);
+                            }
+                        }
+                    }
+                    for goal in self.runtime.as_ref().unwrap().proposals.goals().to_vec() {
+                        ui.horizontal(|ui| {
+                            ui.label(host::proposal::goal_line(&goal));
+                            if ui.button("Stop").clicked() {
+                                self.runtime.as_mut().unwrap().cancel_goal(&goal.goal_id);
+                            }
+                        });
+                    }
+                    let proposal_status = self.runtime.as_ref().unwrap().proposals.status().to_owned();
+                    if !proposal_status.is_empty() {
+                        ui.label(proposal_status);
+                    }
                     if let Some(error)=self.runtime.as_ref().unwrap().gate.operation_error(){ui.label(format!("Last operation error: {error}"));}
                     ui.label(format!(
                         "Pose: {} · microphone not controlled here",
