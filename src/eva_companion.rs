@@ -184,6 +184,48 @@ impl EvaHost {
         self.card = !self.card;
     }
 
+    /// The next approved agent handoff for the task composer.
+    pub(crate) fn take_handoff(&mut self) -> Option<host::AgentHandoff> {
+        self.runtime.as_mut()?.take_handoff()
+    }
+    pub(crate) fn handoff_opened(&mut self, operation_id: &str) {
+        if let Some(r) = self.runtime.as_mut() {
+            r.handoff_opened(operation_id);
+        }
+    }
+    pub(crate) fn handoff_closed(&mut self, operation_id: &str) {
+        if let Some(r) = self.runtime.as_mut() {
+            r.handoff_closed(operation_id);
+        }
+    }
+    pub(crate) fn handoff_unavailable(&mut self, operation_id: &str, reason: &str) {
+        if let Some(r) = self.runtime.as_mut() {
+            r.handoff_unavailable(operation_id, reason);
+        }
+    }
+    pub(crate) fn handoff_created(&mut self, operation_id: &str, agent_task_id: &str) {
+        if let Some(r) = self.runtime.as_mut() {
+            r.handoff_created(operation_id, agent_task_id);
+        }
+    }
+    /// Report the lifecycle of tasks created from Eva handoffs, as the task
+    /// runtime has them. Only linked tasks are sent, and only when they change.
+    pub(crate) fn report_agent_tasks(&mut self, tasks: &[jterm_core::agent_task::AgentTask]) {
+        let Some(r) = self.runtime.as_mut() else {
+            return;
+        };
+        let linked: Vec<String> = r.handoffs.linked_tasks().map(str::to_owned).collect();
+        for id in linked {
+            if let Some(task) = tasks.iter().find(|t| t.id.to_string() == id) {
+                r.agent_task_status(
+                    &id,
+                    agent_state(task.status),
+                    agent_validation(task.validation.status),
+                );
+            }
+        }
+    }
+
     /// Headline of the newest proactive notice, for the dock indicator.
     pub(crate) fn notice_headline(&self) -> Option<String> {
         let notice = self.runtime.as_ref()?.notices.latest()?;
@@ -203,9 +245,12 @@ impl EvaHost {
     fn runtime(&mut self, ctx: &egui::Context) -> &mut SharedHost {
         self.runtime.get_or_insert_with(|| {
             let ctx = ctx.clone();
-            SharedHost::from_env("ember", RetirementCapability::NativePresented, move || {
-                ctx.request_repaint()
-            })
+            // Ember can open its own task composer for an approved handoff.
+            SharedHost::from_env_delegating(
+                "ember",
+                RetirementCapability::NativePresented,
+                move || ctx.request_repaint(),
+            )
         })
     }
     pub fn host_id(&mut self, ctx: &egui::Context) -> String {
@@ -1382,4 +1427,32 @@ mod tests {
     }
     // Native ordering is exercised by tools/native-feedback-harness and the
     // family X11 matrix; searching source text for a submit hook cannot prove it.
+}
+
+fn agent_state(status: jterm_core::agent_task::TaskStatus) -> host::AgentTaskState {
+    use jterm_core::agent_task::TaskStatus as T;
+    match status {
+        T::Created => host::AgentTaskState::Created,
+        T::Starting => host::AgentTaskState::Starting,
+        T::Working => host::AgentTaskState::Working,
+        T::WaitingForApproval => host::AgentTaskState::WaitingForApproval,
+        T::WaitingForHuman => host::AgentTaskState::WaitingForHuman,
+        T::ReadyForReview => host::AgentTaskState::ReadyForReview,
+        T::Completed => host::AgentTaskState::Completed,
+        T::Failed => host::AgentTaskState::Failed,
+        T::Cancelled => host::AgentTaskState::Cancelled,
+        T::Archived => host::AgentTaskState::Archived,
+    }
+}
+
+fn agent_validation(status: jterm_core::agent_task::TaskValidationStatus) -> host::AgentValidation {
+    use jterm_core::agent_task::TaskValidationStatus as V;
+    match status {
+        V::NotRun => host::AgentValidation::NotRun,
+        V::Running => host::AgentValidation::Running,
+        V::Passed => host::AgentValidation::Passed,
+        V::Failed => host::AgentValidation::Failed,
+        V::Inconclusive => host::AgentValidation::Inconclusive,
+        V::Cancelled => host::AgentValidation::Cancelled,
+    }
 }

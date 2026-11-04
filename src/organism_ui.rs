@@ -2831,6 +2831,15 @@ impl crate::TerminalApp {
                 );
             }
             self.organism.eva.root(ui, self.vim9_editors.is_empty());
+            // Approved Eva handoffs open the task composer; the task runtime's
+            // own state is reported back for tasks created from them.
+            while let Some(handoff) = self.organism.eva.take_handoff() {
+                self.open_eva_handoff(handoff, ui.ctx());
+            }
+            self.settle_eva_composer();
+            self.organism
+                .eva
+                .report_agent_tasks(self.task_manager.tasks());
             if self.organism.eva.take_capture_request() {
                 let selected = self
                     .session_manager

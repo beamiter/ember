@@ -636,7 +636,11 @@ impl TerminalApp {
         ctx.request_repaint();
     }
 
-    fn reference_request_sidebar_view(&mut self, view: sidebar::SidebarView, ctx: &egui::Context) {
+    pub(crate) fn reference_request_sidebar_view(
+        &mut self,
+        view: sidebar::SidebarView,
+        ctx: &egui::Context,
+    ) {
         self.sidebar.note_files_user_intent();
         self.reference_inspector.pending = Some(ReferenceInspectorRequest::Navigation(view));
         self.return_focus_to_terminal(ctx);

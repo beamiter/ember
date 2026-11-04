@@ -457,6 +457,9 @@ struct TaskComposer {
     validation_command: String,
     validation_shell: String,
     error: Option<String>,
+    /// The approved Eva handoff this draft was opened for, if any. It grants
+    /// nothing; it only lets the created task (or a discarded draft) be reported.
+    eva_operation: Option<String>,
 }
 
 impl Default for TaskComposer {
@@ -471,6 +474,7 @@ impl Default for TaskComposer {
             validation_command: String::new(),
             validation_shell: "/bin/sh".into(),
             error: None,
+            eva_operation: None,
         }
     }
 }
@@ -485,6 +489,42 @@ struct TaskCreationRequest {
 }
 
 impl TaskComposer {
+    /// Why this composer cannot take an Eva handoff now, as the identifier
+    /// reported back; an existing draft is never replaced.
+    fn eva_handoff_refusal(&self, tasks_enabled: bool, creating: bool) -> Option<&'static str> {
+        if !tasks_enabled {
+            Some("agent_tasks_disabled")
+        } else if creating {
+            Some("task_creation_busy")
+        } else if !self.title.trim().is_empty()
+            || !self.goal.trim().is_empty()
+            || self.with_validation
+            || self.eva_operation.is_some()
+        {
+            Some("task_draft_in_progress")
+        } else {
+            None
+        }
+    }
+
+    /// Prefill only the title and goal. Project, agent and validation stay the
+    /// composer's own defaults for the user to choose.
+    fn prefill_eva_handoff(&mut self, handoff: companion_host::AgentHandoff) {
+        self.title = handoff.title;
+        self.goal = handoff.goal;
+        self.eva_operation = Some(handoff.operation_id);
+        self.error = None;
+    }
+
+    /// A handoff draft closed while no task is being created was abandoned.
+    /// The draft text is kept, as for any closed draft; only the link goes.
+    fn take_abandoned_eva(&mut self, creating: bool) -> Option<String> {
+        if self.open || creating {
+            return None;
+        }
+        self.eva_operation.take()
+    }
+
     fn request(&self) -> Result<TaskCreationRequest, String> {
         let title = self.title.trim();
         if title.is_empty() || title.len() > 256 || title.chars().any(char::is_control) {
@@ -1675,6 +1715,52 @@ impl TerminalApp {
         draft.open = true;
     }
 
+    /// An approved Eva handoff opens the ordinary task composer prefilled. The
+    /// user still chooses project, agent and validation and creates the task;
+    /// starting the agent stays a separate action. An existing draft is never
+    /// replaced.
+    pub(crate) fn open_eva_handoff(
+        &mut self,
+        handoff: companion_host::AgentHandoff,
+        ctx: &egui::Context,
+    ) {
+        let op = handoff.operation_id.clone();
+        let creating =
+            self.task_sidebar.pending_creation.is_some() || self.task_sidebar.recovery_job.is_some();
+        if let Some(reason) = self
+            .task_sidebar
+            .composer
+            .eva_handoff_refusal(self.config.experimental_task_sidebar, creating)
+        {
+            self.organism.eva.handoff_unavailable(&op, reason);
+            self.set_status(match reason {
+                "agent_tasks_disabled" => {
+                    "Eva suggested an agent task, but Tasks are off in Settings."
+                }
+                "task_creation_busy" => {
+                    "Eva suggested an agent task; another task is still being created."
+                }
+                _ => "Eva suggested an agent task; your current task draft is kept.",
+            });
+            return;
+        }
+        self.open_task_composer();
+        self.task_sidebar.composer.prefill_eva_handoff(handoff);
+        // The composer is drawn in the Tasks view, as for the New task button.
+        self.reference_request_sidebar_view(crate::sidebar::SidebarView::Tasks, ctx);
+        self.organism.eva.handoff_opened(&op);
+        self.set_status("Eva's task suggestion is in the composer. Review it before creating.");
+    }
+
+    /// A handoff draft that was closed without a task (and is not being
+    /// created) is reported once and unlinked.
+    pub(crate) fn settle_eva_composer(&mut self) {
+        let creating = self.task_sidebar.pending_creation.is_some();
+        if let Some(op) = self.task_sidebar.composer.take_abandoned_eva(creating) {
+            self.organism.eva.handoff_closed(&op);
+        }
+    }
+
     pub(crate) fn open_task_handoff(
         &mut self,
         packet: &jterm_core::agent_workspace::WorkspaceHandoff,
@@ -1694,7 +1780,10 @@ impl TerminalApp {
             return Err("The handoff must fit within 16 KiB.".into());
         }
         let draft = &self.task_sidebar.composer;
-        if !draft.title.trim().is_empty() || !draft.goal.trim().is_empty() || draft.with_validation
+        if !draft.title.trim().is_empty()
+            || !draft.goal.trim().is_empty()
+            || draft.with_validation
+            || draft.eva_operation.is_some()
         {
             return Err("An existing task draft is retained. Finish or discard it before creating this handoff.".into());
         }
@@ -1925,6 +2014,9 @@ impl TerminalApp {
                 self.task_sidebar.scroll_to_selected = true;
                 self.task_sidebar.show_dashboard();
                 if authored {
+                    if let Some(op) = self.task_sidebar.composer.eva_operation.take() {
+                        self.organism.eva.handoff_created(&op, &id.to_string());
+                    }
                     self.task_sidebar.dashboard_query.clear();
                     self.task_sidebar.dashboard_view = jterm_core::agent_task::DashboardView::All;
                     self.task_sidebar.dashboard_provider = None;
@@ -4574,6 +4666,97 @@ mod management_v2_tests {
         assert!(draft.request().unwrap().brief.unwrap().validation.is_none());
         draft.project = "relative/path".into();
         assert!(draft.request().is_err());
+    }
+
+    fn eva_handoff(op: &str) -> companion_host::AgentHandoff {
+        companion_host::AgentHandoff {
+            operation_id: op.into(),
+            context: companion_host::ContextRef {
+                host_id: "ember".into(),
+                pane_id: "pane-1".into(),
+                task_id: Some("build".into()),
+                project_id: Some("alpha".into()),
+                revision: 1,
+            },
+            title: "找出 build 失败原因".into(),
+            goal: "找出 build 失败原因并给出最小修复\n\nEva 的说明：没有附带终端输出。".into(),
+        }
+    }
+
+    #[test]
+    fn eva_handoff_is_an_ordinary_unsent_draft_and_is_abandoned_once() {
+        let mut draft = TaskComposer {
+            project: "/work/terminal".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            draft.eva_handoff_refusal(false, false),
+            Some("agent_tasks_disabled")
+        );
+        assert_eq!(
+            draft.eva_handoff_refusal(true, true),
+            Some("task_creation_busy")
+        );
+        assert_eq!(
+            composer().eva_handoff_refusal(true, false),
+            Some("task_draft_in_progress"),
+            "an existing draft is never replaced"
+        );
+        assert_eq!(draft.eva_handoff_refusal(true, false), None);
+        draft.open = true;
+        draft.prefill_eva_handoff(eva_handoff("op-1"));
+        assert_eq!(
+            draft.eva_handoff_refusal(true, false),
+            Some("task_draft_in_progress"),
+            "a second handoff never replaces the first"
+        );
+        let kept = (draft.title.clone(), draft.goal.clone());
+        draft.title.clear();
+        draft.goal.clear();
+        assert_eq!(
+            draft.eva_handoff_refusal(true, false),
+            Some("task_draft_in_progress"),
+            "an emptied handoff draft still holds its link"
+        );
+        (draft.title, draft.goal) = kept;
+        // Only the title and goal are prefilled; agent and validation stay the user's choice.
+        assert_eq!(draft.provider, AgentProvider::Codex);
+        assert!(!draft.with_validation);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |_ui| {
+                    assert!(
+                        show_task_composer(&ctx, &mut draft, &[], false).is_none(),
+                        "showing a handoff creates nothing"
+                    );
+                },
+            );
+            output.textures_delta.clear();
+        }
+        // Create would make exactly the visible, unstarted task, with no terminal output.
+        let request = draft.request().unwrap();
+        assert!(!request.autostart);
+        assert!(request.context.is_none());
+        assert_eq!(request.title, "找出 build 失败原因");
+        assert_eq!(request.brief.unwrap().goal, draft.goal);
+        assert_eq!(draft.take_abandoned_eva(false), None, "still open");
+        draft.open = false;
+        assert_eq!(
+            draft.take_abandoned_eva(true),
+            None,
+            "closed while its task is being created"
+        );
+        assert_eq!(draft.take_abandoned_eva(false).as_deref(), Some("op-1"));
+        assert_eq!(draft.take_abandoned_eva(false), None, "reported once");
+        assert_eq!(draft.title, "找出 build 失败原因", "the draft text is kept");
     }
 
     #[test]
