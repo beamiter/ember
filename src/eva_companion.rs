@@ -7,6 +7,7 @@ struct NativeCandidate {
     body: Option<host::Token>,
     clear: bool,
     dialogue: Option<String>,
+    notice: Option<String>,
 }
 
 pub(crate) struct EvaHost {
@@ -50,6 +51,8 @@ pub(crate) struct EvaHost {
     dialogue_status: String,
     dialogue_displayed: bool,
     dialogue_display_pending: Option<(String, u64)>,
+    /// A proactive notice drawn in this pass; acknowledged once presented.
+    notice_display_pending: Option<(String, u64)>,
     /// Local request error, shown until the history view changes.
     history_error: Option<(String, u64)>,
     history_text: Option<(u64, String)>,
@@ -118,6 +121,7 @@ impl Default for EvaHost {
             dialogue_status: String::new(),
             dialogue_displayed: false,
             dialogue_display_pending: None,
+            notice_display_pending: None,
             history_error: None,
             history_text: None,
             voice_text_error: None,
@@ -178,6 +182,12 @@ impl EvaHost {
 
     pub(crate) fn toggle_card(&mut self) {
         self.card = !self.card;
+    }
+
+    /// Headline of the newest proactive notice, for the dock indicator.
+    pub(crate) fn notice_headline(&self) -> Option<String> {
+        let notice = self.runtime.as_ref()?.notices.latest()?;
+        Some(host::notice::headline(notice).to_owned())
     }
 
     pub fn reduced_motion(&mut self, reduced: bool) {
@@ -286,7 +296,12 @@ impl EvaHost {
             .as_ref()
             .filter(|(_, at)| pass >= *at)
             .map(|(id, _)| id.clone());
-        if !clear && !needs_body && dialogue.is_none() {
+        let notice = self
+            .notice_display_pending
+            .as_ref()
+            .filter(|(_, at)| pass >= *at)
+            .map(|(id, _)| id.clone());
+        if !clear && !needs_body && dialogue.is_none() && notice.is_none() {
             return false;
         }
         if self.native_candidates.len() == 64 {
@@ -298,6 +313,7 @@ impl EvaHost {
                 body,
                 clear,
                 dialogue,
+                notice,
             },
         );
         true
@@ -386,6 +402,9 @@ impl EvaHost {
                     self.dialogue_displayed = true;
                 }
             }
+            if let Some(notice_id) = candidate.notice {
+                r.notice_displayed(&notice_id);
+            }
         }
     }
     pub fn root(&mut self, ui: &mut Ui, force_close_allowed: bool) {
@@ -393,6 +412,7 @@ impl EvaHost {
             .data_mut(|d| d.insert_temp(egui::Id::new("eva-shared-mode-active"), true));
         let pass = ui.ctx().cumulative_pass_nr();
         self.dialogue_display_pending = None;
+        self.notice_display_pending = None;
         let runtime = self.runtime(ui.ctx());
         runtime.begin_frame(pass);
         let changed = runtime.poll();
@@ -586,6 +606,18 @@ impl EvaHost {
                     .max_height((ui.ctx().content_rect().height() - 96.0).max(120.0))
                     .show(ui, |ui| {
                     ui.label(self.runtime.as_ref().unwrap().gate.status());
+                    // Proactive notice (negotiated only). Its offer is a label; nothing here runs it.
+                    if let Some(notice) = self.runtime.as_ref().unwrap().notices.latest().cloned() {
+                        ui.group(|ui| {
+                            let shown = ui.label(host::notice::card_text(&notice));
+                            if shown.rect.intersects(ui.clip_rect()) {
+                                self.notice_display_pending = Some((notice.notice_id.clone(), pass));
+                            }
+                            if ui.button("Dismiss notice").clicked() {
+                                self.runtime.as_mut().unwrap().dismiss_notice(&notice.notice_id);
+                            }
+                        });
+                    }
                     if let Some(error)=self.runtime.as_ref().unwrap().gate.operation_error(){ui.label(format!("Last operation error: {error}"));}
                     ui.label(format!(
                         "Pose: {} · microphone not controlled here",

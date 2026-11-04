@@ -869,6 +869,11 @@ impl TerminalApp {
                 self.render_reference_inspector_toggle(ui, toggle);
                 if self.organism.eva.enabled() {
                     let dock = toggle.translate(egui::vec2(-toggle_w - 6.0, 0.0));
+                    let notice = self.organism.eva.notice_headline();
+                    let hover = match &notice {
+                        Some(headline) => format!("Eva notice: {headline} · Alt+Shift+E"),
+                        None => "Eva companion · Alt+Shift+E".to_owned(),
+                    };
                     if ui
                         .put(
                             dock,
@@ -877,7 +882,7 @@ impl TerminalApp {
                                 .stroke(Stroke::new(1.0, shell::rgba(shell::token::BORDER)))
                                 .corner_radius(shell::CONTROL_RADIUS),
                         )
-                        .on_hover_text("Eva companion · Alt+Shift+E")
+                        .on_hover_text(hover)
                         .clicked()
                     {
                         self.organism.eva.toggle_card();
@@ -885,7 +890,7 @@ impl TerminalApp {
                     ui.painter().with_clip_rect(dock).text(
                         dock.center(),
                         egui::Align2::CENTER_CENTER,
-                        "Eva",
+                        if notice.is_some() { "Eva •" } else { "Eva" },
                         FontId::proportional(10.0 * scale),
                         shell::rgba(shell::token::TEXT),
                     );
