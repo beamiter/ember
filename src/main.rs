@@ -871,7 +871,16 @@ fn main() -> Result<(), eframe::Error> {
                 cc.egui_ctx.clone(),
                 cc.wgpu_render_state.clone(),
             )
-            .map(|app| Box::new(app) as Box<dyn eframe::App>)
+            .map(|mut app| {
+                use winit::raw_window_handle::{HasWindowHandle,RawWindowHandle};
+                let native=cc.window_handle().ok().and_then(|handle|match handle.as_raw(){
+                    RawWindowHandle::Xlib(handle)=>Some(handle.window as u64),
+                    RawWindowHandle::Xcb(handle)=>Some(handle.window.get() as u64),
+                    _=>None,
+                });
+                app.init_desktop_sessions(native,&cc.egui_ctx);
+                Box::new(app) as Box<dyn eframe::App>
+            })
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
         }),
     );
@@ -5985,6 +5994,7 @@ impl eframe::App for TerminalApp {
         // this frame. SSH follow is drained only after rendering, so a first
         // observation must still yield to an explicit Files intent that ran
         // earlier in the same frame.
+        self.sync_desktop_sessions(ctx);
         let frame_start_files_user_intent = self.sidebar.files_user_intent_generation();
         self.flush_vim9_tab_closes(ctx);
 
