@@ -70,3 +70,7 @@ mod tests {
         assert!(subscription.0.is_none());
     }
 }
+
+#[cfg(all(test, target_os = "linux", feature = "reduced-motion"))]
+#[path = "callback_private_bus_test.rs"]
+mod private_bus_test;

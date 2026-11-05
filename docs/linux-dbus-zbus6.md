@@ -99,8 +99,10 @@ Local validation on Linux with Rust 1.99.1:
 - AT-SPI common/proxies: 1,141 unit tests and 9 doctests passed; the 31 upstream
   ignored doctests remain ignored. Core-only AT-SPI check and all-target Clippy
   passed.
-- Mundy: 11 unit tests passed in default, Tokio-only and combined configurations;
-  all 3 supported default-feature doctests also passed.
+- Mundy's initial 11 unit tests passed in default, Tokio-only and combined
+  configurations; all 3 supported default-feature doctests also passed. The
+  follow-up adds a twelfth real private-bus lifecycle test, compiled in every
+  supported runtime configuration but not executed locally.
   These focused tests used debug info disabled; the application checks used their
   existing default profile. The cancellation unit test exercises the oneshot
   cancellation primitive and empty-interest no-op, not a live subscription's
@@ -108,10 +110,12 @@ Local validation on Linux with Rust 1.99.1:
   also passed all 11 unit tests. Its unit-only gate uses `--lib` because upstream
   doctest examples require the optional AccentColor feature; full doctests remain
   enabled in the default/all-preferences gate.
-- AccessKit default and Tokio-only test code compiled. **The three real private-bus
-  tests did not reach their assertions locally:** the execution environment
-  rejected socket creation with `EPERM`, including an isolated retry.
-  This is not a protocol or lifecycle pass.
+- AccessKit default and Tokio-only test binaries compiled. The initial three
+  real private-bus tests did not reach their assertions locally: the execution
+  environment rejected socket creation with `EPERM`, including an isolated retry.
+  The follow-up active-tree tests and live Mundy subscription test are also
+  compile-only locally; they are mandatory runtime gates in candidate CI. This
+  is not a local protocol or lifecycle pass.
 - `check-linux-dbus-stack.py` verifies a single active root zbus 6.2.1 graph, no
   obsolete split crates/lockstep in that graph, and provenance for the five
   audited fork test graphs. Unrelated historical `vendor/eframe/Cargo.lock` and
@@ -128,8 +132,29 @@ Candidate CI must pass the private-bus root-registration and lifecycle assertion
 for default and Tokio runtimes. These cover exactly-once root embedding, duplicate
 registration, real Parent `(so)`/role/state/interface results, error replies,
 live-bus disabled→enabled toggles, session/a11y bus loss, and terminal callback
-shutdown while activation is pending (`ActivationHandler` returns `None`). They
-do not exercise an `Active(AdapterImpl)` tree's shutdown or live node teardown. Native acceptance must also pass:
+shutdown while activation is pending (`ActivationHandler` returns `None`).
+Additional active-tree fixtures return a real `TreeUpdate`, export a window and
+button, read their public AT-SPI children/name and execute one real Action. A FIFO
+callback fence establishes that registration finished before bus loss. Both
+session-bus and accessibility-bus loss must deactivate exactly once, clear the
+AppContext tree, leave retained platform handles defunct and reject subsequent
+remote actions. Session loss additionally observes the accessibility connection's
+name-owner loss and verifies `NameHasOwner` is false. The tests pass the existing
+callback channel into the loop rather than starting the process-global adapter
+thread; the production path uses the very same channel as before.
+
+The real Mundy fixture reexecutes its exact test under a disposable
+`dbus-run-session`, drives public `Preferences::subscribe` through an initial Read
+and a SettingChanged signal, then drops the subscription. Test-only observation
+joins the actual callback thread after its outer `block_on` returns, including
+thread-local runtime teardown. D-Bus `NameOwnerChanged` plus `NameHasOwner` confirms
+that the subscriber connection is gone. A post-drop signal and bus round-trip
+barrier must leave the callback channel disconnected with no queued callback.
+The child exit status and explicit completion marker prevent a zero-test child
+from passing. Bounded waits and an outer timeout fail hung teardown; there are no
+sleep-based success conditions or ignored lifecycle tests. This covers the
+subscription-owned thread and connection, not a claim that the process has no
+other shared helper threads. Native acceptance must also pass:
 
 - `scripts/test-organism-system-motion.py`: actual private-bus appearance, GNOME
   fallback and missing-preference behavior in Ember.
@@ -140,8 +165,9 @@ do not exercise an `Active(AdapterImpl)` tree's shutdown or live node teardown. 
 
 Compilation does not establish desktop accessibility, idle runtime behavior,
 physical GPU behavior, non-Linux runtime behavior, or a real screen reader session.
-Wayland AT-SPI smoke, active-tree bus-loss teardown, live Mundy subscription
-cancellation/resource cleanup, repeated window/adapter churn and thread-growth
-observation remain additional runtime coverage to establish if they are not exercised by the
-existing native jobs. No upstream submission or master publication is part of
+Wayland AT-SPI smoke, repeated multi-window/adapter churn and process-wide
+thread-growth observation remain additional runtime coverage to establish if they
+are not exercised by the existing native jobs. The new active-tree and live-drop
+fixtures must pass remotely before those narrower lifetime gaps are considered
+closed. No upstream submission or master publication is part of
 this candidate record.

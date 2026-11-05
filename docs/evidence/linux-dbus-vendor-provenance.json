@@ -18,6 +18,7 @@
       "Cargo.toml",
       "src/async_rt.rs",
       "src/callback.rs",
+      "src/callback_private_bus_test.rs",
       "src/freedesktop/mod.rs",
       "src/lib.rs"
     ]
@@ -43,6 +44,7 @@
       "Cargo.toml",
       "LICENSE-APACHE",
       "LICENSE-MIT",
+      "src/adapter.rs",
       "src/atspi/bus.rs",
       "src/atspi/object_address.rs",
       "src/atspi/object_id.rs",

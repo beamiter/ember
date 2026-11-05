@@ -1,3 +1,4 @@
+// Ember zbus 6 compatibility patch; see ../../docs/linux-dbus-zbus6.md.
 // Copyright 2022 The AccessKit Authors. All rights reserved.
 // Licensed under the Apache License, Version 2.0 (found in
 // the LICENSE-APACHE file) or the MIT license (found in
@@ -24,7 +25,10 @@ pub(crate) struct Callback {
 
 impl Callback {
     pub(crate) fn new() -> Self {
-        let messages = get_or_init_messages();
+        Self::with_messages(get_or_init_messages())
+    }
+
+    pub(crate) fn with_messages(messages: Sender<Message>) -> Self {
         Self { messages }
     }
 
@@ -225,6 +229,9 @@ impl Drop for Adapter {
 }
 
 pub(crate) enum Message {
+    // A test-only FIFO fence acknowledges processing of all earlier callbacks.
+    #[cfg(test)]
+    Barrier(async_channel::Sender<()>),
     AddAdapter {
         id: usize,
         activation_handler: Box<dyn ActivationHandler + Send>,

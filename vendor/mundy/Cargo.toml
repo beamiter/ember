@@ -238,3 +238,9 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
 ]
+
+# Private portal fixture for Linux subscription lifecycle regression tests.
+[target.'cfg(target_os = "linux")'.dev-dependencies.zbus]
+version = "6.2.1"
+features = ["service"]
+default-features = false
