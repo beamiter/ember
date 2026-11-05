@@ -90,7 +90,13 @@ def validate_tree(nodes, root, owner, pid, expected_text='E03DISCOVERY'):
 
 
 def save_tree(nodes, root, owner, pid, output, expected_text='E03DISCOVERY'):
-    editor = validate_tree(nodes, root, owner, pid, expected_text)
+    try:
+        editor = validate_tree(nodes, root, owner, pid, expected_text)
+    except RuntimeError as error:
+        output.with_name(output.stem + '-unvalidated.json').write_text(json.dumps(
+            dict(status='unvalidated', error=str(error), expected_text=expected_text,
+                 pid=pid, owner=owner, root=root, nodes=nodes), indent=2))
+        raise
     result = dict(pid=pid, owner=owner, root=root, nodes=nodes,
                   editor_path=editor,
                   picker_common_ancestor='unverified', focus_acceptance='unverified')
@@ -180,6 +186,12 @@ def discovery(pid, output, expected_text='E03DISCOVERY'):
             return save_tree(nodes, root, owner, pid, output, expected_text)
         except (RuntimeError, dbus.DBusException) as error:
             last_error = str(error)
+            # Diagnostic only. Never consumed as a verified owned tree.
+            output.with_name(output.stem + '-discovery-error.json').write_text(json.dumps(
+                dict(status='unvalidated', error=last_error,
+                     elapsed_seconds=time.monotonic()-started,
+                     nodes_collected=len(nodes) if 'nodes' in locals() else 0,
+                     partial_nodes=nodes if 'nodes' in locals() else []), indent=2))
             time.sleep(0.1)
     raise RuntimeError('AT-SPI discovery unproven: ' + str(last_error))
 

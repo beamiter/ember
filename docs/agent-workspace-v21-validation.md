@@ -157,3 +157,26 @@ requires a normal VimLeavePre receipt, retirement of that exact process
 incarnation, same-shell PID/TTY input before/after exit, and actual native window
 closure (including the exact visible confirmation where required). Forced cleanup
 cannot satisfy normal exit. These final native interactions remain pending CI.
+
+
+The complete `03b6da4` run passed session recovery on both desktops and the
+Block input-method-v2 compositor preedit/commit/Return gate. The first Block
+segment of live-switch passed too; Chat and active-switch acceptance remain
+incomplete. This is hosted protocol input, not physical IME/IBus/Fcitx coverage.
+
+Two failed IME observations contain the exact whole-image token but the complete
+body OCR omits it or joins its arrow. An independent paint witness now registers
+all connected production preedit chips using the exact fill/ink colors and the
+already registered font/line-height bounds. The observed exact token must lie
+inside one such painted chip within the owned native body. No token-selected
+crop, extra OCR, character repair or rectangular-layout-only witness is added.
+The two archived `03b6da4` PNGs pass this offline check; new native acceptance
+remains pending. Source PNG hashes are
+`d91dc1cacb7b89a597745b42853c3b8797078602d9c5de77e31432fcb235393a` and
+`52c57ead433c9c2eb147f6334c8d9ca8af14d390e18dd607bfe5818296511b3b`.
+
+E03 reaches a visibly open Block Search window, but exact empty-entry AT-SPI
+validation fails. Failed/partial discovery trees are now preserved separately
+and explicitly marked unvalidated; they can never satisfy an acceptance gate.
+The ownership, node/time bounds and exact editable-entry requirements stay intact
+while the next native run collects the missing evidence.

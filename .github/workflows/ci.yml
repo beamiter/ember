@@ -481,6 +481,7 @@ jobs:
           python3 scripts/test-native-ime-keyboard.py
           EMBER_CAPTURE_BUDGET_EVIDENCE="$GITHUB_WORKSPACE/native-smoke-artifacts/capture-budget-unit" python3 scripts/test-native-ime-capture-budget.py
           python3 scripts/test-native-ime-visual.py
+          python3 scripts/test-native-ime-chip-witness.py
           python3 scripts/test-native-ime-body-observer.py
           mkdir -p "$RUNNER_TEMP/ember-ime"
           wayland-scanner client-header scripts/protocols/input-method-unstable-v2.xml "$RUNNER_TEMP/ember-ime/input-method-unstable-v2-client-protocol.h"

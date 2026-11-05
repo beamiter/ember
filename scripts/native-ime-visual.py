@@ -354,6 +354,43 @@ def require_native_plane_witness(word, rectangle, canvas, planes):
     return matches[0]
 
 
+def preedit_chip_planes(pixels, width, height, body, contract):
+    """Independent exact-paint witness from production PreeditPaint, not OCR.
+
+    Register every connected pale chip in the complete native body before any
+    token lookup. No text-selected crop, added OCR pass or character repair.
+    """
+    from PIL import Image, ImageChops, ImageDraw
+    if len(pixels) != width * height * 3:
+        raise RuntimeError('Invalid native chip RGB byte count')
+    image = Image.frombytes('RGB', (width, height), pixels)
+    diff = ImageChops.difference(image, Image.new('RGB', image.size, (231, 237, 253)))
+    channels = diff.split()
+    distance = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]), channels[2])
+    mask = distance.point([255] + [0] * 255)
+    planes = []
+    while mask.getbbox() is not None:
+        bounds = mask.getbbox()
+        # The first nonzero row has a seed; skip all blank rows in one step.
+        top = bounds[1]
+        seed_x = mask.crop((0, top, width, top + 1)).tobytes().index(255)
+        ImageDraw.floodfill(mask, (seed_x, top), 128, thresh=0)
+        component = mask.point([255 if value == 128 else 0 for value in range(256)])
+        left, top, right, bottom = component.getbbox()
+        region = dict(x=left, y=top, width=right-left, height=bottom-top)
+        area = region['width'] * region['height']
+        pale = component.histogram()[255]
+        ink = sum(color == (40, 52, 76) for color in image.crop((left, top, right, bottom)).getdata())
+        if (contained(region, body) and contract['min_height'] <= region['height'] <= contract['line_height']
+                and region['width'] >= 2 * region['height'] and pale >= area * 0.55
+                and area * 0.03 <= ink <= area * 0.4):
+            planes.append(dict(rectangle=region, pale_pixels=pale, ink_pixels=ink,
+                               profile='production-preedit-chip-v1',
+                               fill_rgb=[231, 237, 253], ink_rgb=[40, 52, 76]))
+        mask.paste(0, mask=component)
+    return planes
+
+
 def reference_native_plane_witnesses(smoke, image, rectangle, contract):
     """Geometry only for multi-line planes; do not add a tighter OCR pass."""
     owned = rectangle['rect']
@@ -371,8 +408,13 @@ def reference_native_plane_witnesses(smoke, image, rectangle, contract):
     if glass_profile.selected(smoke):
         if len(raw) != canvas['width'] * canvas['height'] * 3:
             raise RuntimeError('Unexpected glass canvas RGB byte count')
-        # A full-image-only word without another actual OCR observation must
-        # still fail: a layout rectangle is not a manufactured paint witness.
+        # The actual painted preedit chip is independent of OCR and of token
+        # position. A declared canvas/body rectangle alone still cannot pass.
+        body = glass_profile.layout(owned)['native_body']
+        local_body = dict(body, x=body['x']-canvas['x'], y=body['y']-canvas['y'])
+        for plane in preedit_chip_planes(raw, canvas['width'], canvas['height'], local_body, contract):
+            local = plane['rectangle']
+            planes.append(dict(plane, rectangle=dict(local, x=local['x']+canvas['x'], y=local['y']+canvas['y'])))
         return canvas, planes, hashlib.sha256(raw).hexdigest()
     for registration in native_body_registration(raw, canvas['width'], canvas['height'], single_line=False,
             min_height=contract['min_height'], max_height=contract['line_height']):

@@ -219,6 +219,14 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'poll failed'): p.close_resources(daemon, smoke)
         smoke.close.assert_called_once_with()
 
+    def test_unvalidated_accessibility_tree_is_diagnostic_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)/'tree.json'
+            with self.assertRaises(RuntimeError):
+                p.save_tree([], p.ROOT, ':1.0', 42, output, '')
+            self.assertFalse(output.exists())
+            self.assertIn('"status": "unvalidated"', output.with_name('tree-unvalidated.json').read_text())
+
     def test_no_private_controller_or_action_dispatch(self):
         source=Path(p.__file__).read_text()
         self.assertNotIn('DoAction(',source)
