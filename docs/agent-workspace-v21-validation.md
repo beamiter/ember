@@ -243,3 +243,23 @@ exclusion is unchanged. All four retained actual closed trees validate offline;
 new native navigation, fresh target/neighbor pixels and all remaining E03 stages
 still must run independently. A separate search archive exposes completed
 public evidence while the later compositor gates continue.
+
+
+The `f237e49` hosted run completes all three compositor IME gates, including
+Block → Chat → Block live switching and Settings-boundary cancellation during
+active preedit in both directions. Exact preedit pixels, zero PTY bytes during
+composition, rejected stale commits, fresh composition and same-shell identity
+all pass. This does not cover physical input devices or full IBus/Fcitx/XIM.
+
+The `c8be357` hosted run passes bounded raw and snapshot E03 navigation, plus the
+independent compatibility snapshot. Compatibility raw passes its first stopped
+hit navigation, then a whole-frame Tesseract PSM11 process exceeds the existing
+30-second budget during restart-flow observation. The failed run remains failed.
+OCR subprocesses now explicitly use `OMP_THREAD_LIMIT=1`, already used by the
+Vim close observer, to bound contention with the software-rendered desktop. The
+application/compositor environment, image, PSM, exact predicates and 30-second
+process timeout are unchanged; timeouts still fail immediately with no retry.
+The execution policy is saved with native evidence. Offline replay of the
+original timed-out PNG gives byte-identical TSV with and without this setting
+on the cloud's newer Tesseract, but does not reproduce or prove the hosted
+load cause. A fresh hosted run remains required.

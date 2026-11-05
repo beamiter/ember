@@ -315,6 +315,10 @@ class Smoke:
         self.binary, self.backend, self.out = binary, backend, out
         self.processes = []
         self.logs = []
+        (out / 'ocr-execution.json').write_text(json.dumps({
+            'program': 'tesseract', 'environment': {'OMP_THREAD_LIMIT': '1'},
+            'per_process_timeout_seconds': 30, 'timeout_retries': 0,
+            'scope': 'OCR observer only; application and compositor environment unchanged'}, indent=2))
         # The unified native workspace is now the product UI, not an opt-in
         # screenshot fixture. Historical observer functions remain separately
         # testable, but real Settings input uses its owned current surface.
@@ -365,7 +369,13 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         self.env['EMBER_SMOKE_SENTINELS'] = str(self.transcript)
 
     def run(self, args, **kwargs):
-        return subprocess.run(args, env=self.env, check=True, timeout=30, **kwargs)
+        # Pin OCR CPU concurrency on small hosted runners. OpenMP workers must
+        # not compete with the real software-rendered application/compositor.
+        # This changes no OCR input, PSM, output predicate or 30-second bound.
+        env = dict(self.env)
+        if args and Path(args[0]).name == 'tesseract':
+            env['OMP_THREAD_LIMIT'] = '1'
+        return subprocess.run(args, env=env, check=True, timeout=30, **kwargs)
 
     def spawn(self, args, label, **options):
         log = open(self.out / (label + '.log'), 'w')

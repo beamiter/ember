@@ -3,6 +3,8 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
+import subprocess
 
 spec = importlib.util.spec_from_file_location('workspace_desktop', Path(__file__).with_name('native-desktop-smoke.py'))
 desktop = importlib.util.module_from_spec(spec)
@@ -14,6 +16,30 @@ def word(text, x, y, width=40, height=14):
 
 
 class PublicPresentationTests(unittest.TestCase):
+    def test_ocr_uses_one_worker_without_changing_environment_or_parameters(self):
+        original = dict(PATH='/usr/bin', DISPLAY=':42', OMP_THREAD_LIMIT='8')
+        smoke = SimpleNamespace(env=original.copy())
+        for program in ('tesseract', '/usr/bin/tesseract'):
+            args = [program, 'owned.png', 'stdout', '--psm', '11', 'tsv']
+            with patch.object(desktop.subprocess, 'run') as run:
+                desktop.Smoke.run(smoke, args, text=True, capture_output=True)
+            run.assert_called_once_with(args, env=dict(original, OMP_THREAD_LIMIT='1'),
+                                        check=True, timeout=30, text=True, capture_output=True)
+            self.assertEqual(smoke.env, original)
+        with patch.object(desktop.subprocess, 'run') as run:
+            desktop.Smoke.run(smoke, ['swaymsg', '-t', 'get_tree'])
+        run.assert_called_once_with(['swaymsg', '-t', 'get_tree'], env=original,
+                                    check=True, timeout=30)
+
+    def test_ocr_timeout_is_not_retried_or_converted_to_success(self):
+        smoke = SimpleNamespace(env={})
+        args = ['tesseract', 'owned.png', 'stdout', '--psm', '11', 'tsv']
+        with patch.object(desktop.subprocess, 'run', side_effect=subprocess.TimeoutExpired(args, 30)) as run:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                desktop.Smoke.run(smoke, args)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(smoke.env, {})
+
     def test_legacy_configuration_maps_to_current_presentation(self):
         self.assertEqual(desktop.presentation_mode('normal'), 'block')
         self.assertEqual(desktop.presentation_mode('block'), 'block')
