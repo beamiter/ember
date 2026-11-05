@@ -116,6 +116,19 @@ class Targets(unittest.TestCase):
                 driver.locate('Unrelated target', (43, 62))
             smoke.run.assert_not_called()
 
+    def test_draft_readback_scrolls_back_to_the_visible_label_and_editor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            smoke = Mock(out=Path(directory))
+            driver = m.Driver(smoke)
+            clipped = self.tree()
+            clipped['nodes'][4]['screen_extents'] = [110, 20, 50, 15]
+            clipped['nodes'][5]['screen_extents'] = [110, 40, 200, 25]
+            driver.read = Mock(side_effect=[clipped, self.tree()])
+            with patch.object(m.time, 'sleep'):
+                value = m.editor(driver.locate('Title', (29,), below=100), 'Title')['text']
+            self.assertEqual(value, 'fixture')
+            self.assertEqual(smoke.run.call_args.args[0][-1], '4')
+
     def test_no_database_means_no_success(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertIsNone(m.stored(Path(directory)))

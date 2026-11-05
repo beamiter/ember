@@ -335,10 +335,10 @@ def main():
         driver.press(FREEZE, enabled=False)
         driver.press('Refresh saved Missions')
         time.sleep(1)
-        assert editor(driver.read('draft-retained'), 'Title')['text'] == 'Unsaved Mission title'
+        assert editor(driver.locate('Title', (29,), below=100), 'Title')['text'] == 'Unsaved Mission title'
         assert stored(out / 'home')[0]['title'] == 'EmberMissionFixture'
         driver.press('Discard draft changes')
-        assert editor(driver.read('draft-discarded'), 'Title')['text'] == 'EmberMissionFixture'
+        assert editor(driver.locate('Title', (29,), below=100), 'Title')['text'] == 'EmberMissionFixture'
         result['assertions'].append('Unsaved draft disabled Inspect/Freeze, survived Refresh, and required explicit discard')
         result['saved_plan'], result['last_host_report'] = stored(out / 'home')
         # Leave by the native window manager, not SIGTERM success accounting.

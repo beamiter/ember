@@ -104,7 +104,7 @@ The observer uncovered an AT-SPI state-mapping defect: disabled buttons did not
 support ReadOnly, so they were incorrectly advertised as Enabled/Sensitive.
 The bundled adapter now suppresses those states for all disabled roles while
 retaining the existing ReadOnly mapping for editors. Two Rust regression tests
-and ten pure observer contract tests cover the fix and fail-closed targeting.
+and eleven pure observer contract tests cover the fix and fail-closed targeting.
 Those pure tests do not establish native acceptance. The new exact-commit CI
 gate must pass before native Mission acceptance is claimed. Wayland Mission UI,
 physical hardware, provider execution and actual five-repository delivery are
@@ -117,6 +117,13 @@ uses a fresh public tree, and still requires the complete control bounds to be
 inside the content area below the observed title bar before a click. Offscreen
 AT-SPI nodes and apparent Showing state alone never authorize input. Mission
 evidence is included in both the early and final desktop archives.
+
+The next hosted run proved native create, Inspect, candidate/core-pin Freeze,
+uninspected rejection and post-Refresh stale-freeze rejection. Its added draft
+scenario reached a successful Discard but correctly rejected reading the Title
+outside the scrolled viewport. Draft verification now uses the same real scroll
+and freshly visible labelled editor before reading the exact retained/restored
+text; it does not weaken the visible-control predicate.
 
 ### Published Mission checkpoint CI
 

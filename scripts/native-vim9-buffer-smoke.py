@@ -21,6 +21,7 @@ import time
 import traceback
 
 from PIL import Image, ImageChops, ImageGrab
+from native_x11_capture import X11StripCapture
 
 
 def wait_for(probe, label, process, timeout=25):
@@ -51,6 +52,12 @@ def read_vim_state(path, timeout=0.25):
             if remaining <= 0:
                 return {}
             time.sleep(min(0.005, remaining))
+
+
+def fractional_wheel_positions(trace, start_y, end_y, row_height):
+    """Keep the existing 0.08-row rejection band around integral positions."""
+    return [y for _, y in trace if y is not None and end_y < y < start_y
+            and abs((start_y - y) / row_height - round((start_y - y) / row_height)) > 0.08]
 
 
 def workspace_header_bounds(image, app):
@@ -228,6 +235,7 @@ def main():
     env.pop("JTERM_VIM9_BIN", None)
     log = (out / "application.log").open("w")
     app = subprocess.Popen([str(args.binary.resolve()), "--ide", str(source)], env=env, stdout=log, stderr=log)
+    wheel_capture = None
     def xdo(*parts):
         result = subprocess.run(["xdotool", *map(str, parts)], env=env, text=True, capture_output=True, timeout=4)
         if result.returncode and parts[0] != "search":
@@ -488,10 +496,12 @@ def main():
         box = (int(geometry["X"]), int(geometry["Y"]),
                int(geometry["X"]) + int(geometry["WIDTH"]), int(geometry["Y"]) + int(geometry["HEIGHT"]))
         wheel_images = []
-        def wheel_bounds(name):
-            # XCB memory capture avoids ImageMagick process/PNG latency inside
-            # the 100 ms gesture. Encode artifacts after sampling has finished.
-            image = ImageGrab.grab(bbox=box, xdisplay=env["DISPLAY"]).convert("RGB")
+        def wheel_bounds(name, full=False):
+            # Full frames establish source ownership. Timed reads retain one
+            # X11 connection and copy only the observed source's narrow strip.
+            # Pillow's bbox still reads the whole screen before cropping it.
+            image = (wheel_capture.capture() if wheel_capture is not None and not full else
+                     ImageGrab.grab(bbox=box, xdisplay=env["DISPLAY"]).convert("RGB"))
             wheel_images.append((name, image))
             mask = None
             for channel, value in zip(image.split(), (0x30, 0x40, 0x50)):
@@ -503,22 +513,46 @@ def main():
             bounds = wheel_bounds(name)
             return bounds[1] if bounds is not None else None
         def trace_notch(prefix, mode):
+            nonlocal wheel_capture
             # The workspace navigation now occupies x0..292. Use the actual
             # painted fixture line, never a stale whole-window coordinate.
-            source_bounds = wait_for(lambda: wheel_bounds(prefix + "-pointer-source"),
+            source_bounds = wait_for(lambda: wheel_bounds(prefix + "-pointer-source", full=True),
                                      "native wheel pointer source pixels", app)
             pointer = [(source_bounds[0] + source_bounds[2]) // 2,
                        (source_bounds[1] + source_bounds[3]) // 2]
             xdo("mousemove", "--window", window, *pointer)
-            start_y = wait_for(lambda: wheel_y(prefix + "-before"), "painted wheel source highlight", app)
+            baseline = wait_for(lambda: wheel_bounds(prefix + "-before", full=True),
+                                "painted wheel source highlight", app)
+            start_y = baseline[1]
+            left, right = baseline[0], min(baseline[0] + 64, baseline[2])
+            strip = (box[0] + left, box[1], box[0] + right, box[3])
+            if wheel_capture is not None:
+                wheel_capture.close()
+            wheel_capture = X11StripCapture(env["DISPLAY"], strip)
+            # An independent full-window observation must agree with the strip
+            # before the one real gesture. Retain the full vertical extent.
+            strip_bounds = wheel_bounds(prefix + "-strip-baseline")
+            assert strip_bounds is not None and strip_bounds[1::2] == baseline[1::2], (baseline, strip_bounds)
+            report["wheel_capture_" + mode] = {"root_box": strip, "window_box": box,
+                "source_rgb": [0x30, 0x40, 0x50], "baseline_bounds": baseline,
+                "strip_baseline_bounds": strip_bounds,
+                "method": "retained X11 root-window XGetImage"}
             before_ack = state().get("render", {}).get("scroll_ack", 0)
             started = time.monotonic()
             xdo("click", "--delay", "0", "5")
             trace = []
-            for index in range(8):
-                trace.append([round(time.monotonic() - started, 4), wheel_y(prefix + "-step-" + str(index))])
+            capture_spans = []
+            # Observe the same bounded ~350 ms single gesture at native frame
+            # cadence, not eight full-screen captures. Never retry the gesture.
+            while time.monotonic() - started < 0.35:
+                before_capture = time.monotonic() - started
+                y = wheel_y(prefix + "-step-" + str(len(trace)))
+                after_capture = time.monotonic() - started
+                trace.append([round(after_capture, 4), y])
+                capture_spans.append([round(before_capture, 4), round(after_capture, 4)])
                 time.sleep(0.008)
             report["wheel_attempt_" + mode] = {"start_y": start_y, "trace": trace,
+                                               "capture_spans": capture_spans,
                                                "source_rgb_bounds": list(source_bounds), "pointer": pointer,
                                                "before_ack": before_ack, "after_state": state()}
             for name, image in wheel_images:
@@ -528,8 +562,7 @@ def main():
             end_y = wheel_y(prefix + "-after")
             assert end_y < start_y, (start_y, trace, end_y)
             row_height = (start_y - end_y) / 3.0
-            fractional = [y for _, y in trace if y is not None and end_y < y < start_y
-                          and abs((start_y - y) / row_height - round((start_y - y) / row_height)) > 0.08]
+            fractional = fractional_wheel_positions(trace, start_y, end_y, row_height)
             assert fractional, ("wheel moved only by complete Vim rows", mode, start_y, trace, end_y, row_height)
             return {"source_topline": [50, 53], "start_y": start_y,
                     "end_y": end_y, "row_height": row_height,
@@ -827,6 +860,8 @@ def main():
         (out / "failure-state.json").write_text(json.dumps(report, indent=2) + "\n")
         raise
     finally:
+        if wheel_capture is not None:
+            wheel_capture.close()
         if app.poll() is None:
             app.send_signal(signal.SIGCONT)
             app.terminate()
