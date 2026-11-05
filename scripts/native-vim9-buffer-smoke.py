@@ -35,6 +35,24 @@ def wait_for(probe, label, process, timeout=25):
     raise RuntimeError("Timed out: " + label)
 
 
+def read_vim_state(path, timeout=0.25):
+    """Read a complete receipt, tolerating only a bounded publication gap.
+
+    Vim's rename() removes an existing destination before renaming the temp
+    file, even on Unix. A reader can therefore see ENOENT between two valid
+    receipts. Never reuse a previous snapshot or retry a valid modified state.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {}
+            time.sleep(min(0.005, remaining))
+
+
 def workspace_header_bounds(image, app):
     """Registered geometry plus independent owned-window paint, not guessed RGB."""
     if app == "ember":
@@ -216,10 +234,7 @@ def main():
             raise RuntimeError("xdotool " + " ".join(map(str, parts)) + ": " + result.stderr)
         return result
     def state():
-        try:
-            return json.loads(state_file.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+        return read_vim_state(state_file)
     def capture(name):
         image = out / f"{name}.png"
         subprocess.run(["import", "-window", str(window), str(image)], env=env, check=True, timeout=5)
@@ -445,10 +460,15 @@ def main():
                 xdo("key", "ctrl+shift+g")
                 xdo("type", "--clearmodifiers", "--delay", "0", f"{line}:{column}")
                 xdo("key", "Return")
-                wait_for(lambda: state().get("line") == line and state().get("column") == column,
-                         f"keyboard-only Go to {line}:{column}", app)
+                def goto_state():
+                    current = state()
+                    return current if (current.get("line") == line
+                                       and current.get("column") == column) else None
+                current = wait_for(goto_state, f"keyboard-only Go to {line}:{column}", app)
+                assert current.get("modified") == 0, current
                 capture(f"goto-{line}-{column}")
-                assert state().get("modified") == 0
+                current = state()
+                assert current.get("modified") == 0, current
                 assert source.read_text(encoding="utf-8") == original
             report["goto_reopen_without_click"] = "passed"
             report["vim_state"] = state()

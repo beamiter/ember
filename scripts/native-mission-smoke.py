@@ -61,8 +61,22 @@ def visible(node, frame):
             public.inside(node.get('screen_extents', []), frame.get('screen_extents', [])))
 
 
+def content_frame(frame, nodes):
+    """Exclude the observed title bar and a conservative bottom border inset."""
+    bars = [node for node in nodes if node['role'] == 67 and node['parent'] == frame['path']]
+    if len(bars) != 1 or not visible(bars[0], frame):
+        raise RuntimeError('Missing or ambiguous owned Mission title bar')
+    x, y, width, height = frame['screen_extents']
+    top = bars[0]['screen_extents'][1] + bars[0]['screen_extents'][3]
+    if not y < top < y + height - 8:
+        raise RuntimeError('Invalid Mission content viewport')
+    return dict(frame, screen_extents=[x, top, width, y + height - 8 - top])
+
+
 def button(tree, label, enabled=True, dialog=True):
     frame, nodes = owned_nodes(tree, dialog)
+    if dialog:
+        frame = content_frame(frame, nodes)
     choices = [node for node in nodes if node['name'] == label and
                node['role'] in (43, 62) and visible(node, frame)]
     if len(choices) != 1:
@@ -79,6 +93,7 @@ def button(tree, label, enabled=True, dialog=True):
 
 def editor(tree, label):
     frame, nodes = owned_nodes(tree)
+    frame = content_frame(frame, nodes)
     labels = [node for node in nodes if node['name'] == label and node['role'] == 29
               and visible(node, frame)]
     if len(labels) != 1:
@@ -167,7 +182,7 @@ class Driver:
         time.sleep(.3)
 
     def press(self, text, enabled=True, dialog=True):
-        before = self.read('target-button')
+        before = self.locate(text, (43, 62), dialog=dialog)
         node = button(before, text, enabled, dialog)
         after = self.read('settled-button')
         fresh = button(after, text, enabled, dialog)
@@ -175,8 +190,39 @@ class Driver:
             raise RuntimeError('Mission control moved before click: ' + text)
         self.click(fresh, text)
 
+    def locate(self, label, roles, dialog=True, below=0):
+        # Egui exposes offscreen children in its public tree. Their extents
+        # locate a scroll direction, never authorize clicking through clipping.
+        for attempt in range(9):
+            tree = self.read('locate-control')
+            frame, nodes = owned_nodes(tree, dialog)
+            area = content_frame(frame, nodes) if dialog else frame
+            matches = [node for node in nodes if node['name'] == label and node['role'] in roles]
+            if len(matches) != 1:
+                raise RuntimeError('Missing or ambiguous exact Mission target: ' + label)
+            node = matches[0]
+            bounds = node.get('screen_extents', [])
+            if len(bounds) != 4 or min(bounds[2:]) <= 0:
+                raise RuntimeError('Invalid Mission target geometry: ' + label)
+            x, y, width, height = bounds
+            ax, ay, aw, ah = area['screen_extents']
+            if visible(node, area) and y + height + below <= ay + ah:
+                return tree
+            if not dialog or x < ax or x + width > ax + aw or attempt == 8:
+                raise RuntimeError('Mission target is not safely visible: ' + label)
+            direction = '5' if y + height + below > ay + ah else '4'
+            # Use the owned dialog's right gutter, away from multiline inputs.
+            self.smoke.run(['xdotool', 'mousemove', str(ax + aw - 12), str(ay + ah // 2),
+                            'click', '--repeat', '3', '--delay', '60', direction])
+            self.actions.append(dict(label=label, input='X11 wheel', direction=direction,
+                                     viewport=area['screen_extents'], target_bounds=bounds,
+                                     monotonic_ns=time.monotonic_ns()))
+            (self.smoke.out / 'pointer-actions.json').write_text(json.dumps(self.actions, indent=2))
+            time.sleep(.25)
+        raise RuntimeError('Mission target scroll budget exhausted')
+
     def fill(self, label, value):
-        node = editor(self.read('target-editor'), label)
+        node = editor(self.locate(label, (29,), below=100), label)
         self.click(node, label)
         self.smoke.key('a', ('ctrl',))
         self.smoke.text(value)

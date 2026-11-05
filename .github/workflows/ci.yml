@@ -415,6 +415,7 @@ jobs:
         run: |
           python3 scripts/test-native-x11-display.py
           python3 scripts/test-native-vim9-workspace-profile.py
+          python3 scripts/test-native-vim9-state.py
           python3 scripts/test-native-vim9-shell-profile.py
           python3 scripts/test-native-vim9-exit.py
           xvfb-run -a -s '-screen 0 1600x1100x24 -noreset' /usr/bin/python3 scripts/native-vim9-buffer-smoke.py \
@@ -441,6 +442,7 @@ jobs:
             native-smoke-artifacts/binary-identity.txt
             native-smoke-artifacts/font-ocr-identities.json
             native-smoke-artifacts/x11
+            native-smoke-artifacts/mission-x11
             native-smoke-artifacts/vim9-buffer-gui
             native-smoke-artifacts/vim9-modal-focus
           if-no-files-found: error

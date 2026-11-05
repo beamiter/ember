@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location('mission', Path(__file__).with_name('native-mission-smoke.py'))
 m = importlib.util.module_from_spec(spec)
@@ -29,7 +30,8 @@ class Targets(unittest.TestCase):
                  node('/editor', root + '/mission', role=79, text='fixture',
                       interfaces=[m.public.COMPONENT, m.public.TEXT],
                       states=[sum(1 << bit for bit in (7, 8, 12, 24, 25, 30)), 0],
-                      screen_extents=[110, 170, 200, 25])]
+                      screen_extents=[110, 170, 200, 25]),
+                 node('/titlebar', root + '/mission', role=67, screen_extents=[125, 100, 650, 30])]
         by_path = {node['path']: node for node in nodes}
         for value in nodes:
             if value['parent']:
@@ -84,6 +86,35 @@ class Targets(unittest.TestCase):
         tree['nodes'][2]['screen_extents'] = [100, 100, 1400, 900]
         with self.assertRaises(RuntimeError):
             m.button(tree, m.FREEZE)
+
+    def test_offscreen_button_and_title_bar_occlusion_cannot_be_clicked(self):
+        for bounds in ([110, 810, 200, 24], [110, 105, 200, 24], [110, 780, 200, 24]):
+            tree = self.tree()
+            tree['nodes'][3]['screen_extents'] = bounds
+            with self.subTest(bounds=bounds), self.assertRaises(RuntimeError):
+                m.button(tree, m.FREEZE)
+
+    def test_scroll_uses_owned_gutter_then_requires_fresh_visible_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            smoke = Mock(out=Path(directory))
+            driver = m.Driver(smoke)
+            clipped = self.tree()
+            clipped['nodes'][3]['screen_extents'] = [110, 810, 200, 24]
+            visible = self.tree()
+            driver.read = Mock(side_effect=[clipped, visible])
+            with patch.object(m.time, 'sleep'):
+                self.assertEqual(driver.locate(m.FREEZE, (43, 62)), visible)
+            smoke.run.assert_called_once_with(['xdotool', 'mousemove', '788', '461',
+                                               'click', '--repeat', '3', '--delay', '60', '5'])
+
+    def test_missing_exact_target_is_not_a_license_to_scroll_or_click(self):
+        with tempfile.TemporaryDirectory() as directory:
+            smoke = Mock(out=Path(directory))
+            driver = m.Driver(smoke)
+            driver.read = Mock(return_value=self.tree())
+            with self.assertRaises(RuntimeError):
+                driver.locate('Unrelated target', (43, 62))
+            smoke.run.assert_not_called()
 
     def test_no_database_means_no_success(self):
         with tempfile.TemporaryDirectory() as directory:

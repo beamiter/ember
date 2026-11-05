@@ -104,11 +104,19 @@ The observer uncovered an AT-SPI state-mapping defect: disabled buttons did not
 support ReadOnly, so they were incorrectly advertised as Enabled/Sensitive.
 The bundled adapter now suppresses those states for all disabled roles while
 retaining the existing ReadOnly mapping for editors. Two Rust regression tests
-and seven pure observer contract tests cover the fix and fail-closed targeting.
+and ten pure observer contract tests cover the fix and fail-closed targeting.
 Those pure tests do not establish native acceptance. The new exact-commit CI
 gate must pass before native Mission acceptance is claimed. Wayland Mission UI,
 physical hardware, provider execution and actual five-repository delivery are
 explicitly outside this new gate.
+
+The first hosted run created and independently read back the exact Mission,
+then correctly refused to click Freeze below the default 420-pixel dialog's
+viewport. The driver now scrolls the owned dialog through real wheel input,
+uses a fresh public tree, and still requires the complete control bounds to be
+inside the content area below the observed title bar before a click. Offscreen
+AT-SPI nodes and apparent Showing state alone never authorize input. Mission
+evidence is included in both the early and final desktop archives.
 
 ### Published Mission checkpoint CI
 
