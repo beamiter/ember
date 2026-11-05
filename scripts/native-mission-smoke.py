@@ -32,11 +32,11 @@ FREEZE = 'Freeze observed candidates'
 INSPECT = 'Inspect repositories (read-only)'
 
 
-def owned_nodes(tree, dialog=True):
+def owned_nodes(tree, dialog=True, title=TITLE):
     probe.validate_tree(tree['nodes'], tree['root'], tree['owner'], tree['pid'], None)
     nodes = {node['path']: node for node in tree['nodes']}
     frames = [node for node in nodes.values() if node['role'] == 23 and
-              (node['name'] == TITLE if dialog else node['parent'] == tree['root'])]
+              (node['name'] == title if dialog else node['parent'] == tree['root'])]
     if len(frames) != 1:
         raise RuntimeError('Missing or ambiguous owned Mission frame')
     frame = frames[0]
@@ -61,22 +61,25 @@ def visible(node, frame):
             public.inside(node.get('screen_extents', []), frame.get('screen_extents', [])))
 
 
-def content_frame(frame, nodes):
-    """Exclude the observed title bar and a conservative bottom border inset."""
+def content_frame(frame, nodes, scrollable=True):
+    """Exclude the observed title bar; inset only the Mission scroll viewport."""
     bars = [node for node in nodes if node['role'] == 67 and node['parent'] == frame['path']]
     if len(bars) != 1 or not visible(bars[0], frame):
         raise RuntimeError('Missing or ambiguous owned Mission title bar')
     x, y, width, height = frame['screen_extents']
     top = bars[0]['screen_extents'][1] + bars[0]['screen_extents'][3]
-    if not y < top < y + height - 8:
+    # The non-scrolling, content-sized close dialog uses its full owned client
+    # bounds. It has no Mission scrollbar/gutter to inset or scroll through.
+    inset = 8 if scrollable else 0
+    if not y < top < y + height - inset:
         raise RuntimeError('Invalid Mission content viewport')
-    return dict(frame, screen_extents=[x, top, width, y + height - 8 - top])
+    return dict(frame, screen_extents=[x, top, width, y + height - inset - top])
 
 
-def button(tree, label, enabled=True, dialog=True):
-    frame, nodes = owned_nodes(tree, dialog)
+def button(tree, label, enabled=True, dialog=True, title=TITLE):
+    frame, nodes = owned_nodes(tree, dialog, title)
     if dialog:
-        frame = content_frame(frame, nodes)
+        frame = content_frame(frame, nodes, scrollable=title == TITLE)
     choices = [node for node in nodes if node['name'] == label and
                node['role'] in (43, 62) and visible(node, frame)]
     if len(choices) != 1:
@@ -181,22 +184,22 @@ class Driver:
         (self.smoke.out / 'pointer-actions.json').write_text(json.dumps(self.actions, indent=2))
         time.sleep(.3)
 
-    def press(self, text, enabled=True, dialog=True):
-        before = self.locate(text, (43, 62), dialog=dialog)
-        node = button(before, text, enabled, dialog)
+    def press(self, text, enabled=True, dialog=True, title=TITLE):
+        before = self.locate(text, (43, 62), dialog=dialog, title=title)
+        node = button(before, text, enabled, dialog, title)
         after = self.read('settled-button')
-        fresh = button(after, text, enabled, dialog)
+        fresh = button(after, text, enabled, dialog, title)
         if (node['path'], node['screen_extents']) != (fresh['path'], fresh['screen_extents']):
             raise RuntimeError('Mission control moved before click: ' + text)
         self.click(fresh, text)
 
-    def locate(self, label, roles, dialog=True, below=0):
+    def locate(self, label, roles, dialog=True, below=0, title=TITLE):
         # Egui exposes offscreen children in its public tree. Their extents
         # locate a scroll direction, never authorize clicking through clipping.
         for attempt in range(9):
             tree = self.read('locate-control')
-            frame, nodes = owned_nodes(tree, dialog)
-            area = content_frame(frame, nodes) if dialog else frame
+            frame, nodes = owned_nodes(tree, dialog, title)
+            area = content_frame(frame, nodes, scrollable=title == TITLE) if dialog else frame
             matches = [node for node in nodes if node['name'] == label and node['role'] in roles]
             if len(matches) != 1:
                 raise RuntimeError('Missing or ambiguous exact Mission target: ' + label)
@@ -208,7 +211,7 @@ class Driver:
             ax, ay, aw, ah = area['screen_extents']
             if visible(node, area) and y + height + below <= ay + ah:
                 return tree
-            if not dialog or x < ax or x + width > ax + aw or attempt == 8:
+            if not dialog or title != TITLE or x < ax or x + width > ax + aw or attempt == 8:
                 raise RuntimeError('Mission target is not safely visible: ' + label)
             direction = '5' if y + height + below > ay + ah else '4'
             # Use the owned dialog's right gutter, away from multiline inputs.
@@ -343,7 +346,25 @@ def main():
         result['saved_plan'], result['last_host_report'] = stored(out / 'home')
         # Leave by the native window manager, not SIGTERM success accounting.
         smoke.key('F4', ('alt',))
-        native.wait_for(lambda: smoke.app.poll() is not None, 'native normal close')
+        close_deadline = time.monotonic() + 30
+        confirmed = False
+        while smoke.app.poll() is None and time.monotonic() < close_deadline:
+            try:
+                tree = driver.read('native-close')
+                closing = [node for node in tree['nodes'] if node['role'] == 23
+                           and node['name'] == 'Closing this window']
+                if closing and not confirmed:
+                    # The product may require explicit Eva retirement consent.
+                    # Honor that exact owned dialog once; never disable its
+                    # guard, kill the app, or repeatedly click through prompts.
+                    driver.press('Close anyway', title='Closing this window')
+                    confirmed = True
+                    result['native_close_confirmation'] = 'Closing this window / Close anyway'
+            except RuntimeError:
+                if smoke.app.poll() is None:
+                    raise
+            time.sleep(.1)
+        assert smoke.app.poll() is not None, 'Timed out: native normal close'
         assert smoke.app.returncode == 0
         result.update(status='pass', normal_quit=True)
     except BaseException as error:

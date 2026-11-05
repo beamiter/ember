@@ -129,6 +129,26 @@ class Targets(unittest.TestCase):
             self.assertEqual(value, 'fixture')
             self.assertEqual(smoke.run.call_args.args[0][-1], '4')
 
+    def test_close_confirmation_requires_the_exact_owned_dialog(self):
+        tree = self.tree()
+        tree['nodes'][3]['name'] = 'Close anyway'
+        with self.assertRaises(RuntimeError):
+            m.button(tree, 'Close anyway', title='Closing this window')
+        tree['nodes'][2]['name'] = 'Closing this window'
+        self.assertEqual(m.button(tree, 'Close anyway', title='Closing this window')['name'], 'Close anyway')
+        with self.assertRaises(RuntimeError):
+            m.button(tree, 'Close anyway')
+
+    def test_close_confirmation_is_not_admitted_when_disabled_or_outside_dialog(self):
+        for key, value in [('states', [(1 << 25) | (1 << 30), 0]),
+                           ('screen_extents', [900, 500, 200, 24])]:
+            tree = self.tree()
+            tree['nodes'][2]['name'] = 'Closing this window'
+            tree['nodes'][3]['name'] = 'Close anyway'
+            tree['nodes'][3][key] = value
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                m.button(tree, 'Close anyway', title='Closing this window')
+
     def test_no_database_means_no_success(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertIsNone(m.stored(Path(directory)))

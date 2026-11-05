@@ -104,7 +104,7 @@ The observer uncovered an AT-SPI state-mapping defect: disabled buttons did not
 support ReadOnly, so they were incorrectly advertised as Enabled/Sensitive.
 The bundled adapter now suppresses those states for all disabled roles while
 retaining the existing ReadOnly mapping for editors. Two Rust regression tests
-and eleven pure observer contract tests cover the fix and fail-closed targeting.
+and thirteen pure observer contract tests cover the fix and fail-closed targeting.
 Those pure tests do not establish native acceptance. The new exact-commit CI
 gate must pass before native Mission acceptance is claimed. Wayland Mission UI,
 physical hardware, provider execution and actual five-repository delivery are
@@ -124,6 +124,13 @@ scenario reached a successful Discard but correctly rejected reading the Title
 outside the scrolled viewport. Draft verification now uses the same real scroll
 and freshly visible labelled editor before reading the exact retained/restored
 text; it does not weaken the visible-control predicate.
+
+The third hosted run completed all six Mission assertions and both independent
+native Vim gates. Its final window-manager close correctly opened Eva's explicit
+retirement confirmation. The driver now handles only the exact PID-owned
+"Closing this window" frame's enabled "Close anyway" control once, via real
+pointer input, and still requires exit code zero within the original close
+deadline. It does not disable close guards or count forced cleanup as success.
 
 ### Published Mission checkpoint CI
 
