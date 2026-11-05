@@ -33,6 +33,8 @@ pub const COMPOSER_TERMINAL_MIN_AVAILABLE: f32 = 280.0;
 pub const MODE_CONTROL_HEIGHT: f32 = 28.0;
 pub const MODE_CONTROL_TOP: f32 = 7.0;
 pub const MODE_CONTROL_MIN_WIDTH: f32 = 52.0;
+/// Space reserved for the default-enabled Eva companion topbar control.
+pub const EVA_CONTROL_RESERVE: f32 = 38.0;
 pub const SELECTED_RAIL_SIZE: f32 = 32.0;
 pub const PROFILE_DIAMETER: f32 = 28.0;
 pub const NAVIGATION_PADDING: f32 = 10.0;

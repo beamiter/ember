@@ -33,19 +33,35 @@ def wait_startup_surface(smoke):
     """
     sequence = 0
     observations = []
+    expected_identity = None
     def painted():
-        nonlocal sequence
+        nonlocal sequence, expected_identity
         assert smoke.app.poll() is None, 'Ember exited before startup paint'
         sequence += 1
         label = f'startup-paint-{sequence:02d}'
         owned = glass_profile.owned_window(smoke) if glass_profile.selected(smoke) else None
+        if owned is not None:
+            identity = (owned['id'], owned['pid'])
+            if expected_identity is None:
+                expected_identity = identity
+            elif identity != expected_identity:
+                raise RuntimeError('Recovery identity changed while awaiting startup paint')
         smoke.screenshot(label)
         image = smoke.out / (label + '.png')
         if owned is not None:
             from PIL import Image
             digest = hashlib.sha256(image.read_bytes()).hexdigest()
-            if glass_profile.owned_window(smoke) != owned:
-                raise RuntimeError('Recovery identity/geometry changed across capture')
+            after = glass_profile.owned_window(smoke)
+            if (after['id'], after['pid']) != (owned['id'], owned['pid']):
+                raise RuntimeError('Recovery identity changed across capture')
+            if after['rect'] != owned['rect']:
+                # The initial compositor configure can settle between these
+                # reads. This frame is not evidence: retain it and require a
+                # wholly new, stable capture within the same startup deadline.
+                observations.append(dict(image=image.name, sha256=digest,
+                                         owned=owned, after=after,
+                                         rejected='Startup geometry changed during capture'))
+                return False
             try:
                 with Image.open(image) as pixels:
                     witness = glass_profile.header_paint(pixels, owned['rect'],

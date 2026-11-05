@@ -60,6 +60,23 @@ class GlassProfileTests(unittest.TestCase):
                 self.assertEqual((slot['width'], slot['height']), (52, 26))
             self.assertEqual(chat['x'] - block['x'] - block['width'], 6)
 
+    def test_default_eva_reserve_matches_independently_captured_mode_coordinates(self):
+        owned = dict(x=0, y=25, width=1280, height=875)
+        self.assertEqual(g.mode_slot(owned, 'block'), dict(x=1046, y=33, width=52, height=26))
+        # These literal paint bounds are independent of mode_slot: the real
+        # b600737 Wayland recovery image's selected Block surface starts here.
+        image = Image.new('RGB', (1280, 900), (15, 24, 38))
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((1045, 34, 1094, 59), radius=6, fill=(62,108,255))
+        draw.text((1057, 42), 'Block', fill=(239,245,255))
+        self.assertEqual(g.header_paint(image, owned, 'block')['selected_mode'], 'block')
+        # The previous observation domain (no Eva reserve) cannot stand in
+        # for a real default-enabled frame, even though it partly overlaps.
+        old = Image.new('RGB', (1280, 900), (15, 24, 38))
+        ImageDraw.Draw(old).rounded_rectangle((1084, 33, 1135, 58), radius=6, fill=(62,108,255))
+        with self.assertRaises(RuntimeError):
+            g.header_paint(old, owned, 'block')
+
     def test_offset_short_narrow_and_threshold_are_exact(self):
         for width,height in [(700,640),(1179,704),(1180,704),(1280,875)]:
             plain=g.layout(dict(x=0,y=0,width=width,height=height))
@@ -172,6 +189,45 @@ class GlassIntegrationTests(unittest.TestCase):
         for name in ('REFERENCE_SHELL_HEALTH','REFERENCE_INLINE_BODY'):
             p=patch.object(visual,name,True);p.start();self.addCleanup(p.stop)
 
+    def test_recovery_startup_discards_configure_frame_then_requires_stable_paint(self):
+        before = dict(id=5, pid=self.smoke.app.pid, rect=dict(self.smoke.rect))
+        changed = dict(before, rect=dict(self.smoke.rect, height=875))
+        def bounded_probe(probe, label, timeout):
+            self.assertEqual(timeout, 30)
+            self.assertFalse(probe(), 'a configure-spanning screenshot is not evidence')
+            self.assertTrue(probe(), 'only a new stable owned screenshot can pass')
+        with patch.object(recovery.glass_profile, 'owned_window', side_effect=[before, changed, before, before]), \
+                patch.object(recovery.driver, 'wait_for', side_effect=bounded_probe):
+            recovery.wait_startup_surface(self.smoke)
+        observations = json.loads((self.smoke.out / 'startup-paint.json').read_text())['observations']
+        self.assertEqual(len(observations), 2)
+        self.assertIn('rejected', observations[0])
+        self.assertNotIn('witness', observations[0])
+        self.assertEqual(observations[1]['witness']['selected_mode'], 'block')
+        self.assertEqual(self.smoke.captures, ['startup-paint-01', 'startup-paint-02'])
+
+    def test_recovery_startup_never_adopts_replacement_identity_between_retries(self):
+        before = dict(id=5, pid=self.smoke.app.pid, rect=dict(self.smoke.rect))
+        configured = dict(before, rect=dict(self.smoke.rect, height=875))
+        replacement = dict(before, id=6)
+        def bounded_probe(probe, *args, **kwargs):
+            self.assertFalse(probe())
+            probe()
+        with patch.object(recovery.glass_profile, 'owned_window', side_effect=[before, configured, replacement]), \
+                patch.object(recovery.driver, 'wait_for', side_effect=bounded_probe):
+            with self.assertRaisesRegex(RuntimeError, 'identity changed while awaiting'):
+                recovery.wait_startup_surface(self.smoke)
+        self.assertEqual(self.smoke.captures, ['startup-paint-01'])
+
+    def test_recovery_startup_identity_change_still_fails_immediately(self):
+        before = dict(id=5, pid=self.smoke.app.pid, rect=dict(self.smoke.rect))
+        after = dict(before, id=6)
+        with patch.object(recovery.glass_profile, 'owned_window', side_effect=[before, after]), \
+                patch.object(recovery.driver, 'wait_for', side_effect=lambda probe, *args, **kwargs: probe()):
+            with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+                recovery.wait_startup_surface(self.smoke)
+        self.assertEqual(self.smoke.captures, ['startup-paint-01'])
+
     def capture(self,label,present,baseline=None):
         self.smoke.present=present
         return visual.snapshot(self.smoke,label,baseline,present,health_footer=True)
@@ -230,8 +286,16 @@ class GlassIntegrationTests(unittest.TestCase):
         record=json.loads((self.smoke.out/'startup-paint.json').read_text())
         self.assertEqual(record['observations'][0]['witness']['selected_mode'],'block')
         self.smoke.tree_calls=0;self.smoke.mutate_after=dict(width=1279)
-        with patch.object(recovery.driver,'wait_for',side_effect=lambda predicate,*a,**k:predicate()):
-            with self.assertRaisesRegex(RuntimeError,'geometry changed'):recovery.wait_startup_surface(self.smoke)
+        def expire_without_stable_frame(predicate, *args, **kwargs):
+            for _ in range(3):
+                self.assertFalse(predicate())
+            raise RuntimeError('Timed out: no stable startup geometry')
+        with patch.object(recovery.driver, 'wait_for', side_effect=expire_without_stable_frame):
+            with self.assertRaisesRegex(RuntimeError, 'Timed out'):
+                recovery.wait_startup_surface(self.smoke)
+        record = json.loads((self.smoke.out / 'startup-paint.json').read_text())
+        self.assertEqual(len(record['observations']), 3)
+        self.assertTrue(all('rejected' in row and 'witness' not in row for row in record['observations']))
 
 
 if __name__=='__main__':unittest.main()

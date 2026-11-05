@@ -118,3 +118,14 @@ input, recheck, export or IME behavior. Seven pure recovery regressions retain t
 unique-body, attached-header and exact-warning requirements. The separate shell
 Vim smoke now targets actual leftmost fixture-owned RGB ink instead of x=200 in
 the workspace navigation; two pure tests reject missing or insufficient ink.
+
+A further archived-frame check found that the header observer omitted the
+38-pixel Eva control reserve although the product and fixtures enable Eva by
+default. The observer now reads the same named reserve used by the unchanged
+production layout, and a literal-coordinate regression independently matches the
+captured frame. The old slot contained 260 exact blue pixels; the registered slot
+contains 1,077 on Wayland and 1,093 on X11, under the original strict paint bounds.
+Startup recovery also discards a screenshot spanning an initial compositor resize
+and waits for a new stable frame within the existing 30-second deadline. The first
+owned PID/window identity stays fixed across retries; identity/focus changes still
+fail, and discarded frames cannot provide a paint witness.

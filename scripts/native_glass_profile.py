@@ -92,7 +92,8 @@ def registration():
     adapter_tokens = {name: float(value) for name, value in re.findall(
         r'^pub const (\w+): f32 = ([0-9.]+);$', adapter, re.M)}
     adapter_names = ('NAVIGATION_MIN_WIDTH', 'INSPECTOR_MIN_WIDTH',
-                     'CENTER_MIN_WIDTH', 'MODE_CONTROL_MIN_WIDTH', 'COMPOSER_CONTROL_BOTTOM')
+                     'CENTER_MIN_WIDTH', 'MODE_CONTROL_MIN_WIDTH', 'COMPOSER_CONTROL_BOTTOM',
+                     'EVA_CONTROL_RESERVE')
     for name in adapter_names:
         if name not in adapter_tokens:
             raise RuntimeError('Unregistered glass adapter geometry')
@@ -108,6 +109,7 @@ def registration():
         'tokens_sha256': hashlib.sha256(data).hexdigest(),
         'layout_sources_sha256': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                                  for p in (ROOT/'src/glass_shell.rs', ROOT/'src/reference_workspace.rs')},
+        'eva_companion': 'default-enabled, reserved control width',
         'scope': 'Registered native-layout observation domains, not measured allocation/alpha',
     }
 
@@ -162,10 +164,10 @@ def mode_slot(owned, mode):
         raise RuntimeError('Unregistered glass mode for paint witness')
     layout(owned)
     t, _ = registration()
-    settings_x = owned['width'] - 8 - 32 - 6 - 32
+    settings_x = owned['width'] - 8 - 32 - 6 - 32 - t['EVA_CONTROL_RESERVE']
     width, height = t['MODE_CONTROL_MIN_WIDTH'], t['TOOL_BUTTON_HEIGHT']
     x = settings_x - 8 - width - (width + 6 if mode == 'block' else 0)
-    # Registered fixtures use the default 14pt UI font and disabled Eva reserve.
+    # Registered fixtures use the default 14pt UI font and default-enabled Eva.
     # Production chrome_control_height(14) resolves to TOOL_BUTTON_HEIGHT.
     y = (t['TOPBAR_HEIGHT'] - height) // 2
     return dict(x=owned['x']+x, y=owned['y']+y, width=width, height=height)

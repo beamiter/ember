@@ -841,7 +841,7 @@ impl TerminalApp {
                 }
                 let mode_width = shell::MODE_CONTROL_MIN_WIDTH * scale.max(1.0);
                 let eva_reserve = if self.organism.eva.enabled() {
-                    38.0
+                    shell::EVA_CONTROL_RESERVE
                 } else {
                     0.0
                 };
