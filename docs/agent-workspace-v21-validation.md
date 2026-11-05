@@ -180,3 +180,19 @@ validation fails. Failed/partial discovery trees are now preserved separately
 and explicitly marked unvalidated; they can never satisfy an acceptance gate.
 The ownership, node/time bounds and exact editable-entry requirements stay intact
 while the next native run collects the missing evidence.
+
+`80920cf` early native evidence advances the complete Vim fixture through editing,
+save/undo, scrolling/completion and clean Vim process retirement, followed by
+same-shell PID/TTY input. Window closure then correctly refuses a deliberately
+unintegrated shell of unknown activity. The fixture now types normal `exit` into
+that already verified shell, requires its exact process incarnation to retire,
+and only then requests window closure. Closing OCR has one 30-second total bound
+and one CPU thread; no forced process cleanup can count as a pass.
+
+The same native run genuinely switched X11 to Chat and passed its clipboard and
+Find isolation, then reached the reverse menu with Chat visibly selected. The
+selected row's exact production `(37,56,101)` fill now counts inside the same
+connected `(16,24,37)` menu body, preserving the 80% painted-density threshold.
+Wrong RGB values, disconnected/ambiguous bodies and inexact words still fail.
+The archived reverse-menu PNG is recorded in the profile's provenance and passes
+an offline exact Block-target observation; its new click remains pending CI.

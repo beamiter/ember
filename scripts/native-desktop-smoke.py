@@ -208,6 +208,10 @@ SETTINGS_GLASS_POPUP_PROVENANCE = {
     'selector_source_sha256': '99736efe6863310b7c9051674185faf9a4f25f4aef5420ac1ee8cc1ee21a34a2',
     'cross_backend_image': 'wayland/chat-mode-menu.png',
     'cross_backend_image_sha256': '6e5b40097f7b028ec128e5683aa2be6b5ac1111ff739572959f1b17412d190b8',
+    'selected_source_commit': '80920cf6ad9924b3283a44af3d1c4e4537663ee3',
+    'selected_source_artifact': 13387780628,
+    'selected_source_image': 'x11/block-mode-menu.png',
+    'selected_source_sha256': '8e992efa4dfde01a8021e17230454ab35d8a4a983fa87ebf875e7576ca7f21b7',
     'selector_observer': 'strict native OCR selector',
     'measured_body': {'x': 475, 'y': 585, 'width': 98, 'height': 67},
     'scope': 'Exact opaque body in the selector-bound native menu domain; not its translucent border',
@@ -219,8 +223,8 @@ def settings_popup_profile_metadata(native_ui_profile):
         return {'profile': native_ui_profile, 'border_rgb': [60, 60, 60],
                 'minimum_contiguous_rows': '2 * selector height'}
     if native_ui_profile == 'glass-v1':
-        return {'profile': native_ui_profile, 'popup_revision': 'opaque-body-v2',
-                'body_rgb': [16, 24, 37], 'body_width': 98,
+        return {'profile': native_ui_profile, 'popup_revision': 'opaque-body-v3',
+                'body_rgb': [16, 24, 37], 'selected_rgb': [37, 56, 101], 'body_width': 98,
                 'minimum_height': '2 * selector height', 'minimum_body_density': 0.8,
                 'calibration': SETTINGS_GLASS_POPUP_PROVENANCE.copy()}
     raise RuntimeError('Unknown native Settings popup observation profile')
@@ -233,6 +237,8 @@ def glass_settings_mode_popup_plane(pixels, region, selector):
     and scale. Its connected exact-color surface must straddle the selector,
     start below it, and densely fill at least two selector heights. Translucent
     edge pixels, words, fuzzy colors and prior palettes cannot identify a menu.
+    The selected row uses its exact production fill inside the connected body;
+    it is not counted as a missing-body hole or selected by its text.
     """
     from PIL import Image, ImageChops, ImageDraw
     import re
@@ -247,6 +253,9 @@ def glass_settings_mode_popup_plane(pixels, region, selector):
     surface = Image.frombytes('RGB', (width, height), pixels)
     channels = ImageChops.difference(surface, Image.new('RGB', surface.size, (16,24,37))).split()
     mask = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]), channels[2]).point([255] + [0] * 255)
+    selected_channels = ImageChops.difference(surface, Image.new('RGB', surface.size, (37,56,101))).split()
+    selected = ImageChops.lighter(ImageChops.lighter(selected_channels[0], selected_channels[1]), selected_channels[2]).point([255] + [0] * 255)
+    painted = ImageChops.lighter(mask, selected)
     raw = mask.tobytes()
     planes = []
     for y in range(height):
@@ -261,7 +270,7 @@ def glass_settings_mode_popup_plane(pixels, region, selector):
             if (right-left == 98 and bottom-top >= minimum
                     and region['x']+left < center < region['x']+right
                     and region['y']+top >= selector_bottom
-                    and component.histogram()[255] >= area * 0.8):
+                    and painted.crop((left,top,right,bottom)).histogram()[255] >= area * 0.8):
                 planes.append(dict(x=region['x']+left, y=region['y']+top,
                                    width=right-left, height=bottom-top))
             mask.paste(0, mask=component)

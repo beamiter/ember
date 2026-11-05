@@ -121,6 +121,14 @@ class GlassPopupPlaneTests(unittest.TestCase):
    with self.subTest(box=box):self.assertIsNone(self.observe(self.pixels(box=box)))
  def test_exact_body_density_is_required_without_color_tolerance(self):
   self.assertIsNone(self.observe(self.pixels(hole=(100,20,190,55))))
+ def test_exact_selected_row_fill_counts_as_real_body_without_lower_density(self):
+  from PIL import Image,ImageDraw
+  image=Image.frombytes('RGB',(self.region()['width'],self.region()['height']),self.pixels())
+  ImageDraw.Draw(image).rectangle((102,45,187,72),fill=(37,56,101))
+  self.assertEqual(self.observe(image.tobytes()),dict(x=503,y=516,width=98,height=62))
+  ImageDraw.Draw(image).rectangle((102,45,187,72),fill=(37,56,102))
+  self.assertIsNone(self.observe(image.tobytes()))
+  self.assertIsNone(self.observe(self.pixels(color=(37,56,101))))
  def test_two_independent_menu_bodies_remain_ambiguous(self):
   with self.assertRaisesRegex(RuntimeError,'Ambiguous'):
    self.observe(self.pixels(box=(96,1,194,24),extra=(96,40,194,63)))

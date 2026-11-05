@@ -326,11 +326,29 @@ def main():
         assert shell_identity(lines[0], before_marker) == after == before
         capture("workspace-after-native-vim-exit")
         report["workspace_after_vim"] = dict(shell_pid=after[0], tty=after[1], receipt=receipt.name)
+        # This deliberately unintegrated shell has unknown activity to Ember.
+        # Retire it normally before requesting window close, instead of trying
+        # to bypass the product's conservative unknown-shell close guard.
+        shell_pid = int(after[0])
+        shell_incarnation = process_incarnation(shell_pid)
+        assert shell_incarnation is not None, "Workspace shell vanished before normal exit"
+        xdo("type", "--clearmodifiers", "--delay", "8", "exit")
+        xdo("key", "Return")
+        shell_deadline = time.monotonic() + 10
+        while process_incarnation(shell_pid) == shell_incarnation and time.monotonic() < shell_deadline:
+            time.sleep(0.05)
+        assert process_incarnation(shell_pid) != shell_incarnation, "Workspace shell did not exit normally"
+        report["workspace_shell_exit"] = dict(pid=shell_pid, incarnation=shell_incarnation, input="exit")
+        if app.poll() is not None:
+            assert app.returncode == 0
+            report["native_window_close"] = dict(exit_code=app.returncode, cause="last shell exited")
+            report["normal_quit"] = "passed"
+            return
         # Actual titlebar Close control, not XDestroyWindow, SIGTERM or SIGKILL.
         # Fixture UI is 14pt: production reference_workspace reserves [8,36]x[7,35].
         xdo("mousemove", "--window", window, 22, 21)
         xdo("click", 1)
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 30
         confirmed = False
         close_observation = 0
         while app.poll() is None and time.monotonic() < deadline:
@@ -344,7 +362,10 @@ def main():
                     break
                 raise
             result = subprocess.run(["tesseract", str(out / (label + ".png")), "stdout", "--psm", "11", "tsv"],
-                                    env=env, text=True, capture_output=True, check=True, timeout=5)
+                                    env=dict(env, OMP_THREAD_LIMIT="1"), text=True, capture_output=True, check=True,
+                                    timeout=max(0.1, deadline-time.monotonic()))
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Native close observation exceeded its deadline")
             (out / (label + ".tsv")).write_text(result.stdout)
             rows = list(csv.DictReader(io.StringIO(result.stdout), delimiter="\t", quoting=csv.QUOTE_NONE))
             target = close_confirmation_target(rows, image.width, image.height)
