@@ -122,4 +122,22 @@ class FixedPlanTests(unittest.TestCase):
         for p in [PLAN,ROOT/'scripts/benchmark-session-startup-plan.py']:
             self.assertIn(bench.digest(p),text)
 
+    def test_direct_work_uses_the_preregistered_driver_closure(self):
+        text=(ROOT/'.github/workflows/session-direct-work-benchmark.yml').read_text()
+        plan=bench.read_plan(PLAN)
+        self.assertIn('ref: '+plan['driver_control_sha'],text)
+        self.assertIn('path: driver-control',text)
+        self.assertIn('test "$(git -C driver-control rev-parse HEAD)" = '+plan['driver_control_sha'],text)
+        self.assertIn('test -z "$(git -C driver-control status --porcelain)"',text)
+        for relative,digest in plan['driver_files'].items():
+            self.assertIn(digest+' driver-control/'+relative+' | sha256sum --check',text)
+            self.assertNotIn(' control/'+relative,text)
+        self.assertIn('--driver driver-control/scripts/native-desktop-smoke.py',text)
+        self.assertIn('cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/ember-pointer" driver-control/scripts/native-pointer.c',text)
+        self.assertIn('git -C driver-control rev-parse HEAD; printf',text)
+        self.assertIn('python3 control/scripts/test-session-startup-benchmark.py',text)
+        self.assertIn('PYTHONDONTWRITEBYTECODE: "1"',text)
+        self.assertIn('60e70c4a24d52e41d173c4baf26bf06bf3bd1569',text)
+        self.assertIn('e564f56be1a4b2f2cf8cfb94b767ed6d176eecee5bee0af476444dcc79c3ba79',text)
+
 if __name__=='__main__':unittest.main()

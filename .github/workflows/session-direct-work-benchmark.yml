@@ -21,6 +21,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 1
       CARGO_INCREMENTAL: 0
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Validate immutable refs
         env:
@@ -49,6 +50,14 @@ jobs:
           if [[ -f "candidate/scripts/materialize-shared-core.sh" ]]; then
             bash "candidate/scripts/materialize-shared-core.sh"
           fi
+      # This experiment's driver is preregistered independently of current master.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: e4c292f10463e52fe7e74e808ca10fc4ab27729c
+          path: driver-control
+          persist-credentials: false
+      - name: Check frozen benchmark contracts
+        run: python3 control/scripts/test-session-startup-benchmark.py
       - name: Install official build and desktop packages
         run: |
           sudo apt-get update
@@ -69,31 +78,33 @@ jobs:
         run: |
           test "$(git -C control rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git -C control status --porcelain)"
+          test "$(git -C driver-control rev-parse HEAD)" = e4c292f10463e52fe7e74e808ca10fc4ab27729c
+          test -z "$(git -C driver-control status --porcelain)"
           printf '%s  %s\n' 19967416389d166f427aaa5b0337e31e8762dd4ca1d03b6d14cc1ef7661d620c control/scripts/benchmark-session-startup.py | sha256sum --check
           printf '%s  %s\n' e564f56be1a4b2f2cf8cfb94b767ed6d176eecee5bee0af476444dcc79c3ba79 control/tests/fixtures/session-startup/direct-work-overlay.patch | sha256sum --check
           printf '%s  %s\n' 6f206f84585edaba9c5a9de15c9ef68d852c70d4e0871a0c6c3c199aa689779c control/scripts/benchmark-session-direct-work.py | sha256sum --check
-          printf '%s  %s\n' 15459be5d29042ab08ba7dd1fa67fdd4afd3799d33acbeb8c97446b384aad16f control/scripts/native-desktop-smoke.py | sha256sum --check
-          printf '%s  %s\n' ead6106b6df0fb28c8eeaccc33a5894c5a05d227193e417144f30347bf5db38b control/scripts/native-pointer.c | sha256sum --check
-          printf '%s  %s\n' 7849f8c25b5104da9dc508301414331cdd3c8fa33daf08f85b67a8fcd6e2f0b8 control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml | sha256sum --check
-          printf '%s  %s\n' 4d9b53092843e291ad09d16e72cd915df312185aa010291b098547e809db998e control/scripts/native-pty-capture.py | sha256sum --check
+          printf '%s  %s\n' 15459be5d29042ab08ba7dd1fa67fdd4afd3799d33acbeb8c97446b384aad16f driver-control/scripts/native-desktop-smoke.py | sha256sum --check
+          printf '%s  %s\n' ead6106b6df0fb28c8eeaccc33a5894c5a05d227193e417144f30347bf5db38b driver-control/scripts/native-pointer.c | sha256sum --check
+          printf '%s  %s\n' 7849f8c25b5104da9dc508301414331cdd3c8fa33daf08f85b67a8fcd6e2f0b8 driver-control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml | sha256sum --check
+          printf '%s  %s\n' 4d9b53092843e291ad09d16e72cd915df312185aa010291b098547e809db998e driver-control/scripts/native-pty-capture.py | sha256sum --check
           test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
           test -z "$(git -C candidate status --porcelain)"
           mkdir -p benchmark-artifacts
-          { uname -a; rustc -Vv; git -C control rev-parse HEAD; printf '%s\n' "$CANDIDATE_SHA"; sha256sum candidate/Cargo.lock control/tests/fixtures/session-startup/direct-work-overlay.patch control/scripts/benchmark-session-direct-work.py control/scripts/benchmark-session-startup.py; } > benchmark-artifacts/source-identity.txt
+          { uname -a; rustc -Vv; git -C control rev-parse HEAD; git -C driver-control rev-parse HEAD; printf '%s\n' "$CANDIDATE_SHA"; sha256sum candidate/Cargo.lock control/tests/fixtures/session-startup/direct-work-overlay.patch control/scripts/benchmark-session-direct-work.py control/scripts/benchmark-session-startup.py driver-control/scripts/native-desktop-smoke.py driver-control/scripts/native-pty-capture.py driver-control/scripts/native-pointer.c driver-control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml; } > benchmark-artifacts/source-identity.txt
           git -C candidate apply --check "$GITHUB_WORKSPACE/control/tests/fixtures/session-startup/direct-work-overlay.patch"
       - name: Build temporary instrumented candidate only
         run: |
           git -C candidate apply "$GITHUB_WORKSPACE/control/tests/fixtures/session-startup/direct-work-overlay.patch"
           git -C candidate diff --binary > benchmark-artifacts/candidate-overlay.diff
-          cargo build --manifest-path candidate/Cargo.toml -p ember --release --all-features --locked
+          cargo build --manifest-path candidate/Cargo.toml --workspace --release --all-features --locked
           cp candidate/target/release/ember "$RUNNER_TEMP/ember-direct-work-candidate"
           sha256sum "$RUNNER_TEMP/ember-direct-work-candidate" > benchmark-artifacts/binary-identity.txt
       - name: Build compositor pointer prerequisite for shared desktop driver
         run: |
           mkdir -p "$RUNNER_TEMP/ember-pointer"
-          wayland-scanner client-header control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/wlr-virtual-pointer-unstable-v1-client-protocol.h"
-          wayland-scanner private-code control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/protocol.c"
-          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/ember-pointer" control/scripts/native-pointer.c "$RUNNER_TEMP/ember-pointer/protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/ember-pointer/native-pointer"
+          wayland-scanner client-header driver-control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/wlr-virtual-pointer-unstable-v1-client-protocol.h"
+          wayland-scanner private-code driver-control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/protocol.c"
+          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/ember-pointer" driver-control/scripts/native-pointer.c "$RUNNER_TEMP/ember-pointer/protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/ember-pointer/native-pointer"
           echo "EMBER_POINTER_HELPER=$RUNNER_TEMP/ember-pointer/native-pointer" >> "$GITHUB_ENV"
       - name: Preregistered direct-work enclosing-region samples
         env:
@@ -104,7 +115,7 @@ jobs:
           for backend in x11 wayland; do
             if ! /usr/bin/python3 control/scripts/benchmark-session-direct-work.py \
               --candidate "$RUNNER_TEMP/ember-direct-work-candidate" \
-              --driver control/scripts/native-desktop-smoke.py --backend "$backend" \
+              --driver driver-control/scripts/native-desktop-smoke.py --backend "$backend" \
               --helper control/scripts/benchmark-session-startup.py --candidate-sha "$CANDIDATE_SHA" \
               --overlay-sha "$overlay_sha" --output "benchmark-artifacts/$backend"; then
               status=1
