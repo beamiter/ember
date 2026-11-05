@@ -375,6 +375,23 @@ jobs:
             --binary "$RUNNER_TEMP/ember-installed/bin/ember" --app ember --scenario palette \
             --output native-smoke-artifacts/vim9-modal-focus
 
+      # Make completed first-stage evidence available while later native gates
+      # continue. The final full archive below still runs for every outcome.
+      - name: Preserve early X11 and Vim evidence
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ember-native-early-${{ github.sha }}
+          path: |
+            native-smoke-artifacts/environment.txt
+            native-smoke-artifacts/binary-identity.txt
+            native-smoke-artifacts/font-ocr-identities.json
+            native-smoke-artifacts/x11
+            native-smoke-artifacts/vim9-buffer-gui
+            native-smoke-artifacts/vim9-modal-focus
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Probe owned Block Search accessibility on isolated X11
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
         timeout-minutes: 3
