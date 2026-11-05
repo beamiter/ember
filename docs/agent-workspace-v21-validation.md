@@ -196,3 +196,14 @@ connected `(16,24,37)` menu body, preserving the 80% painted-density threshold.
 Wrong RGB values, disconnected/ambiguous bodies and inexact words still fail.
 The archived reverse-menu PNG is recorded in the profile's provenance and passes
 an offline exact Block-target observation; its new click remains pending CI.
+
+E03's empty-entry ambiguity is now traced to the real `03b6da4` public tree:
+the workspace sidebar and Block Search each expose an editable Entry. Both are
+empty before the first query, but the old probe selected by text globally. The
+probe now requires the unique named Block Search frame under the owned top-level
+window, then its direct editable Entry with exact expected text. A sidebar entry
+cannot shadow it or substitute for a missing/wrong picker entry. Duplicate
+entries inside the picker still fail. The actual populated tree and a replay of
+its empty-query state validate this hierarchy; fresh E03 native acceptance is
+still pending. Discovery node/time limits and unvalidated diagnostic retention
+are unchanged.

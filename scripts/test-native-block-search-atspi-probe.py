@@ -78,9 +78,12 @@ class Tests(unittest.TestCase):
             result.update(kw)
             return result
         children = [p.ROOT+'/'+x for x in ('All', 'Cmd', 'Out', 'editor')]
-        return [node(p.ROOT, parent=None, children=children)] + [
-            node(children[i], name='Search scope: '+x) for i, x in enumerate(('All','Cmd','Out'))
-        ] + [node(children[3], role=79, states=[1 << 7, 0],
+        window, picker = p.ROOT+'/window', p.ROOT+'/picker'
+        return [node(p.ROOT, parent=None, children=[window]),
+                node(window, role=23, children=[picker]),
+                node(picker, role=23, name='Block Search', parent=window, children=children)] + [
+            node(children[i], parent=picker, name='Search scope: '+x) for i, x in enumerate(('All','Cmd','Out'))
+        ] + [node(children[3], parent=picker, role=79, states=[1 << 7, 0],
                   interfaces=['org.a11y.atspi.Text'], text='E03DISCOVERY')]
 
     def validate(self, nodes):
@@ -105,8 +108,23 @@ class Tests(unittest.TestCase):
             with self.subTest(field=field, value=value):
                 bad = copy.deepcopy(nodes); bad[-1][field] = value
                 with self.assertRaises(RuntimeError): self.validate(bad)
-        bad = copy.deepcopy(nodes); bad[1]['name'] = ''
+        bad = copy.deepcopy(nodes); bad[3]['name'] = ''
         with self.assertRaises(RuntimeError): self.validate(bad)
+
+    def test_empty_sidebar_entry_cannot_shadow_the_owned_picker_editor(self):
+        nodes = self.tree(); nodes[-1]['text'] = ''
+        sidebar = copy.deepcopy(nodes[-1]); sidebar.update(path=p.ROOT+'/sidebar', parent=p.ROOT+'/window')
+        nodes[1]['children'].append(sidebar['path']); nodes.append(sidebar)
+        self.assertEqual(p.validate_tree(nodes,p.ROOT,':1.2',42,''),p.ROOT+'/editor')
+        # Matching an outside entry cannot excuse a missing/wrong picker entry.
+        nodes[-2]['text'] = 'different'
+        with self.assertRaisesRegex(RuntimeError,'exact editable Entry'):
+            p.validate_tree(nodes,p.ROOT,':1.2',42,'')
+        nodes[-2]['text'] = ''
+        duplicate = copy.deepcopy(nodes[-2]); duplicate['path'] += '-duplicate'
+        nodes[2]['children'].append(duplicate['path']); nodes.append(duplicate)
+        with self.assertRaisesRegex(RuntimeError,'exact editable Entry'):
+            p.validate_tree(nodes,p.ROOT,':1.2',42,'')
 
     def test_static_exact_text_is_not_editor(self):
         nodes = self.tree(); nodes[-1].update(role=0, states=[0, 0], name='Static label')
@@ -132,7 +150,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(saved, result)
             self.assertEqual(saved['editor_path'], p.ROOT+'/editor')
             self.assertEqual(saved['root'], p.ROOT)
-            self.assertEqual(saved['nodes'][0]['children'][-1], saved['editor_path'])
+            self.assertEqual(saved['nodes'][2]['children'][-1], saved['editor_path'])
             self.assertEqual(saved['picker_common_ancestor'], 'unverified')
             bad = self.tree(); bad[-1]['role'] = 0
             absent = Path(directory)/'invalid.json'

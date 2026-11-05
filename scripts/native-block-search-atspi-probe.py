@@ -80,7 +80,17 @@ def validate_tree(nodes, root, owner, pid, expected_text='E03DISCOVERY'):
     for label in ('Search scope: All', 'Search scope: Cmd', 'Search scope: Out'):
         if names.count(label) != 1:
             raise RuntimeError('Missing or ambiguous picker scope: ' + label)
-    editors = [n for n in nodes if 'org.a11y.atspi.Text' in n['interfaces']
+    # The workspace sidebar is a second real editable Entry, often also empty.
+    # Resolve the editor under the one named owned picker, not globally by text.
+    pickers = [n for n in nodes if n['name'] == 'Block Search' and n['role'] == 23]
+    if len(pickers) != 1:
+        raise RuntimeError('Missing or ambiguous named Block Search frame')
+    picker = pickers[0]
+    window = by_path.get(picker['parent'])
+    if window is None or window['role'] != 23 or window['parent'] != root:
+        raise RuntimeError('Picker does not belong to the owned top-level frame')
+    editors = [n for n in nodes if n['parent'] == picker['path']
+               and 'org.a11y.atspi.Text' in n['interfaces']
                and n['role'] == 79 and len(n['states']) == 2
                and n['states'][0] & (1 << 7)
                and n.get('text') == expected_text]
