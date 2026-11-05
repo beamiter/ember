@@ -15,6 +15,7 @@ on:
       - vendor/atspi-common/**
       - vendor/atspi-proxies/**
       - .github/workflows/security.yml
+      - .github/workflows/ci.yml
   push:
     branches: [master, candidate/zbus6]
     paths:
@@ -29,6 +30,7 @@ on:
       - vendor/atspi-common/**
       - vendor/atspi-proxies/**
       - .github/workflows/security.yml
+      - .github/workflows/ci.yml
   schedule:
     - cron: "11 4 * * 1"
   workflow_dispatch:
