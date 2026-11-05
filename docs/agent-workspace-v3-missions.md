@@ -82,6 +82,34 @@ SSH host was used for these headless tests. Hardware/native acceptance remains
 separate. See [V2.1 validation](agent-workspace-v21-validation.md) for the baseline
 failures and cloud security-precondition limits.
 
+### Native Mission gate
+
+`scripts/native-mission-smoke.py` now exercises the installed release through
+real X11 pointer and keyboard events. A fresh PID-owned public AT-SPI tree locates
+exact visible controls and verifies field text; the observer performs no public
+actions, application callbacks, host RPCs, or database writes. Read-only SQLite
+inspection independently checks persisted plans and reports. The gate creates
+five disposable local Git repositories, not the user's real delivery combination.
+
+The required path is native create, exact five-head Inspect, and explicit Freeze
+at the next revision with the shared-core pin retained. Negative clicks require
+disabled controls before any inspection, after Refresh retires inspection
+permission, and while an unsaved draft exists. Refresh must retain that draft;
+only an explicit Discard may remove it. Missing remote/check evidence must never
+become pushed, integrated or validated. Normal window-manager close must succeed.
+Screenshots, owned trees, pointer actions, final records and the binary hash are
+retained under the release job's `mission-x11` artifact directory.
+
+The observer uncovered an AT-SPI state-mapping defect: disabled buttons did not
+support ReadOnly, so they were incorrectly advertised as Enabled/Sensitive.
+The bundled adapter now suppresses those states for all disabled roles while
+retaining the existing ReadOnly mapping for editors. Two Rust regression tests
+and seven pure observer contract tests cover the fix and fail-closed targeting.
+Those pure tests do not establish native acceptance. The new exact-commit CI
+gate must pass before native Mission acceptance is claimed. Wayland Mission UI,
+physical hardware, provider execution and actual five-repository delivery are
+explicitly outside this new gate.
+
 ### Published Mission checkpoint CI
 
 [The d28010f Tests job](https://github.com/beamiter/ember/actions/runs/41954431700/job/127009759104)

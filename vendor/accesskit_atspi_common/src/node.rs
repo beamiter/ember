@@ -351,7 +351,7 @@ impl NodeWrapper<'_> {
 
         if state.is_read_only_supported() && state.is_read_only_or_disabled() {
             atspi_state.insert(State::ReadOnly);
-        } else {
+        } else if !state.is_disabled() {
             atspi_state.insert(State::Enabled | State::Sensitive);
         }
 
@@ -1749,4 +1749,54 @@ impl Hash for PlatformRoot {
 pub enum NodeIdOrRoot {
     Node(NodeId),
     Root,
+}
+
+#[cfg(test)]
+mod mission_control_state_tests {
+    use super::*;
+
+    fn mapped_state(role: Role, disabled: bool, read_only: bool) -> StateSet {
+        let id = LocalNodeId(0);
+        let mut node = accesskit::Node::new(role);
+        node.set_label("Mission control");
+        if disabled {
+            node.set_disabled();
+        }
+        if read_only {
+            node.set_read_only();
+        }
+        let tree = Tree::new(
+            accesskit::TreeUpdate {
+                nodes: vec![(id, node)],
+                tree: Some(accesskit::Tree::new(id)),
+                tree_id: TreeId::ROOT,
+                focus: id,
+            },
+            true,
+        );
+        NodeWrapper(&tree.state().root()).state(true)
+    }
+
+    #[test]
+    fn disabled_mission_button_is_not_enabled_or_sensitive() {
+        for role in [Role::Button, Role::DefaultButton, Role::DisclosureTriangle] {
+            let enabled = mapped_state(role, false, false);
+            assert!(enabled.contains(State::Enabled));
+            assert!(enabled.contains(State::Sensitive));
+            let disabled = mapped_state(role, true, false);
+            assert!(!disabled.contains(State::Enabled));
+            assert!(!disabled.contains(State::Sensitive));
+            assert!(!disabled.contains(State::ReadOnly));
+        }
+    }
+
+    #[test]
+    fn mission_editor_retains_read_only_and_disabled_mapping() {
+        for (disabled, read_only) in [(true, false), (false, true)] {
+            let state = mapped_state(Role::TextInput, disabled, read_only);
+            assert!(state.contains(State::ReadOnly));
+            assert!(!state.contains(State::Enabled));
+            assert!(!state.contains(State::Sensitive));
+        }
+    }
 }

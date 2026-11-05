@@ -402,6 +402,13 @@ jobs:
         if: steps.desktop-install.outcome == 'success'
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend x11 --output native-smoke-artifacts/x11
 
+      - name: Gate native Mission create inspect and candidate freeze
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          python3 scripts/test-native-mission-smoke.py
+          /usr/bin/python3 scripts/native-mission-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --output native-smoke-artifacts/mission-x11
+
       - name: Gate native Vim buffer GUI colors and real editing
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
         timeout-minutes: 3
