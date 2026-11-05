@@ -227,6 +227,16 @@ class RawEvidenceTests(unittest.TestCase):
    tree=self.raw_tree();extra=copy.deepcopy(tree['nodes'][-1]);extra['path']+='stale';extra['name']=label
    tree['nodes'][2]['children'].append(extra['path']);tree['nodes'].append(extra)
    with self.subTest(label=label),self.assertRaises(RuntimeError):p.raw_hit(tree,'E03DISCOVERY','active')
+ def test_topology_confirmation_cannot_excuse_stable_phase_conflict(self):
+  tree=self.raw_tree();extra=copy.deepcopy(tree['nodes'][-1])
+  extra.update(path=extra['path']+'-status',name='Complete for this retained output only')
+  tree['nodes'][2]['children'].append(extra['path']);tree['nodes'].append(extra)
+  by_path={node['path']:node for node in tree['nodes']}
+  p.probe.confirm_children(tree['nodes'],tree['owner'],lambda path:
+   [(tree['owner'],child) for child in by_path[path]['children']])
+  with self.assertRaisesRegex(RuntimeError,'Raw phase conflicts') as error:
+   p.raw_hit(tree,'E03DISCOVERY','active')
+  self.assertNotIsInstance(error.exception,p.MissingTarget)
  def test_exact_completion_text_and_stable_claim(self):
   tree=self.raw_tree();node=tree['nodes'][-1]
   node.update(name='Retained blocks #1–#6 · Block #2: Complete for this retained output only; 100 chunks this window; 98 windows, 100001 row decodes, 16300163 charged cells, 4.3s',role=29)

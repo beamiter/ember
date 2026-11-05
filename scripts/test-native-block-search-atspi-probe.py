@@ -189,6 +189,101 @@ class Tests(unittest.TestCase):
             self.assertEqual(result['editor_path'], p.ROOT+'/editor')
         self.assertEqual(broker.GetConnectionUnixProcessID.call_count, 2)
 
+    def test_end_check_rejects_removed_added_reordered_or_foreign_children(self):
+        nodes = self.tree(); owned = {n['path']: n for n in nodes}
+        picker = nodes[2]
+        for change in ('removed', 'added', 'reordered', 'foreign'):
+            def read(path):
+                children = [(n['owner'], x) for n in [owned[path]] for x in n['children']]
+                if path == picker['path']:
+                    if change == 'removed': children.pop()
+                    elif change == 'added': children.append((':1.2', p.ROOT+'/new'))
+                    elif change == 'reordered': children.reverse()
+                    else: children[0] = (':9.9', children[0][1])
+                return children
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                p.confirm_children(nodes, ':1.2', read)
+        p.confirm_children(nodes, ':1.2', lambda path:
+            [(':1.2', child) for child in owned[path]['children']])
+
+    def changing_bus(self):
+        # Deterministic public-bus model of the hosted 0049 order: Stop is
+        # collected before status, then completion removes Stop from parent.
+        nodes = self.tree(); picker = nodes[2]
+        stop = copy.deepcopy(nodes[3]); stop.update(path=p.ROOT+'/stop', name='Stop search', role=43)
+        latest = copy.deepcopy(stop); latest.update(path=p.ROOT+'/latest', name='Latest')
+        status = copy.deepcopy(nodes[-1]); status.update(path=p.ROOT+'/status', role=29,
+            name='Complete for this retained output only', text='Complete for this retained output only')
+        nodes += [stop, latest, status]; picker['children'] += [stop['path'], latest['path'], status['path']]
+        by_path = {node['path']: node for node in nodes}; reads = []; state = {'changed': False}
+        broker = Mock(); broker.GetNameOwner.return_value = ':1.2'
+        broker.GetConnectionUnixProcessID.return_value = 42
+        registry = Mock(); registry.GetChildren.return_value = [(':1.2', p.ROOT)]
+        service = Mock(); service.GetAddress.return_value = 'inert-only'
+        bus = Mock(); bus.get_object.side_effect = lambda owner, path: (owner, path)
+        def interface(obj, name):
+            if name == 'org.a11y.Bus': return service
+            if name == 'org.freedesktop.DBus': return broker
+            if obj[0] == 'org.a11y.atspi.Registry': return registry
+            node = by_path[obj[1]]
+            proxy = Mock(spec=['GetInterfaces', 'GetRole', 'GetState', 'GetChildren', 'Get', 'GetText'])
+            def get(method, *args, **kwargs):
+                reads.append((method, node['path']))
+                if method == 'GetInterfaces': return node['interfaces']
+                if method == 'GetRole': return node['role']
+                if method == 'GetState': return node['states']
+                if method == 'GetChildren': return [(node['owner'], x) for x in node['children']]
+                if method == 'Get':
+                    return node['name'] if args[1] == 'Name' else '' if args[1] == 'Description' else len(node['text'])
+                if method == 'GetText':
+                    if node is status and not state['changed']:
+                        # egui reuses Stop's auto-ID for Latest; the old Latest
+                        # child disappears, exactly as hosted 0046/0049 show.
+                        stop['name'] = 'Latest'
+                        picker['children'].remove(latest['path']); state['changed'] = True
+                    return node.get('text', '')
+                raise AssertionError('Unexpected operation: '+method)
+            for method in ('GetInterfaces', 'GetRole', 'GetState', 'GetChildren', 'Get', 'GetText'):
+                getattr(proxy, method).side_effect = lambda *a, m=method, **kw: get(m, *a, **kw)
+            return proxy
+        dbus = Mock(); dbus.SessionBus.return_value = bus; dbus.bus.BusConnection.return_value = bus
+        dbus.Interface.side_effect = interface; dbus.DBusException = type('FakeDBusError', (Exception,), {})
+        return dbus, registry, reads, stop, latest, picker
+
+    def test_actual_discovery_discards_proven_torn_tree_and_only_rereads(self):
+        dbus, registry, reads, stop, latest, picker = self.changing_bus()
+        with tempfile.TemporaryDirectory() as directory, patch.dict('sys.modules', dbus=dbus), patch.object(p.time, 'sleep'):
+            out = Path(directory)/'tree.json'; result = p.discovery(42, out)
+            diagnostic = json.loads(out.with_name('tree-discovery-error.json').read_text())
+            self.assertEqual(registry.GetChildren.call_count, 2)
+            self.assertNotIn(latest['path'], [node['path'] for node in result['nodes']])
+            self.assertEqual(next(node['name'] for node in result['nodes'] if node['path'] == stop['path']), 'Latest')
+            self.assertEqual(diagnostic['status'], 'unvalidated')
+            self.assertEqual(diagnostic['topology_change']['path'], picker['path'])
+            self.assertIn(latest['path'], diagnostic['topology_change']['before'])
+            self.assertNotIn(latest['path'], diagnostic['topology_change']['after'])
+            # The failed traversal is retained, not silently rewritten.
+            self.assertIn('Stop search', [node['name'] for node in diagnostic['partial_nodes']])
+            self.assertIn('Complete for this retained output only', [node['name'] for node in diagnostic['partial_nodes']])
+            self.assertEqual(result, json.loads(out.read_text()))
+        self.assertTrue(reads)
+        self.assertTrue(all(method.startswith('Get') for method, path in reads))
+
+    def test_topology_recheck_uses_original_discovery_deadline(self):
+        dbus, registry, reads, stop, latest, picker = self.changing_bus()
+        clock = [0.0]
+        def expire(nodes, owner, read_children):
+            clock[0] = 20.0
+            read_children(nodes[0]['path'])
+        with tempfile.TemporaryDirectory() as directory, patch.dict('sys.modules', dbus=dbus), \
+                patch.object(p, 'confirm_children', side_effect=expire), \
+                patch.object(p.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(p.time, 'sleep'):
+            out = Path(directory)/'tree.json'
+            with self.assertRaisesRegex(RuntimeError, 'Bounded accessibility discovery exhausted'):
+                p.discovery(42, out)
+            self.assertFalse(out.exists())
+            self.assertEqual(registry.GetChildren.call_count, 1)
+
     def test_enable_status_uses_bus_object_and_verifies_readback(self):
         for enabled in (True, False):
             with self.subTest(enabled=enabled):

@@ -1257,8 +1257,21 @@ fn run_capture_with_cancel_inheriting(
     cancel: Option<Arc<AtomicBool>>,
     inherited_fds: &[i32],
 ) -> io::Result<Capture> {
+    run_capture_with_spawn(argv, stdin_bytes, timeout, max_out, cancel, |argv| {
+        spawn_piped_inheriting(argv, inherited_fds)
+    })
+}
+
+fn run_capture_with_spawn(
+    argv: &[String],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+    max_out: u64,
+    cancel: Option<Arc<AtomicBool>>,
+    spawn: impl FnOnce(&[String]) -> io::Result<SupervisedChild>,
+) -> io::Result<Capture> {
     let deadline = command_deadline(timeout, cancel.as_ref())?;
-    let mut child = spawn_piped_inheriting(argv, inherited_fds)?;
+    let mut child = spawn(argv)?;
     let stdin_pipe = child
         .take_stdin()
         .ok_or_else(|| io::Error::other("child stdin pipe missing"))?;
@@ -5800,6 +5813,28 @@ docker = true
         );
     }
 
+    // Fixture startup is not part of the pipe deadline being tested. For
+    // exited-leader cases, retain the real exit status before starting the clock.
+    #[cfg(target_os = "linux")]
+    fn spawn_ready_escaped_holder(
+        argv: &[String],
+        ready: &Path,
+        expect_root_exit: bool,
+    ) -> SupervisedChild {
+        let mut child = spawn_piped(argv).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if ready.exists() && (!expect_root_exit || child.root_has_exited().unwrap()) {
+                return child;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "escaped holder fixture did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn lifecycle_capture_bounds_an_escaped_stdout_holder() {
@@ -5809,8 +5844,13 @@ docker = true
         let argv = vec!["sh".into(), "-c".into(), format!(
             "setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} & while [ ! -f {ready} ]; do sleep 0.01; done; exit 23"
         )];
+        let child = spawn_ready_escaped_holder(&argv, &dir.join("ready"), true);
         let started = std::time::Instant::now();
-        let capture = run_capture(&argv, &[], Duration::from_millis(100), 1024).unwrap();
+        let capture =
+            run_capture_with_spawn(&argv, &[], Duration::from_millis(100), 1024, None, |_| {
+                Ok(child)
+            })
+            .unwrap();
         assert!(dir.join("ready").exists(), "escaped holder did not start");
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -5828,8 +5868,13 @@ docker = true
         let argv = vec!["sh".into(), "-c".into(), format!(
             "setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} >&2 & while [ ! -f {ready} ]; do sleep 0.01; done; exit 23"
         )];
+        let child = spawn_ready_escaped_holder(&argv, &dir.join("ready"), true);
         let started = std::time::Instant::now();
-        let capture = run_capture(&argv, &[], Duration::from_millis(100), 1024).unwrap();
+        let capture =
+            run_capture_with_spawn(&argv, &[], Duration::from_millis(100), 1024, None, |_| {
+                Ok(child)
+            })
+            .unwrap();
         assert!(
             dir.join("ready").exists(),
             "escaped holder did not start: elapsed={:?}, status={:?}, timed_out={}, cancelled={}, stderr={:?}",
@@ -5854,12 +5899,15 @@ docker = true
         let argv = vec!["sh".into(), "-c".into(), format!(
             "exec 3<&0; setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} <&3 >/dev/null 2>&1 & while [ ! -f {ready} ]; do sleep 0.01; done; exec 3<&-; sleep 2"
         )];
+        let child = spawn_ready_escaped_holder(&argv, &dir.join("ready"), false);
         let started = std::time::Instant::now();
-        let capture = run_capture(
+        let capture = run_capture_with_spawn(
             &argv,
             &vec![0; 1024 * 1024],
             Duration::from_millis(100),
             1024,
+            None,
+            |_| Ok(child),
         )
         .unwrap();
         assert!(

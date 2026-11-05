@@ -41,6 +41,24 @@ class Targets(unittest.TestCase):
     def test_exact_owned_control_and_label(self):
         self.assertEqual(m.button(self.tree(), m.FREEZE)['name'], m.FREEZE)
         self.assertEqual(m.editor(self.tree(), 'Title')['text'], 'fixture')
+        self.assertEqual(m.visible_label(self.tree(), 'Title')['name'], 'Title')
+
+    def test_reason_text_requires_visible_owned_label(self):
+        for key, value in [('role', 43), ('name', 'Other reason'),
+                           ('screen_extents', [900, 500, 200, 24]), ('states', [1 << 25, 0])]:
+            tree = self.tree()
+            tree['nodes'][4][key] = value
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                m.visible_label(tree, 'Title')
+
+    def test_duplicate_reason_text_is_rejected(self):
+        tree = self.tree()
+        node = copy.deepcopy(tree['nodes'][4])
+        node['path'] += '-duplicate'
+        tree['nodes'][2]['children'].append(node['path'])
+        tree['nodes'].append(node)
+        with self.assertRaises(RuntimeError):
+            m.visible_label(tree, 'Title')
 
     def test_disabled_is_only_admitted_for_negative_click(self):
         tree = self.tree()

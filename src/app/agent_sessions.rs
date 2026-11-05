@@ -2269,16 +2269,34 @@ impl TerminalApp {
             self.agent_sessions.missions.open();
         }
         if self.agent_sessions.status == Some(SessionStatus::Waiting) {
-            for (id, title) in self.agent_sessions.missions.attention_rows() {
+            for item in self.agent_sessions.missions.attention_rows() {
+                let location = item
+                    .repository
+                    .as_ref()
+                    .map_or("Mission", |repo| repo.full_name.as_str());
+                let check = item
+                    .check_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!(" · {name}"));
+                let label = format!(
+                    "Mission · {}\n{} · {}{}",
+                    crate::review_text::visible_bounded(&item.mission_title, 80),
+                    crate::review_text::visible_bounded(location, 120),
+                    item.kind.label(),
+                    crate::review_text::visible_bounded(&check, 120),
+                );
                 if ui
-                    .button(format!(
-                        "Mission · {}",
-                        crate::review_text::visible_bounded(&title, 80)
-                    ))
+                    .push_id(("workspace-mission-attention", &item.id), |ui| {
+                        ui.add_enabled(
+                            self.agent_sessions.missions.accepts_attention(&item),
+                            egui::Button::new(label).wrap(),
+                        )
+                        .on_hover_text(crate::review_text::visible_bounded(&item.detail, 4096))
+                    })
+                    .inner
                     .clicked()
                 {
-                    self.agent_sessions.missions.open = true;
-                    self.agent_sessions.missions.host.select(&id);
+                    self.agent_sessions.missions.open_attention(&item);
                 }
             }
         }

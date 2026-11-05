@@ -135,6 +135,28 @@ def close_resources(daemon, smoke):
         raise RuntimeError('; '.join(errors))
 
 
+class TreeChanged(RuntimeError):
+    """A read-only end check proved that the traversal crossed a tree update."""
+    def __init__(self, path, before, after):
+        super().__init__('Accessibility children changed during discovery: ' + path)
+        self.change = dict(path=path, before=before, after=after)
+
+
+def confirm_children(nodes, owner, read_children):
+    """Reject mixed topology, without repairing nodes or performing any action.
+
+    AT-SPI Get calls are not an atomic snapshot. In particular, Stop can be
+    collected before completion and its following status after completion.
+    Re-reading all child lists detects removed/replaced/added nodes. Stable
+    contradictory operation states remain untouched for the caller to reject.
+    """
+    for node in nodes:
+        current = [validate_address(address, owner)[1]
+                   for address in read_children(node['path'])]
+        if current != node['children']:
+            raise TreeChanged(node['path'], node['children'], current)
+
+
 def discovery(pid, output, expected_text='E03DISCOVERY'):
     import dbus  # Official system package, only loaded in isolated child.
     session = dbus.SessionBus()
@@ -191,8 +213,15 @@ def discovery(pid, output, expected_text='E03DISCOVERY'):
                 children = [validate_address(a, owner) for a in kids]
                 node['children'] = [a[1] for a in children]
                 queue.extend((a, address[1]) for a in children)
+            def read_children(path):
+                if time.monotonic() - started >= 20:
+                    raise RuntimeError('Bounded accessibility discovery exhausted')
+                return dbus.Interface(bus.get_object(owner, path), ACCESSIBLE).GetChildren(timeout=3)
+            confirm_children(nodes, owner, read_children)
             if int(broker.GetConnectionUnixProcessID(owner, timeout=3)) != pid:
                 raise RuntimeError('Accessibility ownership changed')
+            if time.monotonic() - started >= 20:
+                raise RuntimeError('Bounded accessibility discovery exhausted')
             return save_tree(nodes, root, owner, pid, output, expected_text)
         except (RuntimeError, dbus.DBusException) as error:
             last_error = str(error)
@@ -201,7 +230,8 @@ def discovery(pid, output, expected_text='E03DISCOVERY'):
                 dict(status='unvalidated', error=last_error,
                      elapsed_seconds=time.monotonic()-started,
                      nodes_collected=len(nodes) if 'nodes' in locals() else 0,
-                     partial_nodes=nodes if 'nodes' in locals() else []), indent=2))
+                     partial_nodes=nodes if 'nodes' in locals() else [],
+                     topology_change=error.change if isinstance(error, TreeChanged) else None), indent=2))
             time.sleep(0.1)
     raise RuntimeError('AT-SPI discovery unproven: ' + str(last_error))
 

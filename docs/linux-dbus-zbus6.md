@@ -2,8 +2,11 @@
 
 This patch ports Ember's existing Linux accessibility and desktop-preference
 adapters to the released **zbus 6.2.1**. It does not disable AccessKit, reduced
-motion, or any existing native gate. The production shared-core revision remains
-`c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816`.
+motion, or any existing native gate. At this D-Bus checkpoint, the production
+shared-core revision remained `c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816`.
+The later [Mission attention update](agent-workspace-v3-missions.md) advances the
+application dependency to `4ffa774138ee89dc2916ce21786c45e411196ca4` without
+changing these adapter sources.
 
 ## Source and scope
 

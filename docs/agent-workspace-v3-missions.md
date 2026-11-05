@@ -25,9 +25,26 @@ execution reducer, or automatic Git operation.
    A current task/Result button checks both Task ID and source-qualified
    conversation. It explicitly opens the current task, not a historical run.
 
-Known incomplete Missions contribute to **Needs you**. Selecting its Mission row
-opens the same stable identity. The catalog refresh is explicit, so other
+Known incomplete Missions contribute to **Needs you**. The sidebar and Mission
+panel use the shared reasoned queue: failed, blocked, stale and not-run checks,
+candidate and core-pin gaps, and missing publication evidence remain distinct.
+Each row shows the reason, repository and check. Selecting it shows the detail,
+required environment, candidate, receipt and unambiguous linked task/run identity.
+Uninspected or reopened plans ask for an explicit inspection, not a replay of
+old execution or publication actions. The catalog refresh is explicit, so other
 frontends' newly created Missions appear after refresh rather than being inferred.
+
+Queue callbacks compare the complete current entry, not only its stable ID.
+Changed revisions, receipts, reasons, busy requests and unsaved contracts cannot
+open stale evidence. The selected reason is retired if it changes or the user
+selects another Mission. Missing or ambiguous task links have no receipt shortcut.
+A receipt view reuses the existing read-only host result capture and displays a
+validation log or captured diff only when the conversation, Task ID, run and
+exact receipt event match. A newer run or event never replaces the requested
+receipt. Stale validation remains explicitly stale. The current-worktree diff
+is labelled as a separate dated capture, not as the validation input. The
+existing **Open task / current Result** control remains a separate, explicitly
+current-task navigation path; it makes no claim about a historical receipt.
 
 Drafts are retained independently by Mission ID while selecting other records or
 closing the window. An external revision does not silently rebase a dirty draft.
@@ -41,7 +58,21 @@ is not a promise that unsaved UI drafts survive an application crash.
 
 ## Validation scope
 
-Shared core: `c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816`.
+Current shared core: `4ffa774138ee89dc2916ce21786c45e411196ca4`.
+The manifest, dev dependency, lockfile and host-bundle provenance use that same
+immutable revision. The bundled companion sources are unchanged.
+
+The PR4 production-source harness passed 27 tests: 15 Mission tests, six result
+review tests and six review-text tests. It compiled the actual Mission UI,
+result loader and text sanitizers with egui and the pinned core, omitting only
+the application entrypoint adapter. New coverage includes every attention-entry
+field, stale/busy/dirty callbacks, absent task/receipt links, newer run/event and
+source rejection, selection retirement, and log/diff rendering at 320/960-point
+widths. These are headless regressions, not native historical-receipt acceptance.
+Full application and exact-commit CI/native results remain separate.
+
+The following older results apply to the original Mission checkpoint and its
+previous core pin `c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816`.
 Stability checkpoint: [b600737](https://github.com/beamiter/ember/commit/b600737d37202643f6d74a1bbecafb7ed8622041).
 
 Seven focused tests executed successfully against the final core pin:
@@ -104,11 +135,18 @@ The observer uncovered an AT-SPI state-mapping defect: disabled buttons did not
 support ReadOnly, so they were incorrectly advertised as Enabled/Sensitive.
 The bundled adapter now suppresses those states for all disabled roles while
 retaining the existing ReadOnly mapping for editors. Two Rust regression tests
-and thirteen pure observer contract tests cover the fix and fail-closed targeting.
+and fifteen pure observer contract tests cover the fix and fail-closed targeting.
 Those pure tests do not establish native acceptance. The new exact-commit CI
 gate must pass before native Mission acceptance is claimed. Wayland Mission UI,
 physical hardware, provider execution and actual five-repository delivery are
 explicitly outside this new gate.
+
+The PR4 extension also clicks the reasoned Needs-you inspection request and
+reads its exact visible detail. After freezing and inspecting, it opens the
+missing-validation and missing-publication reasons through real input. Refresh
+must retire those prior reasons and return to an inspection request, without
+changing the saved revision. This disposable fixture has no historical task
+receipt, so native log/diff receipt navigation remains outside its coverage.
 
 The first hosted run created and independently read back the exact Mission,
 then correctly refused to click Freeze below the default 420-pixel dialog's

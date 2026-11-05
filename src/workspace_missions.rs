@@ -2,8 +2,8 @@
 //! Drafts are UI state keyed by stable Mission identity, never execution state.
 use egui::{Button, Context, Ui};
 use jterm_core::agent_workspace::{
-    ConversationId, MissionWorkbench, WorkspaceMission, WorkspaceMissionReport,
-    WorkspaceMissionTaskRef,
+    ConversationId, MissionWorkbench, WorkspaceMission, WorkspaceMissionAttention,
+    WorkspaceMissionReport, WorkspaceMissionTaskRef, WorkspaceResultReport,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -49,6 +49,9 @@ pub(crate) struct MissionPanel {
     pub(crate) open: bool,
     pub(crate) host: MissionWorkbench,
     drafts: HashMap<String, Draft>,
+    attention: Option<WorkspaceMissionAttention>,
+    evidence: crate::workspace_review::WorkspaceReview,
+    attention_changes: bool,
     title: String,
     goal: String,
     parent: String,
@@ -58,17 +61,73 @@ impl MissionPanel {
         self.open = true;
         self.host.refresh();
     }
-    pub(crate) fn attention_rows(&self) -> Vec<(String, String)> {
-        self.host
-            .missions
-            .iter()
-            .filter(|mission| {
-                self.host
-                    .report_for(&mission.id)
-                    .is_none_or(WorkspaceMissionReport::needs_you)
-            })
-            .map(|mission| (mission.id.clone(), mission.title.clone()))
-            .collect()
+    pub(crate) fn attention_rows(&self) -> Vec<WorkspaceMissionAttention> {
+        self.host.attention_items()
+    }
+    pub(crate) fn accepts_attention(&self, item: &WorkspaceMissionAttention) -> bool {
+        !self.host.busy
+            && !self.drafts.get(&item.mission_id).is_some_and(Draft::dirty)
+            && self
+                .host
+                .missions
+                .iter()
+                .find(|mission| mission.id == item.mission_id)
+                .is_some_and(|mission| {
+                    mission
+                        .attention_items(self.host.report_for(&mission.id))
+                        .iter()
+                        .any(|current| current == item)
+                })
+    }
+    pub(crate) fn open_attention(&mut self, item: &WorkspaceMissionAttention) {
+        if !self.accepts_attention(item) {
+            return;
+        }
+        self.open = true;
+        self.attention = Some(item.clone());
+        self.attention_changes = false;
+        self.evidence.clear_task();
+        if !self
+            .host
+            .selected
+            .as_ref()
+            .is_some_and(|saved| saved.id == item.mission_id)
+        {
+            // Reopening a saved report invalidates its current gates in core.
+            // The next poll retires this selection if the entry has changed.
+            self.host.select(&item.mission_id);
+        }
+        if let Some(task) = &item.task {
+            self.evidence.select_task(task.conversation.clone());
+        }
+    }
+    fn selected_attention(&self) -> Option<&WorkspaceMissionAttention> {
+        self.attention.as_ref().filter(|item| {
+            self.accepts_attention(item)
+                && self
+                    .host
+                    .selected
+                    .as_ref()
+                    .is_some_and(|saved| saved.id == item.mission_id)
+        })
+    }
+    fn exact_result(&self, item: &WorkspaceMissionAttention) -> Option<&WorkspaceResultReport> {
+        self.selected_attention()
+            .filter(|selected| *selected == item)
+            .and_then(|_| exact_receipt(item, self.evidence.report.as_ref()))
+    }
+    fn open_attention_result(&mut self, item: &WorkspaceMissionAttention, changes: bool) {
+        if self.exact_result(item).is_some() {
+            self.attention_changes = changes;
+        }
+    }
+    fn reconcile_attention(&mut self) {
+        // A stable ID alone cannot retain a changed receipt, revision or reason.
+        // Busy requests temporarily hide the result, not retire a valid choice.
+        if !self.host.busy && self.attention.is_some() && self.selected_attention().is_none() {
+            self.attention = None;
+            self.evidence.clear_task();
+        }
     }
     fn sync_draft(&mut self) {
         if let Some(saved) = &self.host.selected {
@@ -81,7 +140,9 @@ impl MissionPanel {
     fn poll(&mut self, ctx: &Context) {
         self.host.poll();
         self.sync_draft();
-        if self.host.busy {
+        self.evidence.poll();
+        self.reconcile_attention();
+        if self.host.busy || self.evidence.report_loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -198,9 +259,72 @@ impl MissionPanel {
                     draw_report(ui, report);
                 } else { ui.weak("No current inspection. An uninspected or changed plan is never presumed complete."); }
                 });
+                self.draw_attention(ui);
             });
         self.open = open;
         navigate
+    }
+    fn draw_attention(&mut self, ui: &mut Ui) {
+        let Some(mission_id) = self.host.selected.as_ref().map(|saved| saved.id.clone()) else {
+            return;
+        };
+        if self.drafts.get(&mission_id).is_some_and(Draft::dirty) {
+            return;
+        }
+        let items: Vec<_> = self
+            .attention_rows()
+            .into_iter()
+            .filter(|item| item.mission_id == mission_id)
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        ui.separator();
+        ui.strong(format!("Needs you · {} next actions", items.len()));
+        for item in items {
+            ui.push_id(("mission-attention", &item.id), |ui| {
+                let location = item.repository.as_ref().map_or("Mission", |repo| repo.full_name.as_str());
+                let check = item.check_name.as_ref().map_or(String::new(), |name| format!(" · {name}"));
+                let label = format!("{} · {}{}", visible(location), item.kind.label(), visible(&check));
+                if ui.add_enabled(self.accepts_attention(&item), Button::new(label).wrap()).clicked() {
+                    self.open_attention(&item);
+                }
+                if self.selected_attention() != Some(&item) {
+                    return;
+                }
+                ui.small(visible(&item.detail));
+                if let Some(candidate) = &item.candidate { ui.monospace(format!("Candidate: {}", visible(candidate))); }
+                if let Some(environment) = &item.environment { ui.small(format!("Required environment: {}", visible(environment))); }
+                if let Some(receipt) = &item.receipt_id { ui.monospace(format!("Receipt: {}", visible(receipt))); }
+                let Some(task) = &item.task else {
+                    if item.receipt_id.is_some() {
+                        ui.weak("This receipt has no unambiguous linked task run. No task shortcut is available.");
+                    }
+                    return;
+                };
+                ui.small(format!("Task {} · run {} · source {}", task.task_id, visible(&task.run_id), task.source_sequence));
+                ui.small(format!("Conversation: {}", visible(&task.conversation.0)));
+                let captured = self.exact_result(&item).is_some();
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(captured, Button::new("Show validation log")).clicked() {
+                        self.open_attention_result(&item, false);
+                    }
+                    if ui.add_enabled(captured, Button::new("Show captured diff")).clicked() {
+                        self.open_attention_result(&item, true);
+                    }
+                    if ui.add_enabled(!self.evidence.report_loading && self.accepts_attention(&item), Button::new("Reload exact receipt")).clicked() {
+                        self.evidence.refresh_result();
+                    }
+                });
+                if self.evidence.report_loading { ui.spinner(); }
+                if let Some(notice) = &self.evidence.notice { ui.weak(visible(notice)); }
+                let Some(report) = self.exact_result(&item) else {
+                    ui.weak("The exact run receipt is unavailable in the current host view. Inspect again; newer output is not this receipt.");
+                    return;
+                };
+                draw_receipt(ui, report, self.attention_changes);
+            });
+        }
     }
 }
 fn known(value: &str) -> &str {
@@ -209,6 +333,65 @@ fn known(value: &str) -> &str {
     } else {
         value
     }
+}
+fn visible(value: &str) -> String {
+    crate::review_text::visible_bounded(value, 4096)
+}
+fn exact_receipt<'a>(
+    item: &WorkspaceMissionAttention,
+    report: Option<&'a WorkspaceResultReport>,
+) -> Option<&'a WorkspaceResultReport> {
+    report.filter(|report| item.matches_result(report))
+}
+fn draw_receipt(ui: &mut Ui, report: &WorkspaceResultReport, changes: bool) {
+    ui.small(format!(
+        "Receipt capture · run {} · event {}",
+        visible(&report.run_id),
+        report.source_sequence
+    ));
+    if let Some(error) = &report.error {
+        ui.weak(visible(error));
+    }
+    ui.label(visible(&report.validation_status));
+    if !report.validation_current {
+        ui.weak("Validation is stale for the current worktree capture.");
+    }
+    if let Some(validation) = &report.validation {
+        ui.monospace(format!(
+            "Validation input HEAD: {}\nValidation input fingerprint: {}",
+            visible(&validation.head),
+            visible(&validation.fingerprint)
+        ));
+    }
+    if changes {
+        ui.weak("Current worktree capture, not necessarily the validation input.");
+        if let Some(current) = &report.current {
+            ui.monospace(format!(
+                "Captured HEAD: {}\nCaptured fingerprint: {}\nCaptured at: {} ms UTC",
+                visible(&current.head),
+                visible(&current.fingerprint),
+                current.captured_at_ms
+            ));
+            ui.monospace(crate::review_text::visible_bounded(
+                &current.diff,
+                64 * 1024,
+            ));
+            if current.diff_truncated || current.diff.len() > 64 * 1024 {
+                ui.weak("The captured diff is a retained excerpt.");
+            }
+        } else {
+            ui.weak("This receipt has no captured diff.");
+        }
+    } else {
+        ui.monospace(crate::review_text::visible_bounded(
+            &report.validation_output,
+            64 * 1024,
+        ));
+        if report.validation_output_truncated || report.validation_output.len() > 64 * 1024 {
+            ui.weak("The validation log is a retained excerpt.");
+        }
+    }
+    ui.weak("Read-only receipt view. Current worktree data is a separate dated capture; inspect again after new work.");
 }
 fn same_task(a: &WorkspaceMissionTaskRef, b: &WorkspaceMissionTaskRef) -> bool {
     a.task_id == b.task_id && a.conversation == b.conversation
@@ -281,6 +464,268 @@ impl crate::app::state::TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn attention_panel() -> MissionPanel {
+        let mut panel = MissionPanel::default();
+        let mut mission =
+            WorkspaceMission::four_terminals("Delivery", "Exact evidence", "/missing-fixture");
+        mission.revision = 1;
+        panel.host.missions.push(mission.clone());
+        panel.host.selected = Some(mission);
+        panel.sync_draft();
+        panel
+    }
+    fn receipt_fixture() -> (WorkspaceMissionAttention, WorkspaceResultReport) {
+        let mut item = attention_panel().attention_rows().remove(0);
+        let task_id = jterm_core::agent_task::TaskId::new();
+        let task = WorkspaceMissionTaskRef {
+            conversation: ConversationId(format!(
+                "jterm:task:v1:{}",
+                serde_json::to_string(&("host", "namespace", task_id.to_string())).unwrap()
+            )),
+            task_id,
+            run_id: "saved:run".into(),
+            source_sequence: 7,
+        };
+        item.kind = jterm_core::agent_workspace::WorkspaceMissionAttentionKind::ValidationFailed;
+        item.receipt_id = Some("workspace:saved:run:9".into());
+        item.task = Some(task.clone());
+        let result = WorkspaceResultReport {
+            conversation: task.conversation,
+            task_id,
+            run_id: task.run_id,
+            source_sequence: 9,
+            baseline: None,
+            current: None,
+            validation: None,
+            validation_current: false,
+            validation_status: "Failed".into(),
+            validation_output: "Exact saved failure".into(),
+            validation_output_truncated: false,
+            error: None,
+        };
+        (item, result)
+    }
+    #[test]
+    fn attention_callbacks_compare_every_entry_field_not_only_stable_id() {
+        let mut panel = attention_panel();
+        let item = panel.attention_rows().remove(0);
+        assert_eq!(item.kind.label(), "Inspect current delivery");
+        assert!(panel.accepts_attention(&item));
+        for field in 0..12 {
+            let mut changed = item.clone();
+            match field {
+                0 => changed.id.push('x'),
+                1 => changed.mission_id.push('x'),
+                2 => changed.revision += 1,
+                3 => changed.mission_title.push('x'),
+                4 => {
+                    changed.repository =
+                        Some(panel.host.missions[0].repositories[0].identity.clone())
+                }
+                5 => changed.candidate = Some("b".repeat(40)),
+                6 => {
+                    changed.kind =
+                        jterm_core::agent_workspace::WorkspaceMissionAttentionKind::ReviewEvidence
+                }
+                7 => changed.check_name = Some("validation".into()),
+                8 => changed.environment = Some("different environment".into()),
+                9 => changed.receipt_id = Some("another receipt".into()),
+                10 => changed.task = receipt_fixture().0.task,
+                _ => changed.detail.push('x'),
+            }
+            assert!(!panel.accepts_attention(&changed), "changed field {field}");
+            panel.open_attention(&changed);
+            assert!(panel.attention.is_none());
+            assert!(!panel.open);
+            assert!(!panel.evidence.report_loading);
+        }
+        panel.host.missions[0].revision += 1;
+        let revised = panel.attention_rows().remove(0);
+        assert_eq!(item.id, revised.id);
+        assert!(!panel.accepts_attention(&item));
+        assert!(panel.accepts_attention(&revised));
+    }
+    #[test]
+    fn attention_callbacks_reject_busy_and_unsaved_contracts() {
+        let mut panel = attention_panel();
+        let item = panel.attention_rows().remove(0);
+        panel.host.busy = true;
+        panel.open_attention(&item);
+        assert!(panel.attention.is_none());
+        panel.host.busy = false;
+        panel.drafts.get_mut(&item.mission_id).unwrap().edited.goal = "Unsaved acceptance".into();
+        panel.open_attention(&item);
+        assert!(panel.attention.is_none());
+        assert!(!panel.evidence.report_loading);
+        assert!(!panel.host.busy);
+    }
+    #[test]
+    fn attention_without_task_opens_reason_without_requesting_a_result() {
+        let mut panel = attention_panel();
+        let item = panel.attention_rows().remove(0);
+        panel.open_attention(&item);
+        assert!(panel.open);
+        assert_eq!(panel.selected_attention(), Some(&item));
+        assert!(!panel.evidence.report_loading);
+        assert!(!panel.host.busy);
+        panel.open_attention_result(&item, true);
+        assert!(!panel.attention_changes);
+    }
+    #[test]
+    fn changed_reason_or_selection_retires_cached_receipt() {
+        for change in 0..3 {
+            let mut panel = attention_panel();
+            let item = panel.attention_rows().remove(0);
+            panel.open_attention(&item);
+            panel.evidence.report = Some(receipt_fixture().1);
+            match change {
+                0 => panel.host.missions[0].title.push_str(" updated"),
+                1 => panel.host.selected = Some(WorkspaceMission::new("Another", "goal")),
+                _ => panel
+                    .drafts
+                    .get_mut(&item.mission_id)
+                    .unwrap()
+                    .edited
+                    .goal
+                    .push_str(" edited"),
+            }
+            panel.reconcile_attention();
+            assert!(panel.attention.is_none());
+            assert!(panel.evidence.report.is_none());
+        }
+    }
+    #[test]
+    fn receipt_navigation_rejects_newer_run_event_source_and_task() {
+        let (item, report) = receipt_fixture();
+        assert!(exact_receipt(&item, Some(&report)).is_some());
+        // Stale validation can still be inspected; it is never a current pass.
+        assert!(!report.validation_current);
+        assert!(exact_receipt(&item, None).is_none());
+        for change in 0..4 {
+            let mut changed = report.clone();
+            match change {
+                0 => changed.run_id = "newer run".into(),
+                1 => changed.source_sequence += 1,
+                2 => changed.conversation.0 = "another source".into(),
+                _ => changed.task_id = jterm_core::agent_task::TaskId::new(),
+            }
+            assert!(exact_receipt(&item, Some(&changed)).is_none());
+        }
+        let mut stale = item.clone();
+        stale.task.as_mut().unwrap().source_sequence = 10;
+        assert!(exact_receipt(&stale, Some(&report)).is_none());
+        let mut panel = attention_panel();
+        panel.attention = Some(item.clone());
+        panel.evidence.report = Some(report);
+        panel.open_attention_result(&item, true);
+        assert!(
+            !panel.attention_changes,
+            "an exact report cannot authorize a stale queue callback"
+        );
+        assert!(panel.exact_result(&item).is_none());
+    }
+    #[test]
+    fn missing_or_ambiguous_task_and_missing_receipt_have_no_result_shortcut() {
+        let (mut item, report) = receipt_fixture();
+        // Shared core omits the task for both missing and ambiguous links.
+        let linked = item.task.take();
+        assert!(exact_receipt(&item, Some(&report)).is_none());
+        item.task = linked;
+        item.receipt_id = None;
+        assert!(exact_receipt(&item, Some(&report)).is_none());
+    }
+    #[test]
+    fn projected_missing_and_ambiguous_links_keep_reason_without_result_shortcut() {
+        use jterm_core::agent_workspace::{
+            WorkspaceMissionCheckReport, WorkspaceMissionCheckStatus,
+            WorkspaceMissionLocalEvidence, WorkspaceMissionRepository,
+        };
+        let (item, result) = receipt_fixture();
+        let task = item.task.unwrap();
+        let mut mission = WorkspaceMission::new("One repository", "Validate exact run");
+        let mut repository =
+            WorkspaceMissionRepository::new("beamiter/jterm_core", "/fixture/core").unwrap();
+        repository.baseline = "a".repeat(40);
+        repository.candidate = Some("b".repeat(40));
+        repository.tasks.push(task.clone());
+        mission.repositories.push(repository);
+        let mut report = mission.project(&[]);
+        let repository = &mut report.repositories[0];
+        repository.observed = Some(WorkspaceMissionLocalEvidence {
+            baseline: "a".repeat(40),
+            head: "b".repeat(40),
+            fingerprint: "fixture".into(),
+            modified: false,
+            dirty: false,
+            manifest_core_pin: None,
+            lock_core_pin: None,
+            observed_at_ms: 10,
+        });
+        repository.committed = true;
+        repository.pushed = true;
+        repository.integrated = true;
+        repository.pins_current = true;
+        repository.errors.clear();
+        repository.checks = vec![WorkspaceMissionCheckReport {
+            check_name: "validation".into(),
+            environment: mission.required_environment.clone(),
+            status: WorkspaceMissionCheckStatus::Failed,
+            receipt_id: Some("workspace:saved:run:9".into()),
+            detail: Some("Exact failure".into()),
+        }];
+        let linked = mission.attention_items(Some(&report)).remove(0);
+        assert_eq!(linked.task.as_ref(), Some(&task));
+        assert!(exact_receipt(&linked, Some(&result)).is_some());
+        for ambiguous in [false, true] {
+            let mut changed = mission.clone();
+            if ambiguous {
+                let mut other_source = task.clone();
+                other_source.conversation.0 =
+                    other_source.conversation.0.replace("namespace", "other");
+                changed.repositories[0].tasks.push(other_source);
+            } else {
+                changed.repositories[0].tasks.clear();
+            }
+            let unlinked = changed.attention_items(Some(&report)).remove(0);
+            assert_eq!(unlinked.kind, linked.kind);
+            assert_eq!(unlinked.receipt_id, linked.receipt_id);
+            assert!(unlinked.task.is_none());
+            assert!(exact_receipt(&unlinked, Some(&result)).is_none());
+        }
+    }
+    #[test]
+    fn receipt_log_and_capture_render_narrow_and_wide_without_host_operations() {
+        let (_, mut report) = receipt_fixture();
+        report.current = Some(jterm_core::agent_task::worktree::WorktreeReviewSnapshot {
+            head: "b".repeat(40),
+            branch: "fixture".into(),
+            base_commit: "a".repeat(40),
+            fingerprint: "separate-current-capture".into(),
+            status: "M file".into(),
+            diff: "+ current worktree, not validation input".into(),
+            diff_truncated: true,
+            status_truncated: false,
+            untracked_files: 0,
+            captured_at_ms: 100,
+            attribution: "fixture".into(),
+        });
+        for width in [320.0, 960.0] {
+            for changes in [false, true] {
+                let ctx = Context::default();
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| draw_receipt(ui, &report, changes),
+                );
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
     #[test]
     fn concurrent_saved_revision_preserves_dirty_draft_and_conflict_base() {
         let mut saved = WorkspaceMission::new("first", "goal");
@@ -330,7 +775,11 @@ mod tests {
         let mut panel = MissionPanel::default();
         let mission = WorkspaceMission::new("one", "goal");
         panel.host.missions.push(mission.clone());
-        assert_eq!(panel.attention_rows(), vec![(mission.id, mission.title)]);
+        let rows = panel.attention_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mission_id, mission.id);
+        assert_eq!(rows[0].mission_title, mission.title);
+        assert_eq!(rows[0].kind.label(), "Complete the acceptance plan");
         assert!(!panel.host.busy);
     }
     #[test]
@@ -363,6 +812,9 @@ mod tests {
             );
             panel.host.missions.push(mission.clone());
             panel.host.selected = Some(mission);
+            panel.sync_draft();
+            let attention = panel.attention_rows().remove(0);
+            panel.open_attention(&attention);
             for _ in 0..3 {
                 let output = ctx.run_ui(
                     egui::RawInput {

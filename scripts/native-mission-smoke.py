@@ -112,6 +112,16 @@ def editor(tree, label):
     return choices[0]
 
 
+def visible_label(tree, text):
+    frame, nodes = owned_nodes(tree)
+    frame = content_frame(frame, nodes)
+    choices = [node for node in nodes if node['name'] == text and node['role'] == 29
+               and visible(node, frame)]
+    if len(choices) != 1:
+        raise RuntimeError('Missing or ambiguous visible Mission text: ' + text)
+    return choices[0]
+
+
 def fixture_repositories(parent):
     heads = {}
     for name in REPOSITORIES:
@@ -247,7 +257,8 @@ def main():
     smoke.env = probe.child_environment(smoke.env)
     result = dict(status='running', backend='x11', binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                   assertions=[], not_covered=['real five-repository delivery', 'CI evidence ingestion',
-                  'Wayland Mission UI', 'physical keyboard or GPU', 'external provider execution'])
+                  'Wayland Mission UI', 'physical keyboard or GPU', 'external provider execution',
+                  'native historical receipt log/diff navigation'])
     started = time.monotonic()
     daemon = None
     old_bus = os.environ.get('DBUS_SESSION_BUS_ADDRESS')
@@ -292,6 +303,12 @@ def main():
         result['mission_id'] = saved['id']
         result['assertions'].append('Real native inputs created exactly one five-repository Mission with exact persisted fields')
         driver.press('Create a five-repository Mission')
+        inspect_reason = 'Mission · Inspect current delivery'
+        driver.press(inspect_reason)
+        detail = 'No inspection is available for this saved plan revision'
+        visible_label(driver.locate(detail, (29,)), detail)
+        assert stored(out / 'home')[0]['revision'] == 1
+        result['assertions'].append('A real Needs-you click opened the exact inspection reason without changing the plan')
         driver.press(FREEZE, enabled=False)
         assert stored(out / 'home')[0]['revision'] == 1
         result['assertions'].append('Uninspected Freeze is disabled and a real click cannot change the saved revision')
@@ -328,21 +345,35 @@ def main():
         driver.press(INSPECT)
         native.wait_for(lambda: inspected(2), 'frozen candidate inspection')
         time.sleep(.5)
+        validation_reason = 'beamiter/ember · Run the required validation · validation'
+        publication_reason = 'beamiter/ember · Verify the pushed candidate'
+        driver.press(validation_reason)
+        driver.press(publication_reason)
+        detail = 'No matching remote candidate receipt is available; inspect before taking publication action'
+        visible_label(driver.locate(detail, (29,)), detail)
+        assert stored(out / 'home')[0]['revision'] == 2
+        result['assertions'].append('Real Needs-you clicks exposed missing validation and publication as read-only reasons')
         driver.press('Refresh saved Missions')
         time.sleep(1)
+        driver.press(inspect_reason)
+        _, nodes = owned_nodes(driver.read('refreshed-attention'))
+        assert not any(node['name'] in (validation_reason, publication_reason) for node in nodes)
+        result['assertions'].append('Refresh replaced prior actionable reasons with a fresh inspection request')
         driver.press(FREEZE, enabled=False)
         assert stored(out / 'home')[0]['revision'] == 2
         result['assertions'].append('Refresh revoked fresh observation permission; disabled Freeze click could not create revision 3')
         driver.fill('Title', 'Unsaved Mission title')
         driver.press(INSPECT, enabled=False)
         driver.press(FREEZE, enabled=False)
+        _, nodes = owned_nodes(driver.read('dirty-attention-hidden'))
+        assert not any(node['name'] in (inspect_reason, validation_reason, publication_reason) for node in nodes)
         driver.press('Refresh saved Missions')
         time.sleep(1)
         assert editor(driver.locate('Title', (29,), below=100), 'Title')['text'] == 'Unsaved Mission title'
         assert stored(out / 'home')[0]['title'] == 'EmberMissionFixture'
         driver.press('Discard draft changes')
         assert editor(driver.locate('Title', (29,), below=100), 'Title')['text'] == 'EmberMissionFixture'
-        result['assertions'].append('Unsaved draft disabled Inspect/Freeze, survived Refresh, and required explicit discard')
+        result['assertions'].append('Unsaved draft disabled Inspect/Freeze, hid saved reasons, survived Refresh, and required explicit discard')
         result['saved_plan'], result['last_host_report'] = stored(out / 'home')
         # Leave by the native window manager, not SIGTERM success accounting.
         smoke.key('F4', ('alt',))
