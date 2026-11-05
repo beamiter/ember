@@ -2064,6 +2064,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=885324740c61e3b5c9c4549b4bd82100e1d54f7c#885324740c61e3b5c9c4549b4bd82100e1d54f7c"
 dependencies = [
  "companion-client",
  "companion-core",

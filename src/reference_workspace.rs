@@ -2334,17 +2334,20 @@ mod reference_panel_tests {
                 if let Some(rect) = painted {
                     assert!(rect.right() <= mode_left - 12.0);
                 }
-                if font == 72.0 && pair_left >= 104.0 && width <= 1000.0 {
-                    assert!(
-                        painted.is_none(),
-                        "large identity text cannot paint beneath the mode controls"
-                    );
-                }
-                if font == 14.0 || width == 1356.0 || pair_left < 104.0 {
-                    assert!(
-                        painted.is_some(),
-                        "the full identity remains visible when it fits"
-                    );
+                let measured = ctx.fonts_mut(|fonts| {
+                    fonts.layout_no_wrap(
+                        "Ember".into(),
+                        egui::FontId::proportional(10.0 * scale),
+                        egui::Color32::WHITE,
+                    )
+                });
+                assert_eq!(
+                    painted.is_some(),
+                    132.0 + measured.size().x <= mode_left - 12.0,
+                    "identity visibility follows measured glyphs, not an old title-width heuristic"
+                );
+                if let Some(rect) = painted {
+                    assert_eq!(rect.size(), measured.size());
                 }
                 let icon =
                     egui::Rect::from_min_size(egui::pos2(104.0, 0.0), egui::vec2(20.0, 20.0));

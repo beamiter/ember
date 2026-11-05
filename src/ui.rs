@@ -7660,7 +7660,7 @@ mod tests {
                                 });
                         };
                         if files { navigation(root); inspector(root); } else { inspector(root); navigation(root); }
-                        egui::CentralPanel::default().frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 6, right: 0, top: 4, bottom: 6 }))
+                        egui::CentralPanel::default().frame(egui::Frame::NONE.inner_margin(shell::center_panel_margin(&layout)))
                             .show_bounded(root, |ui| {
                                 let allocated = ui.available_rect_before_wrap();
                                 assert_eq!(allocated.min, egui::pos2(layout.center.x, layout.center.y));
@@ -7671,7 +7671,7 @@ mod tests {
                                     header_ui.allocate_exact_size(egui::vec2(header.width() + 400.0, header.height()), egui::Sense::hover());
                                 });
                                 assert_eq!(ui.available_width(), allocated.width(), "header intrinsic minima cannot widen the following native pane");
-                                let terminal_outer = egui::Rect::from_min_max(allocated.min + egui::vec2(0.0, layout.header.height + 6.0), allocated.max);
+                                let terminal_outer = shell::terminal_content_rect(allocated, layout.header.height);
                                 actual_native = Some(reference_terminal_rects_with_height(terminal_outer, true, true, layout.composer.height).0);
                             });
                     });
@@ -7679,7 +7679,9 @@ mod tests {
                     let native = actual_native.unwrap();
                     assert_eq!(
                         native.right(),
-                        layout.inspector.unwrap().x - shell::token::INSPECTOR_GAP
+                        layout.inspector.unwrap().x
+                            - shell::token::INSPECTOR_GAP
+                            - shell::token::TOOLBAR_INSET_RIGHT
                     );
                     let renderer = TerminalRenderer::new(
                         14.0,
@@ -7794,15 +7796,21 @@ mod tests {
             crate::config::ScrollbarVisibility::Auto,
             crate::theme::Theme::default(),
         );
-        // Compact glass profile: one42px toolbar and6px gap below the native pane.
+        // The current glass profile reserves one toolbar and one gap below the native pane.
         let outer = egui::Rect::from_min_size(egui::pos2(365.0, 171.0), egui::vec2(859.0, 759.0));
         let (native, footer) = reference_foreground_rects(outer, true);
         let footer = footer.unwrap();
         assert_eq!(native.min, outer.min);
         assert_eq!(native.right(), outer.right());
-        assert_eq!(footer.height(), 42.0);
-        assert_eq!(footer.top(), 888.0);
-        assert_eq!(native.bottom(), 882.0);
+        assert_eq!(footer.height(), crate::glass_shell::COMPOSER_HEIGHT);
+        assert_eq!(
+            footer.top(),
+            outer.bottom() - crate::glass_shell::COMPOSER_HEIGHT
+        );
+        assert_eq!(
+            native.bottom(),
+            footer.top() - crate::glass_shell::token::TERMINAL_FOOTER_GAP
+        );
         assert_eq!(
             native.bottom() + crate::glass_shell::token::TERMINAL_FOOTER_GAP,
             footer.top()

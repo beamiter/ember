@@ -82,6 +82,11 @@ mod workspace_sessions_bridge;
 mod workspace_tools;
 mod workspace_visibility;
 
+// Xlib window IDs use c_ulong, which is u32 on some targets and u64 on others.
+fn widen_native_window_id(value: impl Into<u64>) -> u64 {
+    value.into()
+}
+
 use crate::glass_shell::BoundedPanel as _;
 use crate::theme::ThemeExt as _;
 use app::events::{
@@ -872,13 +877,18 @@ fn main() -> Result<(), eframe::Error> {
                 cc.wgpu_render_state.clone(),
             )
             .map(|mut app| {
-                use winit::raw_window_handle::{HasWindowHandle,RawWindowHandle};
-                let native=cc.window_handle().ok().and_then(|handle|match handle.as_raw(){
-                    RawWindowHandle::Xlib(handle)=>Some(handle.window as u64),
-                    RawWindowHandle::Xcb(handle)=>Some(handle.window.get() as u64),
-                    _=>None,
-                });
-                app.init_desktop_sessions(native,&cc.egui_ctx);
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                let native = cc
+                    .window_handle()
+                    .ok()
+                    .and_then(|handle| match handle.as_raw() {
+                        RawWindowHandle::Xlib(handle) => {
+                            Some(widen_native_window_id(handle.window))
+                        }
+                        RawWindowHandle::Xcb(handle) => Some(handle.window.get() as u64),
+                        _ => None,
+                    });
+                app.init_desktop_sessions(native, &cc.egui_ctx);
                 Box::new(app) as Box<dyn eframe::App>
             })
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
@@ -5780,22 +5790,8 @@ impl TerminalApp {
         self.render_organism(root_ui);
         self.render_vim9_workbench(root_ui);
         let layout = self.reference_layout(ctx);
-        let bottom = if ctx.viewport_rect().height() < crate::glass_shell::token::SHORT_HEIGHT {
-            crate::glass_shell::token::SHORT_BOTTOM_GAP
-        } else {
-            crate::glass_shell::token::MAIN_BOTTOM_GAP
-        };
-        let right = if layout.inspector.is_some() {
-            0
-        } else {
-            crate::glass_shell::token::OUTER_RIGHT as i8
-        };
-        let frame = egui::Frame::NONE.inner_margin(egui::Margin {
-            left: crate::glass_shell::token::LEFT_GAP as i8,
-            right,
-            top: (layout.center.y - layout.titlebar.height) as i8,
-            bottom: bottom as i8,
-        });
+        let frame =
+            egui::Frame::NONE.inner_margin(crate::glass_shell::center_panel_margin(&layout));
         let main_panel = egui::CentralPanel::default()
             .frame(frame)
             .show_bounded(root_ui, |ui| {
@@ -5804,15 +5800,8 @@ impl TerminalApp {
                 // report an intrinsic minimum larger than its fixed surface.
                 let bounds = ui.available_rect_before_wrap();
                 self.render_reference_canvas_header(ui);
-                let content = egui::Rect::from_min_max(
-                    bounds.min
-                        + egui::vec2(0.0, layout.header.height)
-                        + egui::vec2(
-                            crate::glass_shell::token::TOOLBAR_INSET_LEFT,
-                            crate::glass_shell::token::TERMINAL_TOP_GAP,
-                        ),
-                    bounds.max - egui::vec2(crate::glass_shell::token::TOOLBAR_INSET_RIGHT, 0.0),
-                );
+                let content =
+                    crate::glass_shell::terminal_content_rect(bounds, layout.header.height);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
                     ui.set_clip_rect(content.intersect(ui.clip_rect()));
                     theme::configure_workspace_text(ui.style_mut(), self.config.font_size);

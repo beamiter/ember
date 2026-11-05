@@ -1725,8 +1725,8 @@ impl TerminalApp {
         ctx: &egui::Context,
     ) {
         let op = handoff.operation_id.clone();
-        let creating =
-            self.task_sidebar.pending_creation.is_some() || self.task_sidebar.recovery_job.is_some();
+        let creating = self.task_sidebar.pending_creation.is_some()
+            || self.task_sidebar.recovery_job.is_some();
         if let Some(reason) = self
             .task_sidebar
             .composer

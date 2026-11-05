@@ -1380,6 +1380,34 @@ impl EvaHost {
     }
 }
 
+fn agent_state(status: jterm_core::agent_task::TaskStatus) -> host::AgentTaskState {
+    use jterm_core::agent_task::TaskStatus as T;
+    match status {
+        T::Created => host::AgentTaskState::Created,
+        T::Starting => host::AgentTaskState::Starting,
+        T::Working => host::AgentTaskState::Working,
+        T::WaitingForApproval => host::AgentTaskState::WaitingForApproval,
+        T::WaitingForHuman => host::AgentTaskState::WaitingForHuman,
+        T::ReadyForReview => host::AgentTaskState::ReadyForReview,
+        T::Completed => host::AgentTaskState::Completed,
+        T::Failed => host::AgentTaskState::Failed,
+        T::Cancelled => host::AgentTaskState::Cancelled,
+        T::Archived => host::AgentTaskState::Archived,
+    }
+}
+
+fn agent_validation(status: jterm_core::agent_task::TaskValidationStatus) -> host::AgentValidation {
+    use jterm_core::agent_task::TaskValidationStatus as V;
+    match status {
+        V::NotRun => host::AgentValidation::NotRun,
+        V::Running => host::AgentValidation::Running,
+        V::Passed => host::AgentValidation::Passed,
+        V::Failed => host::AgentValidation::Failed,
+        V::Inconclusive => host::AgentValidation::Inconclusive,
+        V::Cancelled => host::AgentValidation::Cancelled,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1427,32 +1455,4 @@ mod tests {
     }
     // Native ordering is exercised by tools/native-feedback-harness and the
     // family X11 matrix; searching source text for a submit hook cannot prove it.
-}
-
-fn agent_state(status: jterm_core::agent_task::TaskStatus) -> host::AgentTaskState {
-    use jterm_core::agent_task::TaskStatus as T;
-    match status {
-        T::Created => host::AgentTaskState::Created,
-        T::Starting => host::AgentTaskState::Starting,
-        T::Working => host::AgentTaskState::Working,
-        T::WaitingForApproval => host::AgentTaskState::WaitingForApproval,
-        T::WaitingForHuman => host::AgentTaskState::WaitingForHuman,
-        T::ReadyForReview => host::AgentTaskState::ReadyForReview,
-        T::Completed => host::AgentTaskState::Completed,
-        T::Failed => host::AgentTaskState::Failed,
-        T::Cancelled => host::AgentTaskState::Cancelled,
-        T::Archived => host::AgentTaskState::Archived,
-    }
-}
-
-fn agent_validation(status: jterm_core::agent_task::TaskValidationStatus) -> host::AgentValidation {
-    use jterm_core::agent_task::TaskValidationStatus as V;
-    match status {
-        V::NotRun => host::AgentValidation::NotRun,
-        V::Running => host::AgentValidation::Running,
-        V::Passed => host::AgentValidation::Passed,
-        V::Failed => host::AgentValidation::Failed,
-        V::Inconclusive => host::AgentValidation::Inconclusive,
-        V::Cancelled => host::AgentValidation::Cancelled,
-    }
 }

@@ -64,6 +64,11 @@ jobs:
       - name: Check Files follow ownership
         run: python3 scripts/test-files-follow.py
 
+      - name: Check immutable shared core provenance
+        run: |
+          python3 scripts/check-shared-core-pin.py --self-test
+          python3 scripts/check-shared-core-pin.py
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -247,6 +252,12 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Gate shared host restart and draft ownership
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --locked --bin ember
+          python3 scripts/verify_workspace_host.py target/debug/ember
 
       - name: Gate native Vim fractional selection against a real PTY
         timeout-minutes: 3

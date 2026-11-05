@@ -1,7 +1,8 @@
 //! Conservative command-line classification for the space-saving Blocks bar.
 //! Keep in sync between Ember and Frost. No subprocesses or shell evaluation.
 
-pub(crate) fn immersive_block_command(command: &str) -> bool {
+/// Whether a command owns an immersive terminal surface instead of a Blocks bar.
+pub fn immersive_block_command(command: &str) -> bool {
     classify(command, false)
 }
 

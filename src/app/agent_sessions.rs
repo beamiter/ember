@@ -3084,6 +3084,73 @@ impl TerminalApp {
     }
 }
 
+impl TerminalApp {
+    pub(crate) fn init_desktop_sessions(&mut self, native: Option<u64>, ctx: &egui::Context) {
+        let wake = ctx.clone();
+        self.agent_sessions.desktop_bridge = Some(jterm_core::desktop_sessions::Bridge::new(
+            "ember",
+            native,
+            move || wake.request_repaint(),
+        ));
+    }
+    pub(crate) fn sync_desktop_sessions(&mut self, ctx: &egui::Context) {
+        let Some(bridge) = self.agent_sessions.desktop_bridge.as_ref() else {
+            return;
+        };
+        let identities = self
+            .agent_sessions
+            .catalog
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let pane = self.agent_sessions.opened.get(&open_session_key(session))?;
+                let index = self.session_manager.index_of(pane)?;
+                if self.session_manager.sessions()[index].purpose
+                    != crate::session::SessionPurpose::EphemeralCommand
+                {
+                    return None;
+                }
+                Some((
+                    jterm_core::desktop_sessions::Session::from_agent(session, pane.clone())?,
+                    index,
+                ))
+            })
+            .collect::<Vec<_>>();
+        bridge.publish(
+            identities
+                .iter()
+                .map(|(session, _)| session.clone())
+                .collect(),
+        );
+        let requests = bridge.poll();
+        for request in requests {
+            let success = if let Some((_, index)) = identities
+                .iter()
+                .find(|(s, _)| s.session_id == request.session_id && s.pane_id == request.pane_id)
+            {
+                if self.activate_session(*index) {
+                    self.agent_sessions.is_open = false;
+                    self.agent_sessions.workspace_pending = false;
+                    self.agent_sessions.workspace_task = None;
+                    self.sidebar.view = crate::sidebar::SidebarView::Sessions;
+                    self.ai_chat_panel.close();
+                    self.return_focus_to_terminal(ctx);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            self.agent_sessions
+                .desktop_bridge
+                .as_ref()
+                .unwrap()
+                .acknowledge(request, success);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4842,32 +4909,5 @@ mod tests {
         assert!(state
             .copy_receipt_remaining(&session_key(&missing), CopyKind::Command)
             .is_none());
-    }
-}
-
-impl TerminalApp {
-    pub(crate) fn init_desktop_sessions(&mut self,native:Option<u64>,ctx:&egui::Context){
-        let wake=ctx.clone();
-        self.agent_sessions.desktop_bridge=Some(jterm_core::desktop_sessions::Bridge::new("ember",native,move||wake.request_repaint()));
-    }
-    pub(crate) fn sync_desktop_sessions(&mut self,ctx:&egui::Context){
-        let Some(bridge)=self.agent_sessions.desktop_bridge.as_ref()else{return;};
-        let identities=self.agent_sessions.catalog.sessions.iter().filter_map(|session|{
-            let pane=self.agent_sessions.opened.get(&open_session_key(session))?;
-            let index=self.session_manager.index_of(pane)?;
-            if self.session_manager.sessions()[index].purpose!=crate::session::SessionPurpose::EphemeralCommand{return None;}
-            Some((jterm_core::desktop_sessions::Session::from_agent(session,pane.clone())?,index))
-        }).collect::<Vec<_>>();
-        bridge.publish(identities.iter().map(|(session,_)|session.clone()).collect());
-        let requests=bridge.poll();
-        for request in requests {
-            let success=if let Some((_,index))=identities.iter().find(|(s,_)|s.session_id==request.session_id&&s.pane_id==request.pane_id){
-                if self.activate_session(*index){
-                    self.agent_sessions.is_open=false;self.agent_sessions.workspace_pending=false;self.agent_sessions.workspace_task=None;
-                    self.sidebar.view=crate::sidebar::SidebarView::Sessions;self.ai_chat_panel.close();self.return_focus_to_terminal(ctx);true
-                }else{false}
-            }else{false};
-            self.agent_sessions.desktop_bridge.as_ref().unwrap().acknowledge(request,success);
-        }
     }
 }

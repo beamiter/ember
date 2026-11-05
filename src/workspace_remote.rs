@@ -27,6 +27,7 @@ enum Pending {
     },
 }
 
+#[derive(Default)]
 pub(crate) struct RemoteWorkspace {
     client: Option<WorkspaceClient>,
     pending: HashMap<u64, Pending>,
@@ -49,36 +50,7 @@ pub(crate) struct RemoteWorkspace {
     pub(crate) notice: Option<String>,
 }
 
-impl Default for RemoteWorkspace {
-    fn default() -> Self {
-        Self {
-            client: None,
-            pending: HashMap::new(),
-            epoch: 0,
-            search_epoch: 0,
-            document_epoch: 0,
-            query: String::new(),
-            conversation: None,
-            search_due: None,
-            connected: false,
-            loading: false,
-            search_loading: false,
-            document_loading: false,
-            rows: Vec::new(),
-            next_before: None,
-            total: 0,
-            page: WorkspaceSearchPage::default(),
-            selected_hit: None,
-            document: None,
-            notice: None,
-        }
-    }
-}
-
 impl RemoteWorkspace {
-    pub(crate) fn generation(&self) -> u64 {
-        self.epoch
-    }
     pub(crate) fn connect(&mut self, alias: &str, executable: &str, expected_host_id: &str) {
         self.disconnect();
         let config = WorkspaceSshHost::new(
@@ -115,9 +87,6 @@ impl RemoteWorkspace {
         self.selected_hit = None;
         self.document = None;
         self.notice = None;
-    }
-    pub(crate) fn query(&self) -> &str {
-        &self.query
     }
     pub(crate) fn conversation(&self) -> Option<&ConversationId> {
         self.conversation.as_ref()
@@ -377,9 +346,11 @@ mod tests {
     use super::*;
     #[test]
     fn reconnect_and_query_epochs_reject_old_remote_results() {
-        let mut state = RemoteWorkspace::default();
-        state.epoch = 2;
-        state.search_epoch = 3;
+        let mut state = RemoteWorkspace {
+            epoch: 2,
+            search_epoch: 3,
+            ..Default::default()
+        };
         state.pending.insert(
             1,
             Pending::Search {
@@ -425,8 +396,10 @@ mod tests {
 
     #[test]
     fn a_slow_remote_search_keeps_only_the_latest_debounced_request_due() {
-        let mut state = RemoteWorkspace::default();
-        state.epoch = 1;
+        let mut state = RemoteWorkspace {
+            epoch: 1,
+            ..Default::default()
+        };
         state.pending.insert(
             1,
             Pending::Search {

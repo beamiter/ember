@@ -519,14 +519,7 @@ impl TerminalApp {
             .find(|entry| entry.intent.id == row.id)
             .map(|entry| entry.intent.clone());
         let enabled = !review.queue_loading && !review.queue_saving;
-        if intent.is_none() {
-            if ui
-                .add_enabled(enabled, egui::Button::new("Add task to queue"))
-                .clicked()
-            {
-                review.set_queue(row.id.clone(), Vec::new());
-            }
-        } else {
+        if let Some(intent) = intent {
             if ui
                 .add_enabled(enabled, egui::Button::new("Remove from queue"))
                 .clicked()
@@ -539,11 +532,7 @@ impl TerminalApp {
                     && candidate.id != row.id
                     && !candidate.archived
             }) {
-                let mut selected = intent
-                    .as_ref()
-                    .unwrap()
-                    .dependencies
-                    .contains(&candidate.id);
+                let mut selected = intent.dependencies.contains(&candidate.id);
                 if ui
                     .add_enabled(
                         enabled,
@@ -557,6 +546,11 @@ impl TerminalApp {
                     review.set_dependency(row.id.clone(), candidate.id.clone(), selected);
                 }
             }
+        } else if ui
+            .add_enabled(enabled, egui::Button::new("Add task to queue"))
+            .clicked()
+        {
+            review.set_queue(row.id.clone(), Vec::new());
         }
         if let Some(notice) = &review.notice {
             ui.label(notice);

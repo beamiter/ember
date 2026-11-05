@@ -150,6 +150,37 @@ pub fn bounded_ui<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> 
     bounded_ui_at(ui, rect, contents)
 }
 
+/// Match the fixed center allocation to the same profile used for layout.
+/// Production rendering and headless panel regressions share these margins.
+pub fn center_panel_margin(layout: &Layout) -> egui::Margin {
+    egui::Margin {
+        left: token::LEFT_GAP as i8,
+        right: if layout.inspector.is_some() {
+            0
+        } else {
+            token::OUTER_RIGHT as i8
+        },
+        top: (layout.center.y - layout.titlebar.height) as i8,
+        bottom: if layout.viewport_height < token::SHORT_HEIGHT {
+            token::SHORT_BOTTOM_GAP as i8
+        } else {
+            token::MAIN_BOTTOM_GAP as i8
+        },
+    }
+}
+
+/// The native pane consumes the center after the header and profile insets.
+pub fn terminal_content_rect(center: EguiRect, header_height: f32) -> EguiRect {
+    EguiRect::from_min_max(
+        center.min
+            + egui::vec2(
+                token::TOOLBAR_INSET_LEFT,
+                header_height + token::TERMINAL_TOP_GAP,
+            ),
+        center.max - egui::vec2(token::TOOLBAR_INSET_RIGHT, 0.0),
+    )
+}
+
 pub trait BoundedPanel {
     fn show_bounded<R>(
         self,

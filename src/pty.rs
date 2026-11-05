@@ -1285,12 +1285,22 @@ mod unix_pty {
             }
         }
 
-        /// Wait at most `timeout_ms` for the direct child to exit. Zero is a
-        /// single nonblocking observation. A timeout leaves the child running
-        /// and owned by this Pty; it neither signals nor reaps it.
+        /// Poll for the direct child exit until `timeout_ms` expires. Zero makes
+        /// one leader observation; a completed leader still requires a bounded
+        /// session-drain pass. A timeout retains ownership of the unreaped child.
+        /// Draining may signal remaining descendants while retaining the leader,
+        /// and its per-pass cleanup cost is separate from the polling budget.
         /// Callers holding a shared Pty mutex should prefer `try_reap` and wait
         /// outside the lock when responsiveness to writes/resizes matters.
         pub fn wait_timeout(&mut self, timeout_ms: u64) -> Result<i32> {
+            self.wait_timeout_with_finish(timeout_ms, Self::finish_observed_exit)
+        }
+
+        fn wait_timeout_with_finish(
+            &mut self,
+            timeout_ms: u64,
+            mut finish: impl FnMut(&mut Self) -> std::io::Result<i32>,
+        ) -> Result<i32> {
             if let Some(code) = self.exit_code_cached {
                 return Ok(code);
             }
@@ -1302,11 +1312,15 @@ mod unix_pty {
             let timeout = Duration::from_millis(timeout_ms);
             loop {
                 match Self::observe_child_exit_once(self.child_pid, true) {
-                    Ok(true) => {
-                        return self
-                            .finish_observed_exit()
-                            .map_err(|error| anyhow!("waitpid failed: {error}"));
-                    }
+                    Ok(true) => match finish(self) {
+                        Ok(code) => return Ok(code),
+                        // Session draining is bounded and may need more than one
+                        // poll under load. Keep the unreaped ownership anchor and
+                        // retry within this caller's original deadline.
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) => return Err(anyhow!("waitpid failed: {error}")),
+                    },
                     Ok(false) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
@@ -1546,6 +1560,64 @@ mod unix_pty {
                 assert_eq!(pty.wait_timeout(budget).unwrap(), 7);
             }
             pty.terminate().unwrap();
+            assert_eq!(pty.wait_timeout(0).unwrap(), 7);
+        }
+
+        #[test]
+        fn wait_timeout_retries_incomplete_drain_without_losing_exit_status() {
+            let mut pty = timed_test_child("exit 7");
+            let mut attempts = 0;
+            let code = pty
+                .wait_timeout_with_finish(4000, |pty| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "injected incomplete session drain",
+                        ))
+                    } else {
+                        pty.finish_observed_exit()
+                    }
+                })
+                .unwrap();
+            assert!(attempts >= 2, "the transient drain must be retried");
+            assert_eq!(code, 7);
+            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
+            assert_eq!(pty.wait_timeout(0).unwrap(), 7);
+        }
+
+        #[test]
+        fn wait_timeout_incomplete_drain_obeys_deadline_and_retains_ownership() {
+            let mut pty = timed_test_child("exit 7");
+            let started = Instant::now();
+            while !pty.child_exit_observed(true).unwrap() {
+                assert!(started.elapsed() < Duration::from_secs(4));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let error = pty
+                .wait_timeout_with_finish(0, |_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "injected incomplete session drain",
+                    ))
+                })
+                .expect_err("an incomplete drain cannot publish completion");
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::TimedOut
+            );
+            assert_eq!(pty.lifecycle, ChildLifecycle::Running);
+            assert_eq!(pty.exit_code_cached, None);
+            assert!(pty.child_exit_observed(true).unwrap());
+            assert_eq!(pty.wait_timeout(4000).unwrap(), 7);
+        }
+
+        #[test]
+        fn wait_timeout_drains_background_session_before_caching_leader_status() {
+            let mut pty = timed_test_child("sleep 30 & exit 7");
+            assert_eq!(pty.wait_timeout(4000).unwrap(), 7);
+            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
+            assert_eq!(pty.exit_code_cached, Some(7));
             assert_eq!(pty.wait_timeout(0).unwrap(), 7);
         }
 

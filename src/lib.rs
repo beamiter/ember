@@ -17,6 +17,7 @@ pub mod glass_shell;
 pub mod glass_shell_tokens;
 pub mod gpu;
 mod immersive_command;
+pub use immersive_command::immersive_block_command;
 pub mod keybindings;
 pub mod kitty_graphics;
 pub mod layout;

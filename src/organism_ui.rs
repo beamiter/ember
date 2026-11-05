@@ -7331,6 +7331,8 @@ mod chat_offscreen_tests {
         for _ in 0..3 {
             let output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
                 renderer.sync_font_metrics(&ctx);
+                policy.set_chat_footer_rows(renderer.chat_footer_rows());
+                policy.set_chat_command_bubbles(renderer.chat_command_bubbles);
                 let (cols, rows) = renderer.grid_dimensions(screen.size());
                 let terminal = terminal.get_or_insert_with(|| {
                     let mut terminal = TerminalState::new(cols, rows);
