@@ -129,7 +129,7 @@ jobs:
           for source in baseline candidate; do
             git -C "$source" apply "$GITHUB_WORKSPACE/control/tests/fixtures/session-startup/benchmark-overlay.patch"
             git -C "$source" diff --binary > "benchmark-artifacts/$source-overlay.diff"
-            cargo build --manifest-path "$source/Cargo.toml" --workspace --release --all-features --locked
+            cargo build --manifest-path "$source/Cargo.toml" -p ember --release --all-features --locked
             cp "$source/target/release/ember" "$RUNNER_TEMP/ember-benchmark-$source"
           done
           sha256sum "$RUNNER_TEMP/ember-benchmark-baseline" "$RUNNER_TEMP/ember-benchmark-candidate" > benchmark-artifacts/binary-identity.txt

@@ -85,7 +85,7 @@ jobs:
         run: |
           git -C candidate apply "$GITHUB_WORKSPACE/control/tests/fixtures/session-startup/direct-work-overlay.patch"
           git -C candidate diff --binary > benchmark-artifacts/candidate-overlay.diff
-          cargo build --manifest-path candidate/Cargo.toml --workspace --release --all-features --locked
+          cargo build --manifest-path candidate/Cargo.toml -p ember --release --all-features --locked
           cp candidate/target/release/ember "$RUNNER_TEMP/ember-direct-work-candidate"
           sha256sum "$RUNNER_TEMP/ember-direct-work-candidate" > benchmark-artifacts/binary-identity.txt
       - name: Build compositor pointer prerequisite for shared desktop driver

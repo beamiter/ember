@@ -77,9 +77,9 @@ The regular CI checks include formatting, Clippy, full tests and release builds.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
-cargo build --workspace --release --all-features --locked
+cargo clippy -p ember --all-targets --all-features --locked -- -D warnings
+cargo test -p ember --all-targets --all-features --locked
+cargo build -p ember --release --all-features --locked
 ```
 
 The real Bash PTY acceptance test is explicit because it starts a local

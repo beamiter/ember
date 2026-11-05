@@ -1,0 +1,155 @@
+[
+  {
+    "name": "mundy",
+    "version": "0.2.3",
+    "registry_archive": "https://static.crates.io/crates/mundy/mundy-0.2.3.crate",
+    "sha256": "f32eb0db40f2df2bcfb05c93b8f73938d4c26ce9ac8881f1df0c8d3296921a73",
+    "vcs": {
+      "git": {
+        "sha1": "608fe75c6a5eb82b14ac4539455c00ce01e774fb"
+      },
+      "path_in_vcs": ""
+    },
+    "licenses": [
+      "license.txt"
+    ],
+    "original_manifest_sha256": "f940a74673dfb2e93e90f8baa46dc97e0a86847bcf96534485d5a8ce9aff0755",
+    "modified_files": [
+      "Cargo.toml",
+      "src/async_rt.rs",
+      "src/callback.rs",
+      "src/freedesktop/mod.rs",
+      "src/lib.rs"
+    ]
+  },
+  {
+    "name": "accesskit_unix",
+    "version": "0.21.1",
+    "registry_archive": "https://static.crates.io/crates/accesskit_unix/accesskit_unix-0.21.1.crate",
+    "sha256": "b016ca8db0ea0ea2ceff29a9d6240391492d960716aa471967c00e8cc8cb197c",
+    "vcs": {
+      "git": {
+        "sha1": "f40dfc01a0c0e76de535969f82fb35e19513737d"
+      },
+      "path_in_vcs": "platforms/unix"
+    },
+    "licenses": [
+      "LICENSE-MIT",
+      "LICENSE-APACHE"
+    ],
+    "original_manifest_sha256": "56f7364306f30497dcc8025877a6f4146283f9a9b953cae9b4b1035dd3fbf413",
+    "supplemental_license_source": "https://github.com/AccessKit/accesskit/tree/f40dfc01a0c0e76de535969f82fb35e19513737d",
+    "modified_files": [
+      "Cargo.toml",
+      "LICENSE-APACHE",
+      "LICENSE-MIT",
+      "src/atspi/bus.rs",
+      "src/atspi/object_address.rs",
+      "src/atspi/object_id.rs",
+      "src/context.rs",
+      "src/executor.rs",
+      "src/lib.rs",
+      "src/test_bus.rs",
+      "src/util.rs"
+    ]
+  },
+  {
+    "name": "accesskit_atspi_common",
+    "version": "0.18.1",
+    "registry_archive": "https://static.crates.io/crates/accesskit_atspi_common/accesskit_atspi_common-0.18.1.crate",
+    "sha256": "1e8c61bee90b42a772d39d06a740207dc71a4e780004ace1db8d99fb1baaa954",
+    "vcs": {
+      "git": {
+        "sha1": "f40dfc01a0c0e76de535969f82fb35e19513737d"
+      },
+      "path_in_vcs": "platforms/atspi-common"
+    },
+    "licenses": [
+      "LICENSE-MIT",
+      "LICENSE-APACHE"
+    ],
+    "original_manifest_sha256": "9c9179a9592ccc1f67dff077b53713fcd09d7331f74ed449e715c5ec993bb7fb",
+    "supplemental_license_source": "https://github.com/AccessKit/accesskit/tree/f40dfc01a0c0e76de535969f82fb35e19513737d",
+    "modified_files": [
+      "Cargo.toml",
+      "LICENSE-APACHE",
+      "LICENSE-MIT",
+      "src/action.rs",
+      "src/adapter.rs",
+      "src/node.rs",
+      "src/rect.rs"
+    ]
+  },
+  {
+    "name": "atspi-common",
+    "version": "0.13.0",
+    "registry_archive": "https://static.crates.io/crates/atspi-common/atspi-common-0.13.0.crate",
+    "sha256": "20c5617155740c98003016429ad13fe43ce7a77b007479350a9f8bf95a29f63d",
+    "vcs": {
+      "git": {
+        "sha1": "f486755b9bf993613f63a779133aafc54925004a"
+      },
+      "path_in_vcs": "atspi-common"
+    },
+    "licenses": [
+      "LICENSE-MIT.txt",
+      "LICENSE-APACHE2.txt"
+    ],
+    "original_manifest_sha256": "190376423255c96bc7324d4fda780cd02c2191af549f1140ce5e7b289786ba4a",
+    "modified_files": [
+      "Cargo.toml",
+      "rustfmt.toml",
+      "src/action.rs",
+      "src/cache.rs",
+      "src/error.rs",
+      "src/events/cache.rs",
+      "src/events/event_body.rs",
+      "src/events/event_wrappers.rs",
+      "src/events/keyboard.rs",
+      "src/events/mouse.rs",
+      "src/events/object.rs",
+      "src/events/registry.rs",
+      "src/events/traits.rs",
+      "src/events/window.rs",
+      "src/interface.rs",
+      "src/lib.rs",
+      "src/macros.rs",
+      "src/object_match.rs",
+      "src/object_ref.rs",
+      "src/protocol_xml.rs",
+      "src/relation_type.rs",
+      "src/role.rs",
+      "src/state.rs",
+      "xml/generate-introspection.py"
+    ],
+    "supplemental_rustfmt_source": "https://github.com/odilia-app/atspi/blob/f486755b9bf993613f63a779133aafc54925004a/rustfmt.toml"
+  },
+  {
+    "name": "atspi-proxies",
+    "version": "0.13.0",
+    "registry_archive": "https://static.crates.io/crates/atspi-proxies/atspi-proxies-0.13.0.crate",
+    "sha256": "2230e48787ed3eb4088996eab66a32ca20c0b67bbd4fd6cdfe79f04f1f04c9fc",
+    "vcs": {
+      "git": {
+        "sha1": "f486755b9bf993613f63a779133aafc54925004a"
+      },
+      "path_in_vcs": "atspi-proxies"
+    },
+    "licenses": [
+      "LICENSE-MIT.txt",
+      "LICENSE-APACHE2.txt"
+    ],
+    "original_manifest_sha256": "a3d1129897237ad86b38129441de290b8e150f571874a8e32d479b769736dc8b",
+    "modified_files": [
+      "Cargo.toml",
+      "rustfmt.toml",
+      "src/accessible.rs",
+      "src/collection.rs",
+      "src/device_event_controller.rs",
+      "src/proxy_ext.rs",
+      "src/socket.rs",
+      "src/text.rs"
+    ],
+    "supplemental_rustfmt_source": "https://github.com/odilia-app/atspi/blob/f486755b9bf993613f63a779133aafc54925004a/rustfmt.toml"
+  }
+]

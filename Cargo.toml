@@ -74,7 +74,38 @@ strip = "symbols"
 codegen-units = 1
 opt-level = 3
 
+# Keep fork tests and their dev dependencies in the same audited lockfile.
+[workspace]
+resolver = "2"
+members = [
+    "vendor/mundy",
+    "vendor/accesskit_unix",
+    "vendor/accesskit_atspi_common",
+    "vendor/atspi-common",
+    "vendor/atspi-proxies",
+]
+default-members = ["."]
+# Keep existing independent harnesses and upstream vendor snapshots standalone.
+exclude = [
+    "font-group-harness",
+    "vendor/companion-client",
+    "vendor/companion-host",
+    "vendor/companion-protocol",
+    "vendor/eframe",
+    "vendor/egui-wgpu",
+    "vendor/egui-winit",
+    "vendor/smithay-clipboard",
+    "vendor/wgpu-hal",
+    "vendor/winit",
+]
+
 [patch.crates-io]
+# Auditable Linux D-Bus compatibility patches. See docs/linux-dbus-zbus6.md.
+mundy = { path = "vendor/mundy" }
+accesskit_unix = { path = "vendor/accesskit_unix" }
+accesskit_atspi_common = { path = "vendor/accesskit_atspi_common" }
+atspi-common = { path = "vendor/atspi-common" }
+atspi-proxies = { path = "vendor/atspi-proxies" }
 wgpu-hal = { path = "vendor/wgpu-hal" }
 # X11 legacy wheel release must not emit a second scroll notch.
 winit = { path = "vendor/winit" }

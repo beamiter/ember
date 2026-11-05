@@ -9,15 +9,25 @@ on:
       - deny.toml
       - .cargo/audit.toml
       - scripts/**
+      - vendor/mundy/**
+      - vendor/accesskit_unix/**
+      - vendor/accesskit_atspi_common/**
+      - vendor/atspi-common/**
+      - vendor/atspi-proxies/**
       - .github/workflows/security.yml
   push:
-    branches: [master]
+    branches: [master, candidate/zbus6]
     paths:
       - Cargo.toml
       - Cargo.lock
       - deny.toml
       - .cargo/audit.toml
       - scripts/**
+      - vendor/mundy/**
+      - vendor/accesskit_unix/**
+      - vendor/accesskit_atspi_common/**
+      - vendor/atspi-common/**
+      - vendor/atspi-proxies/**
       - .github/workflows/security.yml
   schedule:
     - cron: "11 4 * * 1"

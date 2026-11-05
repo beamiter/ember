@@ -1704,9 +1704,9 @@ Important modules:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
-cargo build --workspace --release --all-features
+cargo clippy -p ember --all-targets --all-features -- -D warnings
+cargo test -p ember --all-targets --all-features
+cargo build -p ember --release --all-features
 bash scripts/test-install-paths.sh
 bash scripts/security-check.sh
 ```

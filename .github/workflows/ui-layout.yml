@@ -2,7 +2,7 @@ name: UI layout regressions
 
 on:
   push:
-    branches: [master]
+    branches: [master, candidate/zbus6]
   pull_request:
     branches: [master]
 
