@@ -65,6 +65,54 @@ class GeometryTests(unittest.TestCase):
         self.measured = g.layout(self.outputs, self.tree, 42, '1.5', self.owned, False)
         self.smoke = FakeSmoke(self.temp.name, self.outputs, self.tree)
 
+    def test_owned_settings_ocr_uses_exact_physical_crop_at_every_scale(self):
+        for scale, expected in [('1', (30,40,720,720)), ('1.5', (45,60,1080,1080)), ('2', (60,80,1440,1440))]:
+            outputs, tree, owned = fixture(scale, True, origin=(100,-50))
+            measured = g.layout(outputs, tree, 42, scale, owned, True)
+            self.assertEqual(g.physical_app_rect(measured), dict(zip(('x','y','width','height'),expected)))
+        broken = copy.deepcopy(measured); broken['app_rect']['x'] = -10000
+        with self.assertRaises(RuntimeError):g.physical_app_rect(broken)
+        broken = copy.deepcopy(measured); broken['scale'] = '5/4'
+        with self.assertRaises(RuntimeError):g.physical_app_rect(broken)
+
+    def test_owned_settings_ocr_preserves_exact_words_and_global_coordinates(self):
+        from PIL import Image
+        outputs, tree, owned = fixture('1.5', True)
+        measured = g.layout(outputs, tree, 42, '1.5', owned, True)
+        source = self.smoke.out / 'settings.png'
+        Image.new('RGB', g.PHYSICAL, (15,24,38)).save(source)
+        header = 'level\tleft\ttop\twidth\theight\tconf\ttext\n'
+        def ocr(args, **kwargs):
+            self.assertEqual(args[0], 'tesseract')
+            self.assertEqual(args[-3:], ['--psm', '11', 'tsv'])
+            with Image.open(args[1]) as image:self.assertEqual(image.size,(1080,1080))
+            return SimpleNamespace(stdout=header+'5\t100\t100\t50\t20\t96\tRemote\n')
+        original = source.read_bytes()
+        with patch.object(self.smoke, 'run', side_effect=ocr):
+            rows = g.settings_words(self.smoke, 'settings', measured, psm=11)
+        self.assertEqual(rows[0]['text'],'Remote')
+        self.assertEqual((rows[0]['left'], rows[0]['top']),('145','160'))
+        self.assertEqual(source.read_bytes(),original)
+        metadata = json.loads((self.smoke.out/'settings-owned-ocr.json').read_text())
+        self.assertEqual(metadata['psm'],11)
+        self.assertEqual(metadata['physical_region'],dict(x=45,y=60,width=1080,height=1080))
+
+    def test_owned_settings_ocr_rejects_cross_crop_words_and_mutated_pixels(self):
+        from PIL import Image
+        outputs, tree, owned = fixture('1.5', True)
+        measured = g.layout(outputs, tree, 42, '1.5', owned, True)
+        source = self.smoke.out/'settings.png'
+        header = 'level\tleft\ttop\twidth\theight\tconf\ttext\n'
+        for case in ['cross-crop', 'changed-source']:
+            Image.new('RGB', g.PHYSICAL, (15,24,38)).save(source)
+            def ocr(*args, **kwargs):
+                if case == 'changed-source':source.write_bytes(b'changed')
+                x = 1070 if case == 'cross-crop' else 100
+                return SimpleNamespace(stdout=header+f'5\t{x}\t100\t50\t20\t96\tRemote\n')
+            with patch.object(self.smoke, 'run', side_effect=ocr), self.assertRaises(RuntimeError):
+                g.settings_words(self.smoke, 'settings', measured, psm=6)
+        with self.assertRaises(RuntimeError):g.settings_words(self.smoke,'settings',measured,psm=7)
+
     def test_six_actual_geometry_combinations(self):
         for scale in ('1', '1.5', '2'):
             for floating in (False, True):

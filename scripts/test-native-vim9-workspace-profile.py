@@ -25,6 +25,18 @@ class WorkspaceProfileTests(unittest.TestCase):
         self.assertEqual(evidence['paint_witness']['selected_mode'], 'block')
         self.assertIn('Registered', evidence['scope'])
 
+    def test_source_uses_actual_first_cell_instead_of_old_absolute_y(self):
+        header = {'native_body': {'y': 101}}
+        cursor = {'y': 115, 'height': 27}
+        evidence = smoke.verify_focused_native_row({'y_regions': [[120,139]]}, header, cursor)
+        self.assertEqual(evidence['source_top'], 120)
+        for focused, moved in [({'y_regions': [[147,166]]}, cursor),
+                               ({'y_regions': [[120,143]]}, cursor),
+                               ({'y_regions': [[110,119]]}, cursor),
+                               ({'y_regions': [[147,166]]}, {'y':142,'height':27})]:
+            with self.assertRaises(RuntimeError):
+                smoke.verify_focused_native_row(focused, header, moved)
+
     def test_wrong_or_absent_real_mode_paint_cannot_certify_canvas(self):
         for image in [self.fixture('chat'), Image.new('RGB', (1400,950), (9,19,35))]:
             with self.assertRaises(RuntimeError):

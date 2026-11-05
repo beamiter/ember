@@ -96,68 +96,53 @@ class PopupTests(unittest.TestCase):
 class GlassPopupPlaneTests(unittest.TestCase):
  selector=word('Block',507,490,33,11)
  owned=dict(x=0,y=0,width=1356,height=850)
- left_rgb=(42,64,108)
- right_rgb=(36,51,84)
  def region(self):return d.settings_mode_popup_region(self.selector,self.owned)
- def pixels(self,left_rows=None,right_rows=None,left_rgb=None,right_rgb=None,extra_right=False):
-  region=self.region()
-  raw=bytearray(bytes((21,39,76))*region['width']*region['height'])
-  if left_rows is None:left_rows=[y for y in range(15,77) if y not in (25,26,30,31,47)]
-  if right_rows is None:right_rows=[y for y in range(24,77) if y != 47]
-  for x,rows,rgb in [(95,left_rows,left_rgb or self.left_rgb),(194,right_rows,right_rgb or self.right_rgb)]:
-   for y in rows:
-    index=(y*region['width']+x)*3;raw[index:index+3]=bytes(rgb)
-  if extra_right:
-   for y in right_rows:
-    index=(y*region['width']+204)*3;raw[index:index+3]=bytes(right_rgb or self.right_rgb)
-  return bytes(raw)
+ def pixels(self,box=(96,15,194,77),color=(16,24,37),extra=None,hole=None):
+  from PIL import Image, ImageDraw
+  region=self.region();image=Image.new('RGB',(region['width'],region['height']),(15,24,38));draw=ImageDraw.Draw(image)
+  for current in [box,extra]:
+   if current:
+    x,y,right,bottom=current;draw.rectangle((x,y,right-1,bottom-1),fill=color)
+  if hole:
+   x,y,right,bottom=hole;draw.rectangle((x,y,right-1,bottom-1),fill=(15,24,38))
+  return image.tobytes()
  def observe(self,pixels,profile='glass-v1'):
   return d.settings_mode_popup_plane(pixels,self.region(),self.selector,profile)
- def test_measured_glass_edges_register_with_exact_paired_support(self):
+ def test_exact_opaque_connected_body_is_registered_independently_of_text(self):
   self.assertEqual(self.region(),dict(x=407,y=501,width=266,height=77))
-  self.assertEqual(self.observe(self.pixels()),dict(x=502,y=516,width=100,height=62))
-  left={y for y in range(15,77) if y not in (25,26,30,31,47)}
-  right={y for y in range(24,77) if y != 47}
-  self.assertEqual(len(left & right),48)
+  self.assertEqual(self.observe(self.pixels()),dict(x=503,y=516,width=98,height=62))
+  self.assertEqual(self.observe(self.pixels(hole=(105,30,125,40))),dict(x=503,y=516,width=98,height=62))
  def test_profiles_do_not_admit_each_others_palette(self):
   self.assertIsNone(self.observe(self.pixels(),'legacy-reference'))
-  self.assertIsNone(self.observe(self.pixels(left_rgb=(60,60,60),right_rgb=(60,60,60))))
- def test_swapped_sides_and_one_channel_color_changes_are_rejected(self):
-  for pixels in [self.pixels(left_rgb=self.right_rgb,right_rgb=self.left_rgb),
-                 self.pixels(left_rgb=(41,64,108)),self.pixels(right_rgb=(36,51,83)),
-                 self.pixels(left_rgb=(74,99,156),right_rgb=(70,91,140))]:
-   self.assertIsNone(self.observe(pixels))
- def test_insufficient_exact_row_support_cannot_register(self):
-  self.assertIsNone(self.observe(self.pixels(left_rows=range(20,41),right_rows=range(20,41))))
- def test_individually_supported_edges_need_enough_paired_rows(self):
-  self.assertIsNone(self.observe(self.pixels(left_rows=range(10,35),right_rows=range(30,60))))
- def test_three_missing_raster_rows_fail_without_fragment_search(self):
-  rows=[y for y in range(15,77) if y not in (40,41,42)]
-  self.assertIsNone(self.observe(self.pixels(left_rows=rows,right_rows=rows)))
- def test_ambiguous_glass_planes_are_rejected(self):
+  for color in [(29,29,29),(60,60,60),(21,39,76),(42,64,108),(16,24,38)]:
+   self.assertIsNone(self.observe(self.pixels(color=color)))
+ def test_wrong_exact_width_missing_short_or_unanchored_body_rejects(self):
+  for box in [None,(96,15,193,77),(96,15,195,77),(96,15,194,36),(0,15,98,77)]:
+   with self.subTest(box=box):self.assertIsNone(self.observe(self.pixels(box=box)))
+ def test_exact_body_density_is_required_without_color_tolerance(self):
+  self.assertIsNone(self.observe(self.pixels(hole=(100,20,190,55))))
+ def test_two_independent_menu_bodies_remain_ambiguous(self):
   with self.assertRaisesRegex(RuntimeError,'Ambiguous'):
-   self.observe(self.pixels(extra_right=True))
- def test_unknown_profile_does_not_fall_back(self):
-  with self.assertRaisesRegex(RuntimeError,'Unknown'):
-   self.observe(self.pixels(),'glass-next')
- def test_glass_profile_provenance_retains_actual_immutable_capture(self):
+   self.observe(self.pixels(box=(96,1,194,24),extra=(96,40,194,63)))
+ def test_body_must_belong_below_the_observed_selector(self):
+  region=self.region();region['y']-=30
+  self.assertIsNone(d.settings_mode_popup_plane(self.pixels(),region,self.selector,'glass-v1'))
+ def test_whole_dialog_surface_cannot_stand_in_for_its_menu(self):
+  region=self.region()
+  self.assertIsNone(self.observe(bytes((16,24,37))*region['width']*region['height']))
+ def test_unknown_profile_and_wrong_rgb_size_fail_closed(self):
+  with self.assertRaisesRegex(RuntimeError,'Unknown'):self.observe(self.pixels(),'glass-next')
+  with self.assertRaisesRegex(RuntimeError,'RGB size'):self.observe(b'')
+ def test_current_profile_retains_immutable_cross_backend_provenance(self):
   metadata=d.settings_popup_profile_metadata('glass-v1')
-  self.assertEqual(metadata['profile'],'glass-v1')
-  self.assertEqual(metadata['left_border_rgb'],[42,64,108])
-  self.assertEqual(metadata['right_border_rgb'],[36,51,84])
-  self.assertEqual(metadata['minimum_paired_exact_rows'],'2 * selector height')
-  self.assertEqual(metadata['maximum_missing_raster_rows'],2)
-  self.assertEqual(metadata['calibration']['source_image_sha256'],
-                   '3b3e31d9d60d6f3e7ad8b736c7c5ccc35e04f76902a1db3e637ae4a8b13edef2')
-  self.assertEqual(metadata['calibration']['source_binary_sha256'],
-                   '5a4235d633bc0cd94700e5fe6b3cbf1f431d7dbf412a0580ff98380387de6634')
-  self.assertEqual(metadata['calibration']['selector_source_sha256'],
-                   'bfc467c108852a24d6b8cb10e3afa06f3a99ab86a26ddedc733e7de2f7ad5282')
-  self.assertEqual(metadata['calibration']['selector_observer'],'strict native OCR selector')
-  self.assertEqual(metadata['calibration']['paired_exact_rows'],48)
-  self.assertEqual(metadata['calibration']['measured_plane'],dict(x=502,y=516,width=100,height=62))
-  self.assertEqual((metadata['calibration']['backend'],metadata['calibration']['renderer'],
-                    metadata['calibration']['scale']),('x11','glow',1))
+  self.assertEqual(metadata['body_rgb'],[16,24,37])
+  self.assertEqual(metadata['body_width'],98)
+  self.assertEqual(metadata['minimum_body_density'],0.8)
+  calibration=metadata['calibration']
+  self.assertEqual(calibration['source_commit'],'913207036767934bbd71594eea5eb8b3e1c49bd7')
+  self.assertEqual(calibration['source_image_sha256'],'5cafe3ed3d82991668a4c90acc10901f334ccfc6577936b10aa8c05aab08866a')
+  self.assertEqual(calibration['cross_backend_image_sha256'],'6e5b40097f7b028ec128e5683aa2be6b5ac1111ff739572959f1b17412d190b8')
+  self.assertEqual(calibration['measured_body'],dict(x=475,y=585,width=98,height=67))
 
 class SettingsTabAnchorTests(unittest.TestCase):
  def rows(self, font='Font'):

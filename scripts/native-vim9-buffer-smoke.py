@@ -2,18 +2,23 @@
 """Verify native buffer RGB pixels and real Vim input in an isolated X11 window.
 
 Run with xvfb-run, passing --binary, --app ember|frost, and --output.
-Requires Vim, xdotool, ImageMagick import and Pillow. No user config is read.
+Requires Vim, xdotool, ImageMagick import, Pillow and Tesseract (Ember close). No user config is read.
 The GUI color deliberately differs from ctermfg while termguicolors is off.
 """
 import argparse
+import csv
+import io
 import json
 import native_glass_profile
 import os
 from pathlib import Path
 import signal
+import shlex
+import uuid
 import subprocess
 import tempfile
 import time
+import traceback
 
 from PIL import Image, ImageChops, ImageGrab
 
@@ -39,7 +44,7 @@ def workspace_header_bounds(image, app):
         center = domains["center"]
         return center["x"], center["x"] + center["width"], {
             "profile": "glass-v1", "geometry": domains["metadata"],
-            "paint_witness": witness,
+            "paint_witness": witness, "native_body": domains["native_body"],
             "scope": "Registered canvas bounds; independently witnessed mode paint and native source pixels",
         }
     # Keep the separate legacy frontend contract until it is explicitly updated.
@@ -50,6 +55,76 @@ def workspace_header_bounds(image, app):
     assert left == 55 + 237, left
     assert abs(right - (image.width - 306)) <= 2, right
     return left, right, {"profile": "legacy-reference", "header_observation_y": header_y}
+
+
+
+def verify_focused_native_row(focused, header, measured_cursor):
+    """Source ink stays in the measured first cell, not an obsolete screen y."""
+    body = header['native_body']
+    y, height = measured_cursor['y'], measured_cursor['height']
+    if height <= 0 or not body['y'] <= y < body['y'] + height:
+        raise RuntimeError('Native first cell is displaced by extra workspace rows')
+    top, bottom = focused['y_regions'][0]
+    if not y <= top <= bottom < y + height:
+        raise RuntimeError('Focused native source is outside its measured first cell')
+    return dict(native_body_y=body['y'], cursor_y=y, cell_height=height,
+                source_top=top, source_bottom=bottom)
+
+
+def process_incarnation(pid, proc=Path("/proc")):
+    """Bind evidence to a real process incarnation, not a reusable PID alone."""
+    if type(pid) is not int or pid <= 1:
+        raise RuntimeError("Invalid fixture Vim PID")
+    try:
+        stat = (proc / str(pid) / "stat").read_text()
+    except FileNotFoundError:
+        return None
+    fields = stat[stat.rindex(")") + 2:].split()
+    return fields[19]  # /proc stat field 22; comm may contain spaces/parentheses.
+
+
+def shell_identity(text, marker):
+    parts = text.strip().split(":")
+    if (len(parts) != 3 or parts[0] != marker or not parts[1].isdigit()
+            or int(parts[1]) <= 1 or not parts[2].startswith("/dev/pts/")
+            or not parts[2][len("/dev/pts/"):].isdigit()):
+        raise RuntimeError("Invalid real workspace shell PID/TTY receipt")
+    return parts[1:]
+
+
+def close_confirmation_target(rows, width, height):
+    """Exact native withdrawal message and button; never click guessed text."""
+    lines = {}
+    for row in rows:
+        if row.get("text", "").strip():
+            key = tuple(row[k] for k in ("page_num", "block_num", "par_num", "line_num"))
+            lines.setdefault(key, []).append(row)
+    def phrase(words):
+        matches = []
+        for line in lines.values():
+            line.sort(key=lambda r: int(r["left"]))
+            for start in range(len(line) - len(words) + 1):
+                part = line[start:start + len(words)]
+                if [r["text"] for r in part] == words:
+                    matches.append(part)
+        return matches
+    titles, buttons = phrase(["Eva", "is", "leaving", "this", "window."]), phrase(["Close", "anyway"])
+    if not titles or not buttons:
+        return None
+    if len(titles) != 1 or len(buttons) != 1:
+        raise RuntimeError("Ambiguous native close confirmation")
+    def bounds(words):
+        boxes = [(int(r["left"]), int(r["top"]), int(r["width"]), int(r["height"])) for r in words]
+        if any(x < 0 or y < 0 or w <= 0 or h <= 0 or x+w > width or y+h > height for x,y,w,h in boxes):
+            raise RuntimeError("Close confirmation OCR outside owned window")
+        for a, b in zip(boxes, boxes[1:]):
+            if min(a[1]+a[3], b[1]+b[3]) <= max(a[1], b[1]) or not 0 <= b[0]-a[0]-a[2] <= max(a[3],b[3]):
+                raise RuntimeError("Noncontiguous native close confirmation")
+        return min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[0]+b[2] for b in boxes), max(b[1]+b[3] for b in boxes)
+    title, button = bounds(titles[0]), bounds(buttons[0])
+    if button[1] <= title[3]:
+        raise RuntimeError("Close button is not below its withdrawal message")
+    return ((button[0]+button[2])//2, (button[1]+button[3])//2)
 
 
 def main():
@@ -108,9 +183,10 @@ def main():
         "return {'cursor': get(frame, 'cursor', {}), 'completion': get(frame, 'completion', v:null), 'views': map(copy(get(frame, 'windows', [])), {_, w -> w.view}), 'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0), 'native_pointer': get(get(get(frame, 'windows', []), 0, {}), 'native_pointer', 0), 'native_scroll': get(get(get(frame, 'windows', []), 0, {}), 'native_scroll', 0), 'scroll_ack': get(get(get(frame, 'windows', []), 0, {}), 'scroll_ack', 0)}\n"
         "endfunction\n"
         "function! NativeFixtureState(timer) abort\n"
-        f"call writefile([json_encode({{'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'completion': complete_info(['selected', 'pum_visible']), 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
+        f"call writefile([json_encode({{'pid': getpid(), 'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'completion': complete_info(['selected', 'pum_visible']), 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
         f"call rename({quoted(str(state_file) + '.tmp')}, {quoted(state_file)})\n"
         "endfunction\n"
+        f"autocmd VimLeavePre * call writefile([json_encode({{'pid': getpid(), 'modified': &modified, 'dying': v:dying}})], {quoted(out / 'vim-leave.json')})\n"
         "call timer_start(60, function('NativeFixtureState'), {'repeat': -1})\n",
         encoding="utf-8",
     )
@@ -191,6 +267,102 @@ def main():
         xdo("key", "Escape")
         xdo("type", "--clearmodifiers", "--delay", "8", ":" + value)
         xdo("key", "Return")
+    def finish_native_quit():
+        if args.app != "ember":
+            # Preserve Frost's existing standalone-window contract.
+            command("qa")
+            app.wait(timeout=10)
+            assert app.returncode == 0
+            report["normal_quit"] = "passed"
+            return
+        current = state()
+        assert current.get("modified") == 0
+        vim_pid = current["pid"]
+        incarnation = process_incarnation(vim_pid)
+        assert incarnation is not None, "Vim vanished before normal quit"
+        # Keep a real workspace shell so :qa tests editor exit independently
+        # of last-tab window closure / Eva's separate withdrawal confirmation.
+        receipt = out / "workspace-after-vim.txt"
+        nonce = uuid.uuid4().hex
+        before_marker, after_marker = "before-" + nonce, "after-" + nonce
+        assert not receipt.exists()
+        xdo("key", "ctrl+shift+t")
+        wait_for(lambda: color_count("workspace-shell-open") == 0,
+                 "new shell replaces visible native editor", app)
+        def shell_probe(marker, append):
+            redirect = ">>" if append else ">"
+            text = f"printf '%s:%s:%s\\n' {shlex.quote(marker)} \"$$\" \"$(tty)\" {redirect} {shlex.quote(str(receipt))}"
+            xdo("type", "--clearmodifiers", "--delay", "8", text)
+            xdo("key", "Return")
+        shell_probe(before_marker, False)
+        wait_for(lambda: receipt.exists() and len(receipt.read_text().splitlines()) == 1,
+                 "new real workspace shell receipt", app)
+        before = shell_identity(receipt.read_text(), before_marker)
+        xdo("key", "ctrl+1")
+        wait_for(lambda: color_count("editor-before-normal-quit") > 30,
+                 "original native editor selected before quit", app)
+        command("qa")
+        leave = out / "vim-leave.json"
+        def exited():
+            if not leave.exists():
+                return False
+            try:
+                value = json.loads(leave.read_text())
+            except json.JSONDecodeError:
+                return False
+            if value != dict(pid=vim_pid, modified=0, dying=0):
+                raise RuntimeError("Vim did not acknowledge a clean normal exit")
+            return value if process_incarnation(vim_pid) != incarnation else False
+        report["vim_normal_exit"] = wait_for(exited, "normal Vim exit and process retirement", app)
+        assert source.read_text(encoding="utf-8") == original
+        # The closed editor leaves the pre-existing shell, not a replacement.
+        # Select the last tab explicitly even if the close render is still queued.
+        xdo("key", "ctrl+9")
+        shell_probe(after_marker, True)
+        wait_for(lambda: len(receipt.read_text().splitlines()) == 2,
+                 "workspace accepts real shell input after Vim exit", app)
+        lines = receipt.read_text().splitlines()
+        after = shell_identity(lines[1], after_marker)
+        assert shell_identity(lines[0], before_marker) == after == before
+        capture("workspace-after-native-vim-exit")
+        report["workspace_after_vim"] = dict(shell_pid=after[0], tty=after[1], receipt=receipt.name)
+        # Actual titlebar Close control, not XDestroyWindow, SIGTERM or SIGKILL.
+        # Fixture UI is 14pt: production reference_workspace reserves [8,36]x[7,35].
+        xdo("mousemove", "--window", window, 22, 21)
+        xdo("click", 1)
+        deadline = time.monotonic() + 15
+        confirmed = False
+        close_observation = 0
+        while app.poll() is None and time.monotonic() < deadline:
+            close_observation += 1
+            label = f"native-window-close-{close_observation:02d}"
+            try:
+                assert xdo("getwindowpid", window).stdout.strip() == str(app.pid)
+                image = capture(label)
+            except (RuntimeError, subprocess.SubprocessError):
+                if app.poll() is not None:
+                    break
+                raise
+            result = subprocess.run(["tesseract", str(out / (label + ".png")), "stdout", "--psm", "11", "tsv"],
+                                    env=env, text=True, capture_output=True, check=True, timeout=5)
+            (out / (label + ".tsv")).write_text(result.stdout)
+            rows = list(csv.DictReader(io.StringIO(result.stdout), delimiter="\t", quoting=csv.QUOTE_NONE))
+            target = close_confirmation_target(rows, image.width, image.height)
+            if target is not None:
+                if app.poll() is not None:
+                    break
+                assert xdo("getwindowpid", window).stdout.strip() == str(app.pid)
+                xdo("mousemove", "--window", window, *target)
+                xdo("click", 1)
+                confirmed = True
+                report["native_close_confirmation"] = dict(image=label + ".png", target=list(target))
+                break  # One activation only, never retry a confirmation click.
+            time.sleep(0.1)
+        app.wait(timeout=10)
+        assert app.returncode == 0
+        report["native_window_close"] = dict(exit_code=app.returncode, eva_confirmation=confirmed)
+        report["normal_quit"] = "passed"
+
     report = {}
     try:
         windows = wait_for(lambda: xdo("search", "--onlyvisible", "--pid", app.pid).stdout.strip(), "mapped window", app)
@@ -259,10 +431,7 @@ def main():
                 assert source.read_text(encoding="utf-8") == original
             report["goto_reopen_without_click"] = "passed"
             report["vim_state"] = state()
-            command("qa")
-            app.wait(timeout=10)
-            assert app.returncode == 0
-            report["normal_quit"] = "passed"
+            finish_native_quit()
             (out / "result.json").write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(report, indent=2))
             return
@@ -482,9 +651,13 @@ def main():
         image = capture("focused-workspace-header")
         canvas_left, canvas_right, header_witness = workspace_header_bounds(image, args.app)
         assert canvas_left <= focused["x_regions"][0][0] < canvas_left + 80, focused
-        assert focused["y_regions"][0][0] < 120, focused
+        if args.app == "ember":
+            first_row = verify_focused_native_row(focused, header_witness, report["native_cursor"]["block"])
+        else:
+            assert focused["y_regions"][0][0] < 120, focused
+            first_row = {"profile": "legacy-reference", "source_y_limit": 120}
         report["focused_buffer_defaults"] = dict(focused, canvas_header_span=[canvas_left, canvas_right],
-                                                   header_witness=header_witness)
+                                                   header_witness=header_witness, first_row=first_row)
         xdo("key", "Escape")
         xdo("type", "--clearmodifiers", "--delay", "20", "ggIsaved_native_")
         wait_for(lambda: state().get("text", "").startswith("saved_native_"), "Vim received insert text", app)
@@ -595,14 +768,13 @@ def main():
         report["restored_rgb_pixels"] = wait_for(lambda: color_count("restored") > 30 and color_count("restored"), "native RGB restored", app)
         report["vim_state"] = state()
         assert report["vim_state"]["termguicolors"] == 0
-        command("qa")
-        app.wait(timeout=10)
-        assert app.returncode == 0
+        finish_native_quit()
         report["edit_save_undo"] = "passed"
-        report["normal_quit"] = "passed"
         (out / "result.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2))
-    except BaseException:
+    except BaseException as error:
+        report["error"] = dict(type=type(error).__name__, message=str(error))
+        (out / "failure-traceback.txt").write_text(traceback.format_exc(), encoding="utf-8")
         if app.poll() is None:
             app.send_signal(signal.SIGCONT)
             if "window" in locals():

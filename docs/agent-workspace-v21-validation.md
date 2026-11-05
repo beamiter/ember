@@ -129,3 +129,31 @@ Startup recovery also discards a screenshot spanning an initial compositor resiz
 and waits for a new stable frame within the existing 30-second deadline. The first
 owned PID/window identity stays fixed across retries; identity/focus changes still
 fail, and discarded frames cannot provide a paint witness.
+
+The `9132070` native run passed both real X11 AT-SPI discovery and public Block
+Search controls. Four of its six Wayland scale/layout cases passed measured
+geometry, a real Remote-tab click, unchanged configuration and same-shell input.
+The remaining two screenshots visibly contained the correct Settings UI, but raw
+whole-screen OCR failed. Their observer now uses one preselected OCR mode on the
+exact measured physical app crop after grayscale inversion, without resizing,
+text repair or fallback. All 11 available before/after screenshots from the six
+cases pass offline exact-label checks; this does not count as new pointer input.
+
+The current opaque Settings menu also invalidated its historical translucent-edge
+palette. The replacement profile requires one exact-color connected body, exact
+98-pixel width, at least two selector heights and 80% body density, anchored below
+and across the independently observed selector. Both genuine X11/Wayland captures
+identify one exact Chat item; wrong palettes, dimensions, duplicate components,
+low density and unowned/cross-crop OCR remain failures.
+
+Early evidence from `03b6da4` confirms native Vim RGB, plugin paint, scrolling,
+cursor and completion checks progressed beyond the previous startup failure.
+Its first source row starts at y=120, making the old absolute `y < 120` assertion
+stale. Source ink must now fit entirely inside an independently measured first
+cursor cell, which must itself lie in the registered body's first row. A whole
+extra IDE row still fails. The modal fixture's remaining shutdown timeout showed
+Eva's visible close confirmation after clean Vim exit. Its updated exit gate
+requires a normal VimLeavePre receipt, retirement of that exact process
+incarnation, same-shell PID/TTY input before/after exit, and actual native window
+closure (including the exact visible confirmation where required). Forced cleanup
+cannot satisfy normal exit. These final native interactions remain pending CI.

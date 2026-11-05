@@ -196,20 +196,21 @@ def registered_settings_popup_rows(rows, region):
     return result
 
 
-# Glass-v1 compact-palette calibration uses an immutable native popup capture
-# after the strict OCR selector succeeded. The existing exact paired-edge
-# algorithm measured one 100x62 plane with 48 paired rows, without tolerance.
+# Current opaque Settings menu registration. This is the exact owned body,
+# not a tolerant search for translucent strokes over changing background text.
 SETTINGS_GLASS_POPUP_PROVENANCE = {
-    'source_image': '.cloud-environment/compact-ui/palette/after/ember/block/mode-menu.png',
-    'source_image_sha256': '3b3e31d9d60d6f3e7ad8b736c7c5ccc35e04f76902a1db3e637ae4a8b13edef2',
-    'source_binary': '.cloud-environment/target/debug/ember',
-    'source_binary_sha256': '5a4235d633bc0cd94700e5fe6b3cbf1f431d7dbf412a0580ff98380387de6634',
-    'selector_source': '.cloud-environment/compact-ui/palette/after/ember/block/mode-selector.png',
-    'selector_source_sha256': 'bfc467c108852a24d6b8cb10e3afa06f3a99ab86a26ddedc733e7de2f7ad5282',
-    'backend': 'x11', 'renderer': 'glow', 'scale': 1,
+    'source_commit': '913207036767934bbd71594eea5eb8b3e1c49bd7',
+    'source_run': 41957479521, 'source_artifact': 13384654682,
+    'source_image': 'x11/chat-mode-menu.png',
+    'source_image_sha256': '5cafe3ed3d82991668a4c90acc10901f334ccfc6577936b10aa8c05aab08866a',
+    'source_binary_sha256': '4af96b57fc80e94380c8add3780ceef7827e541a6d12d8cfb1047808a6d61a93',
+    'selector_source': 'x11/chat-mode-selector.png',
+    'selector_source_sha256': '99736efe6863310b7c9051674185faf9a4f25f4aef5420ac1ee8cc1ee21a34a2',
+    'cross_backend_image': 'wayland/chat-mode-menu.png',
+    'cross_backend_image_sha256': '6e5b40097f7b028ec128e5683aa2be6b5ac1111ff739572959f1b17412d190b8',
     'selector_observer': 'strict native OCR selector',
-    'paired_exact_rows': 48,
-    'measured_plane': {'x': 502, 'y': 516, 'width': 100, 'height': 62},
+    'measured_body': {'x': 475, 'y': 585, 'width': 98, 'height': 67},
+    'scope': 'Exact opaque body in the selector-bound native menu domain; not its translucent border',
 }
 
 
@@ -218,58 +219,54 @@ def settings_popup_profile_metadata(native_ui_profile):
         return {'profile': native_ui_profile, 'border_rgb': [60, 60, 60],
                 'minimum_contiguous_rows': '2 * selector height'}
     if native_ui_profile == 'glass-v1':
-        return {'profile': native_ui_profile,
-                'left_border_rgb': [42, 64, 108], 'right_border_rgb': [36, 51, 84],
-                'minimum_paired_exact_rows': '2 * selector height',
-                'maximum_missing_raster_rows': 2,
+        return {'profile': native_ui_profile, 'popup_revision': 'opaque-body-v2',
+                'body_rgb': [16, 24, 37], 'body_width': 98,
+                'minimum_height': '2 * selector height', 'minimum_body_density': 0.8,
                 'calibration': SETTINGS_GLASS_POPUP_PROVENANCE.copy()}
     raise RuntimeError('Unknown native Settings popup observation profile')
 
 
 def glass_settings_mode_popup_plane(pixels, region, selector):
-    """Register exact paired glass edges despite at most two raster-row gaps.
+    """Find one exact opaque menu body in the preregistered selector domain.
 
-    The translucent stroke composites differently on its left/right edges.
-    Glyph/line antialiasing interrupts a few edge pixels. Each entire edge and
-    its paired support must retain at least two selector heights of exact RGB
-    rows, with no gap exceeding two missing raster rows. No color tolerance,
-    coordinate fallback, or fragmented-segment search is admitted.
+    The native body is 98 physical pixels wide at the fixture's default font
+    and scale. Its connected exact-color surface must straddle the selector,
+    start below it, and densely fill at least two selector heights. Translucent
+    edge pixels, words, fuzzy colors and prior palettes cannot identify a menu.
     """
+    from PIL import Image, ImageChops, ImageDraw
+    import re
     width, height = region['width'], region['height']
-    if len(pixels) != width*height*3:
+    if len(pixels) != width * height * 3:
         raise RuntimeError('Invalid Settings popup RGB size')
-    minimum = 2*int(selector['height'])
+    minimum = 2 * int(selector['height'])
     if minimum <= 0:
         raise RuntimeError('Invalid native Settings selector height')
-    center = int(selector['left'])+int(selector['width'])/2
-    def supported(rows):
-        return len(rows) >= minimum and all(b-a <= 3 for a,b in zip(rows,rows[1:]))
-    def columns(color):
-        result=[]
-        for x in range(width):
-            rows=[y for y in range(height)
-                  if pixels[(y*width+x)*3:(y*width+x)*3+3] == bytes(color)]
-            if supported(rows):
-                result.append((x,rows))
-        return result
-    planes=[]
-    for left,left_rows in columns((42,64,108)):
-        for right,right_rows in columns((36,51,84)):
-            if not (region['x']+left<center<region['x']+right and
-                    right-left+1>=int(selector['width'])):
+    center = int(selector['left']) + int(selector['width']) / 2
+    selector_bottom = int(selector['top']) + int(selector['height'])
+    surface = Image.frombytes('RGB', (width, height), pixels)
+    channels = ImageChops.difference(surface, Image.new('RGB', surface.size, (16,24,37))).split()
+    mask = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]), channels[2]).point([255] + [0] * 255)
+    raw = mask.tobytes()
+    planes = []
+    for y in range(height):
+        for run in re.finditer(b'\xff{24,}', raw[y*width:(y+1)*width]):
+            seed = (run.start(), y)
+            if mask.getpixel(seed) != 255:
                 continue
-            paired=sorted(set(left_rows).intersection(right_rows))
-            if not supported(paired):
-                continue
-            # Both complete edge spans belong to this one supported pair.
-            # Include their directly observed endpoints, so antialiased top
-            # glyphs are not cropped to the later of the two exact-color runs.
-            top=min(left_rows[0],right_rows[0])
-            bottom=max(left_rows[-1],right_rows[-1])+1
-            planes.append(dict(x=region['x']+left,y=region['y']+top,
-                               width=right-left+1,height=bottom-top))
-    if len(planes)>1:
-        raise RuntimeError('Ambiguous native Settings popup border plane')
+            ImageDraw.floodfill(mask, seed, 128, thresh=0)
+            component = mask.point([255 if value == 128 else 0 for value in range(256)])
+            left, top, right, bottom = component.getbbox()
+            area = (right-left) * (bottom-top)
+            if (right-left == 98 and bottom-top >= minimum
+                    and region['x']+left < center < region['x']+right
+                    and region['y']+top >= selector_bottom
+                    and component.histogram()[255] >= area * 0.8):
+                planes.append(dict(x=region['x']+left, y=region['y']+top,
+                                   width=right-left, height=bottom-top))
+            mask.paste(0, mask=component)
+    if len(planes) > 1:
+        raise RuntimeError('Ambiguous native Settings popup body plane')
     return planes[0] if planes else None
 
 

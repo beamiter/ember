@@ -407,7 +407,9 @@ class RegisteredLayoutTests(unittest.TestCase):
         source=Path(__file__).with_name('native-ime-return-smoke.py').read_text()
         self.assertIn("token_psm=11 if args.mode in ('normal', 'chat') else 6", source)
         geometry=Path(__file__).with_name('native-wayland-geometry-smoke.py').read_text()
-        self.assertIn("words('remote-tab-before', psm=11, capture=False)", geometry)
+        self.assertIn("geometry.settings_words(smoke, 'remote-tab-before', before, psm=11)", geometry)
+        self.assertIn("geometry.settings_words(smoke, 'remote-tab-after', after, psm=6)", geometry)
+        self.assertNotIn("smoke.words('remote-tab-", geometry)
 
 
 class FooterSmoke(Smoke):

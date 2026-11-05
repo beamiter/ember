@@ -1,5 +1,8 @@
 """Measured single-output geometry for an isolated public-protocol pointer."""
 from fractions import Fraction
+import csv
+import hashlib
+import io
 import json
 import math
 
@@ -82,6 +85,67 @@ def capture(smoke, label, scale, expected_rect, floating, expected=None):
     if dimensions != '2400 1800':
         raise RuntimeError('Unexpected actual screenshot dimensions')
     return before
+
+
+
+def physical_app_rect(measured):
+    scale = Fraction(measured['scale'])
+    if scale not in SCALES:
+        raise RuntimeError('Unregistered Settings OCR scale')
+    owned, output = measured['app_rect'], measured['output_rect']
+    values = [(owned['x'] - output['x']) * scale, (owned['y'] - output['y']) * scale,
+              owned['width'] * scale, owned['height'] * scale]
+    if any(value.denominator != 1 for value in values):
+        raise RuntimeError('Settings OCR region does not map to exact physical pixels')
+    region = rect(dict(zip(('x', 'y', 'width', 'height'), map(int, values))))
+    if not contains(dict(x=0, y=0, width=PHYSICAL[0], height=PHYSICAL[1]), region):
+        raise RuntimeError('Settings OCR region crosses the captured output')
+    return region
+
+
+def settings_words(smoke, label, measured, *, psm):
+    """One fixed grayscale-inverted OCR pass in the measured owned app.
+
+    Native screenshot bytes and physical scale remain unchanged. There is no
+    resampling, whole-screen fallback, text repair or search for desired words.
+    """
+    from PIL import Image, ImageOps
+    if psm not in (6, 11):
+        raise RuntimeError('Unregistered Settings OCR layout')
+    region = physical_app_rect(measured)
+    source = smoke.out / (label + '.png')
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    analysis = smoke.out / (label + '-owned-gray-inverted.png')
+    with Image.open(source) as image:
+        if image.size != PHYSICAL:
+            raise RuntimeError('Unexpected Settings OCR screenshot dimensions')
+        crop = image.crop((region['x'], region['y'], region['x'] + region['width'],
+                           region['y'] + region['height']))
+        ImageOps.invert(ImageOps.grayscale(crop)).save(analysis)
+    analysis_hash = hashlib.sha256(analysis.read_bytes()).hexdigest()
+    result = smoke.run(['tesseract', str(analysis), 'stdout', '--psm', str(psm), 'tsv'],
+                       capture_output=True, text=True)
+    tsv = smoke.out / (label + '-owned-gray-inverted.tsv')
+    tsv.write_text(result.stdout)
+    rows = []
+    for row in csv.DictReader(io.StringIO(result.stdout), delimiter='\t', quoting=csv.QUOTE_NONE):
+        if not row['text'].strip():
+            continue
+        local = word_box(row)
+        if not contains(dict(x=0, y=0, width=region['width'], height=region['height']), local):
+            raise RuntimeError('Settings OCR word crosses the measured app crop')
+        translated = dict(row, left=str(local['x'] + region['x']), top=str(local['y'] + region['y']))
+        logical_box(translated, measured)
+        rows.append(translated)
+    if (hashlib.sha256(source.read_bytes()).hexdigest() != source_hash or
+            hashlib.sha256(analysis.read_bytes()).hexdigest() != analysis_hash):
+        raise RuntimeError('Settings OCR source or analysis pixels changed')
+    (smoke.out / (label + '-owned-ocr.json')).write_text(json.dumps(dict(
+        measured=measured, physical_region=region, source_sha256=source_hash,
+        analysis_sha256=analysis_hash, tsv_sha256=hashlib.sha256(tsv.read_bytes()).hexdigest(),
+        algorithm='Pillow grayscale then invert, exact owned physical crop, no resize',
+        psm=psm), indent=2))
+    return rows
 
 
 def word_box(row):

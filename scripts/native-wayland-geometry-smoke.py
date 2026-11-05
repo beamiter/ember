@@ -107,12 +107,12 @@ def main():
         before = geometry.capture(smoke, 'remote-tab-before', args.scale, expected_rect, floating, measured)
         # Tab labels form a sparse control row, not a dense prose paragraph.
         # Select this layout before reading any text; no fallback or repair.
-        rows = smoke.words('remote-tab-before', psm=11, capture=False)
+        rows = geometry.settings_words(smoke, 'remote-tab-before', before, psm=11)
         target = geometry.remote_tab(rows, before)
         result['pointer_target'] = geometry.click(smoke, 'remote-tab', target, before, args.scale, expected_rect, floating)
         time.sleep(0.4)
         after = geometry.capture(smoke, 'remote-tab-after', args.scale, expected_rect, floating, before)
-        heading = geometry.remote_heading(smoke.words('remote-tab-after', psm=6, capture=False), after)
+        heading = geometry.remote_heading(geometry.settings_words(smoke, 'remote-tab-after', after, psm=6), after)
         result['remote_heading'] = heading
         # Toggle closes Settings without Save, editing a host, or invoking SSH.
         smoke.key('o', ('ctrl', 'shift'))
