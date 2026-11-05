@@ -44,6 +44,34 @@ class RecoveryPhraseTests(unittest.TestCase):
                 if case == 'foreign': owned = dict(x=600, y=50, width=600, height=800)
                 with self.assertRaises(RuntimeError): recovery.recovery_rectangle(image, owned)
 
+    def test_glass_card_uses_exact_current_surfaces_without_legacy_fallback(self):
+        from PIL import Image, ImageDraw
+        owned = dict(x=90, y=50, width=1100, height=800)
+        for profile, body, header in [
+            ('glass-v1', (16, 24, 37), (37, 56, 101)),
+            ('legacy-reference', (29, 29, 29), (45, 45, 45)),
+        ]:
+            image = Image.new('RGB', (1280, 900), (15, 24, 38))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((107, 67, 554, 95), fill=header)
+            draw.rectangle((107, 96, 554, 484), fill=body)
+            self.assertEqual(recovery.recovery_rectangle(image, owned, profile), (107, 67, 555, 485))
+            other = 'legacy-reference' if profile == 'glass-v1' else 'glass-v1'
+            with self.assertRaises(recovery.MissingRecoveryCard):
+                recovery.recovery_rectangle(image, owned, other)
+            # A headerless or duplicated current card must never become valid
+            # merely because its body has the registered palette.
+            draw.rectangle((107, 67, 554, 95), fill=(15, 24, 38))
+            with self.assertRaises(RuntimeError):
+                recovery.recovery_rectangle(image, owned, profile)
+            draw.rectangle((107, 67, 554, 95), fill=header)
+            draw.rectangle((607, 67, 1054, 95), fill=header)
+            draw.rectangle((607, 96, 1054, 484), fill=body)
+            with self.assertRaises(RuntimeError):
+                recovery.recovery_rectangle(image, owned, profile)
+        with self.assertRaises(RuntimeError):
+            recovery.recovery_profile_metadata('unregistered')
+
     def test_exact_warning_missing_wrong_or_duplicate_remains_a_failure(self):
         phrase = 'Saved pane layout adjusted: invalid or oversized layout references.'
         for text in ['', phrase.replace('invalid', 'valid'), phrase + ' ' + phrase]:

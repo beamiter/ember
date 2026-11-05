@@ -106,3 +106,15 @@ Three separate unmaintained advisories (`zbus_names`, `zvariant`, `zvariant_deri
 have no patched version in the advisory database; their migration into zbus 6
 requires the upstream native accessibility/settings dependency chain to update.
 The audit remains strict and these advisories are not ignored or marked passed.
+
+The recovery observer's separate old gray body/header palette was also stale.
+The current explicit glass profile registers exact screenshot values, including
+Color32 rounding, without admitting the legacy palette as a fallback. Reanalysis
+of the preserved native artifact finds one recovery card in all six X11/Wayland
+abnormal-startup images and no card in both normal-startup controls. Source
+commit, run, artifact, image and SHA-256 are recorded in the observer metadata.
+This is offline analysis of genuine captured pixels, not a rerun of recovery
+input, recheck, export or IME behavior. Seven pure recovery regressions retain the
+unique-body, attached-header and exact-warning requirements. The separate shell
+Vim smoke now targets actual leftmost fixture-owned RGB ink instead of x=200 in
+the workspace navigation; two pure tests reject missing or insufficient ink.

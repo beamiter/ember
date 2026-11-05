@@ -16,6 +16,18 @@ import time
 from PIL import Image
 
 
+def leftmost_native_target(image):
+    """Observe fixture-owned native ink, never guess a workspace/pane coordinate."""
+    image = image.convert('RGB')
+    pixels = image.get_flattened_data() if hasattr(image, 'get_flattened_data') else image.getdata()
+    spots = [(index % image.width, index // image.width)
+             for index, color in enumerate(pixels) if color == (0x19, 0xc3, 0xa7)]
+    if len(spots) <= 100:
+        raise RuntimeError('Native source RGB does not identify a scroll target')
+    x, y = min(spots)
+    return dict(x=x, y=y, native_rgb_pixels=len(spots))
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -144,7 +156,11 @@ def main():
         assert split['window']!=left['winid'],split
         xdo('type','--clearmodifiers','--delay','15','i')
         focused=wait(lambda: state() if state().get('mode')=='i' else None,'insert mode in right split')
-        xdo('mousemove','--window',child,200,320)
+        hover_image = out / 'inactive-left-split-target.png'
+        subprocess.run(['import', '-window', child, str(hover_image)], env=env, check=True, timeout=5)
+        hover = leftmost_native_target(Image.open(hover_image))
+        report['hovered_split_target'] = hover
+        xdo('mousemove', '--window', child, hover['x'], hover['y'])
         left_top=next(view['topline'] for view in focused['views'] if view['winid']==left['winid'])
         def hovered_top():
             return next((view['topline'] for view in state().get('views',[]) if view['winid']==left['winid']),None)

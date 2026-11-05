@@ -81,3 +81,14 @@ No real IME candidate window, physical keyboard/GPU, external model service or
 SSH host was used for these headless tests. Hardware/native acceptance remains
 separate. See [V2.1 validation](agent-workspace-v21-validation.md) for the baseline
 failures and cloud security-precondition limits.
+
+### Published Mission checkpoint CI
+
+[The d28010f Tests job](https://github.com/beamiter/ember/actions/runs/41954431700/job/127009759104)
+completed on 2026-11-05 with 1,418 library and 2,300 binary tests passing, with
+three and six ignored respectively. Its real built executable passed the Mission
+CAS, five repository identity, missing-checkout and host-restart persistence
+smoke described above. The separate real Vim fractional-selection PTY test and
+three isolated system-preference event cases were explicitly executed and passed.
+These results do not imply that the separate desktop release or supply-chain
+audit jobs passed, nor that later commits inherit unexecuted native acceptance.

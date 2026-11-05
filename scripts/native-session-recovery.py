@@ -74,7 +74,22 @@ def wait_startup_surface(smoke):
             backend=smoke.backend, observations=observations), indent=2))
 
 
-def recovery_rectangle(image, owned):
+def recovery_profile_metadata(profile):
+    if profile == 'legacy-reference':
+        return dict(profile=profile, body_rgb=[29, 29, 29], header_rgb=[45, 45, 45])
+    if profile == 'glass-v1':
+        # Exact current pixels, not token RGB: Color32 opaque conversion and
+        # the selected-title alpha composite introduce rounding differences.
+        return dict(profile=profile, body_rgb=[16, 24, 37], header_rgb=[37, 56, 101],
+                    calibration=dict(commit='b600737d37202643f6d74a1bbecafb7ed8622041',
+                                     run=41952783970, artifact=13382509711,
+                                     image='recovery-wayland-corrupt-layout/failure.png',
+                                     sha256='706a98cc8914476f3c2e2488b41ce71c953ca8ae306f3f11211e50d31cb752fc',
+                                     scope='Exact owned recovery surfaces; warning text is independently checked by OCR'))
+    raise RuntimeError('Unknown recovery observation profile')
+
+
+def recovery_rectangle(image, owned, profile='legacy-reference'):
     """Find the native floating card from its body/header, without OCR words."""
     from PIL import Image, ImageChops, ImageDraw
     x, y, width, height = [owned[key] for key in ('x', 'y', 'width', 'height')]
@@ -85,7 +100,8 @@ def recovery_rectangle(image, owned):
     def palette_mask(surface, color):
         channels = ImageChops.difference(surface, Image.new('RGB', surface.size, color)).split()
         return ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]), channels[2]).point([255] + [0] * 255)
-    mask = palette_mask(client, (29, 29, 29))
+    palette = recovery_profile_metadata(profile)
+    mask = palette_mask(client, tuple(palette['body_rgb']))
     raw = mask.tobytes()
     candidates = []
     for row in range(height):
@@ -110,7 +126,7 @@ def recovery_rectangle(image, owned):
         raise RuntimeError('Native recovery card ambiguous')
     left, top, right, bottom = candidates[0]
     header_top = max(0, top - 42)
-    header = palette_mask(client.crop((left, header_top, right, top)), (45, 45, 45)).getbbox()
+    header = palette_mask(client.crop((left, header_top, right, top)), tuple(palette['header_rgb'])).getbbox()
     if (header is None or header[2] - header[0] < (right-left) * 0.8 or
             header[3] - header[1] < 18):
         raise RuntimeError('Recovery card lacks its attached native header')
@@ -126,7 +142,7 @@ def recovery_words(smoke, label):
     source = smoke.out / (label + '.png')
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     with Image.open(source) as image:
-        region = recovery_rectangle(image, ownership['owned']['rect'])
+        region = recovery_rectangle(image, ownership['owned']['rect'], smoke.native_ui_profile)
         crop = image.convert('RGB').crop(region)
     raw = smoke.out / (label + '-recovery-card.png')
     analysis = smoke.out / (label + '-recovery-card-gray-negate.png')
@@ -148,6 +164,7 @@ def recovery_words(smoke, label):
         raise RuntimeError('Recovery source pixels changed during analysis')
     (smoke.out / (label + '-recovery-analysis.json')).write_text(json.dumps(dict(
         owned=ownership['owned'], region=region, source_sha256=digest,
+        palette=recovery_profile_metadata(smoke.native_ui_profile),
         card_sha256=hashlib.sha256(raw.read_bytes()).hexdigest(),
         analysis_sha256=hashlib.sha256(analysis.read_bytes()).hexdigest(),
         tsv_sha256=hashlib.sha256(tsv.read_bytes()).hexdigest(), ocr_psm=6), indent=2))
@@ -245,7 +262,7 @@ def exercise(smoke, case):
         ownership = json.loads((smoke.out / 'startup-settings-analysis.json').read_text())
         with Image.open(smoke.out / 'startup.png') as image:
             try:
-                recovery_rectangle(image, ownership['owned']['rect'])
+                recovery_rectangle(image, ownership['owned']['rect'], smoke.native_ui_profile)
             except MissingRecoveryCard:
                 pass
             else:

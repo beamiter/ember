@@ -362,6 +362,7 @@ jobs:
         run: |
           python3 scripts/test-native-x11-display.py
           python3 scripts/test-native-vim9-workspace-profile.py
+          python3 scripts/test-native-vim9-shell-profile.py
           xvfb-run -a -s '-screen 0 1600x1100x24 -noreset' /usr/bin/python3 scripts/native-vim9-buffer-smoke.py \
             --binary "$RUNNER_TEMP/ember-installed/bin/ember" --app ember \
             --output native-smoke-artifacts/vim9-buffer-gui
