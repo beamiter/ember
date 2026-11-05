@@ -88,6 +88,16 @@ def registration():
              'TERMINAL_FOOTER_GAP', 'TOOLBAR_HEIGHT', 'INSPECTOR_DRAWER_BREAKPOINT',
              'SHORT_HEIGHT', 'SHORT_HEADER_HEIGHT', 'SHORT_BOTTOM_GAP',
              'TOOL_BUTTON_HEIGHT')
+    adapter = (ROOT / 'src/glass_shell.rs').read_text()
+    adapter_tokens = {name: float(value) for name, value in re.findall(
+        r'^pub const (\w+): f32 = ([0-9.]+);$', adapter, re.M)}
+    adapter_names = ('NAVIGATION_MIN_WIDTH', 'INSPECTOR_MIN_WIDTH',
+                     'CENTER_MIN_WIDTH', 'MODE_CONTROL_MIN_WIDTH', 'COMPOSER_CONTROL_BOTTOM')
+    for name in adapter_names:
+        if name not in adapter_tokens:
+            raise RuntimeError('Unregistered glass adapter geometry')
+        tokens[name] = adapter_tokens[name]
+    names += adapter_names
     if any(name not in tokens or not tokens[name].is_integer() for name in names):
         raise RuntimeError('Unregistered nonintegral glass geometry tokens')
     accent = re.search(r'^pub const ACCENT_TOP: \[u8; 4\] = \[([^]]+)\];$', data.decode(), re.M)
@@ -113,13 +123,13 @@ def layout(owned):
     rail, nav = t['RAIL_WIDTH'], t['NAVIGATION_WIDTH']
     docked = width >= t['INSPECTOR_DRAWER_BREAKPOINT']
     available = max(0, width - t['OUTER_LEFT'] - rail - t['LEFT_GAP']
-                    - t['OUTER_RIGHT'] - 300 - (t['INSPECTOR_GAP'] if docked else 0))
-    if available < 180 + (260 if docked else 0):
+                    - t['OUTER_RIGHT'] - t['CENTER_MIN_WIDTH'] - (t['INSPECTOR_GAP'] if docked else 0))
+    if available < t['NAVIGATION_MIN_WIDTH'] + (t['INSPECTOR_MIN_WIDTH'] if docked else 0):
         nav = 0
     else:
-        nav = min(nav, max(180, available - (260 if docked else 0)))
+        nav = min(nav, max(t['NAVIGATION_MIN_WIDTH'], available - (t['INSPECTOR_MIN_WIDTH'] if docked else 0)))
     x = t['OUTER_LEFT'] + rail + nav + t['LEFT_GAP']
-    inspector = (min(t['INSPECTOR_WIDTH'], max(260, available - nav))
+    inspector = (min(t['INSPECTOR_WIDTH'], max(t['INSPECTOR_MIN_WIDTH'], available - nav))
                  + t['INSPECTOR_GAP']) if docked else 0
     right = width - t['OUTER_RIGHT'] - inspector
     short = height < t['SHORT_HEIGHT']
@@ -136,14 +146,10 @@ def layout(owned):
     # The compact native toolbar uses the same source control height and bottom
     # inset as the renderer. Source registration records both geometry owners.
     # This fixed input+output domain never follows an OCR word.
-    adapter = (ROOT / 'src/glass_shell.rs').read_text()
-    control_bottom = re.search(r'^pub const COMPOSER_CONTROL_BOTTOM: f32 = ([0-9.]+);$', adapter, re.M)
-    if control_bottom is None or not float(control_bottom[1]).is_integer():
-        raise RuntimeError('Unregistered glass toolbar control inset')
     body_y = t['MAIN_TOP'] + header + t['TERMINAL_TOP_GAP']
     body = rect(x + t['TERMINAL_INSET_LEFT'], body_y,
                 right - x - t['TERMINAL_INSET_LEFT'] - t['TERMINAL_INSET_RIGHT'],
-                bottom - int(float(control_bottom[1])) - t['TOOL_BUTTON_HEIGHT'] - body_y)
+                bottom - t['COMPOSER_CONTROL_BOTTOM'] - t['TOOL_BUTTON_HEIGHT'] - body_y)
     terminal = dict(body, height=bottom - t['TOOLBAR_HEIGHT'] - t['TERMINAL_FOOTER_GAP'] - body_y)
     if terminal['height'] <= 0:
         raise RuntimeError('No registered glass native terminal area')
@@ -155,9 +161,14 @@ def mode_slot(owned, mode):
     if mode not in ('block', 'chat'):
         raise RuntimeError('Unregistered glass mode for paint witness')
     layout(owned)
+    t, _ = registration()
     settings_x = owned['width'] - 8 - 32 - 6 - 32
-    x = settings_x - 8 - 64 - (70 if mode == 'block' else 0)
-    return dict(x=owned['x']+x, y=owned['y']+4, width=64, height=32)
+    width, height = t['MODE_CONTROL_MIN_WIDTH'], t['TOOL_BUTTON_HEIGHT']
+    x = settings_x - 8 - width - (width + 6 if mode == 'block' else 0)
+    # Registered fixtures use the default 14pt UI font and disabled Eva reserve.
+    # Production chrome_control_height(14) resolves to TOOL_BUTTON_HEIGHT.
+    y = (t['TOPBAR_HEIGHT'] - height) // 2
+    return dict(x=owned['x']+x, y=owned['y']+y, width=width, height=height)
 
 
 def header_paint(image, owned, mode=None):

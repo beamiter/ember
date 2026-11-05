@@ -75,6 +75,7 @@ mod workflows;
 mod workspace_chat_bridge;
 mod workspace_context;
 mod workspace_inspector;
+mod workspace_missions;
 mod workspace_remote;
 mod workspace_remote_ui;
 mod workspace_review;

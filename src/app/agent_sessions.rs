@@ -280,6 +280,7 @@ pub(crate) struct AgentSessionsState {
     pub(crate) context: crate::workspace_context::ContextEditor,
     pub(crate) review: crate::workspace_review::WorkspaceReview,
     pub(crate) remote: crate::workspace_remote_ui::RemotePanel,
+    pub(crate) missions: crate::workspace_missions::MissionPanel,
     pub(crate) workspace_menu_ids: Vec<egui::Id>,
     pub(crate) tools: crate::workspace_tools::WorkspaceTools,
     pub(crate) workspace_scroll: crate::workspace_visibility::ScrollBookmark,
@@ -1997,6 +1998,31 @@ impl TerminalApp {
         self.agent_sessions.workspace.row(session).cloned()
     }
 
+    pub(crate) fn workspace_open_mission_task(
+        &mut self,
+        ctx: &egui::Context,
+        task: &jterm_core::agent_workspace::WorkspaceMissionTaskRef,
+    ) {
+        if !self.config.experimental_task_sidebar
+            || !self
+                .workspace_task_rows()
+                .iter()
+                .any(|(id, row)| *id == task.task_id && row.id == task.conversation)
+        {
+            return;
+        }
+        self.agent_runtime.select_hosted_view(Some(task.task_id));
+        self.ai_chat_panel.close();
+        self.agent_sessions.cancel_resume();
+        self.agent_sessions.workspace_pending = false;
+        self.agent_sessions.workspace_task = Some(task.task_id);
+        self.task_sidebar.open_workspace_task(task.task_id);
+        self.agent_sessions
+            .review
+            .select_task(task.conversation.clone());
+        self.reference_navigation_entered_canvas(ctx);
+    }
+
     pub(crate) fn workspace_has_conversation(&self) -> bool {
         self.ai_chat_panel.is_open
             || self.agent_sessions.workspace_task.is_some()
@@ -2142,6 +2168,7 @@ impl TerminalApp {
             .chain(chats.iter())
             .filter(|row| row.attention().is_some())
             .count()
+            + self.agent_sessions.missions.host.needs_attention()
             + if self.config.experimental_task_sidebar {
                 task_rows
                     .iter()
@@ -2232,6 +2259,29 @@ impl TerminalApp {
                 self.agent_sessions.status = Some(SessionStatus::Waiting);
             }
         });
+        if ui
+            .button(format!(
+                "Missions · {} need you",
+                self.agent_sessions.missions.host.needs_attention()
+            ))
+            .clicked()
+        {
+            self.agent_sessions.missions.open();
+        }
+        if self.agent_sessions.status == Some(SessionStatus::Waiting) {
+            for (id, title) in self.agent_sessions.missions.attention_rows() {
+                if ui
+                    .button(format!(
+                        "Mission · {}",
+                        crate::review_text::visible_bounded(&title, 80)
+                    ))
+                    .clicked()
+                {
+                    self.agent_sessions.missions.open = true;
+                    self.agent_sessions.missions.host.select(&id);
+                }
+            }
+        }
         if !self.agent_sessions.filter_matches(&old_filter) {
             self.agent_sessions.filters_changed();
         }

@@ -100,6 +100,27 @@ def main():
             assert current["read_position"]["position"] == 0.35
             assert current["row"]["pinned"]
             print(f"PASS {binaries[0].name}: embedded entrypoint, revisioned draft, single submission owner, newer draft preservation, stale receipt rejection, read position")
+            mission = {
+                "id": "mission:embedded-smoke", "revision": 0,
+                "title": "Five-repository delivery fixture", "goal": "Persist exact plan, never infer delivery",
+                "required_environment": "isolated-smoke", "updated_at_ms": 0,
+                "preset": "four_terminals",
+                "repositories": [{
+                    "identity": {"full_name": f"beamiter/{name}", "github_id": 0},
+                    "path": str(Path(temporary) / "missing" / name), "baseline": "",
+                    "candidate": None, "target_ref": "refs/heads/master", "required_core_pin": None,
+                    "tasks": [], "required_checks": ["validation"],
+                } for name in ("jterm_core", "anvil", "forge", "ember", "frost")],
+            }
+            saved = request({"SaveMission": {"expected_revision": 0, "mission": mission}})["Mission"]["mission"]
+            assert saved["id"] == mission["id"] and saved["revision"] == 1
+            request({"SaveMission": {"expected_revision": 0, "mission": mission}}, error=True)
+            assert any(item["id"] == mission["id"] for item in request("MissionList")["Missions"]["missions"])
+            inspected = request({"InspectMission": {"id": mission["id"]}})["Mission"]
+            report = inspected["report"]
+            assert report["state"] == "needs_attention" and len(report["repositories"]) == 5
+            assert all(repo["errors"] and not any(repo[key] for key in ("committed", "pushed", "integrated", "validated")) for repo in report["repositories"])
+            print(f"PASS {binaries[0].name}: Mission CAS, five exact repository identities, missing checkouts cannot claim delivery")
             stop()
             for binary in binaries[1:] or binaries[:1]:
                 start(binary)
@@ -110,7 +131,10 @@ def main():
                 assert len(restored_row["turns"]) == 2
                 assert restored["read_position"]["position"] == 0.35
                 request({"CompleteSubmission": {"receipt": receipt, "text": "duplicate after restart"}}, error=True)
-                print(f"PASS {binary.name}: shared history and reading state survive host replacement; retired receipt stays retired")
+                restored_mission = request({"ReadMission": {"id": mission["id"]}})["Mission"]["mission"]
+                assert restored_mission == saved
+                request({"SaveMission": {"expected_revision": 0, "mission": mission}}, error=True)
+                print(f"PASS {binary.name}: shared history, drafts and Mission contract survive host replacement; retired receipt and stale writes stay rejected")
                 stop()
         finally:
             stop()

@@ -36,18 +36,19 @@ class GlassProfileTests(unittest.TestCase):
 
     def test_reference_domains_use_full_input_and_exclude_actual_control_row(self):
         p = g.layout(dict(x=0,y=0,width=1612,height=976))
-        self.assertEqual(p['header'], dict(x=0,y=0,width=1612,height=40))
-        self.assertEqual(p['center'], dict(x=270,y=80,width=1044,height=890))
-        self.assertEqual(p['terminal'], dict(x=278,y=86,width=1028,height=836))
-        self.assertEqual(p['native_body'], dict(x=278,y=86,width=1028,height=847))
-        self.assertEqual(p['native_body']['y']+p['native_body']['height'],933)
+        self.assertEqual(p['header'], dict(x=0,y=0,width=1612,height=42))
+        self.assertEqual(p['center'], dict(x=330,y=91,width=992,height=875))
+        self.assertEqual(p['terminal'], dict(x=358,y=101,width=936,height=821))
+        self.assertEqual(p['native_body'], dict(x=358,y=101,width=936,height=834))
+        self.assertEqual(p['native_body']['y']+p['native_body']['height'],935)
 
-    def test_compact_domains_reclaim_native_rows_and_columns_at_the_same_cell_size(self):
+    def test_revision3_domains_register_native_rows_and_columns_at_the_same_cell_size(self):
         current = g.layout(dict(x=0,y=0,width=1612,height=976))['terminal']
         previous = dict(width=859,height=648)
         # Compare real observation space at unchanged 8px columns/18px rows.
-        self.assertGreaterEqual(current['width']//8 - previous['width']//8, 20)
-        self.assertGreaterEqual(current['height']//18 - previous['height']//18, 10)
+        self.assertEqual((current['width']//8, current['height']//18), (117, 45))
+        self.assertEqual(current['width']//8 - previous['width']//8, 10)
+        self.assertEqual(current['height']//18 - previous['height']//18, 9)
 
     def test_compact_mode_slots_keep_touch_targets_inside_the_topbar(self):
         for width in (700, 959, 960, 1179, 1180, 1279, 1280, 1612):
@@ -56,7 +57,7 @@ class GlassProfileTests(unittest.TestCase):
             block, chat = [g.mode_slot(owned, mode) for mode in ('block', 'chat')]
             for slot in (block, chat):
                 self.assertTrue(g.contained(slot, topbar))
-                self.assertEqual((slot['width'], slot['height']), (64, 32))
+                self.assertEqual((slot['width'], slot['height']), (52, 26))
             self.assertEqual(chat['x'] - block['x'] - block['width'], 6)
 
     def test_offset_short_narrow_and_threshold_are_exact(self):
@@ -65,8 +66,8 @@ class GlassProfileTests(unittest.TestCase):
             offset=g.layout(dict(x=24,y=25,width=width,height=height))
             for name in ('header','center','native_body','terminal'):
                 self.assertEqual(offset[name], dict(plain[name],x=plain[name]['x']+24,y=plain[name]['y']+25))
-        self.assertEqual(g.layout(dict(x=0,y=0,width=1179,height=704))['center']['width'],905)
-        self.assertEqual(g.layout(dict(x=0,y=0,width=1180,height=704))['center']['width'],612)
+        self.assertEqual(g.layout(dict(x=0,y=0,width=1179,height=704))['center']['width'],849)
+        self.assertEqual(g.layout(dict(x=0,y=0,width=1180,height=704))['center']['width'],560)
         for bad in [dict(x=0,y=0,width=699,height=640),dict(x=0,y=0,width=1280.5,height=900),dict(x=-1,y=0,width=1280,height=900)]:
             with self.assertRaises(RuntimeError):g.layout(bad)
 
