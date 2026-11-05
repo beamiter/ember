@@ -64,6 +64,39 @@ class ChipTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             visual.preedit_chip_planes(b'bad',400,180,self.body,self.contract)
 
+    def test_single_preselected_chip_pass_owns_boxes_and_exact_spelling(self):
+        planes = self.planes(self.fixture())
+        token = dict(self.token(),text=visual.PREEDIT_TOKEN)
+        auth = [('chip-psm7',[token])]
+        # Full-image segmentation differs but cannot add another occurrence.
+        diagnostic = [('whole',[dict(token,width='159')]),('body',[])]
+        self.assertEqual(visual.require_chip_observation_agreement(auth,diagnostic,{'rect':self.body},planes),[token])
+        for wrong in [visual.PREEDIT_TOKEN.lower(),'_'+visual.PREEDIT_TOKEN,visual.PREEDIT_TOKEN+'.']:
+            with self.assertRaises(RuntimeError):
+                visual.require_chip_observation_agreement([('chip',[dict(token,text=wrong)])],diagnostic,{'rect':self.body},planes)
+
+    def test_duplicates_and_outside_or_unpainted_exact_tokens_still_fail(self):
+        planes = self.planes(self.fixture())
+        token = dict(self.token(),text=visual.PREEDIT_TOKEN)
+        auth = [('chip',[token])]
+        for diagnostic in [[('whole',[token,token])], [('whole',[dict(token,left='15')])],
+                           [('whole',[dict(token,top='75')])]]:
+            with self.assertRaises(RuntimeError):
+                visual.require_chip_observation_agreement(auth,diagnostic,{'rect':self.body},planes)
+        with self.assertRaises(RuntimeError):
+            visual.require_chip_observation_agreement([('chip',[token,token])],[],{'rect':self.body},planes)
+        with self.assertRaises(RuntimeError):
+            visual.require_chip_observation_agreement(auth,[],{'rect':self.body},planes*2)
+        with self.assertRaises(RuntimeError):
+            visual.require_chip_observation_agreement([], [('whole',[token])],{'rect':self.body},[])
+
+    def test_absence_and_multiple_painted_tokens_do_not_collapse(self):
+        self.assertEqual(visual.require_chip_observation_agreement([], [('whole',[])],{'rect':self.body},[]),[])
+        image=self.fixture();self.paint(image,(30,80,230,100));planes=self.planes(image)
+        first=dict(self.token(),text=visual.PREEDIT_TOKEN)
+        second=dict(self.token(y=84),text=visual.PREEDIT_TOKEN)
+        matches=visual.require_chip_observation_agreement([('chip-0',[first]),('chip-1',[second])],[],{'rect':self.body},planes)
+        self.assertEqual(matches,[first,second])
 
 
 if __name__ == '__main__':

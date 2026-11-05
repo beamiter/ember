@@ -207,3 +207,19 @@ entries inside the picker still fail. The actual populated tree and a replay of
 its empty-query state validate this hierarchy; fresh E03 native acceptance is
 still pending. Discovery node/time limits and unvalidated diagnostic retention
 are unchanged.
+
+A later `80920cf` active-preedit PNG has the correct painted token but every
+whole/body OCR pass either omits it or joins the arrow. The current glass profile
+therefore uses one preselected PSM7 pass on every independently paint-registered
+chip as its authoritative token geometry. Registration happens before token
+lookup. Whole/canvas/body passes remain negative evidence: an exact token outside
+one painted chip, duplicate exact tokens in any one pass, or a whole-image token
+without an exact authoritative chip token still fails. No pass is retried, no
+spelling is repaired, and crops are neither resampled nor chosen by OCR text.
+Legacy cross-layout equality remains unchanged for the legacy profile.
+
+Offline replay of six original preedit PNGs from `03b6da4` and `80920cf` observes
+exactly one token each with this fixed profile. Both complete Block lifecycles
+also preserve zero-token baseline/commit images and byte-exact pixel restoration
+using the authoritative token rectangle. This is archived-image validation only;
+current-master native compositor/PTY acceptance must still pass independently.

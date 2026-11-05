@@ -129,7 +129,7 @@ class SyntheticSmoke:
         self.transcript=self.out/'sentinels.txt'
         self.transcript.write_text(f'preedit-switch-ready:{os.getpid()}:/dev/pts/99\n')
         self.rect=dict(x=0,y=0,width=1280,height=900)
-        self.present=False;self.partial=False;self.only_whole=False;self.shift_body=0
+        self.present=False;self.partial=False;self.only_whole=False;self.shift_body=0;self.shift_chip=0
         self.tree_calls=0;self.mutate_after=None;self.focused=True;self.pid=self.app.pid
         self.captures=[]
 
@@ -140,14 +140,20 @@ class SyntheticSmoke:
         draw.rounded_rectangle((r['x'],r['y'],r['x']+r['width']-1,r['y']+r['height']-1),radius=6,fill=(62,108,255))
         draw.text((r['x']+12,r['y']+10),'Block',fill=(239,245,255))
         if self.present:
-            token = self.token_box()
-            draw.rectangle((token['x'], token['y'], token['x']+token['width']-1,
-                            token['y']+token['height']-1), fill=(180,70,220))
+            chip = self.chip_box()
+            draw.rounded_rectangle((chip['x'],chip['y'],chip['x']+chip['width']-1,
+                                    chip['y']+chip['height']-1),radius=3,fill=(231,237,253))
+            for x in range(chip['x']+10,chip['x']+chip['width']-10,8):
+                draw.rectangle((x,chip['y']+5,x+2,chip['y']+15),fill=(40,52,76))
         image.save(self.out/(label+'.png'))
 
     def token_box(self):
         body = g.layout(self.rect)['native_body']
-        return dict(x=380, y=body['y']+body['height']-20, width=180, height=18)
+        return dict(x=380, y=body['y']+body['height']-20, width=180, height=10)
+
+    def chip_box(self):
+        token=self.token_box()
+        return dict(x=token['x']-10,y=token['y']-4,width=200,height=18)
 
     def run(self,args,**kwargs):
         if args[:3]==['swaymsg','-t','get_tree']:
@@ -171,14 +177,15 @@ class SyntheticSmoke:
 
     def words(self,label,**kwargs):
         domains=g.layout(self.rect)
-        crop=domains['native_body'] if '-native-body-' in label else domains['center'] if label.endswith('-native-canvas') else dict(x=0,y=0)
+        crop=self.chip_box() if '-painted-preedit-' in label else domains['native_body'] if '-native-body-' in label else domains['center'] if label.endswith('-native-canvas') else dict(x=0,y=0)
         def word(text,x,y,w=180,h=18):
             return dict(level='5',conf='95',text=text,left=str(x-crop['x']),top=str(y-crop['y']),width=str(w),height=str(h))
-        rows=[word('status',400,300,w=45,h=14)]
+        rows=[] if '-painted-preedit-' in label else [word('status',400,300,w=45,h=14)]
         if self.present and not (self.only_whole and crop['x']):
             text='X'+visual.PREEDIT_TOKEN if self.partial else visual.PREEDIT_TOKEN
             token = self.token_box()
-            rows.append(word(text, token['x']+(self.shift_body if '-native-body-' in label else 0), token['y']))
+            shift=self.shift_chip if '-painted-preedit-' in label else self.shift_body if '-native-body-' in label else 0
+            rows.append(word(text,token['x']+shift,token['y'],w=token['width'],h=token['height']))
         return rows
 
 
@@ -232,7 +239,7 @@ class GlassIntegrationTests(unittest.TestCase):
         self.smoke.present=present
         return visual.snapshot(self.smoke,label,baseline,present,health_footer=True)
 
-    def test_original_snapshot_lifecycle_keeps_exact_cross_crop_coordinates_and_restore(self):
+    def test_snapshot_lifecycle_keeps_authoritative_chip_coordinates_and_restore(self):
         before=self.capture('before',False)
         during=self.capture('during',True,before)
         after=self.capture('after',False,before)
@@ -243,16 +250,25 @@ class GlassIntegrationTests(unittest.TestCase):
         self.assertGreater(token['y']+token['height'],terminal['y']+terminal['height'])
         self.assertTrue(g.contained(token, g.layout(self.smoke.rect)['native_body']))
         self.assertEqual(during['native_body_regions'][0]['rectangle'],g.layout(self.smoke.rect)['native_body'])
-        self.assertEqual(set(during['token_observation_groups'][0]['sources']),{'whole-image-psm6','whole-native-canvas-psm6','during-native-body-0'})
+        self.assertEqual(during['token_observation_groups'][0]['source'],'during-painted-preedit-0')
+        self.assertEqual(during['native_plane_geometry']['observations'][0]['ocr_psm'],7)
+        self.assertEqual(during['token_ocr_psm'],7)
+        self.assertEqual(during['token_observation_profile'],'production-preedit-chip-v1/psm7')
         self.assertTrue(visual.verify_restoration(self.smoke,before,during,after)['after_restored'])
         self.assertEqual(self.smoke.captures,['before','during','after'])
 
-    def test_partial_word_only_whole_and_one_pixel_crop_disagreement_are_rejected(self):
-        for field,value,reason in [('partial',True,'Expected 1'),('only_whole',True,'native plane'),('shift_body',1,'geometry')]:
+    def test_partial_word_whole_only_and_out_of_chip_observations_are_rejected(self):
+        for field,value,reason in [('partial',True,'Expected 1'),('only_whole',True,'authoritative painted chip'),('shift_body',30,'authoritative painted chip'),('shift_chip',21,'crosses')]:
             with self.subTest(field=field):
                 setattr(self.smoke,field,value)
                 with self.assertRaisesRegex(RuntimeError,reason):self.capture(field,True)
                 setattr(self.smoke,field,False)
+
+    def test_one_pixel_diagnostic_segmentation_does_not_add_another_token(self):
+        self.smoke.shift_body=1
+        during=self.capture('segmented',True)
+        self.assertEqual(during['observed_token_count'],1)
+        self.assertEqual(visual.box(during['matches'][0]),self.smoke.token_box())
 
     def test_header_missing_and_wrong_configured_mode_cannot_satisfy_real_sentinel(self):
         self.smoke.screenshot('health');image=self.smoke.out/'health.png'

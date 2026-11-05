@@ -425,6 +425,66 @@ def reference_native_plane_witnesses(smoke, image, rectangle, contract):
     return canvas, planes, hashlib.sha256(raw).hexdigest()
 
 
+def require_chip_observation_agreement(authoritative, other_observations, rectangle, planes):
+    """One fixed chip pass owns glyph boxes; other passes can only contradict it.
+
+    Cropping changes OCR segmentation by a pixel, so full-image boxes are not
+    unioned as extra tokens. Every exact outside observation must still map to
+    the same uniquely painted chip, with no duplicate inside any one pass.
+    """
+    matches = [word for _, rows in authoritative for word in exact_matches(rows, rectangle)]
+    per_plane = [[] for _ in planes]
+    for word in matches:
+        selected = [i for i,p in enumerate(planes) if contained(box(word),p['rectangle'])]
+        if len(selected) != 1:
+            raise RuntimeError('Authoritative preedit word outside one painted chip')
+        per_plane[selected[0]].append(word)
+    if any(len(words) > 1 for words in per_plane):
+        raise RuntimeError('Duplicate exact tokens inside one painted chip')
+    for _, rows in other_observations:
+        counts = [0] * len(planes)
+        for word in exact_matches(rows, rectangle):
+            selected = [i for i,p in enumerate(planes) if contained(box(word),p['rectangle'])]
+            if len(selected) != 1 or len(per_plane[selected[0]]) != 1:
+                raise RuntimeError('Full-image exact token lacks its authoritative painted chip')
+            counts[selected[0]] += 1
+        if any(count > 1 for count in counts):
+            raise RuntimeError('Duplicate exact tokens in one diagnostic observation')
+    return matches
+
+
+def painted_preedit_observations(smoke, label, image, rectangle, contract):
+    """Always observe all independently registered chips with one fixed PSM7.
+
+    Registration uses paint only, before any token lookup. There is no fallback
+    pass, text repair, resampling, or crop chosen from an OCR word's location.
+    """
+    canvas, planes, pixels_digest = reference_native_plane_witnesses(smoke,image,rectangle,contract)
+    observations, evidence = [], []
+    for index, plane in enumerate(planes):
+        region = plane['rectangle']
+        name = f'{label}-painted-preedit-{index}'
+        target = smoke.out / (name+'.png')
+        smoke.run(['convert',str(image),'-crop',
+                   f"{region['width']}x{region['height']}+{region['x']}+{region['y']}",
+                   '+repage',str(target)])
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        rows = smoke.words(name,psm=7,capture=False)
+        if rows: validate_rows(rows)
+        mapped = []
+        for row in rows:
+            if not contained(box(row),dict(region,x=0,y=0)):
+                raise RuntimeError('Preedit OCR crosses its independently painted chip')
+            mapped.append(dict(row,left=str(int(row['left'])+region['x']),top=str(int(row['top'])+region['y'])))
+        if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+            raise RuntimeError('Painted preedit chip changed during OCR')
+        observations.append((name,mapped))
+        evidence.append(dict(plane,image=str(target),image_sha256=digest,ocr_psm=7,
+                             tsv=str(smoke.out/(name+'-psm7.tsv'))))
+    return observations, dict(canvas=canvas,planes=planes,canvas_rgb_sha256=pixels_digest,
+                              observations=evidence,scope='fixed single-line OCR of every independently painted chip')
+
+
 def inline_body_fixture_contract(config_path):
     import tomllib
     config_bytes = config_path.read_bytes()
@@ -575,21 +635,28 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
     if REFERENCE_SHELL_HEALTH and REFERENCE_INLINE_BODY:
         body_contract = inline_body_fixture_contract(smoke.config)
         body_observations, body_evidence = reference_body_observations(smoke, label, image, rectangle, body_contract)
-        if legacy_token_pair is not None:
-            require_legacy_token_geometry(*legacy_token_pair, rectangle, body_observations)
         token_observations.extend(body_observations)
-        matches, token_groups = merge_exact_token_observations(token_observations, rectangle)
-        registered = [word for _, body_rows in token_observations[1:]
-                      for word in exact_matches(body_rows, rectangle)]
-        for match in matches:
-            if not any(box(word) == box(match) for word in registered):
-                if native_plane_evidence is None:
-                    canvas, planes, pixels_digest = reference_native_plane_witnesses(smoke, image, rectangle, body_contract)
-                    native_plane_evidence = dict(canvas=canvas, planes=planes, canvas_rgb_sha256=pixels_digest,
-                                                 scope='independent geometry witness only; no extra multi-line OCR')
-                plane = require_native_plane_witness(match, rectangle, native_plane_evidence['canvas'],
-                                                     native_plane_evidence['planes'])
-                spatial_witnesses.append(dict(word=box(match), plane=plane))
+        if glass_profile.selected(smoke):
+            authoritative, native_plane_evidence = painted_preedit_observations(smoke,label,image,rectangle,body_contract)
+            matches = require_chip_observation_agreement(authoritative,token_observations,rectangle,
+                                                        native_plane_evidence['planes'])
+            token_groups = [dict(source=name,words=[box(w) for w in exact_matches(words,rectangle)])
+                            for name,words in authoritative]
+        else:
+            if legacy_token_pair is not None:
+                require_legacy_token_geometry(*legacy_token_pair, rectangle, body_observations)
+            matches, token_groups = merge_exact_token_observations(token_observations, rectangle)
+            registered = [word for _, body_rows in token_observations[1:]
+                          for word in exact_matches(body_rows, rectangle)]
+            for match in matches:
+                if not any(box(word) == box(match) for word in registered):
+                    if native_plane_evidence is None:
+                        canvas, planes, pixels_digest = reference_native_plane_witnesses(smoke, image, rectangle, body_contract)
+                        native_plane_evidence = dict(canvas=canvas, planes=planes, canvas_rgb_sha256=pixels_digest,
+                                                     scope='independent geometry witness only; no extra multi-line OCR')
+                    plane = require_native_plane_witness(match, rectangle, native_plane_evidence['canvas'],
+                                                         native_plane_evidence['planes'])
+                    spatial_witnesses.append(dict(word=box(match), plane=plane))
     else:
         matches = exact_matches(token_rows, rectangle)
     if hashlib.sha256(image.read_bytes()).hexdigest() != image_sha256:
@@ -608,6 +675,10 @@ def snapshot(smoke, label, baseline, present, *, health_fallback=False, token_ps
         result['native_body_contract'] = body_contract
         result['whole_image_native_plane_witnesses'] = spatial_witnesses
         result['native_plane_geometry'] = native_plane_evidence
+        if glass_profile.selected(smoke):
+            result['whole_image_token_ocr_psm'] = token_psm
+            result['token_ocr_psm'] = 7
+            result['token_observation_profile'] = 'production-preedit-chip-v1/psm7'
     if footer_evidence is not None:
         result['health_header' if REFERENCE_SHELL_HEALTH else 'health_footer'] = footer_evidence
     (smoke.out / (label + '-visual.json')).write_text(json.dumps(result, indent=2))
