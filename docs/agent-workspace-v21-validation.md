@@ -223,3 +223,23 @@ exactly one token each with this fixed profile. Both complete Block lifecycles
 also preserve zero-token baseline/commit images and byte-exact pixel restoration
 using the authoritative token rectangle. This is archived-image validation only;
 current-master native compositor/PTY acceptance must still pass independently.
+
+
+The actual `a62ef6f` native run passes complete installed-release interactions on
+X11 and Wayland, full Vim editing and independent modal focus (including normal
+application closure), both desktop recovery matrices, both Block and Chat
+compositor preedit/commit/Return, and all six scale/geometry cases. Its two
+mode-switch IME failures remain exact-token OCR misses; the fixed chip observer
+above still needs a fresh native run before those gates can be claimed.
+
+E03 now reaches the selected result and closes Block Search, but the old
+closed-picker observer mistakes the workspace's persistent sidebar Entry for an
+open query editor. The current glass profile identifies that one Entry only by
+its direct owned top-level frame and containment to the left of the unique
+public `Resize navigation sidebar` separator. A named picker, any scope control,
+unknown/duplicate editor, missing separator or foreign tree still fails. No
+query/body text chooses the exception or supplies a pixel success. Legacy editor
+exclusion is unchanged. All four retained actual closed trees validate offline;
+new native navigation, fresh target/neighbor pixels and all remaining E03 stages
+still must run independently. A separate search archive exposes completed
+public evidence while the later compositor gates continue.

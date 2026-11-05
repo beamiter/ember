@@ -440,6 +440,17 @@ jobs:
           done
           exit "$status"
 
+      - name: Preserve completed Block Search evidence
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ember-native-search-${{ github.sha }}
+          path: |
+            native-smoke-artifacts/binary-identity.txt
+            native-smoke-artifacts/block-search-*
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Build compositor protocol pointer helper
         id: desktop-pointer
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}

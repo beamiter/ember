@@ -127,14 +127,54 @@ class PickerOpen(RuntimeError):
     """Owned picker has not closed yet; observation may wait, never reactivate."""
 
 
-def closed_picker(tree, owner, pid):
+def sidebar_entry(tree):
+    """Recognize only the public navigation-sidebar editor, never search text.
+
+    Its direct owned window and named resize separator establish the sidebar
+    independently of query/result strings. Unknown or duplicate editors fail.
+    """
+    nodes = tree['nodes']; by_path = {n['path']: n for n in nodes}
+    separators = [n for n in nodes if n['name'] == 'Resize navigation sidebar' and n['role'] == 52]
+    if len(separators) != 1:
+        raise RuntimeError('Missing or ambiguous navigation-sidebar separator')
+    separator = separators[0]; window = by_path.get(separator['parent'])
+    if window is None or window['role'] != 23 or window['parent'] != tree['root']:
+        raise RuntimeError('Sidebar separator is not in the owned top-level frame')
+    def rectangle(node):
+        values = node.get('screen_extents', [])
+        if not isinstance(values, list) or len(values) != 4 or any(type(v) is not int for v in values):
+            raise RuntimeError('Invalid public sidebar rectangle')
+        return dict(zip(('x', 'y', 'width', 'height'), values))
+    frame = rectangle(window); divider = rectangle(separator)
+    if not glass_profile.contained(divider, frame):
+        raise RuntimeError('Sidebar separator is outside its owned window')
+    sidebar = dict(x=frame['x'], y=divider['y'], width=divider['x']-frame['x'], height=divider['height'])
+    entries = [n for n in nodes if n['role'] == 79]
+    if len(entries) != 1:
+        raise RuntimeError('Missing or ambiguous closed-surface sidebar Entry')
+    entry = entries[0]
+    if (entry['parent'] != window['path'] or 'org.a11y.atspi.Text' not in entry['interfaces']
+            or len(entry['states']) != 2 or not entry['states'][0] & (1 << 7)
+            or not glass_profile.contained(rectangle(entry), sidebar)):
+        raise RuntimeError('Unknown editor remains outside the navigation sidebar')
+    return entry['path']
+
+
+def closed_picker(tree, owner, pid, profile='legacy-reference'):
     base.public.probe.validate_tree(tree['nodes'], tree['root'], owner, pid, None)
     if tree['owner'] != owner or tree['pid'] != pid:
         raise RuntimeError('Foreign application during pixel observation')
     # Only closed-surface/ownership evidence is used; submitted-body text is NEVER inspected.
-    forbidden = {'Search scope: All', 'Search scope: Cmd', 'Search scope: Out', 'Latest'}
-    if any(n['name'] in forbidden or n['role'] == 79 for n in tree['nodes']):
-        raise PickerOpen('Picker/editor still present; pixels cannot prove final navigation')
+    forbidden = {'Block Search', 'Search scope: All', 'Search scope: Cmd', 'Search scope: Out', 'Latest'}
+    if any(n['name'] in forbidden for n in tree['nodes']):
+        raise PickerOpen('Picker still present; pixels cannot prove final navigation')
+    if profile == glass_profile.NAME:
+        sidebar_entry(tree)
+    elif profile == 'legacy-reference':
+        if any(n['role'] == 79 for n in tree['nodes']):
+            raise PickerOpen('Editor still present; pixels cannot prove final navigation')
+    else:
+        raise RuntimeError('Unregistered closed-picker observation profile')
 
 
 class PilotSmoke(base.SearchSmoke):
@@ -266,8 +306,10 @@ class PilotSmoke(base.SearchSmoke):
             label = f'{self.sequence + 1:04d}-pilot-final-output'
             before_tree = base.public.probe.discovery(self.app.pid, self.out / (label + '-before-picker.json'), None)
             try:
-                closed_picker(before_tree, self.public.owner, self.app.pid)
-            except PickerOpen:
+                closed_picker(before_tree, self.public.owner, self.app.pid,
+                              getattr(self, 'native_ui_profile', 'legacy-reference'))
+            except PickerOpen as error:
+                last_error = str(error)
                 time.sleep(0.1)
                 continue
             if time.monotonic() >= deadline: raise RuntimeError('Pilot observation deadline exhausted')
@@ -278,7 +320,8 @@ class PilotSmoke(base.SearchSmoke):
             except RuntimeError as error:
                 last_error = str(error); time.sleep(0.1); continue
             tree = base.public.probe.discovery(self.app.pid, self.out / (label + '-closed-picker.json'), None)
-            closed_picker(tree, self.public.owner, self.app.pid)
+            closed_picker(tree, self.public.owner, self.app.pid,
+                          getattr(self, 'native_ui_profile', 'legacy-reference'))
             if time.monotonic() >= deadline: raise RuntimeError('Pilot observation deadline exhausted')
             if self.app.poll() is not None or self.app_window() != self.public.window:
                 raise RuntimeError('Application/window changed during pilot observation')

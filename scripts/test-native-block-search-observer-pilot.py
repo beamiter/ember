@@ -21,7 +21,60 @@ def tree():
     return dict(owner=':1.2',pid=42,root=root,nodes=[dict(path=root,parent=None,owner=':1.2',pid=42,
         name='Ember',role=23,children=[],states=[0,0],interfaces=[])])
 
+def glass_tree():
+    t=tree();root=t['root'];t['nodes'][0]['role']=75
+    def add(suffix,parent,role,name,box,**extra):
+        path=root+'/'+suffix
+        n=dict(path=path,parent=parent,owner=':1.2',pid=42,name=name,role=role,
+               screen_extents=box,children=[],states=[0,0],interfaces=[])
+        n.update(extra);t['nodes'].append(n)
+        next(n for n in t['nodes'] if n['path']==parent)['children'].append(path)
+        return path
+    window=add('window',root,23,'',[100,50,1600,900])
+    add('divider',window,52,'Resize navigation sidebar',[428,110,2,812])
+    add('sidebar-entry',window,79,'',[158,144,260,14],states=[1<<7,0],
+        interfaces=['org.a11y.atspi.Text'],text='')
+    return t
+
+
 class Tests(unittest.TestCase):
+    def test_glass_sidebar_entry_is_not_an_open_picker(self):
+        t=glass_tree();p.closed_picker(t,':1.2',42,p.glass_profile.NAME)
+        # Query content never decides which Entry is ignored.
+        t['nodes'][-1]['text']='TARGET PAPAYA NEIGHBOR PAPAYA'
+        p.closed_picker(t,':1.2',42,p.glass_profile.NAME)
+        with self.assertRaises(RuntimeError):p.pixel_claim([],'raw',capture(),100)
+        with self.assertRaises(RuntimeError):p.closed_picker(t,':1.2',42)
+
+    def test_glass_picker_or_scope_cannot_be_hidden_by_sidebar_entry(self):
+        for name in ('Block Search','Search scope: Out','Latest'):
+            t=glass_tree();t['nodes'][1]['name']=name
+            with self.assertRaises(p.PickerOpen):p.closed_picker(t,':1.2',42,p.glass_profile.NAME)
+
+    def test_glass_unknown_duplicate_or_unbounded_editor_is_rejected(self):
+        cases=[('screen_extents',[450,144,260,14]),('screen_extents',[158,144,0,14]),
+               ('screen_extents',[158,49,260,14]),('screen_extents',[158,144,260,900]),
+               ('screen_extents',None),('interfaces',[]),('states',[0,0])]
+        for field,value in cases:
+            t=glass_tree();t['nodes'][-1][field]=value
+            with self.subTest(field=field,value=value),self.assertRaises(RuntimeError):
+                p.closed_picker(t,':1.2',42,p.glass_profile.NAME)
+        t=glass_tree();extra=copy.deepcopy(t['nodes'][-1]);extra['path']+='-second'
+        t['nodes'].append(extra);t['nodes'][1]['children'].append(extra['path'])
+        with self.assertRaisesRegex(RuntimeError,'ambiguous'):
+            p.closed_picker(t,':1.2',42,p.glass_profile.NAME)
+
+    def test_glass_sidebar_boundary_and_ownership_are_required(self):
+        for field,value in [('name','Other separator'),('role',43),
+                            ('screen_extents',[428,110,2,900])]:
+            t=glass_tree();t['nodes'][2][field]=value
+            with self.assertRaises(RuntimeError):p.closed_picker(t,':1.2',42,p.glass_profile.NAME)
+        t=glass_tree();t['nodes'][-1]['owner']=':1.9'
+        with self.assertRaises(RuntimeError):p.closed_picker(t,':1.2',42,p.glass_profile.NAME)
+        t=glass_tree();t['nodes'][-1]['pid']=43
+        with self.assertRaises(RuntimeError):p.closed_picker(t,':1.2',42,p.glass_profile.NAME)
+        with self.assertRaises(RuntimeError):p.closed_picker(glass_tree(),':1.2',42,'unknown')
+
     def test_terminal_region_uses_native_surface_not_sidebar_or_marker_text(self):
         from PIL import Image, ImageDraw
         image = Image.new('RGB', (1800, 1000), (0, 0, 0))
