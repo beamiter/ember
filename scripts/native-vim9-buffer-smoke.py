@@ -7,6 +7,7 @@ The GUI color deliberately differs from ctermfg while termguicolors is off.
 """
 import argparse
 import json
+import native_glass_profile
 import os
 from pathlib import Path
 import signal
@@ -27,6 +28,28 @@ def wait_for(probe, label, process, timeout=25):
             raise RuntimeError(f"{label}: application exited {process.returncode}")
         time.sleep(0.08)
     raise RuntimeError("Timed out: " + label)
+
+
+def workspace_header_bounds(image, app):
+    """Registered geometry plus independent owned-window paint, not guessed RGB."""
+    if app == "ember":
+        owned = dict(x=0, y=0, width=image.width, height=image.height)
+        domains = native_glass_profile.layout(owned)
+        witness = native_glass_profile.header_paint(image, owned, "block")
+        center = domains["center"]
+        return center["x"], center["x"] + center["width"], {
+            "profile": "glass-v1", "geometry": domains["metadata"],
+            "paint_witness": witness,
+            "scope": "Registered canvas bounds; independently witnessed mode paint and native source pixels",
+        }
+    # Keep the separate legacy frontend contract until it is explicitly updated.
+    header_y = 42 + 49 - 3
+    light = [x for x in range(image.width) if min(image.getpixel((x, header_y))) > 200]
+    assert light and light == list(range(light[0], light[-1] + 1)), light
+    left, right = light[0], light[-1] + 1
+    assert left == 55 + 237, left
+    assert abs(right - (image.width - 306)) <= 2, right
+    return left, right, {"profile": "legacy-reference", "header_observation_y": header_y}
 
 
 def main():
@@ -453,23 +476,15 @@ def main():
             regions = color_regions("focused-buffer-defaults")
             return regions if regions["x_regions"] and regions["y_regions"] else None
         focused = wait_for(focused_native, "native buffer repainted after cursor fixture", app)
-        # The native workspace adds a navigation column, not a Vim project
-        # tree. Observe its independent light header before checking the same
-        # small source inset; a second IDE/tree inside the canvas still fails.
+        # Register this frontend's current canvas and independently observe
+        # real mode paint. The source-pixel inset check below still rejects an
+        # extra IDE tree or unexpected chrome inside that canvas.
         image = capture("focused-workspace-header")
-        header_y = 42 + 49 - 3
-        light = [x for x in range(image.width)
-                 if min(image.getpixel((x, header_y))) > 200]
-        assert light and light == list(range(light[0], light[-1] + 1)), light
-        canvas_left, canvas_right = light[0], light[-1] + 1
-        assert canvas_left == 55 + 237, canvas_left
-        # Native panel-stroke ownership may consume up to two raster pixels.
-        # This does not alter the 80px source-inset bound being tested.
-        assert abs(canvas_right - (image.width - 306)) <= 2, canvas_right
+        canvas_left, canvas_right, header_witness = workspace_header_bounds(image, args.app)
         assert canvas_left <= focused["x_regions"][0][0] < canvas_left + 80, focused
         assert focused["y_regions"][0][0] < 120, focused
         report["focused_buffer_defaults"] = dict(focused, canvas_header_span=[canvas_left, canvas_right],
-                                                   header_observation_y=header_y)
+                                                   header_witness=header_witness)
         xdo("key", "Escape")
         xdo("type", "--clearmodifiers", "--delay", "20", "ggIsaved_native_")
         wait_for(lambda: state().get("text", "").startswith("saved_native_"), "Vim received insert text", app)

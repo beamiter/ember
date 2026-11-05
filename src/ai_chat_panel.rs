@@ -697,6 +697,7 @@ impl AiChatPanel {
                     .unwrap_or_default()
             ),
             self.redact_secrets,
+            self.is_open,
         );
         self.workspace.rows.clone()
     }

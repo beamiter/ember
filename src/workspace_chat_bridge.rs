@@ -32,6 +32,7 @@ enum Pending {
     Refresh,
     Import {
         snapshots: HashMap<u64, String>,
+        activate_selection: Option<u64>,
     },
     History {
         chat_id: u64,
@@ -137,7 +138,13 @@ impl WorkspaceChats {
         }
     }
 
-    pub(crate) fn start(&mut self, store: &mut ChatStore, namespace: &str, redact: bool) {
+    pub(crate) fn start(
+        &mut self,
+        store: &mut ChatStore,
+        namespace: &str,
+        redact: bool,
+        visible: bool,
+    ) {
         if self.imported {
             return;
         }
@@ -167,7 +174,10 @@ impl WorkspaceChats {
                                 namespace: namespace.into(),
                                 snapshot_json,
                             },
-                            Pending::Import { snapshots },
+                            Pending::Import {
+                                snapshots,
+                                activate_selection: visible.then_some(self.selection),
+                            },
                         );
                     }
                 }
@@ -554,7 +564,13 @@ impl WorkspaceChats {
                         .then(a.id.cmp(&b.id))
                 });
             }
-            (Pending::Import { snapshots }, WorkspaceReply::Imported { mappings }) => {
+            (
+                Pending::Import {
+                    snapshots,
+                    activate_selection,
+                },
+                WorkspaceReply::Imported { mappings },
+            ) => {
                 let active_before = store.active_id();
                 let mut open_imported = None;
                 // Import ACK plus exact snapshot equality is the proof required
@@ -568,7 +584,12 @@ impl WorkspaceChats {
                             })
                             .and_then(|snapshot| snapshot.to_json().ok());
                         if now.as_ref() == Some(before) {
-                            if mapping.legacy_id == active_before && self.selection == 0 {
+                            // Catalog migration runs while the terminal is visible too.
+                            // Only a chat that was explicitly visible when import began
+                            // may retain focus, and never after the user navigated away.
+                            if mapping.legacy_id == active_before
+                                && activate_selection == Some(self.selection)
+                            {
                                 open_imported = Some(mapping.id.clone());
                             }
                             let _ = store.evict_imported_legacy_chat(mapping.legacy_id);
@@ -1543,8 +1564,15 @@ mod tests {
     }
 
     #[test]
-    fn import_ack_opens_only_an_unchanged_active_placeholder() {
-        for (edited, moved) in [(false, false), (true, false), (false, true)] {
+    fn import_ack_only_preserves_explicitly_visible_unchanged_selection() {
+        for (visible, edited, moved) in [
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
             let mut store = ChatStore::default();
             let old = store.active_id();
             let before = ConversationSnapshot::from_chats(
@@ -1560,10 +1588,13 @@ mod tests {
                 ),
                 ..Default::default()
             };
+            // A visible chat can be reopened after earlier navigation too.
+            bridge.selection = 7;
             bridge.pending.insert(
                 950,
                 Pending::Import {
                     snapshots: HashMap::from([(old, before)]),
+                    activate_selection: visible.then_some(bridge.selection),
                 },
             );
             if edited {
@@ -1587,9 +1618,31 @@ mod tests {
                 .pending
                 .values()
                 .any(|p| matches!(p, Pending::Open { .. }));
-            assert_eq!(opening, !edited && !moved);
+            assert_eq!(opening, visible && !edited && !moved);
             if edited {
                 assert_eq!(store.active_draft(), "typed during migration");
+            }
+            if opening {
+                let request = *bridge
+                    .pending
+                    .iter()
+                    .find(|(_, pending)| matches!(pending, Pending::Open { .. }))
+                    .unwrap()
+                    .0;
+                // Import may finish first, then the user returns to Terminal
+                // while its asynchronous LoadChat is still in flight.
+                bridge.leave();
+                let effects = bridge.handle_reply(
+                    &mut store,
+                    request,
+                    Ok(WorkspaceReply::Chat {
+                        chat: stored((1u64 << 48) + 95, "jterm:api:imported-fixture", ""),
+                    }),
+                    false,
+                );
+                assert!(effects
+                    .iter()
+                    .all(|effect| !matches!(effect, Effect::Activate(_))));
             }
         }
     }

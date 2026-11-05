@@ -80,3 +80,29 @@ hardware or native-environment claims. Ignored/skipped/blocked checks remain suc
 The historical `packaging/jterm-core-src.tar.gz` is retained for provenance but is
 not selected by production Cargo resolution. The materialization entrypoint uses
 `cargo fetch --locked` for the production Git pin and creates no sibling directory.
+
+## Native CI evidence and follow-up (2026-11-05)
+
+The published stability revision's [CI run 41952783970](https://github.com/beamiter/ember/actions/runs/41952783970)
+passed Rustfmt, strict Clippy, full tests (including the trusted-Git cases), host
+restart/draft smoke, font groups, frame receipts and installer checks. Its native
+release job failed. The preserved Wayland screenshot shows the PTY sentinel
+command in an unsolicited API-chat composer; the Vim screenshot shows that same
+chat hiding the running editor. Background catalog migration was opening its
+legacy active chat after the host import acknowledgement, stealing Terminal focus.
+
+Import now captures explicit panel visibility and the current selection generation.
+Only an unchanged, explicitly visible chat may retain selection after migration.
+Hidden catalog refresh cannot open it; closing or selecting another surface while
+either import or load is pending invalidates navigation. The regression matrix
+covers hidden/visible, edited, navigated, nonzero generation and post-import close.
+The native gates remain enabled for exact-commit reruns, not counted as passing.
+The Vim observer also uses the registered current dark canvas, with an independent
+selected-mode paint witness and its unchanged real source-RGB inset assertions.
+
+The dependency audit exposed a yanked `async-executor` 1.14.0. Version 1.14.1 fixes
+the upstream Executor-drop/Waker use-after-free and is now pinned in the lockfile.
+Three separate unmaintained advisories (`zbus_names`, `zvariant`, `zvariant_derive`)
+have no patched version in the advisory database; their migration into zbus 6
+requires the upstream native accessibility/settings dependency chain to update.
+The audit remains strict and these advisories are not ignored or marked passed.
