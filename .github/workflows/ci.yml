@@ -371,9 +371,18 @@ jobs:
         run: cargo build -p ember --release --all-features --locked
 
       - name: Install official desktop test packages
+        timeout-minutes: 6
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
+          # The runner's Azure mirror stalled large fonts/Mesa downloads until
+          # the whole native job expired. Keep Ubuntu's signed packages and
+          # exact dependency list, but prefer its official HTTPS archives.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://security.ubuntu.com/ubuntu/\tpriority:2\n' \
+              | sudo tee /etc/apt/apt-mirrors.txt
+          fi
+          apt_network=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_network[@]}" update
+          sudo apt-get "${apt_network[@]}" install --no-install-recommends -y \
             xvfb openbox xdotool xclip x11-utils sway wtype wl-clipboard grim \
             dbus python3-dbus python3-pil at-spi2-core imagemagick tesseract-ocr fonts-dejavu-core fonts-noto-cjk mesa-vulkan-drivers mesa-utils libxkbcommon-x11-0 libwayland-bin vim ripgrep
 
