@@ -7772,6 +7772,9 @@ docker = true
             "-c".to_string(),
             r#"
 set -eu
+# download_file/download_dir send PROBE_SCRIPT even to this fake remote.
+# Drain it so a short stdin write cannot race the publication safety check.
+cat >/dev/null
 parent=$1
 moved=$2
 stage=
@@ -8840,6 +8843,9 @@ printf genuine
             "-c".to_string(),
             r#"
 set -eu
+# download_file/download_dir send PROBE_SCRIPT even to this fake remote.
+# Drain it so a short stdin write cannot race the publication safety check.
+cat >/dev/null
 parent=$1
 moved=$2
 attacker=$3

@@ -3,34 +3,8 @@ name: Supply-chain security
 on:
   pull_request:
     branches: [master]
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - deny.toml
-      - .cargo/audit.toml
-      - scripts/**
-      - vendor/mundy/**
-      - vendor/accesskit_unix/**
-      - vendor/accesskit_atspi_common/**
-      - vendor/atspi-common/**
-      - vendor/atspi-proxies/**
-      - .github/workflows/security.yml
-      - .github/workflows/ci.yml
   push:
     branches: [master, candidate/zbus6]
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - deny.toml
-      - .cargo/audit.toml
-      - scripts/**
-      - vendor/mundy/**
-      - vendor/accesskit_unix/**
-      - vendor/accesskit_atspi_common/**
-      - vendor/atspi-common/**
-      - vendor/atspi-proxies/**
-      - .github/workflows/security.yml
-      - .github/workflows/ci.yml
   schedule:
     - cron: "11 4 * * 1"
   workflow_dispatch:
@@ -85,6 +59,9 @@ jobs:
             --locked --force
           cargo audit --version | grep -Eq \
             "[[:space:]]${CARGO_AUDIT_VERSION}$"
+
+      - name: Check exact-head audit coverage
+        run: python3 scripts/test-security-workflow.py
 
       - name: Audit the locked dependency graph
         run: scripts/security-check.sh --audit
