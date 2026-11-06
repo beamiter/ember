@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Pure negative target-selection contracts; these are not native acceptance."""
 import copy
+import ast
+import textwrap
 import importlib.util
 from pathlib import Path
 import tempfile
@@ -59,6 +61,90 @@ class Targets(unittest.TestCase):
         tree['nodes'].append(node)
         with self.assertRaises(RuntimeError):
             m.visible_label(tree, 'Title')
+
+    def validation_evidence(self):
+        repository = {'identity': {'full_name': 'beamiter/ember'}, 'path': '/fixture/ember',
+                      'candidate': 'b' * 40}
+        saved = {'id': 'fixture', 'revision': 2, 'required_environment': 'local',
+                 'repositories': [repository]}
+        report = {'id': 'fixture', 'revision': 2, 'repositories': [dict(repository,
+                  validated=False, checks=[{'check_name': 'validation', 'environment': 'local',
+                  'status': 'not_run', 'detail': 'Fixture missing validation'}])]}
+        return saved, report
+
+    def test_fixture_validation_reason_maps_only_blocked_and_not_run(self):
+        for status, label in [('blocked', 'Validation blocked'), ('not_run', 'Run the required validation')]:
+            saved, report = self.validation_evidence()
+            report['repositories'][0]['checks'][0]['status'] = status
+            before = copy.deepcopy(report)
+            self.assertEqual(m.fixture_validation_reason(saved, report),
+                             'beamiter/ember · ' + label + ' · validation')
+            self.assertEqual(report, before)
+            self.assertFalse(report['repositories'][0]['validated'])
+
+    def test_fixture_validation_reason_rejects_other_statuses(self):
+        for status in ['passed', 'failed', 'stale', 'unknown', None]:
+            saved, report = self.validation_evidence()
+            report['repositories'][0]['checks'][0]['status'] = status
+            with self.subTest(status=status), self.assertRaises(RuntimeError):
+                m.fixture_validation_reason(saved, report)
+
+    def test_fixture_validation_reason_rejects_mismatched_evidence(self):
+        for change in ['id', 'revision', 'path', 'candidate', 'environment', 'duplicate', 'validated']:
+            saved, report = self.validation_evidence()
+            repo = report['repositories'][0]
+            if change in ('id', 'revision'): report[change] = 'wrong'
+            elif change in ('path', 'candidate'): repo[change] = 'wrong'
+            elif change == 'environment': repo['checks'][0]['environment'] = 'wrong'
+            elif change == 'duplicate': repo['checks'].append(copy.deepcopy(repo['checks'][0]))
+            else: repo['validated'] = True
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                m.fixture_validation_reason(saved, report)
+
+    def validation_block(self, opens_detail):
+        # Execute the real production block so omitting its assertion fails this test.
+        source = Path(m.__file__).read_text()
+        parsed = ast.parse(source)
+        start = next(node.lineno for node in ast.walk(parsed) if isinstance(node, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == 'validation_reason'
+                             for target in node.targets))
+        claim = 'Real Needs-you clicks exposed missing validation and publication as read-only reasons'
+        end = next(node.end_lineno for node in ast.walk(parsed) if isinstance(node, ast.Expr)
+                   and isinstance(node.value, ast.Call)
+                   and any(isinstance(arg, ast.Constant) and arg.value == claim for arg in node.value.args))
+        block = textwrap.dedent('\n'.join(source.splitlines()[start - 1:end]))
+        tree = self.tree()
+        reason = 'beamiter/ember · Run the required validation · validation'
+        detail = 'Fixture exact missing validation detail'
+        tree['nodes'][3]['name'] = reason
+        # The ordinary report has the same detail even when navigation is broken.
+        tree['nodes'][4]['name'] = detail
+        driver = Mock()
+        def press(label):
+            if label == reason and opens_detail:
+                node = copy.deepcopy(tree['nodes'][4])
+                node.update(path=node['path'] + '-selected', screen_extents=[110, 530, 300, 20])
+                tree['nodes'][2]['children'].append(node['path'])
+                tree['nodes'].append(node)
+        driver.press.side_effect = press
+        driver.locate.return_value = tree
+        saved, report = self.validation_evidence()
+        report['repositories'][0]['checks'][0]['detail'] = detail
+        result = {'assertions': []}
+        exec(compile('\n' * (start - 1) + block, m.__file__, 'exec'),
+             dict(driver=driver, saved=saved, report=report,
+                  fixture_validation_reason=m.fixture_validation_reason,
+                  visible_reason_detail=m.visible_reason_detail,
+                  visible_label=Mock(), stored=lambda home: [{'revision': 2}],
+                  out=Path('/tmp'), result=result))
+        self.assertEqual(result['assertions'], [claim])
+
+    def test_validation_click_noop_cannot_use_report_detail(self):
+        with self.assertRaisesRegex(RuntimeError, 'Missing or ambiguous selected Mission reason detail'):
+            self.validation_block(False)
+
+    def test_validation_click_checks_selected_detail_before_publication(self):
+        self.validation_block(True)
 
     def test_disabled_is_only_admitted_for_negative_click(self):
         tree = self.tree()

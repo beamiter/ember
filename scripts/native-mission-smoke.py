@@ -122,6 +122,49 @@ def visible_label(tree, text):
     return choices[0]
 
 
+def fixture_validation_reason(saved, report):
+    if (report['id'], report['revision']) != (saved['id'], saved['revision']):
+        raise RuntimeError('Validation reason requires the exact fresh saved revision')
+    planned = [repo for repo in saved['repositories'] if repo['identity']['full_name'] == 'beamiter/ember']
+    observed = [repo for repo in report['repositories'] if repo['identity']['full_name'] == 'beamiter/ember']
+    if len(planned) != 1 or len(observed) != 1:
+        raise RuntimeError('Missing or ambiguous Ember validation repository')
+    planned, observed = planned[0], observed[0]
+    if (observed['path'], observed['candidate']) != (planned['path'], planned['candidate']):
+        raise RuntimeError('Validation reason does not match the exact saved candidate')
+    checks = [check for check in observed['checks'] if check['check_name'] == 'validation'
+              and check['environment'] == saved['required_environment']]
+    if len(checks) != 1 or observed['validated']:
+        raise RuntimeError('Unexpected fixture validation evidence')
+    labels = {'blocked': 'Validation blocked', 'not_run': 'Run the required validation'}
+    status = checks[0]['status']
+    if status not in labels:
+        raise RuntimeError('Unexpected fixture validation status: ' + str(status))
+    return 'beamiter/ember · ' + labels[status] + ' · validation'
+
+
+def visible_reason_detail(tree, label, text):
+    # The report also renders check.detail; require the label immediately below
+    # this exact reason button, not another repository's report or selection.
+    frame, nodes = owned_nodes(tree)
+    frame = content_frame(frame, nodes)
+    anchor = button(tree, label)
+    _, y, _, height = anchor['screen_extents']
+    bottom = y + height
+    following = [node['screen_extents'][1] for node in nodes
+                 if node['role'] in (43, 62) and node['path'] != anchor['path']
+                 and len(node.get('screen_extents', [])) == 4
+                 and node['screen_extents'][1] >= bottom]
+    limit = min(following, default=frame['screen_extents'][1] + frame['screen_extents'][3])
+    choices = [node for node in nodes if node['name'] == text and node['role'] == 29
+               and visible(node, frame)
+               and bottom <= node['screen_extents'][1]
+               and node['screen_extents'][1] + node['screen_extents'][3] <= limit]
+    if len(choices) != 1:
+        raise RuntimeError('Missing or ambiguous selected Mission reason detail: ' + label)
+    return choices[0]
+
+
 def fixture_repositories(parent):
     heads = {}
     for name in REPOSITORIES:
@@ -343,11 +386,18 @@ def main():
         result['assertions'].append('One explicit native Freeze recorded the five observed candidates at revision 2')
         time.sleep(.5)
         driver.press(INSPECT)
-        native.wait_for(lambda: inspected(2), 'frozen candidate inspection')
+        saved, report = native.wait_for(lambda: inspected(2), 'frozen candidate inspection')
         time.sleep(.5)
-        validation_reason = 'beamiter/ember · Run the required validation · validation'
+        validation_reason = fixture_validation_reason(saved, report)
         publication_reason = 'beamiter/ember · Verify the pushed candidate'
+        checks = [check for repo in report['repositories']
+                  if repo['identity']['full_name'] == 'beamiter/ember'
+                  for check in repo['checks'] if check['check_name'] == 'validation']
+        if len(checks) != 1 or not isinstance(checks[0].get('detail'), str) or not checks[0]['detail'].strip():
+            raise RuntimeError('Missing or ambiguous Ember validation detail in fresh report')
         driver.press(validation_reason)
+        visible_reason_detail(driver.locate(validation_reason, (43, 62), below=60),
+                              validation_reason, checks[0]['detail'])
         driver.press(publication_reason)
         detail = 'No matching remote candidate receipt is available; inspect before taking publication action'
         visible_label(driver.locate(detail, (29,)), detail)
