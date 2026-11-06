@@ -211,6 +211,46 @@ class Targets(unittest.TestCase):
             smoke.run.assert_called_once_with(['xdotool', 'mousemove', '788', '461',
                                                'click', '--repeat', '3', '--delay', '60', '5'])
 
+    def scroll_sequence(self, positions, error=None, below=0):
+        with tempfile.TemporaryDirectory() as directory:
+            smoke = Mock(out=Path(directory))
+            driver = m.Driver(smoke)
+            trees = []
+            for y in positions:
+                tree = self.tree()
+                tree['nodes'][3]['screen_extents'][1] = y
+                trees.append(tree)
+            driver.read = Mock(side_effect=trees)
+            driver.click = Mock()
+            with patch.object(m.time, 'sleep'):
+                if error:
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        driver.locate(m.FREEZE, (43, 62), below=below)
+                else:
+                    self.assertEqual(driver.locate(m.FREEZE, (43, 62), below=below), trees[-1])
+            driver.click.assert_not_called()
+            return smoke.run.call_count, driver.read.call_count, smoke.run.call_args_list
+
+    def test_long_report_scroll_down_and_back_up(self):
+        down = list(range(2500, 699, -120))
+        count, reads, calls = self.scroll_sequence(down, below=60)
+        self.assertEqual(count, len(down) - 1)
+        self.assertGreater(count, 8)
+        self.assertEqual(reads, len(down))
+        self.assertTrue(all(call.args[0][-1] == '5' for call in calls))
+        up = list(range(-1500, 181, 120))
+        count, reads, calls = self.scroll_sequence(up)
+        self.assertGreater(count, 8)
+        self.assertTrue(all(call.args[0][-1] == '4' for call in calls))
+
+    def test_scroll_stall_and_wrong_direction_stop_without_click(self):
+        self.assertEqual(self.scroll_sequence([2500, 2500, 2500], 'scrolling stalled')[:2], (2, 3))
+        self.assertEqual(self.scroll_sequence([2500, 2510], 'against scroll direction')[:2], (1, 2))
+        self.assertEqual(self.scroll_sequence([-1000, -1010], 'against scroll direction')[:2], (1, 2))
+
+    def test_scroll_budget_remains_bounded_without_click(self):
+        self.assertEqual(self.scroll_sequence(range(4000, 3975, -1), 'scroll budget exhausted')[:2], (24, 25))
+
     def test_missing_exact_target_is_not_a_license_to_scroll_or_click(self):
         with tempfile.TemporaryDirectory() as directory:
             smoke = Mock(out=Path(directory))

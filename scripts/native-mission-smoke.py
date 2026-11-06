@@ -249,7 +249,12 @@ class Driver:
     def locate(self, label, roles, dialog=True, below=0, title=TITLE):
         # Egui exposes offscreen children in its public tree. Their extents
         # locate a scroll direction, never authorize clicking through clipping.
-        for attempt in range(9):
+        # Long five-repository reports need more than eight 120px wheel batches.
+        # Bound the work and stop early if scrolling stalls or moves backwards.
+        max_scrolls = 24
+        previous = None
+        stalled = 0
+        for attempt in range(max_scrolls + 1):
             tree = self.read('locate-control')
             frame, nodes = owned_nodes(tree, dialog, title)
             area = content_frame(frame, nodes, scrollable=title == TITLE) if dialog else frame
@@ -262,11 +267,22 @@ class Driver:
                 raise RuntimeError('Invalid Mission target geometry: ' + label)
             x, y, width, height = bounds
             ax, ay, aw, ah = area['screen_extents']
+            if previous is not None:
+                old_y, old_direction = previous
+                progress = old_y - (y - ay) if old_direction == '5' else (y - ay) - old_y
+                if progress < 0:
+                    raise RuntimeError('Mission target moved against scroll direction: ' + label)
+                stalled = stalled + 1 if progress == 0 else 0
+                if stalled >= 2:
+                    raise RuntimeError('Mission target scrolling stalled: ' + label)
             if visible(node, area) and y + height + below <= ay + ah:
                 return tree
-            if not dialog or title != TITLE or x < ax or x + width > ax + aw or attempt == 8:
+            if not dialog or title != TITLE or x < ax or x + width > ax + aw:
                 raise RuntimeError('Mission target is not safely visible: ' + label)
+            if attempt == max_scrolls:
+                raise RuntimeError('Mission target scroll budget exhausted: ' + label)
             direction = '5' if y + height + below > ay + ah else '4'
+            previous = (y - ay, direction)
             # Use the owned dialog's right gutter, away from multiline inputs.
             self.smoke.run(['xdotool', 'mousemove', str(ax + aw - 12), str(ay + ah // 2),
                             'click', '--repeat', '3', '--delay', '60', direction])
