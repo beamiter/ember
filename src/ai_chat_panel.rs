@@ -297,7 +297,9 @@ impl AiChatPanel {
         // Ordering: a debounced save may still be running with an older view of
         // the library, and it must not land after this one.
         self.join_persist_thread();
-        if !persist_allowed(self.persistence_owner, &self.persist_state) {
+        if !persist_allowed(self.persistence_owner, &self.persist_state)
+            || self.workspace.is_unpersisted_startup(&self.store)
+        {
             self.dirty_since = None;
             return;
         }
@@ -320,7 +322,9 @@ impl AiChatPanel {
     /// serialise-and-write half runs on a short-lived worker thread so a
     /// contended directory lock cannot stall the frame that is about to paint.
     fn persist_debounced(&mut self) {
-        if !persist_allowed(self.persistence_owner, &self.persist_state) {
+        if !persist_allowed(self.persistence_owner, &self.persist_state)
+            || self.workspace.is_unpersisted_startup(&self.store)
+        {
             self.dirty_since = None;
             return;
         }
@@ -395,6 +399,7 @@ impl AiChatPanel {
         }
         match restore_library() {
             RestoreOutcome::Loaded(store) => {
+                self.workspace.preserve_restored_chats();
                 self.store = store;
                 self.persist_state = PersistState::Ready;
             }
@@ -708,17 +713,19 @@ impl AiChatPanel {
         config: &Config,
     ) {
         self.open(config);
-        self.workspace_summaries(config.ai_redact_secrets);
+        // Record the selected/new chat before startup migration sees the
+        // visible panel, so it cannot also import the unused local composer.
         match id {
             Some(id) => self.workspace.open(id),
             None => self.workspace.create(),
         }
+        self.workspace_summaries(config.ai_redact_secrets);
     }
 
     pub(crate) fn open_workspace_draft(&mut self, config: &Config, title: String, body: String) {
         self.open(config);
-        self.workspace_summaries(config.ai_redact_secrets);
         self.workspace.create_with_draft(title, body);
+        self.workspace_summaries(config.ai_redact_secrets);
     }
 
     pub(crate) fn drive_workspace(&mut self, ctx: &egui::Context, config: &Config) {

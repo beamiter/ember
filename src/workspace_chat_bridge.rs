@@ -4,7 +4,7 @@ use jterm_core::agent_workspace::{
     ConversationId, ConversationKind, StoredChat, StoredMessage, SubmissionReceipt,
     WorkspaceClient, WorkspaceCommand as Command, WorkspaceEvent, WorkspaceReply, WorkspaceRow,
 };
-use jterm_core::ai::{ChatStore, ConversationSnapshot, RequestToken};
+use jterm_core::ai::{ChatSnapshot, ChatStore, ConversationSnapshot, RequestToken};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -89,6 +89,9 @@ pub(crate) struct WorkspaceChats {
     pub(crate) rows: Vec<WorkspaceRow>,
     pub(crate) notice: Option<String>,
     imported: bool,
+    deferred_startup_chat: Option<u64>,
+    restored_legacy_chats: bool,
+    startup_edited: bool,
     selection: u64,
     last_refresh: Instant,
     read_pending: HashMap<u64, (f64, Instant)>,
@@ -115,6 +118,9 @@ impl Default for WorkspaceChats {
             rows: Vec::new(),
             notice: None,
             imported: false,
+            deferred_startup_chat: None,
+            restored_legacy_chats: false,
+            startup_edited: false,
             selection: 0,
             last_refresh: Instant::now() - Duration::from_secs(10),
             read_pending: HashMap::new(),
@@ -122,6 +128,24 @@ impl Default for WorkspaceChats {
             cancelled_dispatch: HashSet::new(),
         }
     }
+}
+
+/// Payload check only: the caller must separately establish fresh-store origin.
+/// An empty named, archived, truncated, or in-flight chat is still user data.
+fn is_startup_placeholder(chat: &ChatSnapshot, store: &ChatStore) -> bool {
+    chat.id() == 1
+        && chat.title() == jterm_core::ai::DEFAULT_CHAT_TITLE
+        && chat.turns().is_empty()
+        && chat.draft().is_empty()
+        && chat.block_context().is_none()
+        && !chat.archived()
+        && !chat.history_truncated()
+        && (store.active_id() != chat.id()
+            || matches!(store.active_status(), jterm_core::ai::ChatStatus::Idle))
+        && !store
+            .in_flight_tokens()
+            .iter()
+            .any(|token| token.chat_id == chat.id())
 }
 
 impl WorkspaceChats {
@@ -138,6 +162,27 @@ impl WorkspaceChats {
         }
     }
 
+    /// A loaded legacy file is user data even when it contains one empty id=1.
+    pub(crate) fn preserve_restored_chats(&mut self) {
+        self.restored_legacy_chats = true;
+    }
+
+    /// Do not turn an unused local composer into a restored chat on next launch.
+    /// This is a no-write gate only; it never removes an existing snapshot.
+    pub(crate) fn is_unpersisted_startup(&self, store: &ChatStore) -> bool {
+        !self.restored_legacy_chats
+            && !self.startup_edited
+            && store.len() == 1
+            && store.active_id() == 1
+            && self.known.is_empty()
+            && self.awaiting_dispatch.is_empty()
+            && self.receipts.is_empty()
+            && self.pending.values().all(|p| matches!(p, Pending::Refresh))
+            && store
+                .snapshot_chat_for_persistence(1, false)
+                .is_some_and(|chat| is_startup_placeholder(&chat, store))
+    }
+
     pub(crate) fn start(
         &mut self,
         store: &mut ChatStore,
@@ -145,19 +190,48 @@ impl WorkspaceChats {
         redact: bool,
         visible: bool,
     ) {
-        if self.imported {
+        let first_start = !self.imported;
+        let may_defer = self.deferred_startup_chat.is_some()
+            || (!self.restored_legacy_chats && store.len() == 1 && store.active_id() == 1);
+        let candidates = if first_start {
+            self.imported = true;
+            store
+                .snapshot_for_persistence(redact)
+                .map(|(snapshot, _)| snapshot.chats().to_vec())
+                .unwrap_or_default()
+        } else if let Some(id) = self.deferred_startup_chat {
+            store
+                .snapshot_chat_for_persistence(id, redact)
+                .into_iter()
+                .collect()
+        } else {
             return;
-        }
-        self.imported = true;
-        // Shared IDs occupy a disjoint numeric range and must never be imported
-        // as another legacy conversation when a local safety snapshot is restored.
-        if let Ok((snapshot, _)) = store.snapshot_for_persistence(redact) {
-            let legacy = snapshot
-                .chats()
-                .iter()
-                .filter(|chat| chat.id() < (1u64 << 48))
-                .cloned()
-                .collect::<Vec<_>>();
+        };
+        // Shared IDs must never be reimported from a local safety snapshot.
+        // The store's initial empty chat is only a local composer until it is
+        // edited or explicitly opened. Keep checking that one deferred row:
+        // marking all migration complete here would strand its first draft.
+        let explicitly_opened = visible && !self.opening();
+        let legacy = candidates
+            .into_iter()
+            .filter(|chat| chat.id() < (1u64 << 48))
+            .filter(|chat| {
+                if may_defer
+                    && !self.startup_edited
+                    && is_startup_placeholder(chat, store)
+                    && !self.is_pending(chat.id())
+                    && !self.awaiting_dispatch.contains_key(&chat.id())
+                    && !self.receipts.keys().any(|token| token.chat_id == chat.id())
+                    && !(explicitly_opened && store.active_id() == chat.id())
+                {
+                    self.deferred_startup_chat = Some(chat.id());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>();
+        if !legacy.is_empty() {
             let snapshots = legacy
                 .iter()
                 .filter_map(|chat| {
@@ -165,11 +239,14 @@ impl WorkspaceChats {
                         .and_then(|snapshot| snapshot.to_json().ok())
                         .map(|json| (chat.id(), json))
                 })
-                .collect();
+                .collect::<HashMap<_, _>>();
             if let Some(first) = legacy.first() {
                 if let Some(snapshot) = ConversationSnapshot::from_chats(first.id(), legacy) {
                     if let Ok(snapshot_json) = snapshot.to_json() {
-                        self.send(
+                        let includes_deferred = self
+                            .deferred_startup_chat
+                            .is_some_and(|id| snapshots.contains_key(&id));
+                        if self.send(
                             Command::ImportChats {
                                 namespace: namespace.into(),
                                 snapshot_json,
@@ -178,12 +255,17 @@ impl WorkspaceChats {
                                 snapshots,
                                 activate_selection: visible.then_some(self.selection),
                             },
-                        );
+                        ) && includes_deferred
+                        {
+                            self.deferred_startup_chat = None;
+                        }
                     }
                 }
             }
+            self.refresh();
+        } else if first_start {
+            self.refresh();
         }
-        self.refresh();
     }
 
     pub(crate) fn pin(&mut self, id: ConversationId, pinned: bool) {
@@ -303,7 +385,13 @@ impl WorkspaceChats {
         true
     }
     pub(crate) fn opening(&self) -> bool {
-        self.pending.values().any(|pending| matches!(pending, Pending::Open { selection, .. } if *selection == self.selection))
+        self.pending.values().any(|pending| match pending {
+            Pending::Open { selection, .. } => *selection == self.selection,
+            Pending::Import {
+                activate_selection, ..
+            } => *activate_selection == Some(self.selection),
+            _ => false,
+        })
     }
     pub(crate) fn leave(&mut self) {
         self.selection = self.selection.wrapping_add(1);
@@ -395,6 +483,7 @@ impl WorkspaceChats {
 
     pub(crate) fn changed(&mut self, store: &ChatStore) {
         let id = store.active_id();
+        self.startup_edited |= id == 1;
         if let Some(chat) = self.known.get_mut(&id) {
             chat.generation = chat.generation.wrapping_add(1);
             chat.dirty = true;
@@ -404,6 +493,7 @@ impl WorkspaceChats {
     }
 
     pub(crate) fn changed_id(&mut self, store: &ChatStore, id: u64) {
+        self.startup_edited |= id == 1;
         if let Some(chat) = self.known.get_mut(&id) {
             chat.generation = chat.generation.wrapping_add(1);
             chat.dirty = true;
@@ -1090,6 +1180,300 @@ mod tests {
     use super::*;
     use jterm_core::agent_workspace::RuntimeState;
     use jterm_core::ai::{ChatSnapshot, Role, Turn};
+
+    fn startup_bridge() -> WorkspaceChats {
+        WorkspaceChats {
+            client: WorkspaceClient::for_state_dir(
+                std::env::temp_dir().join(format!("bridge-startup-{}", uuid::Uuid::new_v4())),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn imported_ids(bridge: &WorkspaceChats) -> Vec<u64> {
+        let mut ids: Vec<_> = bridge
+            .pending
+            .values()
+            .filter_map(|pending| match pending {
+                Pending::Import { snapshots, .. } => Some(snapshots.keys().copied()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn startup_placeholder_stays_local_without_catalog_writes_or_repeated_refresh() {
+        let mut bridge = startup_bridge();
+        let mut store = ChatStore::default();
+        bridge.start(&mut store, "startup-test", false, false);
+        assert_eq!(bridge.deferred_startup_chat, Some(1));
+        assert!(imported_ids(&bridge).is_empty());
+        assert!(bridge
+            .pending
+            .values()
+            .all(|p| matches!(p, Pending::Refresh)));
+        bridge.pending.clear();
+        bridge.start(&mut store, "startup-test", false, false);
+        assert!(bridge.pending.is_empty());
+        assert_eq!(store.active_id(), 1);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn unused_startup_is_not_persisted_but_restored_or_explicit_work_is() {
+        let mut store = ChatStore::default();
+        let mut bridge = startup_bridge();
+        assert!(bridge.is_unpersisted_startup(&store));
+        bridge.start(&mut store, "startup-test", false, false);
+        assert!(bridge.is_unpersisted_startup(&store));
+        bridge.preserve_restored_chats();
+        assert!(!bridge.is_unpersisted_startup(&store));
+
+        let mut bridge = startup_bridge();
+        store.set_active_draft("user draft".into());
+        assert!(!bridge.is_unpersisted_startup(&store));
+        store.set_active_draft(String::new());
+        store.new_chat().unwrap();
+        assert!(!bridge.is_unpersisted_startup(&store));
+
+        let store = ChatStore::default();
+        bridge.create();
+        assert!(!bridge.is_unpersisted_startup(&store));
+    }
+
+    #[test]
+    fn an_edited_then_cleared_startup_chat_is_still_user_data() {
+        for edit_active in [false, true] {
+            let mut store = ChatStore::default();
+            let mut bridge = startup_bridge();
+            bridge.start(&mut store, "startup-test", false, false);
+            store.set_active_draft("typed then cleared".into());
+            if edit_active {
+                bridge.changed(&store);
+            } else {
+                bridge.changed_id(&store, 1);
+            }
+            store.set_active_draft(String::new());
+            assert!(!bridge.is_unpersisted_startup(&store));
+            bridge.start(&mut store, "startup-test", false, false);
+            assert_eq!(imported_ids(&bridge), [1]);
+        }
+    }
+
+    #[test]
+    fn restored_empty_default_chat_is_user_data_and_still_migrates() {
+        let mut original = ChatStore::default();
+        let (snapshot, _) = original.snapshot_for_persistence(false).unwrap();
+        let mut store = ChatStore::restore(snapshot);
+        let mut bridge = startup_bridge();
+        bridge.preserve_restored_chats();
+        bridge.start(&mut store, "startup-test", false, false);
+        assert_eq!(imported_ids(&bridge), [1]);
+        assert_eq!(bridge.deferred_startup_chat, None);
+    }
+
+    #[test]
+    fn startup_filter_preserves_named_draft_archived_truncated_and_completed_chats() {
+        let empty = ChatSnapshot::from_completed_history(1, "New chat", false, &[], None, "");
+        let cases = [
+            ChatSnapshot::from_completed_history(1, "My empty chat", false, &[], None, ""),
+            ChatSnapshot::from_completed_history(1, "New chat", false, &[], None, "draft"),
+            ChatSnapshot::from_completed_history(1, "New chat", false, &[], None, " "),
+            ChatSnapshot::from_completed_history(1, "New chat", true, &[], None, ""),
+            empty.with_history_truncated(true),
+            ConversationSnapshot::from_json(&stored(1, "local", "").snapshot_json)
+                .unwrap()
+                .active_chat()
+                .unwrap()
+                .clone(),
+        ];
+        for chat in cases {
+            let expected = chat.clone();
+            let mut store =
+                ChatStore::restore(ConversationSnapshot::from_chats(1, vec![chat]).unwrap());
+            let mut bridge = startup_bridge();
+            bridge.start(&mut store, "startup-test", false, false);
+            assert_eq!(imported_ids(&bridge), [1]);
+            assert_eq!(
+                store.snapshot_chat_for_persistence(1, false).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn startup_filter_keeps_explicit_empty_chats_and_excludes_shared_ids() {
+        let mut store = ChatStore::default();
+        let explicit = store.new_chat().unwrap();
+        let named = store.new_chat().unwrap();
+        store.rename_active("Empty but intentional");
+        let shared = (1 << 48) + 1;
+        store
+            .upsert_persisted_chat(ChatSnapshot::from_completed_history(
+                shared,
+                "Already shared",
+                false,
+                &[],
+                None,
+                "",
+            ))
+            .unwrap();
+        let mut bridge = startup_bridge();
+        bridge.start(&mut store, "startup-test", false, false);
+        assert_eq!(imported_ids(&bridge), [1, explicit, named]);
+        assert_eq!(bridge.deferred_startup_chat, None);
+        assert_eq!(store.len(), 4);
+    }
+
+    #[test]
+    fn startup_filter_preserves_submission_with_no_durable_payload() {
+        let mut store = ChatStore::default();
+        let token = store
+            .begin_turn("New chat".into(), None, "Thinking".into(), false)
+            .unwrap()
+            .token;
+        let chat = store.snapshot_chat_for_persistence(1, false).unwrap();
+        assert_eq!(chat.title(), "New chat");
+        assert!(chat.turns().is_empty());
+        assert!(chat.draft().is_empty());
+        let mut bridge = startup_bridge();
+        bridge.start(&mut store, "startup-test", false, false);
+        assert_eq!(imported_ids(&bridge), [1]);
+        assert_eq!(store.active_request_token(), Some(token));
+    }
+
+    #[test]
+    fn startup_filter_keeps_an_empty_cancelled_submission() {
+        let mut store = ChatStore::default();
+        let token = store
+            .begin_turn("New chat".into(), None, "Thinking".into(), false)
+            .unwrap()
+            .token;
+        store.cancel_request(token, "Cancelled".into());
+        assert!(store.active_history().is_empty());
+        assert!(store.active_draft().is_empty());
+        let mut bridge = startup_bridge();
+        bridge.start(&mut store, "startup-test", false, false);
+        assert_eq!(imported_ids(&bridge), [1]);
+    }
+
+    #[test]
+    fn deferred_startup_chat_migrates_after_edit_or_explicit_visibility() {
+        for (draft, title, visible) in [
+            ("first draft", "New chat", false),
+            ("", "Named after startup", false),
+            ("", "New chat", true),
+        ] {
+            let mut store = ChatStore::default();
+            let mut bridge = startup_bridge();
+            bridge.start(&mut store, "startup-test", false, false);
+            store.set_active_draft(draft.into());
+            store.rename_active(title);
+            bridge.start(&mut store, "startup-test", false, visible);
+            assert_eq!(imported_ids(&bridge), [1]);
+            assert_eq!(bridge.deferred_startup_chat, None);
+            assert_eq!(store.active_draft(), draft);
+            assert_eq!(store.active_title(), title);
+            bridge.start(&mut store, "startup-test", false, visible);
+            assert_eq!(imported_ids(&bridge), [1], "import must not repeat");
+        }
+    }
+
+    #[test]
+    fn explicit_shared_open_and_create_do_not_also_import_startup_composer() {
+        for delayed in [false, true] {
+            for intent in 0..3 {
+                let mut store = ChatStore::default();
+                let mut bridge = startup_bridge();
+                if delayed {
+                    bridge.start(&mut store, "startup-test", false, false);
+                }
+                match intent {
+                    0 => bridge.create(),
+                    1 => bridge.open(ConversationId("jterm:api:existing".into())),
+                    _ => bridge.create_with_draft("Handoff".into(), "Reviewed draft".into()),
+                }
+                bridge.start(&mut store, "startup-test", false, true);
+                assert!(bridge.opening());
+                assert!(imported_ids(&bridge).is_empty());
+                assert_eq!(bridge.deferred_startup_chat, Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn visible_startup_import_guards_edits_until_ack_and_respects_navigation() {
+        let mut store = ChatStore::default();
+        let mut bridge = startup_bridge();
+        bridge.start(&mut store, "startup-test", false, false);
+        assert!(!bridge.opening());
+        let reference = bridge.reference(1);
+        bridge.start(&mut store, "startup-test", false, true);
+        assert!(bridge.opening());
+        assert!(!bridge.accepts(reference, 1));
+        bridge.leave();
+        assert!(
+            !bridge.opening(),
+            "leaving must not keep another view loading"
+        );
+    }
+
+    #[test]
+    fn deferred_first_draft_reaches_shared_chat_and_can_submit_after_import_ack() {
+        let mut store = ChatStore::default();
+        let mut bridge = startup_bridge();
+        bridge.start(&mut store, "startup-test", false, false);
+        store.set_active_draft("First real question".into());
+        bridge.start(&mut store, "startup-test", false, true);
+        let request = *bridge
+            .pending
+            .iter()
+            .find(|(_, p)| matches!(p, Pending::Import { .. }))
+            .unwrap()
+            .0;
+        bridge.handle_reply(
+            &mut store,
+            request,
+            Ok(WorkspaceReply::Imported {
+                mappings: vec![jterm_core::agent_workspace::LegacyChatMapping {
+                    legacy_id: 1,
+                    id: ConversationId("jterm:api:first".into()),
+                }],
+            }),
+            false,
+        );
+        let open = *bridge
+            .pending
+            .iter()
+            .find(|(_, p)| matches!(p, Pending::Open { .. }))
+            .unwrap()
+            .0;
+        let shared = (1 << 48) + 10;
+        let mut chat = stored(shared, "jterm:api:first", "First real question");
+        chat.snapshot_json = ConversationSnapshot::from_chats(
+            shared,
+            vec![ChatSnapshot::from_completed_history(
+                shared,
+                "New chat",
+                false,
+                &[],
+                None,
+                "First real question",
+            )],
+        )
+        .unwrap()
+        .to_json()
+        .unwrap();
+        let effects =
+            bridge.handle_reply(&mut store, open, Ok(WorkspaceReply::Chat { chat }), false);
+        assert!(matches!(effects.as_slice(), [Effect::Activate(id)] if *id == shared));
+        store.select_chat(shared);
+        assert_eq!(store.active_draft(), "First real question");
+        assert!(bridge.submit(&store, "First real question".into()));
+    }
 
     fn stored(id: u64, remote: &str, draft: &str) -> StoredChat {
         let snapshot = ChatSnapshot::from_completed_history(
