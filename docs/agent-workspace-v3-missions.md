@@ -58,11 +58,18 @@ is not a promise that unsaved UI drafts survive an application crash.
 
 ## Validation scope
 
-Current shared core: `4ffa774138ee89dc2916ce21786c45e411196ca4`.
+Current shared core: `e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e`.
 The manifest, dev dependency, lockfile and host-bundle provenance use that same
-immutable revision. The bundled companion sources are unchanged.
+immutable revision. The bundled companion sources are unchanged. This revision
+is a direct child of `4ffa774138ee89dc2916ce21786c45e411196ca4` and changes only
+the core security workflow and its audit scripts/tests; core Cargo manifests,
+lockfiles and runtime sources are unchanged. Ember runtime sources and its
+independent font-group harness are not changed by this source migration.
+The new revision requires its own exact-commit CI; older results below are not
+relabelled as validation of the new pin.
 
-The PR4 production-source harness passed 27 tests: 15 Mission tests, six result
+At the original `4ffa774138ee89dc2916ce21786c45e411196ca4` PR4 pin, the
+production-source harness passed 27 tests: 15 Mission tests, six result
 review tests and six review-text tests. It compiled the actual Mission UI,
 result loader and text sanitizers with egui and the pinned core, omitting only
 the application entrypoint adapter. New coverage includes every attention-entry
