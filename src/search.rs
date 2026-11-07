@@ -450,6 +450,23 @@ impl SearchState {
     }
 }
 
+/// Convert monotonic UTF-8 byte offsets without rescanning the line prefix
+/// for every match. Start and end use separate cursors so literal matches may
+/// overlap; escaped literals have fixed character length and monotonic ends.
+#[derive(Default)]
+struct CharOffsetCursor {
+    byte: usize,
+    character: usize,
+}
+
+impl CharOffsetCursor {
+    fn advance(&mut self, text: &str, byte: usize) -> usize {
+        self.character += text[self.byte..byte].chars().count();
+        self.byte = byte;
+        self.character
+    }
+}
+
 /// 搜索引擎（用于在完整终端缓冲区中进行搜索）
 pub struct SearchEngine;
 
@@ -653,11 +670,13 @@ impl SearchEngine {
         query: &str,
     ) -> bool {
         let mut start_byte = 0;
+        let mut starts = CharOffsetCursor::default();
+        let mut ends = CharOffsetCursor::default();
         while let Some(rel) = line_str[start_byte..].find(query) {
             let found_start = start_byte + rel;
             // 字节偏移 → 字符索引 → 网格列号(col_map 已跳过宽字符续接单元)。
-            let start_char = line_str[..found_start].chars().count();
-            let end_char = line_str[..found_start + query.len()].chars().count();
+            let start_char = starts.advance(line_str, found_start);
+            let end_char = ends.advance(line_str, found_start + query.len());
             matches.push(SearchMatch {
                 line_id,
                 col_start: Self::column_of(col_map, total_cols, start_char),
@@ -676,6 +695,8 @@ impl SearchEngine {
         false
     }
 
+    // Only escaped literal regexes belong here. Their fixed scalar length keeps
+    // match ends monotonic even when Unicode case folding changes byte lengths.
     fn append_plaintext_regex_matches(
         matches: &mut Vec<SearchMatch>,
         line_id: u64,
@@ -685,10 +706,12 @@ impl SearchEngine {
         regex: &regex::Regex,
     ) -> bool {
         let mut start_byte = 0;
+        let mut starts = CharOffsetCursor::default();
+        let mut ends = CharOffsetCursor::default();
         while let Some(found) = regex.find_at(line_str, start_byte) {
             // 字节偏移 → 字符索引 → 网格列号(col_map 已跳过宽字符续接单元)。
-            let start_char = line_str[..found.start()].chars().count();
-            let end_char = line_str[..found.end()].chars().count();
+            let start_char = starts.advance(line_str, found.start());
+            let end_char = ends.advance(line_str, found.end());
             matches.push(SearchMatch {
                 line_id,
                 col_start: Self::column_of(col_map, total_cols, start_char),
@@ -746,10 +769,12 @@ impl SearchEngine {
         total_cols: usize,
         regex: &regex::Regex,
     ) -> bool {
+        let mut starts = CharOffsetCursor::default();
+        let mut ends = CharOffsetCursor::default();
         for mat in regex.find_iter(line_str) {
             // regex 返回字节偏移,需转成字符索引再映射到网格列号。
-            let start_char = line_str[..mat.start()].chars().count();
-            let end_char = line_str[..mat.end()].chars().count();
+            let start_char = starts.advance(line_str, mat.start());
+            let end_char = ends.advance(line_str, mat.end());
             matches.push(SearchMatch {
                 line_id,
                 col_start: Self::column_of(col_map, total_cols, start_char),
@@ -765,6 +790,138 @@ impl SearchEngine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn monotonic_offsets_match_prefix_counts_with_unicode_and_repeated_positions() {
+        let text = "a雪İK界e\u{301}";
+        let mut cursor = CharOffsetCursor::default();
+        for byte in text
+            .char_indices()
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+        {
+            for _ in 0..2 {
+                assert_eq!(cursor.advance(text, byte), text[..byte].chars().count());
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_match_columns_preserve_unicode_overlap_and_zero_width_results() {
+        let text = "雪İiKkΣς aaAa 界界界 e\u{301}";
+        // Exercise nonidentity terminal columns as well as plain scrollback.
+        let columns: Vec<usize> = (0..text.chars().count()).map(|n| n * 2).collect();
+        let total = text.chars().count() * 2;
+        let expected_match = |start: usize, end: usize| SearchMatch {
+            line_id: 17,
+            col_start: SearchEngine::column_of(
+                Some(&columns),
+                total,
+                text[..start].chars().count(),
+            ),
+            col_end: SearchEngine::column_of(Some(&columns), total, text[..end].chars().count()),
+        };
+        for query in ["a", "aa", "界界", "k", "σ", "i", "e\u{301}"] {
+            for sensitive in [false, true] {
+                let regex = RegexBuilder::new(&regex::escape(query))
+                    .case_insensitive(!sensitive)
+                    .build()
+                    .unwrap();
+                let mut expected = Vec::new();
+                let mut byte = 0;
+                while let Some(found) = regex.find_at(text, byte) {
+                    expected.push(expected_match(found.start(), found.end()));
+                    byte = found.start() + text[found.start()..].chars().next().unwrap().len_utf8();
+                }
+                let mut actual = Vec::new();
+                let truncated = if sensitive {
+                    SearchEngine::append_substring_matches(
+                        &mut actual,
+                        17,
+                        text,
+                        Some(&columns),
+                        total,
+                        query,
+                    )
+                } else {
+                    SearchEngine::append_plaintext_regex_matches(
+                        &mut actual,
+                        17,
+                        text,
+                        Some(&columns),
+                        total,
+                        &regex,
+                    )
+                };
+                assert!(!truncated);
+                assert_eq!(actual, expected, "query={query:?} sensitive={sensitive}");
+            }
+        }
+        for pattern in ["", "^|$", r"\w+", "a?", "(?:界|a)+", "雪|İi|k"] {
+            let regex = regex::Regex::new(pattern).unwrap();
+            let expected: Vec<_> = regex
+                .find_iter(text)
+                .map(|found| expected_match(found.start(), found.end()))
+                .collect();
+            let mut actual = Vec::new();
+            assert!(!SearchEngine::append_regex_matches(
+                &mut actual,
+                17,
+                text,
+                Some(&columns),
+                total,
+                &regex
+            ));
+            assert_eq!(actual, expected, "pattern={pattern:?}");
+        }
+    }
+
+    #[test]
+    fn dense_matches_retain_the_existing_result_limit() {
+        let text = "a".repeat(MAX_SEARCH_MATCHES * 2);
+        let regex = regex::Regex::new("a").unwrap();
+        for mode in 0..3 {
+            let mut actual = Vec::new();
+            let truncated = match mode {
+                0 => SearchEngine::append_substring_matches(
+                    &mut actual,
+                    4,
+                    &text,
+                    None,
+                    text.len(),
+                    "a",
+                ),
+                1 => SearchEngine::append_plaintext_regex_matches(
+                    &mut actual,
+                    4,
+                    &text,
+                    None,
+                    text.len(),
+                    &regex,
+                ),
+                _ => SearchEngine::append_regex_matches(
+                    &mut actual,
+                    4,
+                    &text,
+                    None,
+                    text.len(),
+                    &regex,
+                ),
+            };
+            assert!(truncated);
+            assert_eq!(actual.len(), MAX_SEARCH_MATCHES);
+            for (column, found) in actual.iter().enumerate() {
+                assert_eq!(
+                    *found,
+                    SearchMatch {
+                        line_id: 4,
+                        col_start: column,
+                        col_end: column + 1
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn live_navigation_refreshes_deleted_match_before_the_debounce_tick() {
         for previous in [false, true] {

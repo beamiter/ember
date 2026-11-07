@@ -99,3 +99,11 @@ The current CI workflow has no dedicated benchmark regression gate. Run and save
 repeated measurements explicitly before proposing a baseline or threshold. Debug
 profile smoke runs validate the harness only; do not compare them with release
 performance measurements.
+
+## Dense search mapping
+
+`dense_search/{literal,folded_literal,regex}/{128,512,1024}` runs the real
+search engine on one dense Unicode terminal row, up to the supported 1,024-column limit. Grid setup and regex compilation
+are outside timing. Line extraction, matching, UTF-8-to-cell mapping, and result
+allocation are included. This detects repeated-prefix scans without presenting
+microbenchmark timings as complete UI frame-rate measurements.

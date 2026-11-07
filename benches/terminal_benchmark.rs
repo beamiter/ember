@@ -156,11 +156,48 @@ fn bench_link_detection(c: &mut Criterion) {
     group.finish();
 }
 
+/// Measure dense Unicode matches through the production search engine.
+fn bench_dense_search(c: &mut Criterion) {
+    use ember::search::SearchEngine;
+    let mut group = c.benchmark_group("dense_search");
+    for cols in [128, 512, ember::terminal::MAX_TERMINAL_COLS] {
+        let mut terminal = TerminalState::new(cols, 1);
+        for col in 0..cols {
+            terminal.grid.get_mut(0, col).character = 'µ';
+        }
+        for (name, regex, sensitive) in [
+            ("literal", false, true),
+            ("folded_literal", false, false),
+            ("regex", true, true),
+        ] {
+            let mut cache = None;
+            // Populate regex caches and validate the fixture outside timing.
+            let (matches, error, _) =
+                SearchEngine::search(&terminal, "µ", regex, sensitive, &mut cache);
+            assert!(error.is_none());
+            assert_eq!(matches.len(), cols);
+            group.bench_function(criterion::BenchmarkId::new(name, cols), |b| {
+                b.iter(|| {
+                    black_box(SearchEngine::search(
+                        black_box(&terminal),
+                        "µ",
+                        regex,
+                        sensitive,
+                        &mut cache,
+                    ))
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_ansi_parsing,
     bench_grid_operations,
-    bench_link_detection
+    bench_link_detection,
+    bench_dense_search
 );
 
 criterion_main!(benches);
