@@ -37,6 +37,11 @@ offset update, not cell projection or rendering; timer overhead can be significa
   strings, including allocation and disposal of returned links. Detector creation
   is outside the measured loop.
 
+- **trailing_parentheses/{1024,16384,65536}**: Full production link detection
+  on a URL followed by excess closing parentheses. Inputs and detector are built
+  before timing; matching, URI validation, column mapping and result allocation
+  remain inside the measured loop. This guards the long-output refresh path.
+
 The former `key_to_string` placeholder was removed because it did not call the
 conversion function. Previous placeholder link-detection results are also invalid;
 do not compare them with this production-path benchmark.

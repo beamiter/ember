@@ -140,6 +140,19 @@ fn bench_link_detection(c: &mut Criterion) {
         });
     });
 
+    // Process output can contain long punctuation runs. Keep regex detection,
+    // URI policy, column mapping, and result allocation inside the timed path.
+    for closers in [1_024, 16_384, 65_536] {
+        use ember::link::{LinkDetectionConfig, LinkDetector};
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let line = format!("https://example.com/Foo_(bar){}", ")".repeat(closers));
+        group.bench_with_input(
+            criterion::BenchmarkId::new("trailing_parentheses", closers),
+            &line,
+            |b, line| b.iter(|| black_box(detector.detect_links_in_line(black_box(line), 0))),
+        );
+    }
+
     group.finish();
 }
 
