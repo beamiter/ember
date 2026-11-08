@@ -14,6 +14,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - run: bash scripts/materialize-shared-core.sh
       - run: |
           sudo apt-get update
@@ -45,7 +46,7 @@ jobs:
           target.write_text(new[:a] + old[c:d] + new[b:])
           PY
           set +e
-          cargo test -p ember --all-features --locked link::tests::parsed_wide_links_keep_targets_and_physical_columns -- --exact --nocapture > /tmp/negative-control.log 2>&1
+          CARGO_TERM_COLOR=never cargo test -p ember --all-features --locked link::tests::parsed_wide_links_keep_targets_and_physical_columns -- --exact --nocapture > /tmp/negative-control.log 2>&1
           status=$?
           set -e
           cat /tmp/negative-control.log
@@ -53,4 +54,5 @@ jobs:
           test "$status" -ne 0
           grep -q 'parsed_wide_links_keep_targets_and_physical_columns ... FAILED' /tmp/negative-control.log
       - name: Clippy candidate
+        if: ${{ !cancelled() }}
         run: cargo clippy -p ember --all-targets --all-features --locked -- -D warnings
