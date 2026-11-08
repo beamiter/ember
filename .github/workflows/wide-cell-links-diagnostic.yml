@@ -1,0 +1,56 @@
+name: Wide-cell link candidate validation
+on:
+  push:
+    branches: [diagnostics/wide-cell-links]
+permissions:
+  contents: read
+jobs:
+  links:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash scripts/materialize-shared-core.sh
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libfontconfig1-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxi-dev libxrandr-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt,clippy
+      - name: Format candidate and preserve exact tested source
+        run: |
+          rustfmt --edition 2021 src/link.rs
+          echo 'FORMATTED_LINK_BEGIN'
+          base64 -w0 src/link.rs
+          printf '\nFORMATTED_LINK_END\n'
+      - name: Link regression suite with real terminal parser
+        run: cargo test -p ember --all-features --locked link::tests -- --nocapture
+      - name: Original implementation must fail new regression
+        run: |
+          cp src/link.rs /tmp/validated-link.rs
+          git show 2589f0b920f222cd99c678a9ea7afbdbc963e5d9:src/link.rs > /tmp/original-link.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          target = Path('src/link.rs')
+          new, old = target.read_text(), Path('/tmp/original-link.rs').read_text()
+          def span(s):
+              start = s.index('        let mut all_links = Vec::new();', s.index('pub fn detect_links_in_visible_cells_with_wrapping('))
+              return start, s.index('\n    }', start)
+          a, b = span(new)
+          c, d = span(old)
+          target.write_text(new[:a] + old[c:d] + new[b:])
+          PY
+          set +e
+          cargo test -p ember --all-features --locked link::tests::parsed_wide_links_keep_targets_and_physical_columns -- --exact --nocapture > /tmp/negative-control.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/negative-control.log
+          cp /tmp/validated-link.rs src/link.rs
+          test "$status" -ne 0
+          grep -q 'parsed_wide_links_keep_targets_and_physical_columns ... FAILED' /tmp/negative-control.log
+      - name: Clippy candidate
+        run: cargo clippy -p ember --all-targets --all-features --locked -- -D warnings
