@@ -260,7 +260,7 @@ impl LinkDetector {
         for (row, cells) in visible_cells.iter().enumerate() {
             let start = columns.len();
             for (col, cell) in cells.iter().enumerate() {
-                if cell.wide_continuation {
+                if cell.flags.wide_continuation() {
                     if columns.len() > start {
                         columns.last_mut().unwrap().1 = col + 1;
                     }
@@ -497,10 +497,14 @@ fn file_opener_args(path: &std::path::Path) -> std::io::Result<Vec<std::ffi::OsS
 mod tests {
     use super::*;
 
-    fn parsed_link_cells(text: &str, cols: usize) -> (Vec<Vec<crate::terminal::TerminalCell>>, Vec<bool>) {
+    fn parsed_link_cells(
+        text: &str,
+        cols: usize,
+    ) -> (Vec<Vec<crate::terminal::TerminalCell>>, Vec<bool>) {
         let mut terminal = crate::terminal::TerminalState::new(cols, 3);
         terminal.process_input(text.as_bytes());
-        let viewport = terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), true);
+        let viewport =
+            terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), true);
         (viewport.cells().to_vec(), viewport.row_wrapped().to_vec())
     }
 
@@ -508,13 +512,31 @@ mod tests {
     fn parsed_wide_links_keep_targets_and_physical_columns() {
         let detector = LinkDetector::new(LinkDetectionConfig::default());
         for (text, target, start, end, kind) in [
-            ("https://example.com/界x", "https://example.com/界x", 0, 23, LinkType::Url),
-            ("https://example.com/界", "https://example.com/界", 0, 22, LinkType::Url),
+            (
+                "https://example.com/界x",
+                "https://example.com/界x",
+                0,
+                23,
+                LinkType::Url,
+            ),
+            (
+                "https://example.com/界",
+                "https://example.com/界",
+                0,
+                22,
+                LinkType::Url,
+            ),
             ("/tmp/界x", "/tmp/界x", 0, 8, LinkType::FilePath),
-            ("界 https://example.com/x", "https://example.com/x", 3, 24, LinkType::Url),
+            (
+                "界 https://example.com/x",
+                "https://example.com/x",
+                3,
+                24,
+                LinkType::Url,
+            ),
         ] {
             let (cells, wraps) = parsed_link_cells(text, 80);
-            assert!(cells[0].iter().any(|cell| cell.wide_continuation));
+            assert!(cells[0].iter().any(|cell| cell.flags.wide_continuation()));
             let expected = vec![Link {
                 line: 0,
                 col_start: start,
@@ -540,12 +562,27 @@ mod tests {
         // cell, not a space in the target. Each physical segment keeps the URL.
         let (cells, wraps) = parsed_link_cells(target, 22);
         assert!(wraps[0]);
-        assert!(cells[0][21].wide_continuation);
+        assert!(cells[0][21].flags.wide_continuation());
         let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
-        assert_eq!(links, vec![
-            Link { line: 0, col_start: 0, col_end: 22, link_type: LinkType::Url, text: target.into() },
-            Link { line: 1, col_start: 0, col_end: 1, link_type: LinkType::Url, text: target.into() },
-        ]);
+        assert_eq!(
+            links,
+            vec![
+                Link {
+                    line: 0,
+                    col_start: 0,
+                    col_end: 22,
+                    link_type: LinkType::Url,
+                    text: target.into()
+                },
+                Link {
+                    line: 1,
+                    col_start: 0,
+                    col_end: 1,
+                    link_type: LinkType::Url,
+                    text: target.into()
+                },
+            ]
+        );
         let fallback = detector.detect_links_in_visible_cells_with_wrapping(&cells, &[true]);
         assert_eq!(fallback.len(), 1);
         assert_eq!(fallback[0].text, "https://example.com/界");
@@ -562,7 +599,10 @@ mod tests {
             let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
             assert_eq!(links.len(), 1, "{input:?}");
             assert_eq!(links[0].text, "https://example.com/界");
-            assert_eq!((links[0].line, links[0].col_start, links[0].col_end), (0, 0, 22));
+            assert_eq!(
+                (links[0].line, links[0].col_start, links[0].col_end),
+                (0, 0, 22)
+            );
         }
     }
 
@@ -727,7 +767,8 @@ mod tests {
         let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
         let detector = LinkDetector::new(LinkDetectionConfig::default());
         let links = detector.detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
-            viewport.cells(), viewport.row_wrapped(),
+            viewport.cells(),
+            viewport.row_wrapped(),
             |id| terminal.hyperlink_uri(id).map(str::to_owned),
         );
         assert_eq!(links.len(), 1);
@@ -963,4 +1004,3 @@ mod tests {
         assert_eq!(links[0].text, "https://en.wikipedia.org/wiki/Foo_(bar)");
     }
 }
-
