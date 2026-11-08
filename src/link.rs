@@ -250,77 +250,56 @@ impl LinkDetector {
         row_wrapped: &[bool],
     ) -> Vec<Link> {
         let mut all_links = Vec::new();
+        let wraps_valid = row_wrapped.len() == visible_cells.len();
+        let mut text = String::new();
+        // One entry per logical character, not per terminal cell. Its physical
+        // extent includes any following wide-character continuation cells.
+        let mut columns: Vec<(usize, usize)> = Vec::new();
+        let mut rows: Vec<(usize, usize, usize)> = Vec::new();
 
-        if row_wrapped.is_empty() || row_wrapped.len() != visible_cells.len() {
-            for (line_idx, line) in visible_cells.iter().enumerate() {
-                let line_str: String = line.iter().map(|cell| cell.character).collect();
-                let links = self.detect_links_in_line(&line_str, line_idx);
-                all_links.extend(links);
+        for (row, cells) in visible_cells.iter().enumerate() {
+            let start = columns.len();
+            for (col, cell) in cells.iter().enumerate() {
+                if cell.flags.wide_continuation() {
+                    if columns.len() > start {
+                        columns.last_mut().unwrap().1 = col + 1;
+                    }
+                    continue;
+                }
+                text.push(cell.character);
+                columns.push((col, col + 1));
             }
-            return all_links;
-        }
-
-        // 将连续的换行行合并为逻辑行，记录每行的列数累积偏移
-        let mut logical_lines: Vec<(usize, usize, String, Vec<usize>)> = Vec::new();
-        let mut current_start = 0;
-        let mut current_text = String::new();
-        let mut current_columns = 0;
-        let mut row_char_offsets: Vec<usize> = Vec::new(); // 每个物理行在逻辑行中的起始字符偏移
-
-        for (line_idx, line) in visible_cells.iter().enumerate() {
-            // One character per cell, including wide-character continuations.
-            // Accumulate offsets instead of rescanning every wrapped prefix.
-            row_char_offsets.push(current_columns);
-            current_columns += line.len();
-            current_text.extend(line.iter().map(|cell| cell.character));
-
-            if line_idx == visible_cells.len() - 1 || !row_wrapped[line_idx] {
-                logical_lines.push((
-                    current_start,
-                    line_idx,
-                    std::mem::take(&mut current_text),
-                    std::mem::take(&mut row_char_offsets),
-                ));
-                current_columns = 0;
-                current_start = line_idx + 1;
+            rows.push((row, start, columns.len()));
+            // Missing/malformed metadata means separate physical lines. Ordinary
+            // spaces, including row-end padding, remain text; never guess a wrap.
+            if wraps_valid && row_wrapped[row] && row + 1 < visible_cells.len() {
+                continue;
             }
-        }
-
-        for (start_row, _end_row, logical_text, char_offsets) in logical_lines {
-            let links = self.detect_links_in_line(&logical_text, 0);
-
-            for link in links {
-                let full_url = link.text.clone();
-                let link_start = link.col_start;
-                let link_end = link.col_end;
-
-                // 将逻辑偏移分割到多个物理行
-                for (i, &row_offset) in char_offsets.iter().enumerate() {
-                    let row_idx = start_row + i;
-                    let row_len = visible_cells[row_idx].len();
-                    let row_end_offset = row_offset + row_len;
-
-                    // 检查该链接是否与这个物理行重叠
-                    if link_start < row_end_offset && link_end > row_offset {
-                        let col_start = link_start.saturating_sub(row_offset);
-                        let col_end = if link_end < row_end_offset {
-                            link_end - row_offset
-                        } else {
-                            row_len
-                        };
-
+            for link in self.detect_links_in_line(&text, 0) {
+                // Start at the first overlapping row instead of rescanning the
+                // entire wrapped paragraph for every detected link.
+                let first = rows.partition_point(|&(_, _, end)| end <= link.col_start);
+                for &(line, start, end) in &rows[first..] {
+                    if start >= link.col_end {
+                        break;
+                    }
+                    let from = start.max(link.col_start);
+                    let to = end.min(link.col_end);
+                    if from < to {
                         all_links.push(Link {
-                            line: row_idx,
-                            col_start,
-                            col_end,
+                            line,
+                            col_start: columns[from].0,
+                            col_end: columns[to - 1].1,
                             link_type: link.link_type,
-                            text: full_url.clone(),
+                            text: link.text.clone(),
                         });
                     }
                 }
             }
+            text.clear();
+            columns.clear();
+            rows.clear();
         }
-
         all_links
     }
 
@@ -518,6 +497,115 @@ fn file_opener_args(path: &std::path::Path) -> std::io::Result<Vec<std::ffi::OsS
 mod tests {
     use super::*;
 
+    fn parsed_link_cells(
+        text: &str,
+        cols: usize,
+    ) -> (Vec<Vec<crate::terminal::TerminalCell>>, Vec<bool>) {
+        let mut terminal = crate::terminal::TerminalState::new(cols, 3);
+        terminal.process_input(text.as_bytes());
+        let viewport =
+            terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), true);
+        (viewport.cells().to_vec(), viewport.row_wrapped().to_vec())
+    }
+
+    #[test]
+    fn parsed_wide_links_keep_targets_and_physical_columns() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        for (text, target, start, end, kind) in [
+            (
+                "https://example.com/界x",
+                "https://example.com/界x",
+                0,
+                23,
+                LinkType::Url,
+            ),
+            (
+                "https://example.com/界",
+                "https://example.com/界",
+                0,
+                22,
+                LinkType::Url,
+            ),
+            ("/tmp/界x", "/tmp/界x", 0, 8, LinkType::FilePath),
+            (
+                "界 https://example.com/x",
+                "https://example.com/x",
+                3,
+                24,
+                LinkType::Url,
+            ),
+        ] {
+            let (cells, wraps) = parsed_link_cells(text, 80);
+            assert!(cells[0].iter().any(|cell| cell.flags.wide_continuation()));
+            let expected = vec![Link {
+                line: 0,
+                col_start: start,
+                col_end: end,
+                link_type: kind,
+                text: target.into(),
+            }];
+            for metadata in [&wraps[..], &[][..], &[true][..]] {
+                assert_eq!(
+                    detector.detect_links_in_visible_cells_with_wrapping(&cells, metadata),
+                    expected,
+                    "input {text:?}, wrap metadata {metadata:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_wide_links_split_wrapped_cells_without_joining_real_spaces() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let target = "https://example.com/界x";
+        // The wide glyph fills the first row exactly; its continuation is a
+        // cell, not a space in the target. Each physical segment keeps the URL.
+        let (cells, wraps) = parsed_link_cells(target, 22);
+        assert!(wraps[0]);
+        assert!(cells[0][21].flags.wide_continuation());
+        let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
+        assert_eq!(
+            links,
+            vec![
+                Link {
+                    line: 0,
+                    col_start: 0,
+                    col_end: 22,
+                    link_type: LinkType::Url,
+                    text: target.into()
+                },
+                Link {
+                    line: 1,
+                    col_start: 0,
+                    col_end: 1,
+                    link_type: LinkType::Url,
+                    text: target.into()
+                },
+            ]
+        );
+        let fallback = detector.detect_links_in_visible_cells_with_wrapping(&cells, &[true]);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].text, "https://example.com/界");
+        assert_eq!(fallback[0].col_end, 22);
+
+        // Ordinary internal and trailing spaces are never trimmed away to
+        // manufacture a target across a soft wrap or explicit newline.
+        for (input, width) in [
+            ("https://example.com/界 x", 80),
+            ("https://example.com/界 x", 23),
+            ("https://example.com/界 \r\nx", 23),
+        ] {
+            let (cells, wraps) = parsed_link_cells(input, width);
+            let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
+            assert_eq!(links.len(), 1, "{input:?}");
+            assert_eq!(links[0].text, "https://example.com/界");
+            assert_eq!(
+                (links[0].line, links[0].col_start, links[0].col_end),
+                (0, 0, 22)
+            );
+        }
+    }
+
     #[test]
     fn parenthesis_trimming_matches_legacy_for_all_short_inputs() {
         fn legacy(mut url: &str) -> &str {
@@ -668,6 +756,24 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].text, TARGET);
         assert_eq!(links[0].col_end, "https://decoy.example".len());
+    }
+
+    #[test]
+    fn osc8_wide_decoy_keeps_explicit_target_and_continuation_extent() {
+        let mut terminal = TerminalState::new(80, 2);
+        terminal.process_input(b"\x1b]8;;https://real.example/target\x1b\\");
+        terminal.process_input("https://decoy.example/界".as_bytes());
+        terminal.process_input(b"\x1b]8;;\x1b\\");
+        let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let links = detector.detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
+            viewport.cells(),
+            viewport.row_wrapped(),
+            |id| terminal.hyperlink_uri(id).map(str::to_owned),
+        );
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].text, "https://real.example/target");
+        assert_eq!((links[0].col_start, links[0].col_end), (0, 24));
     }
 
     #[test]
