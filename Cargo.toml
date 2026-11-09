@@ -10,10 +10,12 @@ keywords = ["terminal", "terminal-emulator", "egui", "wgpu"]
 categories = ["command-line-utilities", "gui"]
 
 [dependencies]
+# Shared engine and compatibility core resolve one published source tree.
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a6e47726d02bed2ca4a6ba1a682511f970853527" }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 libc = "0.2"
 # Immutable shared release; local candidates require an explicit Cargo --config override.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a6e47726d02bed2ca4a6ba1a682511f970853527" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -52,7 +54,7 @@ mundy = { version = "=0.2.3", default-features = false, features = ["async-io", 
 harfrust = "0.14.0"
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "a6e47726d02bed2ca4a6ba1a682511f970853527" }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]

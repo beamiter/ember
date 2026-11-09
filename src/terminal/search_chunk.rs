@@ -166,7 +166,7 @@ impl TerminalState {
         id: &str,
     ) -> Result<(RawSearchSeal, usize), SearchChunkError> {
         use SearchChunkError::*;
-        if self.use_alt_buffer
+        if self.screen.use_alt_buffer
             || self.search_scrollback_epoch == 0
             || self.total_lines_scrolled == u64::MAX
         {
@@ -307,7 +307,7 @@ impl TerminalState {
         if source.epoch == 0 || source.revision == 0 {
             return Err(Unsupported("source revision exhausted"));
         }
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             return Err(Unsupported("alternate screen"));
         }
         if cursor.is_some_and(|c| {
@@ -403,7 +403,7 @@ impl TerminalState {
                 };
                 cells
             } else {
-                self.grid[absolute - self.scrollback.len()].to_vec()
+                self.screen.grid[absolute - self.scrollback.len()].to_vec()
             };
             if cells.len() != width || width > super::MAX_TERMINAL_COLS {
                 return Err(Unsupported("invalid row width"));

@@ -36,6 +36,8 @@ const CASES: &[(&str, &[u8])] = &[
         "aborted",
         include_bytes!("../../tests/fixtures/parser/aborted.bin"),
     ),
+    ("screen_operations", "\x1b[2;5r\x1b[?6h\x1b[1;2Ha界b\x1b7\x1b[4hX\x1b[4l\x1b8\x1b[@\x1b[P\x1b[X\x1b[1\"qSAFE\x1b[0\"qfree\x1b[?2K\x1b[?6l\x1b[1;1H\x1b]133;A\x07\x1b]133;C;id=screen\x07界\x1b[2GX\x1b]133;D;0;id=screen\x07".as_bytes()),
+    ("keyboard_screens", b"\x1b[=17u\x1b[>31u\x1b[>4;2m\x1b[>4;1f\x1b[?1049h\x1b[>8u\x1b[>16u\x1b[?u\x1b[?1049l\x1b[=32768;2u\x1b[?u"),
 ];
 
 // Debug formatting retains every cell attribute, including link IDs. Keep the
@@ -48,6 +50,45 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
         ($($field:ident),* $(,)?) => {$(result.insert(stringify!($field), format!("{:?}", t.$field));)*};
     }
     fields!(
+        window_title,
+        icon_title,
+        title_stack,
+        announced_jsh_session_id,
+        current_working_dir,
+        global_bg,
+        output_buffer,
+        sync_output_active,
+        pending_osc52_clipboard_set,
+        pending_osc52_clipboard_queries,
+        pending_clipboard_requests,
+        pending_notifications,
+        pending_bell,
+        dynamic_fg,
+        dynamic_bg,
+        dynamic_cursor_color,
+        dynamic_palette,
+        command_marks,
+        next_command_sequence,
+        consumed_command_ids,
+        total_lines_scrolled,
+    );
+    let parser = t.parser.snapshot();
+    result.insert("pending_escape", format!("{:?}", parser.pending_escape));
+    result.insert("pending_apc", format!("{:?}", parser.pending_apc));
+    result.insert("pending_osc", format!("{:?}", parser.pending_osc));
+    result.insert("pending_string", format!("{:?}", parser.pending_string));
+    result.insert(
+        "discarding_oversized_apc",
+        format!("{:?}", parser.discarding_oversized_apc),
+    );
+    result.insert(
+        "discarding_apc_prev_escape",
+        format!("{:?}", parser.discarding_apc_prev_escape),
+    );
+    macro_rules! screen_fields {
+        ($($field:ident),* $(,)?) => {$(result.insert(stringify!($field), format!("{:?}", t.screen.$field));)*};
+    }
+    screen_fields!(
         cursor_row,
         cursor_col,
         cursor_shape,
@@ -63,12 +104,6 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
         current_bg,
         current_flags,
         current_hyperlink,
-        window_title,
-        icon_title,
-        title_stack,
-        announced_jsh_session_id,
-        current_working_dir,
-        global_bg,
         scroll_region_top,
         scroll_region_bottom,
         g0_charset,
@@ -76,38 +111,40 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
         active_charset,
         tab_stops,
         last_printed_char,
-        modes,
-        output_buffer,
-        keyboard_enhancement_flags,
-        keyboard_enhancement_stack,
-        alt_keyboard_enhancement_flags,
-        alt_keyboard_enhancement_stack,
-        xterm_modify_other_keys,
-        xterm_format_other_keys,
-        sync_output_active,
-        pending_osc52_clipboard_set,
-        pending_osc52_clipboard_queries,
-        pending_clipboard_requests,
-        pending_notifications,
-        pending_bell,
-        dynamic_fg,
-        dynamic_bg,
-        dynamic_cursor_color,
-        dynamic_palette,
-        command_marks,
-        next_command_sequence,
-        consumed_command_ids,
-        total_lines_scrolled,
-        pending_escape,
-        pending_apc,
-        pending_osc,
-        pending_string,
-        discarding_oversized_apc,
-        discarding_apc_prev_escape
     );
+    // Keep protocol lanes separately named, including the inactive screen.
+    for (name, value) in [
+        ("modes", format!("{:?}", t.protocol.modes())),
+        (
+            "keyboard_enhancement_flags",
+            format!("{:?}", t.protocol.keyboard_enhancement_flags()),
+        ),
+        (
+            "keyboard_enhancement_stack",
+            format!("{:?}", t.protocol.keyboard_enhancement_stack()),
+        ),
+        (
+            "alt_keyboard_enhancement_flags",
+            format!("{:?}", t.protocol.inactive_keyboard_enhancement_flags()),
+        ),
+        (
+            "alt_keyboard_enhancement_stack",
+            format!("{:?}", t.protocol.inactive_keyboard_enhancement_stack()),
+        ),
+        (
+            "xterm_modify_other_keys",
+            format!("{:?}", t.protocol.xterm_modify_other_keys()),
+        ),
+        (
+            "xterm_format_other_keys",
+            format!("{:?}", t.protocol.xterm_format_other_keys()),
+        ),
+    ] {
+        result.insert(name, value);
+    }
     for (name, saved) in [
-        ("saved_cursor", &t.saved_state),
-        ("saved_primary", &t.saved_primary_screen_state),
+        ("saved_cursor", &t.screen.saved_state),
+        ("saved_primary", &t.screen.saved_primary_screen_state),
     ] {
         result.insert(
             name,
@@ -120,11 +157,14 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
             ),
         );
     }
-    result.insert("grid", format!("{:?}", t.grid.to_vec()));
-    result.insert("alt_grid", format!("{:?}", t.alt_grid.to_vec()));
+    result.insert("grid", format!("{:?}", t.screen.grid.to_vec()));
+    result.insert("alt_grid", format!("{:?}", t.screen.alt_grid.to_vec()));
     result.insert(
         "wraps",
-        format!("{:?}", (&t.grid.row_wrapped, &t.alt_grid.row_wrapped)),
+        format!(
+            "{:?}",
+            (&t.screen.grid.row_wrapped, &t.screen.alt_grid.row_wrapped)
+        ),
     );
     result.insert(
         "history",
@@ -140,7 +180,8 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
         "links",
         format!(
             "{:?}",
-            t.grid
+            t.screen
+                .grid
                 .iter()
                 .flatten()
                 .map(|c| t.hyperlink_uri(c.hyperlink_id))
@@ -149,7 +190,13 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
     );
     result.insert(
         "utf8",
-        format!("{:?}", (&t.utf8_buf[..t.utf8_len as usize], t.utf8_len)),
+        format!(
+            "{:?}",
+            (
+                &t.parser.snapshot().utf8_buf[..t.parser.snapshot().utf8_len as usize],
+                t.parser.snapshot().utf8_len
+            )
+        ),
     );
     let records = t
         .command_records
@@ -205,10 +252,10 @@ fn run(bytes: &[u8], ends: impl IntoIterator<Item = usize>) -> TerminalState {
         assert!(end >= start && end <= bytes.len());
         terminal.process_input(&bytes[start..end]);
         for pending in [
-            &terminal.pending_escape,
-            &terminal.pending_apc,
-            &terminal.pending_osc,
-            &terminal.pending_string,
+            &terminal.parser.snapshot().pending_escape,
+            &terminal.parser.snapshot().pending_apc,
+            &terminal.parser.snapshot().pending_osc,
+            &terminal.parser.snapshot().pending_string,
         ] {
             assert!(pending.len() <= MAX_PENDING_ESCAPE);
         }
@@ -299,10 +346,10 @@ fn corpus_oracle_negative_controls() {
     );
     let expected = snapshot(&terminal);
     let mut changed = run(bytes, [bytes.len()]);
-    changed.grid[0][0].character = '!';
+    changed.screen.grid[0][0].character = '!';
     assert_ne!(snapshot(&changed)["grid"], expected["grid"]);
     let mut changed = run(bytes, [bytes.len()]);
-    changed.modes.insert(2004);
+    changed.protocol.modes_mut().insert(2004);
     assert_ne!(snapshot(&changed)["modes"], expected["modes"]);
     let mut changed = run(bytes, [bytes.len()]);
     changed.output_buffer.push(0);
@@ -327,11 +374,11 @@ fn corpus_known_effects_and_abnormal_reset_recovery() {
     );
     assert!(!t.output_buffer.is_empty());
     let t = run(CASES[8].1, [CASES[8].1.len()]);
-    assert!(!t.use_alt_buffer);
-    assert!(!t.modes.contains(&2004));
+    assert!(!t.screen.use_alt_buffer);
+    assert!(!t.protocol.modes().contains(&2004));
     assert!(t.command_records.is_empty());
-    assert!(t.pending_osc.is_empty());
-    assert_eq!(t.grid[0][0].character, 'R');
+    assert!(t.parser.snapshot().pending_osc.is_empty());
+    assert_eq!(t.screen.grid[0][0].character, 'R');
     assert!(!t.output_buffer.is_empty());
 }
 
@@ -378,8 +425,14 @@ fn oversized_osc_and_dcs_characterize_batch_scoped_drop_then_reset() {
         bytes.extend_from_slice(b"\x1b\\Z");
         let mut whole = run(&bytes, [bytes.len()]);
         let mut split = run(&bytes, [MAX_PENDING_ESCAPE + 1, bytes.len()]);
-        assert!(whole.pending_osc.is_empty() && whole.pending_string.is_empty());
-        assert!(split.pending_osc.is_empty() && split.pending_string.is_empty());
+        assert!(
+            whole.parser.snapshot().pending_osc.is_empty()
+                && whole.parser.snapshot().pending_string.is_empty()
+        );
+        assert!(
+            split.parser.snapshot().pending_osc.is_empty()
+                && split.parser.snapshot().pending_string.is_empty()
+        );
         assert_ne!(
             snapshot(&whole)["grid"],
             snapshot(&split)["grid"],
@@ -396,9 +449,9 @@ fn minimal_interrupted_utf8_prefix_has_one_replacement() {
     let bytes = b"\xe2\x82X";
     for ends in [vec![3], vec![1, 3], vec![2, 3], vec![1, 2, 3]] {
         let t = run(bytes, ends);
-        assert_eq!(t.cursor_col, 2);
-        assert_eq!(t.grid[0][0].character, '\u{fffd}');
-        assert_eq!(t.grid[0][1].character, 'X');
+        assert_eq!(t.screen.cursor_col, 2);
+        assert_eq!(t.screen.grid[0][0].character, '\u{fffd}');
+        assert_eq!(t.screen.grid[0][1].character, 'X');
     }
 }
 
@@ -446,7 +499,7 @@ fn utf8_replacement_matches_standard_library_for_all_partitions() {
         let expected = String::from_utf8_lossy(&terminated);
         for cut in 0..=terminated.len() {
             let t = run(&terminated, [cut, terminated.len()]);
-            let rendered: String = t.grid[0][..t.cursor_col]
+            let rendered: String = t.screen.grid[0][..t.screen.cursor_col]
                 .iter()
                 .filter(|c| !c.flags.wide_continuation())
                 .map(|c| c.character)
@@ -454,7 +507,7 @@ fn utf8_replacement_matches_standard_library_for_all_partitions() {
             assert_eq!(rendered, expected, "bytes={bytes:?}, cut={cut}");
         }
         let t = run(&terminated, 1..=terminated.len());
-        let rendered: String = t.grid[0][..t.cursor_col]
+        let rendered: String = t.screen.grid[0][..t.screen.cursor_col]
             .iter()
             .filter(|c| !c.flags.wide_continuation())
             .map(|c| c.character)
@@ -467,8 +520,14 @@ fn utf8_replacement_matches_standard_library_for_all_partitions() {
         b"\xf0\x90\x80".as_slice(),
     ] {
         let t = run(bytes, 1..=bytes.len());
-        assert_eq!(t.cursor_col, 0, "unfinished scalar is pending, not EOF");
-        assert_eq!(&t.utf8_buf[..t.utf8_len as usize], bytes);
+        assert_eq!(
+            t.screen.cursor_col, 0,
+            "unfinished scalar is pending, not EOF"
+        );
+        assert_eq!(
+            &t.parser.snapshot().utf8_buf[..t.parser.snapshot().utf8_len as usize],
+            bytes
+        );
     }
 }
 
@@ -506,22 +565,236 @@ fn oversized_kitty_discard_is_bounded_and_does_not_amplify_replies() {
             let mut t = TerminalState::new(24, 6);
             t.process_input(format!("\x1b_Gi=99,q={quiet};").as_bytes());
             t.process_input(&vec![b'A'; MAX_PENDING_ESCAPE]);
-            assert!(t.pending_apc.is_empty());
-            assert!(t.discarding_oversized_apc);
+            assert!(t.parser.snapshot().pending_apc.is_empty());
+            assert!(t.parser.snapshot().discarding_oversized_apc);
             let reply = t.get_output();
             assert_eq!(reply.is_empty(), quiet == 2);
             assert!(reply.len() < 256);
             for _ in 0..8 {
                 t.process_input(&[b'A'; 1024]);
-                assert!(t.pending_apc.is_empty());
+                assert!(t.parser.snapshot().pending_apc.is_empty());
                 assert!(t.get_output().is_empty(), "one rejection per packet");
             }
             t.process_input(terminator);
             t.process_input(b"RECOVERED");
-            assert!(!t.discarding_oversized_apc);
-            assert_eq!(t.grid[0][0].character, 'R');
+            assert!(!t.parser.snapshot().discarding_oversized_apc);
+            assert_eq!(t.screen.grid[0][0].character, 'R');
             assert!(t.command_records.is_empty());
             assert!(t.pending_completed_command_outputs.is_empty());
+        }
+    }
+}
+
+// Stable non-security fingerprints keep the independent golden compact.
+// Compare both byte length and FNV-1a; original full snapshots were captured
+// before integration and retained with their SHA-256 in the fixture README.
+fn migration_fingerprints(
+    snapshot: BTreeMap<&'static str, String>,
+) -> BTreeMap<&'static str, (usize, String)> {
+    snapshot
+        .into_iter()
+        .map(|(key, value)| {
+            let hash = value
+                .as_bytes()
+                .iter()
+                .fold(14695981039346656037u64, |h, b| {
+                    (h ^ u64::from(*b)).wrapping_mul(1099511628211)
+                });
+            (key, (value.len(), format!("{hash:016x}")))
+        })
+        .collect()
+}
+
+/// Independent pre-extraction snapshots. Capture is explicit and must run on
+/// the original scanner before the production adapter is replaced.
+#[test]
+fn parser_migration_recorded_oracle() {
+    let mut cases: Vec<(String, Vec<u8>)> = CASES
+        .iter()
+        .map(|(n, b)| ((*n).to_owned(), b.to_vec()))
+        .collect();
+    for (name, bytes) in [
+        (
+            "malformed_csi",
+            b"\x1b[12\r\n;3mX\x1b[999999:;mQ\x1b[12\xfftail\x1b[0mY".as_slice(),
+        ),
+        (
+            "esc_intermediates",
+            b"\x1b%Gx\x1b#8\x1b#\x18A\x1b#\x1b[0mZ\x1b(\x1bcEND",
+        ),
+        (
+            "invalid_utf8",
+            b"\xe0\x80\x80\xed\xa0\x80\xf4\x90\x80\x80\xe2A\xf0\x9f\x1bcZ",
+        ),
+        ("incomplete", b"A\x1b[38:2::1\r\n:2:3m\x1b]0;unfinished"),
+    ] {
+        cases.push((name.to_owned(), bytes.to_vec()));
+    }
+    let mut records = Vec::new();
+    for (name, bytes) in cases {
+        for cut in 0..=bytes.len() {
+            let mut terminal = TerminalState::new(24, 6);
+            terminal.process_input(&bytes[..cut]);
+            let prefix = migration_fingerprints(snapshot(&terminal));
+            terminal.process_input(&bytes[cut..]);
+            records.push((
+                name.clone(),
+                cut,
+                prefix,
+                migration_fingerprints(snapshot(&terminal)),
+            ));
+        }
+    }
+    for (name, prefix) in [
+        ("oversize_osc", b"\x1b]0;".as_slice()),
+        ("oversize_dcs", b"\x1bP"),
+        ("oversize_apc", b"\x1b_Gi=9,q=1;"),
+    ] {
+        let mut bytes = prefix.to_vec();
+        bytes.resize(MAX_PENDING_ESCAPE + 33, b'A');
+        bytes.extend_from_slice(b"\x1b\\Z");
+        for cut in [
+            0,
+            1,
+            2,
+            3,
+            MAX_PENDING_ESCAPE - 1,
+            MAX_PENDING_ESCAPE + 1,
+            bytes.len() - 2,
+            bytes.len(),
+        ] {
+            let mut terminal = TerminalState::new(24, 6);
+            terminal.process_input(&bytes[..cut]);
+            // Record semantic lanes, not multi-megabyte parser carry debug text.
+            let mut prefix = migration_fingerprints(snapshot(&terminal));
+            prefix.retain(|key, _| !key.starts_with("pending_"));
+            terminal.process_input(&bytes[cut..]);
+            let mut final_state = migration_fingerprints(snapshot(&terminal));
+            final_state.retain(|key, _| !key.starts_with("pending_"));
+            records.push((name.to_owned(), cut, prefix, final_state));
+        }
+    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/parser/pre-extraction-oracle.json");
+    let actual = serde_json::to_value(records).unwrap();
+    if std::env::var_os("EMBER_CAPTURE_PARSER_ORACLE").is_some() {
+        use std::io::Write;
+        // Explicit capture can create a new baseline but never overwrite one.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&actual).unwrap())
+            .unwrap();
+    } else {
+        let expected: serde_json::Value = super::oracle_fixture::decode(
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let a = actual.as_array().unwrap();
+        let b = expected.as_array().unwrap();
+        assert_eq!(a.len(), b.len());
+        for (actual, expected) in a.iter().zip(b) {
+            assert_eq!(actual, expected, "case {} cut {}", actual[0], actual[1]);
+        }
+    }
+}
+
+/// Independent original semantic-dispatch oracle; separate from the scanner
+/// and structural migration baselines, which must remain unchanged.
+#[test]
+fn semantic_migration_recorded_oracle() {
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    let setup =
+        b"\x1b[2;5r\x1b[?6h\x1b[2;4H\x1b[41m\x1b[1\"q\x1b]133;A\x07\x1b]133;C;id=semantic\x07";
+    let suffix = b"\x1b[6n\x1b[?6n\x1b]133;D;0;id=semantic\x07";
+    for final_byte in b"ABCDEFGHIZadefgjk`msuK@PXrqn" {
+        for params in [
+            "",
+            "0",
+            "1",
+            "2;3",
+            "4;1",
+            "38:2::255:256:65535",
+            "41;44;49;0",
+        ] {
+            for prefix in ["", ">", "?", "="] {
+                let mut bytes = setup.to_vec();
+                bytes.extend(format!("\x1b[{prefix}{params}{}", *final_byte as char).as_bytes());
+                bytes.extend_from_slice(suffix);
+                cases.push((format!("csi-{final_byte}-{prefix}-{params}"), bytes));
+            }
+        }
+    }
+    for (name, bytes) in [
+        (
+            "mixed_modes",
+            b"\x1b[?7;1004;2026;47h\x1b[?7;5522;2026;47l".as_slice(),
+        ),
+        (
+            "selective",
+            b"\x1b[1\"qPROTECTED\x1b[0\"qfree\x1b[?0K\x1b[2K\x1b[3X",
+        ),
+        (
+            "cursor_save",
+            b"\x1b[?7h\x1b7\x1b[1;1H\x1b8\x1b[s\x1b[3G\x1b[u",
+        ),
+        (
+            "styles",
+            b"\x1b[3 q\x1b[1\"q\x1b[4:3;58:2::1:2:3;0m\x1b[?6n",
+        ),
+        (
+            "controls",
+            b"abc\x08\t\r\x0e\x0f\x07\x1b(0q\x1b(B\x1bH\x1b=\x1b>\x1b<",
+        ),
+        (
+            "reply_order",
+            b"\x1b[5n\x1b[6n\x1b[?6n\x1b[=17u\x1b[?u\x1b]10;?\x07\x1b[>q",
+        ),
+    ] {
+        let mut combined = setup.to_vec();
+        combined.extend_from_slice(bytes);
+        combined.extend_from_slice(suffix);
+        cases.push((name.to_owned(), combined));
+    }
+    let mut records = Vec::new();
+    for (name, bytes) in cases {
+        for cut in [0, setup.len(), bytes.len() / 2, bytes.len()] {
+            let mut terminal = TerminalState::new(24, 6);
+            terminal.process_input(&bytes[..cut]);
+            let prefix = migration_fingerprints(snapshot(&terminal));
+            terminal.process_input(&bytes[cut..]);
+            records.push((
+                name.clone(),
+                cut,
+                prefix,
+                migration_fingerprints(snapshot(&terminal)),
+            ));
+        }
+    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/parser/pre-semantic-oracle.json");
+    let actual = serde_json::to_value(records).unwrap();
+    if std::env::var_os("EMBER_CAPTURE_SEMANTIC_ORACLE").is_some() {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&actual).unwrap())
+            .unwrap();
+    } else {
+        let expected: serde_json::Value = super::oracle_fixture::decode(
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let a = actual.as_array().unwrap();
+        let b = expected.as_array().unwrap();
+        assert_eq!(a.len(), b.len());
+        for (actual, expected) in a.iter().zip(b) {
+            assert_eq!(actual, expected, "case {} cut {}", actual[0], actual[1]);
         }
     }
 }

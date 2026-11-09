@@ -30,6 +30,7 @@ pub mod pty;
 pub mod remote_fs;
 pub mod remote_picker;
 pub mod review_text;
+pub mod runtime_wake;
 pub mod search;
 pub mod search_replace;
 pub mod search_replace_panel;

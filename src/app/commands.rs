@@ -2639,7 +2639,7 @@ impl TerminalApp {
                             .finished_at
                             .and_then(crate::block_mode::epoch_secs)
                             .map(|seconds| seconds.saturating_mul(1_000)),
-                        terminal.grid.row_len(),
+                        terminal.screen.grid.row_len(),
                         record.start_mark_seen,
                         record.completion_provenance,
                     )

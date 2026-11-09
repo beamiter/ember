@@ -418,6 +418,85 @@ pub(crate) fn is_modifier_only_key(key: egui::Key) -> bool {
     )
 }
 
+// Keep GUI and platform aliases at the edge; the engine sees logical keys.
+fn normalized_key(key: egui::Key) -> jterm_engine::input::Key {
+    use jterm_engine::input::Key;
+    match key {
+        egui::Key::ArrowUp => Key::ArrowUp,
+        egui::Key::ArrowDown => Key::ArrowDown,
+        egui::Key::ArrowRight => Key::ArrowRight,
+        egui::Key::ArrowLeft => Key::ArrowLeft,
+        egui::Key::Home => Key::Home,
+        egui::Key::End => Key::End,
+        egui::Key::Insert => Key::Insert,
+        egui::Key::Delete => Key::Delete,
+        egui::Key::PageUp => Key::PageUp,
+        egui::Key::PageDown => Key::PageDown,
+        egui::Key::F1 => Key::F1,
+        egui::Key::F2 => Key::F2,
+        egui::Key::F3 => Key::F3,
+        egui::Key::F4 => Key::F4,
+        egui::Key::F5 => Key::F5,
+        egui::Key::F6 => Key::F6,
+        egui::Key::F7 => Key::F7,
+        egui::Key::F8 => Key::F8,
+        egui::Key::F9 => Key::F9,
+        egui::Key::F10 => Key::F10,
+        egui::Key::F11 => Key::F11,
+        egui::Key::F12 => Key::F12,
+        egui::Key::Enter => Key::Enter,
+        egui::Key::Escape => Key::Escape,
+        egui::Key::Backspace => Key::Backspace,
+        egui::Key::Tab => Key::Tab,
+        egui::Key::A => Key::Character('a'),
+        egui::Key::B => Key::Character('b'),
+        egui::Key::C => Key::Character('c'),
+        egui::Key::D => Key::Character('d'),
+        egui::Key::E => Key::Character('e'),
+        egui::Key::F => Key::Character('f'),
+        egui::Key::G => Key::Character('g'),
+        egui::Key::H => Key::Character('h'),
+        egui::Key::I => Key::Character('i'),
+        egui::Key::J => Key::Character('j'),
+        egui::Key::K => Key::Character('k'),
+        egui::Key::L => Key::Character('l'),
+        egui::Key::M => Key::Character('m'),
+        egui::Key::N => Key::Character('n'),
+        egui::Key::O => Key::Character('o'),
+        egui::Key::P => Key::Character('p'),
+        egui::Key::Q => Key::Character('q'),
+        egui::Key::R => Key::Character('r'),
+        egui::Key::S => Key::Character('s'),
+        egui::Key::T => Key::Character('t'),
+        egui::Key::U => Key::Character('u'),
+        egui::Key::V => Key::Character('v'),
+        egui::Key::W => Key::Character('w'),
+        egui::Key::X => Key::Character('x'),
+        egui::Key::Y => Key::Character('y'),
+        egui::Key::Z => Key::Character('z'),
+        egui::Key::Num0 => Key::Character('0'),
+        egui::Key::Num1 => Key::Character('1'),
+        egui::Key::Num2 => Key::Character('2'),
+        egui::Key::Num3 => Key::Character('3'),
+        egui::Key::Num4 => Key::Character('4'),
+        egui::Key::Num5 => Key::Character('5'),
+        egui::Key::Num6 => Key::Character('6'),
+        egui::Key::Num7 => Key::Character('7'),
+        egui::Key::Num8 => Key::Character('8'),
+        egui::Key::Num9 => Key::Character('9'),
+        _ => Key::Unidentified,
+    }
+}
+
+fn normalized_modifiers(modifiers: egui::Modifiers) -> jterm_engine::input::Modifiers {
+    jterm_engine::input::Modifiers {
+        shift: modifiers.shift,
+        alt: modifiers.alt,
+        ctrl: modifiers.ctrl,
+        super_key: modifiers.command && !modifiers.ctrl,
+    }
+}
+
 fn key_to_terminal_sequence(
     key: egui::Key,
     modifiers: egui::Modifiers,
@@ -483,13 +562,7 @@ fn legacy_function_key_sequence(
     modifiers: egui::Modifiers,
     application_cursor_keys: bool,
 ) -> Option<Cow<'static, str>> {
-    let modifier = kitty_modifier_value(modifiers);
-    // 1 is the "no modifier" parameter value; xterm omits it entirely.
-    let modified = modifier > 1;
-
-    // Shift+PageUp/PageDown explicitly belong to host scrollback. The full
-    // event encoder additionally withholds plain main-screen Page keys before
-    // Kitty or modifyOtherKeys encoding can forward them to the application.
+    // Shift+Page remains a host scrollback gesture, not a wire protocol rule.
     if modifiers.shift
         && !modifiers.ctrl
         && !modifiers.alt
@@ -497,103 +570,11 @@ fn legacy_function_key_sequence(
     {
         return None;
     }
-
-    // Cursor keys and Home/End follow DECCKM only while unmodified: the
-    // parameterized form is always CSI, never SS3.
-    let cursor =
-        |normal: &'static str, application: &'static str, final_byte: char| -> Cow<'static, str> {
-            if modified {
-                Cow::Owned(format!("\x1b[1;{modifier}{final_byte}"))
-            } else if application_cursor_keys {
-                Cow::Borrowed(application)
-            } else {
-                Cow::Borrowed(normal)
-            }
-        };
-    let tilde = |plain: &'static str, code: u8| -> Cow<'static, str> {
-        if modified {
-            Cow::Owned(format!("\x1b[{code};{modifier}~"))
-        } else {
-            Cow::Borrowed(plain)
-        }
-    };
-    // F1-F4 are SS3 unmodified but join the CSI 1;<mod> form once modified;
-    // they are not affected by DECCKM.
-    let function = |plain: &'static str, final_byte: char| -> Cow<'static, str> {
-        if modified {
-            Cow::Owned(format!("\x1b[1;{modifier}{final_byte}"))
-        } else {
-            Cow::Borrowed(plain)
-        }
-    };
-
-    Some(match key {
-        egui::Key::ArrowUp => cursor("\x1b[A", "\x1bOA", 'A'),
-        egui::Key::ArrowDown => cursor("\x1b[B", "\x1bOB", 'B'),
-        egui::Key::ArrowRight => cursor("\x1b[C", "\x1bOC", 'C'),
-        egui::Key::ArrowLeft => cursor("\x1b[D", "\x1bOD", 'D'),
-        egui::Key::Home => cursor("\x1b[H", "\x1bOH", 'H'),
-        egui::Key::End => cursor("\x1b[F", "\x1bOF", 'F'),
-        egui::Key::Insert => tilde("\x1b[2~", 2),
-        egui::Key::Delete => tilde("\x1b[3~", 3),
-        egui::Key::PageUp => tilde("\x1b[5~", 5),
-        egui::Key::PageDown => tilde("\x1b[6~", 6),
-        egui::Key::F1 => function("\x1bOP", 'P'),
-        egui::Key::F2 => function("\x1bOQ", 'Q'),
-        egui::Key::F3 => function("\x1bOR", 'R'),
-        egui::Key::F4 => function("\x1bOS", 'S'),
-        egui::Key::F5 => tilde("\x1b[15~", 15),
-        egui::Key::F6 => tilde("\x1b[17~", 17),
-        egui::Key::F7 => tilde("\x1b[18~", 18),
-        egui::Key::F8 => tilde("\x1b[19~", 19),
-        egui::Key::F9 => tilde("\x1b[20~", 20),
-        egui::Key::F10 => tilde("\x1b[21~", 21),
-        egui::Key::F11 => tilde("\x1b[23~", 23),
-        egui::Key::F12 => tilde("\x1b[24~", 24),
-        _ => return None,
-    })
-}
-
-fn kitty_text_key_code(key: egui::Key) -> Option<u32> {
-    match key {
-        egui::Key::A => Some('a' as u32),
-        egui::Key::B => Some('b' as u32),
-        egui::Key::C => Some('c' as u32),
-        egui::Key::D => Some('d' as u32),
-        egui::Key::E => Some('e' as u32),
-        egui::Key::F => Some('f' as u32),
-        egui::Key::G => Some('g' as u32),
-        egui::Key::H => Some('h' as u32),
-        egui::Key::I => Some('i' as u32),
-        egui::Key::J => Some('j' as u32),
-        egui::Key::K => Some('k' as u32),
-        egui::Key::L => Some('l' as u32),
-        egui::Key::M => Some('m' as u32),
-        egui::Key::N => Some('n' as u32),
-        egui::Key::O => Some('o' as u32),
-        egui::Key::P => Some('p' as u32),
-        egui::Key::Q => Some('q' as u32),
-        egui::Key::R => Some('r' as u32),
-        egui::Key::S => Some('s' as u32),
-        egui::Key::T => Some('t' as u32),
-        egui::Key::U => Some('u' as u32),
-        egui::Key::V => Some('v' as u32),
-        egui::Key::W => Some('w' as u32),
-        egui::Key::X => Some('x' as u32),
-        egui::Key::Y => Some('y' as u32),
-        egui::Key::Z => Some('z' as u32),
-        egui::Key::Num0 => Some('0' as u32),
-        egui::Key::Num1 => Some('1' as u32),
-        egui::Key::Num2 => Some('2' as u32),
-        egui::Key::Num3 => Some('3' as u32),
-        egui::Key::Num4 => Some('4' as u32),
-        egui::Key::Num5 => Some('5' as u32),
-        egui::Key::Num6 => Some('6' as u32),
-        egui::Key::Num7 => Some('7' as u32),
-        egui::Key::Num8 => Some('8' as u32),
-        egui::Key::Num9 => Some('9' as u32),
-        _ => None,
-    }
+    jterm_engine::input::legacy_function_key_sequence(
+        normalized_key(key),
+        normalized_modifiers(modifiers),
+        application_cursor_keys,
+    )
 }
 
 fn pty_text_payload(text: &str) -> Option<String> {
@@ -629,60 +610,6 @@ fn paired_printable_key_text(events: &[egui::Event], key_index: usize) -> Option
     None
 }
 
-fn text_key_code(key: egui::Key, modifiers: egui::Modifiers) -> Option<u32> {
-    let codepoint = kitty_text_key_code(key)?;
-    if modifiers.shift {
-        Some(match key {
-            egui::Key::A => 'A' as u32,
-            egui::Key::B => 'B' as u32,
-            egui::Key::C => 'C' as u32,
-            egui::Key::D => 'D' as u32,
-            egui::Key::E => 'E' as u32,
-            egui::Key::F => 'F' as u32,
-            egui::Key::G => 'G' as u32,
-            egui::Key::H => 'H' as u32,
-            egui::Key::I => 'I' as u32,
-            egui::Key::J => 'J' as u32,
-            egui::Key::K => 'K' as u32,
-            egui::Key::L => 'L' as u32,
-            egui::Key::M => 'M' as u32,
-            egui::Key::N => 'N' as u32,
-            egui::Key::O => 'O' as u32,
-            egui::Key::P => 'P' as u32,
-            egui::Key::Q => 'Q' as u32,
-            egui::Key::R => 'R' as u32,
-            egui::Key::S => 'S' as u32,
-            egui::Key::T => 'T' as u32,
-            egui::Key::U => 'U' as u32,
-            egui::Key::V => 'V' as u32,
-            egui::Key::W => 'W' as u32,
-            egui::Key::X => 'X' as u32,
-            egui::Key::Y => 'Y' as u32,
-            egui::Key::Z => 'Z' as u32,
-            _ => codepoint,
-        })
-    } else {
-        Some(codepoint)
-    }
-}
-
-fn kitty_modifier_value(modifiers: egui::Modifiers) -> u8 {
-    let mut bits = 0u8;
-    if modifiers.shift {
-        bits |= 0b1;
-    }
-    if modifiers.alt {
-        bits |= 0b10;
-    }
-    if modifiers.ctrl {
-        bits |= 0b100;
-    }
-    if modifiers.command && !modifiers.ctrl {
-        bits |= 0b1000;
-    }
-    bits + 1
-}
-
 fn consumed_key_name(key: egui::Key, modifiers: egui::Modifiers) -> String {
     let mut parts = Vec::new();
     if modifiers.ctrl {
@@ -716,23 +643,11 @@ fn kitty_encode_key_event(
     modifiers: egui::Modifiers,
     keyboard_flags: u16,
 ) -> Option<String> {
-    let disambiguate = (keyboard_flags & 0b1) != 0;
-    let report_all_keys = (keyboard_flags & 0b1000) != 0;
-    if !disambiguate && !report_all_keys {
-        return None;
-    }
-
-    let codepoint = kitty_text_key_code(key)?;
-    let should_encode = report_all_keys || modifiers.ctrl || modifiers.alt || modifiers.command;
-    if !should_encode {
-        return None;
-    }
-
-    Some(format!(
-        "\x1b[{};{}u",
-        codepoint,
-        kitty_modifier_value(modifiers)
-    ))
+    jterm_engine::input::kitty_encode_key_event(
+        normalized_key(key),
+        normalized_modifiers(modifiers),
+        keyboard_flags,
+    )
 }
 
 fn xterm_encode_modify_other_keys(
@@ -743,30 +658,14 @@ fn xterm_encode_modify_other_keys(
     report_all_keys: bool,
     text_character: Option<char>,
 ) -> Option<String> {
-    let codepoint = text_character
-        .map(u32::from)
-        .or_else(|| text_key_code(key, modifiers))?;
-    let modifier_value = kitty_modifier_value(modifiers);
-    let has_non_shift_modifier = modifiers.ctrl || modifiers.alt || modifiers.command;
-    let should_encode = if report_all_keys {
-        modifier_value > 1
-    } else {
-        match modify_other_keys {
-            0 => false,
-            1 => modifiers.alt || (modifiers.command && !modifiers.ctrl),
-            _ => has_non_shift_modifier || modifiers.shift,
-        }
-    };
-
-    if !should_encode {
-        return None;
-    }
-
-    if format_other_keys == 1 || report_all_keys {
-        Some(format!("\x1b[{};{}u", codepoint, modifier_value))
-    } else {
-        Some(format!("\x1b[27;{};{}~", modifier_value, codepoint))
-    }
+    jterm_engine::input::xterm_encode_modify_other_keys(
+        normalized_key(key),
+        normalized_modifiers(modifiers),
+        modify_other_keys,
+        format_other_keys,
+        report_all_keys,
+        text_character,
+    )
 }
 
 /// Per-frame owned snapshot of one visible command block, used for both the
@@ -2823,7 +2722,7 @@ impl TerminalRenderer {
         if records.is_empty() {
             return None;
         }
-        let cols = terminal.grid.row_len();
+        let cols = terminal.screen.grid.row_len();
         let viewport_top = terminal.viewport_top_line_id();
         let viewport_bottom = viewport_top.saturating_add(rows.saturating_sub(1) as u64);
         // Record anchors are monotonic. Binary-search to the one block that can
@@ -3097,7 +2996,7 @@ impl TerminalRenderer {
         if records.is_empty() {
             return None;
         }
-        let cols = terminal.grid.row_len();
+        let cols = terminal.screen.grid.row_len();
         // Only visible blocks need per-frame chrome. A full-record vector made
         // idle rendering grow with retained command history even when only a
         // handful of rows were on screen.
@@ -3571,7 +3470,7 @@ impl TerminalRenderer {
     /// content is wholly app-owned.
     #[allow(dead_code)] // Public/test compatibility; application uses projected ownership.
     pub fn pointer_app_mouse_eligible(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
-        self.pointer_app_mouse_eligible_for_rows(terminal, None, pos, terminal.grid.rows())
+        self.pointer_app_mouse_eligible_for_rows(terminal, None, pos, terminal.screen.grid.rows())
     }
 
     pub fn pointer_app_mouse_eligible_projected(
@@ -3610,7 +3509,7 @@ impl TerminalRenderer {
             if record.complete {
                 return false;
             }
-            let cols = terminal.grid.row_len();
+            let cols = terminal.screen.grid.row_len();
             let start = crate::block_mode::prompt_row_line_id(
                 record.prompt_start.line_id,
                 record.prompt_start.column,
@@ -3632,7 +3531,7 @@ impl TerminalRenderer {
                 start,
                 extent,
                 terminal.total_lines_scrolled,
-                terminal.grid.rows(),
+                terminal.screen.grid.rows(),
             ) else {
                 return false;
             };
@@ -3689,7 +3588,7 @@ impl TerminalRenderer {
     /// selection. Gutter, padding, and scrollbar remain outside this surface.
     #[allow(dead_code)] // Public/test compatibility; application uses projected ownership.
     pub fn pointer_link_eligible(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
-        self.pointer_link_eligible_for_rows(terminal, None, pos, terminal.grid.rows())
+        self.pointer_link_eligible_for_rows(terminal, None, pos, terminal.screen.grid.rows())
     }
 
     pub fn pointer_link_eligible_projected(
@@ -3774,7 +3673,7 @@ impl TerminalRenderer {
         let Some(content_rect) = self.last_content_rect else {
             return false;
         };
-        let rows = terminal.grid.rows();
+        let rows = terminal.screen.grid.rows();
         self.compute_block_chrome(terminal, rows)
             .as_deref()
             .and_then(|entries| {
@@ -4064,7 +3963,7 @@ impl TerminalRenderer {
         let clicked_start = crate::block_mode::prompt_row_line_id(
             clicked.prompt_start.line_id,
             clicked.prompt_start.column,
-            terminal.grid.row_len(),
+            terminal.screen.grid.row_len(),
         );
         let clicked_end = records
             .get(clicked_index + 1)
@@ -4072,14 +3971,14 @@ impl TerminalRenderer {
                 crate::block_mode::prompt_row_line_id(
                     next.prompt_start.line_id,
                     next.prompt_start.column,
-                    terminal.grid.row_len(),
+                    terminal.screen.grid.row_len(),
                 )
                 .saturating_sub(1)
             })
             .or_else(|| clicked.end.map(|end| end.line_id))
             .unwrap_or(clicked_start);
         let long_block = clicked_end.saturating_sub(clicked_start)
-            >= terminal.grid.rows().saturating_sub(1) as u64;
+            >= terminal.screen.grid.rows().saturating_sub(1) as u64;
         let bookmarked = self.bookmarked_block_sequences.contains(&clicked.sequence);
         let collapse_requested = self
             .requested_collapsed_zone_ids
@@ -4467,7 +4366,7 @@ impl TerminalRenderer {
                 egui::pos2(content.right(), top + height),
             );
             let Some(geometry) =
-                self.card_geometry(entry, content, line_height, terminal.grid.rows())
+                self.card_geometry(entry, content, line_height, terminal.screen.grid.rows())
             else {
                 continue;
             };
@@ -4732,13 +4631,13 @@ impl TerminalRenderer {
         let Some(newest) = records.len().checked_sub(1) else {
             return Vec::new();
         };
-        let cols = terminal.grid.row_len();
+        let cols = terminal.screen.grid.row_len();
         let oldest_line_id = terminal
             .total_lines_scrolled
             .saturating_sub(terminal.scrollback.len() as u64);
         let newest_line_id = terminal
             .total_lines_scrolled
-            .saturating_add(terminal.grid.rows().saturating_sub(1) as u64);
+            .saturating_add(terminal.screen.grid.rows().saturating_sub(1) as u64);
         records
             .iter()
             .enumerate()
@@ -4804,8 +4703,8 @@ impl TerminalRenderer {
         hovered_link: &Option<crate::link::Link>,
         target_rect: egui::Rect,
     ) -> Response {
-        let rows = terminal.grid.rows();
-        let cols = terminal.grid.row_len();
+        let rows = terminal.screen.grid.rows();
+        let cols = terminal.screen.grid.row_len();
 
         let line_height = self.line_height;
         let char_width = self.char_width;
@@ -4851,8 +4750,8 @@ impl TerminalRenderer {
         links: &[crate::link::Link],
         hovered_link: &Option<crate::link::Link>,
     ) -> Response {
-        let rows = terminal.grid.rows();
-        let cols = terminal.grid.row_len();
+        let rows = terminal.screen.grid.rows();
+        let cols = terminal.screen.grid.row_len();
 
         // Get available space
         let available = ui.available_size();
@@ -6015,7 +5914,7 @@ impl TerminalRenderer {
                 let dynamic_cursor = terminal
                     .dynamic_cursor_color
                     .map(|(r, g, b)| Color32::from_rgb(r, g, b));
-                match &terminal.cursor_shape {
+                match &terminal.screen.cursor_shape {
                     crate::terminal::CursorShape::Block => {
                         let cursor_c = dynamic_cursor.unwrap_or_else(|| self.theme.cursor_color());
                         let [r, g, b, _] = cursor_c.to_srgba_unmultiplied();
@@ -7923,8 +7822,8 @@ mod tests {
         }
         let mut terminal = TerminalState::new(80, 12);
         terminal.process_input(b"\x1b]8;;https://example.com\x07 \x1b]8;;\x07");
-        assert!(!terminal.grid.get(0, 0).hyperlink_id.is_none());
-        assert!(!companion_cell_is_empty(terminal.grid.get(0, 0)));
+        assert!(!terminal.screen.grid.get(0, 0).hyperlink_id.is_none());
+        assert!(!companion_cell_is_empty(terminal.screen.grid.get(0, 0)));
     }
 
     #[test]
@@ -7932,7 +7831,7 @@ mod tests {
         let mut terminal = TerminalState::new(80, 24);
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         use crate::terminal::{ProjectionPolicy, ProjectionViewState};
-        let before = format!("{:?}", terminal.grid.iter().collect::<Vec<_>>());
+        let before = format!("{:?}", terminal.screen.grid.iter().collect::<Vec<_>>());
         let mut policy = ProjectionPolicy::new();
         policy.set_chat_mode(true);
         policy.set_block_chrome(true, 0);
@@ -7965,7 +7864,7 @@ mod tests {
         }
         assert_eq!(
             before,
-            format!("{:?}", terminal.grid.iter().collect::<Vec<_>>()),
+            format!("{:?}", terminal.screen.grid.iter().collect::<Vec<_>>()),
             "decoration must not edit any PTY cell"
         );
         assert!(
@@ -8205,7 +8104,7 @@ mod tests {
             crate::theme::Theme::default(),
         );
         renderer.block_mode = true;
-        let rows = terminal.grid.rows();
+        let rows = terminal.screen.grid.rows();
         let live_span = |entries: &[BlockChromeEntry]| {
             entries
                 .iter()
@@ -8377,7 +8276,7 @@ mod tests {
                     viewport.application_cell(DisplayPoint::new(row, column))
                 {
                     assert!(
-                        grid_row < terminal.grid.rows(),
+                        grid_row < terminal.screen.grid.rows(),
                         "row {row} col {column} produced grid row {grid_row}"
                     );
                 }
@@ -8508,7 +8407,7 @@ mod tests {
         };
         let raw = live_of(
             &renderer
-                .compute_block_chrome(&terminal, terminal.grid.rows())
+                .compute_block_chrome(&terminal, terminal.screen.grid.rows())
                 .expect("raw chrome"),
         );
         assert!(!raw.starts_in_viewport, "the fixture must clip the top");
@@ -8536,7 +8435,7 @@ mod tests {
         small.process_input(b"\x1b]133;A\x07$ run\r\n\x1b]133;C\x07r0\r\nr1\r\nr2\r\n");
         let small_raw = live_of(
             &renderer
-                .compute_block_chrome(&small, small.grid.rows())
+                .compute_block_chrome(&small, small.screen.grid.rows())
                 .expect("raw chrome"),
         );
         let small_viewport =
@@ -8780,7 +8679,7 @@ mod tests {
             crate::theme::Theme::default(),
         );
         renderer.block_mode = true;
-        let rows = terminal.grid.rows();
+        let rows = terminal.screen.grid.rows();
         // Ownership only. `ends_in_viewport` is a decorative bottom-edge cap
         // that the projected path deliberately withholds for a mid-row next
         // prompt (see `projected_span_edge_flags`); it never decides which
@@ -8857,7 +8756,7 @@ mod tests {
             crate::theme::Theme::default(),
         );
         renderer.block_mode = true;
-        let rows = terminal.grid.rows();
+        let rows = terminal.screen.grid.rows();
 
         // Unscrolled, the raw path is exact and still owns the frame.
         assert!(terminal.viewport_buffer_mapping_is_exact());
@@ -8953,7 +8852,7 @@ mod tests {
         );
         assert!(!renderer.pointer_link_eligible_projected(&terminal, &viewport, header_pos,));
 
-        let raw_grid_row = (0..terminal.grid.rows())
+        let raw_grid_row = (0..terminal.screen.grid.rows())
             .find(|row| {
                 let absolute = terminal.scrollback.len() + row;
                 terminal
@@ -9264,6 +9163,44 @@ mod tests {
         assert_eq!(blocked.block_click, None);
         assert!(blocked.cursor_move_input.is_empty());
         assert!(!blocked_ctx.memory(|memory| memory.has_focus(blocked_id)));
+    }
+
+    #[test]
+    fn engine_input_adapter_preserves_platform_command_aliases() {
+        // command is Ctrl on Linux/Windows and Super on macOS. mac_cmd by
+        // itself did not contribute a wire modifier before this extraction.
+        for bits in 0u8..32 {
+            let modifiers = egui::Modifiers {
+                shift: bits & 1 != 0,
+                alt: bits & 2 != 0,
+                ctrl: bits & 4 != 0,
+                command: bits & 8 != 0,
+                mac_cmd: bits & 16 != 0,
+            };
+            let wire = 1
+                + (bits & 7)
+                + if modifiers.command && !modifiers.ctrl {
+                    8
+                } else {
+                    0
+                };
+            assert_eq!(
+                kitty_encode_key_event(egui::Key::A, modifiers, 8),
+                Some(format!("\x1b[97;{wire}u"))
+            );
+        }
+        assert_eq!(
+            normalized_key(egui::Key::Num9),
+            jterm_engine::input::Key::Character('9')
+        );
+        assert_eq!(
+            normalized_key(egui::Key::Z),
+            jterm_engine::input::Key::Character('z')
+        );
+        assert_eq!(
+            normalized_key(egui::Key::F13),
+            jterm_engine::input::Key::Unidentified
+        );
     }
 
     #[test]
@@ -10794,7 +10731,7 @@ mod tests {
                         assert_eq!(pane.right() - content.right(), 10.0);
                         let mut terminal = TerminalState::new(cols, rows);
                         terminal.on_resize(cols, rows);
-                        assert_eq!(terminal.grid.row_len(), cols);
+                        assert_eq!(terminal.screen.grid.row_len(), cols);
                         for col in [0, cols / 2, cols - 1] {
                             let cell = cursor_rect(content, 0, col, char_width, 20.0);
                             assert_eq!(
@@ -10877,7 +10814,11 @@ mod tests {
                             &mut crate::terminal::ProjectionViewState::default(),
                         );
                         let entries = renderer
-                            .block_chrome_snapshot(&terminal, &viewport, terminal.grid.rows())
+                            .block_chrome_snapshot(
+                                &terminal,
+                                &viewport,
+                                terminal.screen.grid.rows(),
+                            )
                             .unwrap();
                         let entry = entries.iter().find(|entry| entry.id == record_id).unwrap();
                         assert!(
@@ -11885,7 +11826,10 @@ mod block_spacing_tests {
                         .all(|cell| cell.character == ' '))
                 );
             }
-            assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 24));
+            assert_eq!(
+                (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+                (40, 24)
+            );
         }
     }
 
@@ -11967,8 +11911,8 @@ mod block_spacing_tests {
                         >= content.top() + (viewport.cursor().row + 1) as f32 * line_height
                 );
                 assert!(content.contains_rect(region));
-                assert_eq!(terminal.grid.row_len(), 24);
-                assert_eq!(terminal.grid.rows(), 16);
+                assert_eq!(terminal.screen.grid.row_len(), 24);
+                assert_eq!(terminal.screen.grid.rows(), 16);
             }
         }
     }
@@ -12013,8 +11957,8 @@ mod block_spacing_tests {
                         assert!(overflow.right() < collapse.left());
                     }
                 }
-                assert_eq!(terminal.grid.row_len(), 40);
-                assert_eq!(terminal.grid.rows(), 24);
+                assert_eq!(terminal.screen.grid.row_len(), 40);
+                assert_eq!(terminal.screen.grid.rows(), 24);
             }
         }
     }
@@ -12508,7 +12452,10 @@ mod transcript_canvas_tests {
         assert_eq!(after.first_raw_anchor_in_row(0), anchor);
         assert_eq!(renderer.canvas_geometry.translation, translation);
         assert!(!state.follows_bottom());
-        assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 16));
+        assert_eq!(
+            (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+            (40, 16)
+        );
         terminal.process_input(b"\x1b[?1049h");
         let alt = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
         assert!(!alt.is_transformed());
@@ -12617,7 +12564,10 @@ mod transcript_canvas_tests {
             }
         }
         assert_eq!(after.max_scroll_offset(), 0);
-        assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 24));
+        assert_eq!(
+            (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+            (40, 24)
+        );
     }
 
     #[test]
@@ -12756,7 +12706,10 @@ mod transcript_canvas_tests {
                     .collect::<String>()
             );
             assert_eq!(renderer.canvas_geometry.translation, 16.75);
-            assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 16));
+            assert_eq!(
+                (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+                (40, 16)
+            );
             let content =
                 egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(360.0, 320.0));
             let before_y = content.top();
@@ -12839,14 +12792,14 @@ mod transcript_canvas_tests {
                     assert!(
                         renderer.chat_mode,
                         "shortening the same real prompt restores docking: pane={:?}, font={font}, line={}, native_rows={:?}, limit={limit}, cursor=({},{}), wrapped={:?}",
-                        outer.size(), renderer.line_height, terminal.native_prompt_input_rows(), terminal.cursor_row, terminal.cursor_col, terminal.grid.row_wrapped
+                        outer.size(), renderer.line_height, terminal.native_prompt_input_rows(), terminal.screen.cursor_row, terminal.screen.cursor_col, terminal.screen.grid.row_wrapped
                     );
                     assert_eq!(renderer.grid_dimensions(native.size()), short_size);
-                    assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), size);
+                    assert_eq!((terminal.screen.grid.row_len(), terminal.screen.grid.rows()), size);
                     for _ in 0..lines {
                         terminal.process_input(b"x\r\n");
                     }
-                    let archived_cells = terminal.grid.to_vec()[..lines].to_vec();
+                    let archived_cells = terminal.screen.grid.to_vec()[..lines].to_vec();
                     terminal.process_input(b"\x1b[2J\x1b[H");
                     let actual_archive = terminal.scrollback.iter().map(|row| row.decompress()).collect::<Vec<_>>();
                     assert_native_cells_equal(&actual_archive, &archived_cells);
@@ -12909,8 +12862,8 @@ mod transcript_canvas_tests {
                         reference_terminal_rects_with_height(outer, true, true, tools_height).0;
                     let size = renderer.grid_dimensions(native.size());
                     terminal.on_resize(size.0, size.1);
-                    let cursor = (terminal.cursor_row, terminal.cursor_col);
-                    let cells = terminal.grid.to_vec();
+                    let cursor = (terminal.screen.cursor_row, terminal.screen.cursor_col);
+                    let cells = terminal.screen.grid.to_vec();
                     let presentation = renderer.resolve_glass_layout(&terminal, outer);
                     let expected = terminal.native_prompt_input_rows().is_some_and(|rows| {
                         rows as f32 * renderer.line_height
@@ -12931,8 +12884,11 @@ mod transcript_canvas_tests {
                     assert_eq!(renderer.projection_view_rows.is_some(), expected);
                     assert_eq!(renderer.foreground_footer_rect.is_none(), expected);
                     assert_eq!(renderer.grid_dimensions(native.size()), size);
-                    assert_eq!((terminal.cursor_row, terminal.cursor_col), cursor);
-                    assert_native_cells_equal(&terminal.grid.to_vec(), &cells);
+                    assert_eq!(
+                        (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                        cursor
+                    );
+                    assert_native_cells_equal(&terminal.screen.grid.to_vec(), &cells);
                     assert_eq!(terminal.preedit_text, "中文组合");
                     assert_eq!(terminal.preedit_cursor, 2);
                     assert!(terminal.ime_enabled && renderer.ime_enabled);
@@ -12956,8 +12912,8 @@ mod transcript_canvas_tests {
         let ctx = egui::Context::default();
         let (mut renderer, terminal, _) = fixture(true);
         let outer = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 600.0));
-        let cells = terminal.grid.to_vec();
-        let cursor = (terminal.cursor_row, terminal.cursor_col);
+        let cells = terminal.screen.grid.to_vec();
+        let cursor = (terminal.screen.cursor_row, terminal.screen.cursor_col);
         ctx.run_ui(Default::default(), |_| {
             for chat in [false, true, false] {
                 renderer.sync_glass_presentation(&ctx, chat, &terminal, outer.height());
@@ -12966,8 +12922,11 @@ mod transcript_canvas_tests {
                 assert!(!renderer.continuous_block);
                 assert_eq!(renderer.chat_command_bubbles, chat);
                 assert!(renderer.foreground_footer_rect.is_none());
-                assert_native_cells_equal(&terminal.grid.to_vec(), &cells);
-                assert_eq!((terminal.cursor_row, terminal.cursor_col), cursor);
+                assert_native_cells_equal(&terminal.screen.grid.to_vec(), &cells);
+                assert_eq!(
+                    (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                    cursor
+                );
             }
         })
         .drop_without_applying_deltas();
@@ -13112,7 +13071,10 @@ mod transcript_canvas_tests {
         assert_eq!(after.first_raw_anchor_in_row(0), anchor);
         assert_eq!(renderer.canvas_geometry.translation, translation);
         assert!(!state.follows_bottom());
-        assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 16));
+        assert_eq!(
+            (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+            (40, 16)
+        );
         terminal.process_input(b"\x1b[?1049h");
         let native =
             renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
@@ -13177,7 +13139,10 @@ mod transcript_canvas_tests {
                 frame.raw_anchor_at(DisplayPoint::new(row, col)),
                 before_anchor
             );
-            assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 16));
+            assert_eq!(
+                (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+                (40, 16)
+            );
         }
     }
 

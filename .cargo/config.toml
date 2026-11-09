@@ -1,4 +1,5 @@
 # Production builds use the exact Git revision in Cargo.toml and Cargo.lock.
 # For an explicitly selected local candidate only, pass:
 # cargo --config 'patch."https://github.com/beamiter/jterm_core.git".jterm_core.path="../jterm_core"' <command>
+# Also override jterm_engine to ../jterm_core/crates/jterm_engine for that candidate.
 # Never apply a sibling override globally: independent harnesses use their own pins.

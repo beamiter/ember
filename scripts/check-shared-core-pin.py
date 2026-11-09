@@ -31,6 +31,18 @@ def verify(manifest, lock, config):
     expected = f"git+{REMOTE}?rev={revision}#{revision}"
     if len(packages) != 1 or packages[0].get("source") != expected:
         raise ValueError("Cargo.lock does not identify the same exact Git candidate")
+    engine = manifest["dependencies"].get("jterm_engine")
+    if engine is not None:
+        if any(engine.get(key) != core.get(key) for key in ("git", "rev", "path")):
+            raise ValueError("engine and core must use the same published source")
+        engines = [item for item in lock["package"] if item["name"] == "jterm_engine"]
+        if len(engines) != 1 or engines[0].get("source") != expected:
+            raise ValueError("Cargo.lock engine source differs from the core")
+        for document in (manifest, config):
+            for replacements in document.get("patch", {}).values():
+                if any(name == "jterm_engine" or dep.get("package") == "jterm_engine"
+                       for name, dep in replacements.items()):
+                    raise ValueError("a checked-in patch masks the published engine pin")
     return {"status": "passed", "revision": revision, "source": expected,
             "scope": "manifest, lockfile and checked-in Cargo configuration; not runtime validation"}
 
@@ -41,6 +53,22 @@ class ProvenanceTests(unittest.TestCase):
         self.manifest = {"dependencies": {"jterm_core": {"git": REMOTE, "rev": self.revision}}}
         self.lock = {"package": [{"name": "jterm_core", "source":
                                  f"git+{REMOTE}?rev={self.revision}#{self.revision}"}]}
+
+    def test_engine_pin_and_lock_match(self):
+        self.manifest["dependencies"]["jterm_engine"] = copy.deepcopy(
+            self.manifest["dependencies"]["jterm_core"])
+        engine = copy.deepcopy(self.lock["package"][0])
+        engine["name"] = "jterm_engine"
+        self.lock["package"].append(engine)
+        verify(self.manifest, self.lock, {})
+        engine["source"] = "path+../jterm_engine"
+        with self.assertRaisesRegex(ValueError, "engine source"):
+            verify(self.manifest, self.lock, {})
+
+    def test_engine_sibling_is_rejected(self):
+        self.manifest["dependencies"]["jterm_engine"] = {"path": "../jterm_engine"}
+        with self.assertRaisesRegex(ValueError, "engine and core"):
+            verify(self.manifest, self.lock, {})
 
     def test_matching_candidate(self):
         self.assertEqual(verify(self.manifest, self.lock, {})["revision"], self.revision)

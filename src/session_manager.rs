@@ -1108,7 +1108,7 @@ impl SessionManager {
             self.configured_shell.as_deref(),
             command_argv.as_deref(),
             pinned_cwd,
-            self.repaint_ctx.clone(),
+            crate::runtime_wake::egui_wake(self.repaint_ctx.clone()),
         )?;
         let mut terminal = self.new_terminal_state(cols, rows);
         if let Some(argv) = command_argv.as_deref() {
@@ -1351,7 +1351,7 @@ impl SessionManager {
                 Some(&session_id),
                 self.configured_shell.as_deref(),
                 None,
-                self.repaint_ctx.clone(),
+                crate::runtime_wake::egui_wake(self.repaint_ctx.clone()),
             );
             if let Err(error) = &shell_result {
                 if cwd_ref.is_some() {
@@ -1365,7 +1365,7 @@ impl SessionManager {
                         Some(&session_id),
                         self.configured_shell.as_deref(),
                         None,
-                        self.repaint_ctx.clone(),
+                        crate::runtime_wake::egui_wake(self.repaint_ctx.clone()),
                     );
                 }
             }
@@ -1489,7 +1489,7 @@ mod tests {
             Some(&first_id),
             Some("/bin/sh"),
             None,
-            repaint.clone(),
+            crate::runtime_wake::egui_wake(repaint.clone()),
         )
         .expect("interactive fixture shell starts");
         assert_eq!(
@@ -1575,7 +1575,7 @@ mod tests {
             Some(&first_id),
             Some("/bin/sh"),
             None,
-            repaint.clone(),
+            crate::runtime_wake::egui_wake(repaint.clone()),
         )
         .expect("interactive fixture shell starts");
         let first = Session::new_with_session_id(

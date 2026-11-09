@@ -1,29 +1,6 @@
 use super::*;
 
-/// Locate cancellation before the first real string terminator. A fresh ESC
-/// abandons the string and is parsed again; CAN/SUB are consumed. The bool says
-/// that ESC was the final byte of the previous read and must be restored.
-fn control_string_abort(input: &[u8], previous_escape: bool, osc: bool) -> Option<(usize, bool)> {
-    if previous_escape {
-        match input.first().copied()? {
-            b'\\' => return None,
-            0x18 | 0x1a => return Some((1, false)),
-            _ => return Some((0, true)),
-        }
-    }
-    for (index, byte) in input.iter().copied().enumerate() {
-        match byte {
-            0x18 | 0x1a => return Some((index + 1, false)),
-            0x07 if osc => return None,
-            0x1b => match input.get(index + 1) {
-                Some(b'\\') | None => return None,
-                Some(_) => return Some((index, false)),
-            },
-            _ => {}
-        }
-    }
-    None
-}
+use jterm_engine::parser::{Event, RejectReason, StringKind};
 
 impl super::TerminalState {
     /// Sanitise one OSC 9 / OSC 777 notification field.
@@ -62,26 +39,6 @@ impl super::TerminalState {
         field.contains('\u{fffd}')
     }
 
-    /// Carry an unfinished escape across PTY read batches, but cap total size
-    /// to avoid unbounded growth on malformed/binary streams that never send a
-    /// terminator. On overflow the buffer is dropped (parser drops back to a
-    /// clean state) — the alternative would be to keep partial data that we
-    /// already know is too big to ever match.
-    fn stash_pending_escape(&mut self, tail: &[u8]) {
-        let new_len = self.pending_escape.len().saturating_add(tail.len());
-        if new_len > MAX_PENDING_ESCAPE {
-            crate::debug_log!(
-                "[PARSER] pending_escape exceeded {} bytes (have {}, +{}); discarding",
-                MAX_PENDING_ESCAPE,
-                self.pending_escape.len(),
-                tail.len()
-            );
-            self.pending_escape.clear();
-            return;
-        }
-        self.pending_escape.extend_from_slice(tail);
-    }
-
     fn handle_kitty_apc_payload(&mut self, payload: &[u8]) {
         if payload.first() != Some(&b'G') {
             return;
@@ -92,28 +49,33 @@ impl super::TerminalState {
             self.drain_kitty_graphics_responses();
             return;
         };
-        let cursor_col = u32::try_from(self.cursor_col).unwrap_or(u32::MAX);
-        let cursor_row = u32::try_from(self.cursor_row).unwrap_or(u32::MAX);
+        let cursor_col = u32::try_from(self.screen.cursor_col).unwrap_or(u32::MAX);
+        let cursor_row = u32::try_from(self.screen.cursor_row).unwrap_or(u32::MAX);
         let parsed = self
             .kitty_graphics
             .parse_graphics_payload_at(payload, cursor_col, cursor_row);
         if let Err(_error) = parsed {
             crate::debug_log!("[APC] Kitty graphics error: {}", _error);
         } else if let Some((columns, rows)) = self.kitty_graphics.take_cursor_movement() {
-            self.pending_wrap = false;
-            let last_col = self.grid.row_len().saturating_sub(1);
-            self.cursor_col = self
+            self.screen.pending_wrap = false;
+            let last_col = self.screen.grid.row_len().saturating_sub(1);
+            self.screen.cursor_col = self
+                .screen
                 .cursor_col
                 .saturating_add(columns as usize)
                 .min(last_col);
-            let last_row = if self.cursor_row >= self.scroll_region_top
-                && self.cursor_row <= self.scroll_region_bottom
+            let last_row = if self.screen.cursor_row >= self.screen.scroll_region_top
+                && self.screen.cursor_row <= self.screen.scroll_region_bottom
             {
-                self.scroll_region_bottom
+                self.screen.scroll_region_bottom
             } else {
-                self.grid.rows().saturating_sub(1)
+                self.screen.grid.rows().saturating_sub(1)
             };
-            self.cursor_row = self.cursor_row.saturating_add(rows as usize).min(last_row);
+            self.screen.cursor_row = self
+                .screen
+                .cursor_row
+                .saturating_add(rows as usize)
+                .min(last_row);
         }
         self.observe_chat_native_takeover();
         self.drain_kitty_graphics_responses();
@@ -124,180 +86,6 @@ impl super::TerminalState {
         if !responses.is_empty() {
             self.output_buffer.extend_from_slice(&responses);
         }
-    }
-
-    fn reject_buffered_kitty_apc_with_suffix(&mut self, suffix: &[u8], error: &str) {
-        let Some(payload) = self.pending_apc.strip_prefix(b"\x1b_") else {
-            return;
-        };
-        // Usually i/I/q are already buffered. If fragmentation happened
-        // unusually early, copy only a bounded control prefix from the new
-        // fragment so an oversized rejection can still echo the identifier and
-        // honor q without retaining the oversized packet.
-        // Recovery includes the G discriminator; the shared control cap does not.
-        let limit = jterm_core::kitty_graphics::MAX_CONTROL_BYTES + 1;
-        let mut recovery =
-            Vec::with_capacity(limit.min(payload.len().saturating_add(suffix.len())));
-        recovery.extend_from_slice(&payload[..payload.len().min(limit)]);
-        if recovery.len() < limit && !recovery.contains(&b';') {
-            recovery.extend_from_slice(&suffix[..suffix.len().min(limit - recovery.len())]);
-        }
-        // The discriminator itself may be in the new read (ESC _ | G...).
-        if recovery.first() != Some(&b'G') {
-            return;
-        }
-        self.kitty_graphics
-            .reject_graphics_payload(&recovery, error);
-        self.drain_kitty_graphics_responses();
-    }
-
-    /// Abort a fragmented control string before its ordinary resume scanner
-    /// can consume a replacement escape or the visible text after CAN/SUB.
-    fn abort_pending_control_string(&mut self, input: &[u8]) -> bool {
-        let (previous_escape, osc) = if self.discarding_oversized_apc {
-            (self.discarding_apc_prev_escape, false)
-        } else if !self.pending_apc.is_empty() {
-            (self.pending_apc.last() == Some(&0x1b), false)
-        } else if !self.pending_osc.is_empty() {
-            (self.pending_osc.last() == Some(&0x1b), true)
-        } else if !self.pending_string.is_empty() {
-            (self.pending_string.last() == Some(&0x1b), false)
-        } else {
-            return false;
-        };
-        let Some((resume, restore_escape)) = control_string_abort(input, previous_escape, osc)
-        else {
-            return false;
-        };
-        if !self.pending_apc.is_empty() {
-            self.reject_buffered_kitty_apc_with_suffix(
-                &input[..resume],
-                "Kitty graphics APC was cancelled",
-            );
-        }
-        self.pending_apc.clear();
-        self.pending_apc_scan_from = 0;
-        self.pending_osc.clear();
-        self.pending_osc_scan_from = 0;
-        self.pending_string.clear();
-        self.pending_string_scan_from = 0;
-        self.discarding_oversized_apc = false;
-        self.discarding_apc_prev_escape = false;
-        if restore_escape {
-            self.pending_escape.push(0x1b);
-        }
-        self.process_input(&input[resume..]);
-        true
-    }
-
-    fn begin_pending_apc(&mut self, tail: &[u8]) {
-        if tail.len() > MAX_PENDING_ESCAPE {
-            if let Some(payload) = tail.strip_prefix(b"\x1b_") {
-                if payload.first() == Some(&b'G') {
-                    self.kitty_graphics.reject_graphics_payload(
-                        payload,
-                        "Kitty graphics APC exceeded the parser size limit",
-                    );
-                    self.drain_kitty_graphics_responses();
-                }
-            }
-            self.pending_apc.clear();
-            self.discarding_oversized_apc = true;
-            self.discarding_apc_prev_escape = tail.last() == Some(&0x1b);
-            return;
-        }
-        self.pending_apc.clear();
-        self.pending_apc.extend_from_slice(tail);
-        self.pending_apc_scan_from = self.pending_apc.len().saturating_sub(1);
-    }
-
-    /// Resume a fragmented Kitty APC. Returns true when this function consumed
-    /// the input (including any recursively processed bytes after the ST).
-    fn resume_pending_apc(&mut self, input: &[u8]) -> bool {
-        if self.discarding_oversized_apc {
-            let mut previous_escape = self.discarding_apc_prev_escape;
-            for (index, byte) in input.iter().copied().enumerate() {
-                if previous_escape && byte == b'\\' {
-                    self.discarding_oversized_apc = false;
-                    self.discarding_apc_prev_escape = false;
-                    if index + 1 < input.len() {
-                        self.process_input(&input[index + 1..]);
-                    }
-                    return true;
-                }
-                previous_escape = byte == 0x1b;
-            }
-            self.discarding_apc_prev_escape = previous_escape;
-            return true;
-        }
-
-        if self.pending_apc.is_empty() {
-            return false;
-        }
-
-        // Everything before pending_apc_scan_from was proved not to contain
-        // ST in the previous call. A new terminator can therefore only straddle
-        // the old/new boundary or live entirely in input. Search the new bytes
-        // once before doing the capacity check: bytes after ST are normal
-        // terminal input and must not be charged to the APC size limit.
-        let scan_from = self
-            .pending_apc_scan_from
-            .min(self.pending_apc.len().saturating_sub(1));
-        let terminator = if scan_from + 1 == self.pending_apc.len()
-            && self.pending_apc[scan_from] == 0x1b
-            && input.first() == Some(&b'\\')
-        {
-            Some((scan_from, 1))
-        } else {
-            input
-                .windows(2)
-                .position(|window| window == b"\x1b\\")
-                .map(|offset| (self.pending_apc.len() + offset, offset + 2))
-        };
-
-        if let Some((terminator, consumed)) = terminator {
-            let packet_len = self.pending_apc.len().saturating_add(consumed);
-            if packet_len > MAX_PENDING_ESCAPE {
-                self.reject_buffered_kitty_apc_with_suffix(
-                    &input[..consumed],
-                    "Kitty graphics APC exceeded the parser size limit",
-                );
-                self.pending_apc.clear();
-                self.pending_apc_scan_from = 0;
-            } else {
-                self.pending_apc.extend_from_slice(&input[..consumed]);
-                let packet = std::mem::take(&mut self.pending_apc);
-                self.pending_apc_scan_from = 0;
-                if packet.starts_with(b"\x1b_") {
-                    self.handle_kitty_apc_payload(&packet[2..terminator]);
-                }
-            }
-            if consumed < input.len() {
-                self.process_input(&input[consumed..]);
-            }
-            return true;
-        }
-
-        if self.pending_apc.len().saturating_add(input.len()) > MAX_PENDING_ESCAPE {
-            let previous_escape = input
-                .last()
-                .copied()
-                .or_else(|| self.pending_apc.last().copied())
-                == Some(0x1b);
-            self.reject_buffered_kitty_apc_with_suffix(
-                input,
-                "Kitty graphics APC exceeded the parser size limit",
-            );
-            self.pending_apc.clear();
-            self.pending_apc_scan_from = 0;
-            self.discarding_oversized_apc = true;
-            self.discarding_apc_prev_escape = previous_escape;
-            return true;
-        }
-
-        self.pending_apc.extend_from_slice(input);
-        self.pending_apc_scan_from = self.pending_apc.len().saturating_sub(1);
-        true
     }
 
     /// Dispatch a complete OSC payload (the bytes between `ESC ]` and the
@@ -330,10 +118,10 @@ impl super::TerminalState {
                     // OSC 7 — current working directory.
                     // Format: file://hostname/path (path is %-encoded).
                     // We accept either the full URL or a bare path.
-                    self.current_working_dir = Self::decode_osc7_cwd(value);
+                    self.current_working_dir = self.decode_osc7_cwd(value);
                     Self::observe_organism_directory(
                         &mut self.organism_working_dir,
-                        if self.use_alt_buffer {
+                        if self.screen.use_alt_buffer {
                             None
                         } else {
                             self.current_working_dir.as_deref()
@@ -349,15 +137,15 @@ impl super::TerminalState {
                     // preceding safe link over later text.
                     if let Some((params, uri)) = value.split_once(';') {
                         if uri.is_empty() {
-                            self.current_hyperlink = HyperlinkId::NONE;
+                            self.screen.current_hyperlink = HyperlinkId::NONE;
                         } else {
-                            self.current_hyperlink = self
+                            self.screen.current_hyperlink = self
                                 .hyperlinks
                                 .intern(params, uri)
                                 .unwrap_or(HyperlinkId::NONE);
                         }
                     } else {
-                        self.current_hyperlink = HyperlinkId::NONE;
+                        self.screen.current_hyperlink = HyperlinkId::NONE;
                     }
                 } else if command == "4" {
                     self.handle_osc_palette(value);
@@ -370,7 +158,7 @@ impl super::TerminalState {
                 } else if command == "9" {
                     // Desktop notification (iTerm2/ConEmu)
                     if self.pending_notifications.len() < 8 {
-                        let title = jterm_core::identity::get().app_name.to_owned();
+                        let title = self.host_context.notification_app_name.clone();
                         let body = Self::safe_notification_field(value);
                         if !Self::notification_field_is_rewritten(&body) {
                             self.pending_notifications.push((title, body));
@@ -382,7 +170,7 @@ impl super::TerminalState {
                     if parts.len() >= 2 && parts[0] == "notify" {
                         let title = Self::safe_notification_field(parts.get(1).unwrap_or(&""));
                         let title = if title.is_empty() {
-                            jterm_core::identity::get().app_name.to_owned()
+                            self.host_context.notification_app_name.clone()
                         } else {
                             title
                         };
@@ -434,181 +222,6 @@ impl super::TerminalState {
         }
     }
 
-    fn begin_pending_osc(&mut self, tail: &[u8]) {
-        if tail.len() > MAX_PENDING_ESCAPE {
-            crate::debug_log!(
-                "[PARSER] pending_osc exceeded {} bytes (+{}); discarding",
-                MAX_PENDING_ESCAPE,
-                tail.len()
-            );
-            self.pending_osc.clear();
-            return;
-        }
-        self.pending_osc.clear();
-        self.pending_osc.extend_from_slice(tail);
-        self.pending_osc_scan_from = self.pending_osc.len().saturating_sub(1);
-    }
-
-    /// Resume a fragmented OSC. Returns true when this function consumed the
-    /// input (including any recursively processed bytes after the terminator).
-    /// Mirrors resume_pending_apc, except OSCs also terminate on BEL and an
-    /// oversized OSC follows the pending_escape policy: drop the buffer and
-    /// fall back to ground state instead of discarding until the terminator.
-    fn resume_pending_osc(&mut self, input: &[u8]) -> bool {
-        if self.pending_osc.is_empty() {
-            return false;
-        }
-
-        // Everything before pending_osc_scan_from was proved not to contain a
-        // terminator in the previous call. A new ST can therefore only straddle
-        // the old/new boundary or live entirely in input; BEL is a single byte
-        // and cannot straddle. Search the new bytes once before doing the
-        // capacity check: bytes after the terminator are normal terminal input
-        // and must not be charged to the OSC size limit.
-        let scan_from = self
-            .pending_osc_scan_from
-            .min(self.pending_osc.len().saturating_sub(1));
-        let terminator = if scan_from + 1 == self.pending_osc.len()
-            && self.pending_osc[scan_from] == 0x1b
-            && input.first() == Some(&b'\\')
-        {
-            Some((scan_from, 1))
-        } else {
-            let mut found = None;
-            let mut index = 0;
-            while index < input.len() {
-                if input[index] == 0x07 {
-                    found = Some((self.pending_osc.len() + index, index + 1));
-                    break;
-                } else if index + 1 < input.len()
-                    && input[index] == 0x1b
-                    && input[index + 1] == 0x5c
-                {
-                    found = Some((self.pending_osc.len() + index, index + 2));
-                    break;
-                }
-                index += 1;
-            }
-            found
-        };
-
-        if let Some((terminator, consumed)) = terminator {
-            self.pending_osc.extend_from_slice(&input[..consumed]);
-            let packet = std::mem::take(&mut self.pending_osc);
-            self.pending_osc_scan_from = 0;
-            if packet.starts_with(b"\x1b]") {
-                let bel_terminated = packet.get(terminator) == Some(&0x07);
-                self.handle_osc_payload(&packet[2..terminator], bel_terminated);
-            }
-            if consumed < input.len() {
-                self.process_input(&input[consumed..]);
-            }
-            return true;
-        }
-
-        if self.pending_osc.len().saturating_add(input.len()) > MAX_PENDING_ESCAPE {
-            crate::debug_log!(
-                "[PARSER] pending_osc exceeded {} bytes (have {}, +{}); discarding",
-                MAX_PENDING_ESCAPE,
-                self.pending_osc.len(),
-                input.len()
-            );
-            self.pending_osc.clear();
-            self.pending_osc_scan_from = 0;
-            return true;
-        }
-
-        self.pending_osc.extend_from_slice(input);
-        self.pending_osc_scan_from = self.pending_osc.len().saturating_sub(1);
-        true
-    }
-
-    fn begin_pending_string(&mut self, tail: &[u8]) {
-        if tail.len() > MAX_PENDING_ESCAPE {
-            crate::debug_log!(
-                "[PARSER] pending_string exceeded {} bytes (+{}); discarding",
-                MAX_PENDING_ESCAPE,
-                tail.len()
-            );
-            self.pending_string.clear();
-            return;
-        }
-        self.pending_string.clear();
-        self.pending_string.extend_from_slice(tail);
-        self.pending_string_scan_from = self.pending_string.len().saturating_sub(1);
-    }
-
-    /// Resume a fragmented DCS/SOS/PM. Their payloads are opaque — only the
-    /// ST terminator matters — so a completed packet is simply dropped and the
-    /// same overflow policy as pending_escape applies.
-    fn resume_pending_string(&mut self, input: &[u8]) -> bool {
-        if self.pending_string.is_empty() {
-            return false;
-        }
-
-        let scan_from = self
-            .pending_string_scan_from
-            .min(self.pending_string.len().saturating_sub(1));
-        let terminator = if scan_from + 1 == self.pending_string.len()
-            && self.pending_string[scan_from] == 0x1b
-            && input.first() == Some(&b'\\')
-        {
-            Some(1)
-        } else {
-            input
-                .windows(2)
-                .position(|window| window == b"\x1b\\")
-                .map(|offset| offset + 2)
-        };
-
-        if let Some(consumed) = terminator {
-            let split_st = scan_from + 1 == self.pending_string.len()
-                && self.pending_string.get(scan_from) == Some(&0x1b)
-                && input.first() == Some(&b'\\');
-            let dcs_payload = if self.pending_string.get(1) == Some(&b'P') {
-                let mut payload = if self.pending_string.len() >= 2 {
-                    self.pending_string[2..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                if split_st {
-                    payload.pop();
-                } else {
-                    let body_end = consumed.saturating_sub(2);
-                    payload.extend_from_slice(&input[..body_end]);
-                }
-                Some(payload)
-            } else {
-                None
-            };
-            self.pending_string.clear();
-            self.pending_string_scan_from = 0;
-            if let Some(payload) = dcs_payload {
-                self.handle_dcs_payload(&payload);
-            }
-            if consumed < input.len() {
-                self.process_input(&input[consumed..]);
-            }
-            return true;
-        }
-
-        if self.pending_string.len().saturating_add(input.len()) > MAX_PENDING_ESCAPE {
-            crate::debug_log!(
-                "[PARSER] pending_string exceeded {} bytes (have {}, +{}); discarding",
-                MAX_PENDING_ESCAPE,
-                self.pending_string.len(),
-                input.len()
-            );
-            self.pending_string.clear();
-            self.pending_string_scan_from = 0;
-            return true;
-        }
-
-        self.pending_string.extend_from_slice(input);
-        self.pending_string_scan_from = self.pending_string.len().saturating_sub(1);
-        true
-    }
-
     /// DCS `$q` is DECRQSS. Other DCS payloads stay opaque (no reply).
     fn handle_dcs_payload(&mut self, payload: &[u8]) {
         if let Some(pt) = payload.strip_prefix(b"$q") {
@@ -619,7 +232,7 @@ impl super::TerminalState {
     fn handle_decrqss(&mut self, pt: &[u8]) {
         let reply = match pt {
             b" q" => {
-                let n = match self.cursor_shape {
+                let n = match self.screen.cursor_shape {
                     CursorShape::Underline => 4,
                     CursorShape::Beam => 6,
                     _ => 2,
@@ -628,11 +241,15 @@ impl super::TerminalState {
             }
             b"r" => format!(
                 "\x1bP1$r{};{}r\x1b\\",
-                self.scroll_region_top + 1,
-                self.scroll_region_bottom + 1
+                self.screen.scroll_region_top + 1,
+                self.screen.scroll_region_bottom + 1
             ),
             b"\"q" => {
-                let n = if self.current_flags.protected() { 1 } else { 0 };
+                let n = if self.screen.current_flags.protected() {
+                    1
+                } else {
+                    0
+                };
                 format!("\x1bP1$r{n}\"q\x1b\\")
             }
             b"m" => format!("\x1bP1$r{}\x1b\\", self.decrqss_sgr_payload()),
@@ -644,16 +261,16 @@ impl super::TerminalState {
 
     fn decrqss_sgr_payload(&self) -> String {
         let mut params: Vec<String> = Vec::new();
-        if self.current_flags.bold() {
+        if self.screen.current_flags.bold() {
             params.push("1".into());
         }
-        if self.current_flags.dim() {
+        if self.screen.current_flags.dim() {
             params.push("2".into());
         }
-        if self.current_flags.italic() {
+        if self.screen.current_flags.italic() {
             params.push("3".into());
         }
-        match self.current_flags.underline() {
+        match self.screen.current_flags.underline() {
             UnderlineStyle::None => {}
             UnderlineStyle::Single => params.push("4".into()),
             UnderlineStyle::Double => params.push("21".into()),
@@ -661,17 +278,17 @@ impl super::TerminalState {
             UnderlineStyle::Dotted => params.push("4:4".into()),
             UnderlineStyle::Dashed => params.push("4:5".into()),
         }
-        if self.current_flags.blink() {
+        if self.screen.current_flags.blink() {
             params.push("5".into());
         }
-        if self.current_flags.inverse() {
+        if self.screen.current_flags.inverse() {
             params.push("7".into());
         }
-        if self.current_flags.strikethrough() {
+        if self.screen.current_flags.strikethrough() {
             params.push("9".into());
         }
-        params.extend(Self::sgr_color_params(self.current_fg, true));
-        params.extend(Self::sgr_color_params(self.current_bg, false));
+        params.extend(Self::sgr_color_params(self.screen.current_fg, true));
+        params.extend(Self::sgr_color_params(self.screen.current_bg, false));
         if params.is_empty() {
             "0m".into()
         } else {
@@ -724,25 +341,28 @@ impl super::TerminalState {
     /// only when exactly on the bottom margin; below the region the cursor
     /// just moves down and never scrolls.
     fn line_feed(&mut self) {
-        self.pending_wrap = false;
-        let departed_row_id = self.grid.row_id(self.cursor_row);
+        self.screen.pending_wrap = false;
+        let departed_row_id = self.screen.grid.row_id(self.screen.cursor_row);
         let departed_boundary = BufferAnchor {
             line_id: self
                 .total_lines_scrolled
-                .saturating_add(self.cursor_row as u64),
-            column: self.grid.row_len(),
+                .saturating_add(self.screen.cursor_row as u64),
+            column: self.screen.grid.row_len(),
         };
-        if self.cursor_row == self.scroll_region_bottom {
+        if self.screen.cursor_row == self.screen.scroll_region_bottom {
             // 恰在滚动区底边距:向上滚动区域,光标保持在底行
-            self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
-        } else if self.cursor_row + 1 < self.grid.rows() {
+            self.scroll_region_up(
+                self.screen.scroll_region_top,
+                self.screen.scroll_region_bottom,
+            );
+        } else if self.screen.cursor_row + 1 < self.screen.grid.rows() {
             // 区内或区外(底边距下方)正常下移,不滚动
-            self.cursor_row += 1;
+            self.screen.cursor_row += 1;
         }
         let next_boundary = BufferAnchor {
             line_id: self
                 .total_lines_scrolled
-                .saturating_add(self.cursor_row as u64),
+                .saturating_add(self.screen.cursor_row as u64),
             column: 0,
         };
         self.note_output_hard_line_advance(departed_row_id, departed_boundary, next_boundary);
@@ -761,22 +381,22 @@ impl super::TerminalState {
     /// DECALN (`ESC # 8`): fill the screen with 'E', reset the margins and home
     /// the cursor, as xterm does.
     fn screen_alignment_test(&mut self) {
-        let cols = self.grid.row_len();
-        let rows = self.grid.rows();
+        let cols = self.screen.grid.row_len();
+        let rows = self.screen.grid.rows();
         let spans: Vec<_> = (0..rows).map(|row| (row, 0, cols)).collect();
         self.invalidate_grid_mutation_spans(&spans);
         let filled = TerminalCell {
             character: 'E',
             ..TerminalCell::default()
         };
-        for row in self.grid.iter_mut() {
+        for row in self.screen.grid.iter_mut() {
             row.fill(filled);
         }
-        self.scroll_region_top = 0;
-        self.scroll_region_bottom = rows.saturating_sub(1);
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.pending_wrap = false;
+        self.screen.scroll_region_top = 0;
+        self.screen.scroll_region_bottom = rows.saturating_sub(1);
+        self.screen.cursor_row = 0;
+        self.screen.cursor_col = 0;
+        self.screen.pending_wrap = false;
         self.note_output_cursor_reposition(true);
         self.dirty_region.mark_all(rows);
         self.mark_rows_dirty(0, rows.saturating_sub(1));
@@ -785,27 +405,27 @@ impl super::TerminalState {
     /// DECSTR (`CSI ! p`): soft reset of the modes and drawing state DECSTR
     /// is defined to touch, leaving the screen and cursor position alone.
     fn soft_reset(&mut self) {
-        self.current_fg = Color::Default;
-        self.current_bg = Color::Default;
+        self.screen.current_fg = Color::Default;
+        self.screen.current_bg = Color::Default;
         self.global_bg = Color::Default;
-        self.current_flags = StyleFlags::default();
-        self.g0_charset = Charset::Ascii;
-        self.g1_charset = Charset::Ascii;
-        self.active_charset = Charset::Ascii;
-        self.scroll_region_top = 0;
-        self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
-        self.saved_state = None;
-        self.origin_mode = false;
-        self.insert_mode = false;
+        self.screen.current_flags = StyleFlags::default();
+        self.screen.g0_charset = Charset::Ascii;
+        self.screen.g1_charset = Charset::Ascii;
+        self.screen.active_charset = Charset::Ascii;
+        self.screen.scroll_region_top = 0;
+        self.screen.scroll_region_bottom = self.screen.grid.rows().saturating_sub(1);
+        self.screen.saved_state = None;
+        self.screen.origin_mode = false;
+        self.screen.insert_mode = false;
         // DECTCEM and DECAWM on, DECCKM (application cursor keys) off,
         // DECKPAM (application keypad) off. Alternate Scroll returns to the
         // xterm-resource default (enabled).
-        self.modes.insert(25);
-        self.modes.insert(7);
-        self.modes.insert(1007);
-        self.modes.remove(&1);
-        self.modes.remove(&66);
-        self.pending_wrap = false;
+        self.protocol.modes_mut().insert(25);
+        self.protocol.modes_mut().insert(7);
+        self.protocol.modes_mut().insert(1007);
+        self.protocol.modes_mut().remove(&1);
+        self.protocol.modes_mut().remove(&66);
+        self.screen.pending_wrap = false;
     }
 
     /// DECRQM answer for a DEC private mode: 1 set, 2 reset, 0 unrecognised.
@@ -814,7 +434,7 @@ impl super::TerminalState {
     /// misread the replies.
     fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
         let set = match mode {
-            6 => self.origin_mode,
+            6 => self.screen.origin_mode,
             1
             | 7
             | 12
@@ -829,7 +449,7 @@ impl super::TerminalState {
             | 2004
             | 2026
             | 2031
-            | 5522 => self.modes.contains(&mode),
+            | 5522 => self.protocol.modes().contains(&mode),
             _ => return 0,
         };
         if set {
@@ -845,10 +465,25 @@ impl super::TerminalState {
     /// silent-timeout Claude Code hits when an unimplemented mode replies 0.
     fn decrqm_ansi_mode_state(&self, mode: u16) -> u8 {
         match mode {
-            4 if self.insert_mode => 1,
+            4 if self.screen.insert_mode => 1,
             4 => 2,
             20 => 4,
             _ => 0,
+        }
+    }
+
+    fn apply_local_semantic_effects(&mut self, effects: jterm_engine::semantics::Effects) {
+        use jterm_engine::semantics::Effect;
+        for effect in effects {
+            match effect {
+                Effect::Row(mutation) => self.apply_screen_mutation(mutation),
+                Effect::CursorReposition { non_linear } => {
+                    self.note_output_cursor_reposition(non_linear)
+                }
+                Effect::Reply(bytes) => self.output_buffer.extend(bytes),
+                Effect::Bell => self.pending_bell = true,
+                Effect::GlobalBackground(color) => self.global_bg = color,
+            }
         }
     }
 
@@ -856,520 +491,111 @@ impl super::TerminalState {
         if !input.is_empty() {
             self.invalidate_search_source();
         }
-        if self.abort_pending_control_string(input) {
-            return;
-        }
-        if self.resume_pending_apc(input) {
-            return;
-        }
-        if self.resume_pending_osc(input) {
-            return;
-        }
-        if self.resume_pending_string(input) {
-            return;
-        }
-        // Fast path: if no pending escape, process input directly without allocation
-        let data;
-        let data_slice: &[u8] = if self.pending_escape.is_empty() {
-            input
-        } else {
-            // Slow path: merge pending escape with new input
-            let mut combined = std::mem::take(&mut self.pending_escape);
-            combined.extend_from_slice(input);
-            data = combined;
-            &data
-        };
-
-        let mut i = 0;
-
-        while i < data_slice.len() {
-            let byte = data_slice[i];
-
-            // 存在未完成的多字节 UTF-8 序列,而当前字节不是续接字节(10xxxxxx):
-            // 说明前一个序列残缺,按 Unicode 建议输出替换字符 U+FFFD 并复位,
-            // 然后正常处理当前字节,避免残缺序列被静默吞掉或污染后续解析。
-            if self.utf8_len > 0 && (byte & 0xC0) != 0x80 {
-                self.put_char('\u{FFFD}');
-                self.utf8_len = 0;
+        let mut at = 0;
+        loop {
+            let step = self.parser.next(&input[at..]);
+            at += step.consumed;
+            let Some(event) = step.event else {
+                break;
+            };
+            if let jterm_engine::semantics::Dispatch::Handled(effects) =
+                jterm_engine::semantics::dispatch_local(
+                    &mut self.screen,
+                    &mut self.protocol,
+                    &event,
+                )
+            {
+                self.apply_local_semantic_effects(effects);
+                self.observe_chat_native_takeover();
+                continue;
             }
-
-            match byte {
-                b'\x08' => {
-                    // Backspace (0x08) - move cursor left.
-                    // Shell handles actual deletion and sends back updated display.
-                    self.pending_wrap = false;
-                    if self.cursor_col > 0 {
-                        self.cursor_col -= 1;
-                    }
-                    self.note_output_cursor_reposition(false);
-                    i += 1;
-                }
-                b'\x7f' => {
-                    // DEL (0x7f) 在输出流中按 ECMA-48 应被忽略,不能当作退格移动光标。
-                    i += 1;
-                }
-                b'\n' | b'\x0b' | b'\x0c' => {
-                    // LF; VT and FF are executed as LF by xterm and VTE.
-                    self.line_feed();
-                    i += 1;
-                }
-                b'\r' => {
-                    self.pending_wrap = false;
-                    self.cursor_col = 0;
-                    self.note_output_cursor_reposition(false);
-                    i += 1;
-                }
-                b'\x0e' => {
-                    self.active_charset = self.g1_charset;
-                    i += 1;
-                }
-                b'\x0f' => {
-                    self.active_charset = self.g0_charset;
-                    i += 1;
-                }
-                b'\x07' => {
-                    self.pending_bell = true;
-                    i += 1;
-                }
-                // The remaining C0 controls (NUL, ENQ, CAN, SUB outside a
-                // sequence, FS..US, ...) have no effect in xterm or VTE. They
-                // used to reach the fallback below and print U+FFFD.
-                0x00..=0x06 | 0x10..=0x1a | 0x1c..=0x1f => {
-                    i += 1;
-                }
-                b'\t' => {
-                    // Tab - 前进到下一个制表位(支持自定义 HTS/TBC 制表位)
-                    self.pending_wrap = false;
-                    self.cursor_col = self.next_tab_stop(self.cursor_col);
-                    self.note_output_cursor_reposition(false);
-                    i += 1;
-                }
-                b'\x1b' => {
-                    let esc_start = i;
-
-                    if i + 1 >= data_slice.len() {
-                        self.stash_pending_escape(&data_slice[esc_start..]);
-                        break;
-                    }
-
-                    match data_slice[i + 1] {
-                        // A repeated ESC abandons the unfinished prefix.
-                        0x1b => {
-                            i += 1;
-                        }
-                        b'c' => {
-                            // RIS — full terminal reset. Reinitialize graphics
-                            // state as well; the final byte is control syntax,
-                            // never printable text.
-                            self.hard_reset();
-                            i += 2;
-                        }
-                        b'7' => {
-                            // DECSC - 保存光标(含 SGR/字符集/模式)
-                            self.save_cursor_state();
-                            i += 2;
-                        }
-                        b'8' => {
-                            // DECRC - 恢复光标(含 SGR/字符集/模式)
-                            self.restore_cursor_state();
-                            i += 2;
-                        }
-                        b'H' => {
-                            // HTS - 在当前光标列设置制表位
-                            if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
-                                *stop = true;
-                            }
-                            i += 2;
-                        }
-                        b']' => {
-                            i += 2;
-
-                            let payload_start = i;
-                            if let Some((resume, _)) =
-                                control_string_abort(&data_slice[i..], false, true)
-                            {
-                                i += resume;
-                                continue;
-                            }
-
-                            let mut terminated = false;
-                            while i < data_slice.len() {
-                                if data_slice[i] == 0x07 {
-                                    i += 1;
-                                    terminated = true;
-                                    break;
-                                } else if i + 1 < data_slice.len()
-                                    && data_slice[i] == 0x1b
-                                    && data_slice[i + 1] == 0x5c
-                                {
-                                    i += 2;
-                                    terminated = true;
-                                    break;
-                                } else {
-                                    i += 1;
-                                }
-                            }
-
-                            if !terminated {
-                                self.begin_pending_osc(&data_slice[esc_start..]);
-                                break;
-                            }
-
-                            let bel_terminated = data_slice[i - 1] == 0x07;
-                            let payload_end = if bel_terminated { i - 1 } else { i - 2 };
-                            if payload_end >= payload_start {
-                                self.handle_osc_payload(
-                                    &data_slice[payload_start..payload_end],
-                                    bel_terminated,
-                                );
-                            }
-                        }
-                        b'P' | b'X' | b'^' | b'_' => {
-                            // ECMA-48 string introducers share the same ST
-                            // terminator, but Kitty graphics is specifically an
-                            // APC (`ESC _`) whose body starts with the literal
-                            // protocol discriminator `G`. DCS `$q` is DECRQSS;
-                            // other DCS/SOS/PM contents stay opaque.
-                            let introducer = data_slice[i + 1];
-                            let is_apc = introducer == b'_';
-                            let is_dcs = introducer == b'P';
-                            i += 2;
-
-                            if let Some((resume, _)) =
-                                control_string_abort(&data_slice[i..], false, false)
-                            {
-                                if is_apc {
-                                    self.kitty_graphics.reject_graphics_payload(
-                                        &data_slice[i..i + resume],
-                                        "Kitty graphics APC was cancelled",
-                                    );
-                                    let responses = self.kitty_graphics.take_responses();
-                                    self.output_buffer.extend_from_slice(&responses);
-                                }
-                                i += resume;
-                                continue;
-                            }
-                            let mut terminated = false;
-                            let string_start = i;
-                            while i < data_slice.len() {
-                                if i + 1 < data_slice.len()
-                                    && data_slice[i] == 0x1b
-                                    && data_slice[i + 1] == 0x5c
-                                {
-                                    let payload = &data_slice[string_start..i];
-
-                                    if is_apc {
-                                        // Apply the same packet cap as the
-                                        // streaming path before dispatching a
-                                        // complete APC; read size is not policy.
-                                        if i + 2 - esc_start > MAX_PENDING_ESCAPE {
-                                            if payload.first() == Some(&b'G') {
-                                                self.kitty_graphics.reject_graphics_payload(
-                                                    payload,
-                                                    "Kitty graphics APC exceeded the parser size limit",
-                                                );
-                                                self.drain_kitty_graphics_responses();
-                                            }
-                                        } else {
-                                            self.handle_kitty_apc_payload(payload);
-                                        }
-                                    } else if is_dcs {
-                                        self.handle_dcs_payload(payload);
-                                    }
-
-                                    i += 2;
-                                    terminated = true;
-                                    break;
-                                }
-                                i += 1;
-                            }
-
-                            if !terminated {
-                                if is_apc {
-                                    self.begin_pending_apc(&data_slice[esc_start..]);
-                                } else {
-                                    self.begin_pending_string(&data_slice[esc_start..]);
-                                }
-                                break;
-                            }
-                        }
-                        b'>' => {
-                            // ESC > - DECKPNM (numeric keypad)
-                            self.modes.remove(&66);
-                            i += 2;
-                        }
-                        b'=' => {
-                            // ESC = - DECKPAM (application keypad)
-                            self.modes.insert(66);
-                            i += 2;
-                        }
-                        b'<' => {
-                            // ESC < — not DECKPAM; consume so the following
-                            // byte is not printed.
-                            i += 2;
-                        }
-                        b'(' | b')' => {
-                            if i + 2 >= data_slice.len() {
-                                self.stash_pending_escape(&data_slice[esc_start..]);
-                                break;
-                            }
-
-                            // Character set selection: ESC ( X or ESC ) X
-                            // data_slice[i] = ESC, data_slice[i+1] = '(' or ')', data_slice[i+2] = designator
-                            let is_g0 = data_slice[i + 1] == b'(';
-                            let designator = data_slice[i + 2];
-                            let charset = Self::charset_from_designator(designator);
-
-                            crate::debug_log!(
-                                "[CHARSET] ESC {} designator={} (0x{:02x}) charset={:?}",
-                                if is_g0 { '(' } else { ')' },
-                                designator as char,
-                                designator,
-                                charset
-                            );
-
-                            if is_g0 {
-                                self.g0_charset = charset;
-                                self.active_charset = self.g0_charset;
-                            } else {
-                                self.g1_charset = charset;
-                            }
-
-                            i += 3;
-                        }
-                        b'M' => {
-                            // RI - Reverse Index:仅在恰好位于上边距时反向滚动,
-                            // 否则正常上移(在区域上方时不应滚动)。
-                            i += 2;
-                            self.pending_wrap = false;
-
-                            if self.cursor_row == self.scroll_region_top {
-                                if self.scroll_region_bottom < self.grid.rows()
-                                    && self.scroll_region_top <= self.scroll_region_bottom
-                                {
-                                    self.scroll_region_down(
-                                        self.scroll_region_top,
-                                        self.scroll_region_bottom,
-                                    );
-                                }
-                            } else {
-                                self.cursor_row = self.cursor_row.saturating_sub(1);
-                            }
-                        }
-                        b'D' => {
-                            // IND - Index:仅在恰好位于底边距时向上滚动,
-                            // 否则正常下移(在区域下方时不应滚动)。
-                            i += 2;
-                            self.line_feed();
-                        }
-                        b'E' => {
-                            // NEL - Next Line: CR followed by IND.
-                            i += 2;
-                            self.cursor_col = 0;
-                            self.note_output_cursor_reposition(false);
-                            self.line_feed();
-                        }
-                        b'[' => {
-                            i += 2;
-
-                            // Use stack arrays for CSI params. 256 字节足以容纳组合真彩色
-                            // SGR(如 0;1;38;2;...;48;2;... 仅 ~40 字节),避免截断丢色。
-                            let mut param_bytes = [0u8; 256];
-                            let mut param_len = 0;
-                            let mut intermediates = [0u8; 8];
-                            let mut inter_len = 0;
-                            let mut final_byte = None;
-                            let mut cancelled = false;
-
-                            while i < data_slice.len() {
-                                match data_slice[i] {
-                                    0x30..=0x3f => {
-                                        if param_len < param_bytes.len() {
-                                            param_bytes[param_len] = data_slice[i];
-                                            param_len += 1;
-                                        }
-                                    }
-                                    0x20..=0x2f => {
-                                        if inter_len < intermediates.len() {
-                                            intermediates[inter_len] = data_slice[i];
-                                            inter_len += 1;
-                                        }
-                                    }
-                                    0x40..=0x7e => {
-                                        final_byte = Some(data_slice[i]);
-                                        break;
-                                    }
-                                    // ECMA-48 permits C0 controls inside a control
-                                    // sequence. Pagers such as util-linux `more`
-                                    // can insert CR/LF while wrapping colored text,
-                                    // even between the digits of an SGR parameter.
-                                    // Execute those controls immediately and keep
-                                    // collecting the surrounding CSI sequence.
-                                    b'\x08' => {
-                                        self.pending_wrap = false;
-                                        self.cursor_col = self.cursor_col.saturating_sub(1);
-                                        self.note_output_cursor_reposition(false);
-                                    }
-                                    b'\t' => {
-                                        self.pending_wrap = false;
-                                        self.cursor_col = self.next_tab_stop(self.cursor_col);
-                                        self.note_output_cursor_reposition(false);
-                                    }
-                                    b'\n' | b'\x0b' | b'\x0c' => self.line_feed(),
-                                    b'\r' => {
-                                        self.pending_wrap = false;
-                                        self.cursor_col = 0;
-                                        self.note_output_cursor_reposition(false);
-                                    }
-                                    b'\x0e' => self.active_charset = self.g1_charset,
-                                    b'\x0f' => self.active_charset = self.g0_charset,
-                                    // CAN and SUB cancel the current sequence. A
-                                    // following ESC belongs to the replacement
-                                    // sequence and must be left for the outer parser.
-                                    b'\x18' | b'\x1a' => {
-                                        cancelled = true;
-                                        i += 1;
-                                        break;
-                                    }
-                                    b'\x1b' => {
-                                        cancelled = true;
-                                        break;
-                                    }
-                                    // Other embedded C0 controls have no visible
-                                    // effect here, but do not make the CSI partial.
-                                    0x00..=0x1f => {}
-                                    _ => break,
-                                }
-                                i += 1;
-                            }
-
-                            if cancelled {
-                                continue;
-                            }
-
-                            let Some(final_byte) = final_byte else {
-                                // Embedded controls were already executed. Buffer
-                                // only CSI syntax so a later PTY batch cannot replay
-                                // a CR/LF while completing the sequence.
-                                self.stash_pending_escape(b"\x1b[");
-                                self.stash_pending_escape(&param_bytes[..param_len]);
-                                self.stash_pending_escape(&intermediates[..inter_len]);
-                                break;
-                            };
-
-                            let private_prefix = match param_bytes.first().copied() {
-                                Some(prefix @ (b'<' | b'=' | b'>' | b'?')) => {
-                                    // Shift remaining params left
-                                    for j in 0..param_len - 1 {
-                                        param_bytes[j] = param_bytes[j + 1];
-                                    }
-                                    param_len -= 1;
-                                    Some(prefix)
-                                }
-                                _ => None,
-                            };
-                            let (params, colon_flags) =
-                                Self::parse_csi_params(&param_bytes[..param_len]);
-                            let cmd = final_byte as char;
-
-                            self.handle_escape_sequence(
-                                &params,
-                                &colon_flags,
-                                cmd,
-                                private_prefix,
-                                &intermediates[..inter_len],
-                            );
-                            i += 1;
-                        }
-                        _ => {
-                            // Every other `ESC <intermediates> <final>` is
-                            // consumed whole, supported or not. Advancing one
-                            // byte printed the rest: `ESC N`, `ESC O`, a stray
-                            // `ESC \`, `ESC % G` and `ESC # 3` all leaked text.
-                            let mut j = i + 1;
-                            while j < data_slice.len() && (0x20..=0x2f).contains(&data_slice[j]) {
-                                j += 1;
-                            }
-                            let Some(&last) = data_slice.get(j) else {
-                                self.stash_pending_escape(&data_slice[esc_start..]);
-                                break;
-                            };
-                            match last {
-                                0x30..=0x7e => {
-                                    self.handle_esc_dispatch(&data_slice[i + 1..j], last);
-                                    i = j + 1;
-                                }
-                                // CAN/SUB abort the sequence and are consumed.
-                                0x18 | 0x1a => i = j + 1,
-                                // Anything else (ESC, another C0, DEL, a
-                                // non-ASCII byte) abandons the sequence and is
-                                // processed on its own.
-                                _ => i = j,
-                            }
-                        }
-                    }
-                }
-                32..=126 => {
-                    // ASCII fast path: scan for run of printable ASCII and process in bulk
-                    if self.utf8_len == 0 && self.active_charset == Charset::Ascii {
-                        let run_start = i;
-                        i += 1;
-                        while i < data_slice.len() {
-                            let b = data_slice[i];
-                            if !(32..=126).contains(&b) {
-                                break;
-                            }
-                            i += 1;
-                        }
-                        self.put_ascii_run(&data_slice[run_start..i]);
+            // The parser borrow ends before semantic dispatch. RIS may replace
+            // this entire terminal, including its parser, without restoring stale carry.
+            match event {
+                Event::Print(ch) => self.put_char(ch),
+                Event::Ascii(bytes) => {
+                    if self.screen.active_charset == Charset::Ascii {
+                        self.put_ascii_run(bytes);
                     } else {
-                        self.put_char(byte as char);
-                        i += 1;
+                        for &byte in bytes {
+                            self.put_char(byte as char);
+                            self.observe_chat_native_takeover();
+                        }
                     }
                 }
-                // UTF-8 multi-byte sequences: try to consume all bytes eagerly
-                0xC2..=0xDF => {
-                    self.consume_utf8_lead(byte, 2, data_slice, &mut i);
-                }
-                0xE0..=0xEF => {
-                    self.consume_utf8_lead(byte, 3, data_slice, &mut i);
-                }
-                0xF0..=0xF4 => {
-                    self.consume_utf8_lead(byte, 4, data_slice, &mut i);
-                }
-                _ => {
-                    // 到这里 byte 要么是续接字节(由上方的残缺检测保证此时确有进行中的序列),
-                    // 要么是非法的 UTF-8 引导字节(0xC0/0xC1/0xF5..=0xFF)。
-                    if self.utf8_len > 0 && (byte & 0xC0) == 0x80 {
-                        self.utf8_buf[self.utf8_len as usize] = byte;
-                        self.utf8_len += 1;
-                        match std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize]) {
-                            Ok(s) => {
-                                debug_assert_eq!(self.utf8_len, self.utf8_expected);
-                                if let Some(ch) = s.chars().next() {
-                                    self.put_char(ch);
-                                }
-                                self.utf8_len = 0;
-                            }
-                            Err(error) => {
-                                if let Some(invalid_len) = error.error_len() {
-                                    // Validate each prefix, not only full-width
-                                    // sequences: E0 80, ED A0, F4 90 are already
-                                    // invalid at byte two. The remaining bytes
-                                    // here are orphan continuation bytes.
-                                    for _ in 0..=self.utf8_len as usize - invalid_len {
-                                        self.put_char('\u{FFFD}');
+                Event::Control(10..=12) => self.line_feed(),
+                // Other controls and charset designation are consumed by the
+                // local engine dispatcher before reaching this fallback.
+                Event::Control(_) | Event::Charset { .. } => {}
+                Event::Escape {
+                    intermediates,
+                    final_byte,
+                } => {
+                    if intermediates.is_empty() {
+                        match final_byte {
+                            b'c' => self.hard_reset(),
+                            b'M' => {
+                                self.screen.pending_wrap = false;
+                                if self.screen.cursor_row == self.screen.scroll_region_top {
+                                    if self.screen.scroll_region_bottom < self.screen.grid.rows()
+                                        && self.screen.scroll_region_top
+                                            <= self.screen.scroll_region_bottom
+                                    {
+                                        self.scroll_region_down(
+                                            self.screen.scroll_region_top,
+                                            self.screen.scroll_region_bottom,
+                                        );
                                     }
-                                    self.utf8_len = 0;
+                                } else {
+                                    self.screen.cursor_row =
+                                        self.screen.cursor_row.saturating_sub(1);
                                 }
                             }
+                            b'D' => self.line_feed(),
+                            b'E' => {
+                                self.screen.cursor_col = 0;
+                                self.note_output_cursor_reposition(false);
+                                self.line_feed();
+                            }
+                            _ => self.handle_esc_dispatch(&intermediates, final_byte),
                         }
                     } else {
-                        // 孤立的续接字节或非法引导字节。
-                        self.put_char('\u{FFFD}');
-                        self.utf8_len = 0;
+                        self.handle_esc_dispatch(&intermediates, final_byte);
                     }
-                    i += 1;
+                }
+                Event::Csi {
+                    params,
+                    private_prefix,
+                    intermediates,
+                    final_byte,
+                    ..
+                } => self.handle_escape_sequence(
+                    &params,
+                    final_byte as char,
+                    private_prefix,
+                    &intermediates,
+                ),
+                Event::String {
+                    kind,
+                    payload,
+                    bel_terminated,
+                } => match kind {
+                    StringKind::Osc => self.handle_osc_payload(&payload, bel_terminated),
+                    StringKind::Dcs => self.handle_dcs_payload(&payload),
+                    StringKind::Apc => self.handle_kitty_apc_payload(&payload),
+                    StringKind::Sos | StringKind::Pm => {}
+                },
+                Event::Boundary => {}
+                Event::RejectApc { recovery, reason } => {
+                    let message = match reason {
+                        RejectReason::Cancelled => "Kitty graphics APC was cancelled",
+                        RejectReason::TooLarge => {
+                            "Kitty graphics APC exceeded the parser size limit"
+                        }
+                    };
+                    self.kitty_graphics
+                        .reject_graphics_payload(&recovery, message);
+                    self.drain_kitty_graphics_responses();
                 }
             }
             self.observe_chat_native_takeover();
@@ -1379,164 +605,42 @@ impl super::TerminalState {
     pub(super) fn handle_escape_sequence(
         &mut self,
         params: &[u16],
-        colon_flags: &[bool],
         cmd: char,
         private_prefix: Option<u8>,
         intermediates: &[u8],
     ) {
-        // 显式光标定位会取消延迟换行标志(DEC 末列标志)。Tabulation
-        // (CHT/CBT) moves the cursor too, so it clears the flag as well.
-        if matches!(
-            cmd,
-            'A' | 'B'
-                | 'C'
-                | 'D'
-                | 'E'
-                | 'F'
-                | 'G'
-                | 'H'
-                | 'f'
-                | 'd'
-                | '`'
-                | 'I'
-                | 'Z'
-                | 'a'
-                | 'e'
-                | 'j'
-                | 'k'
-        ) {
-            self.pending_wrap = false;
-        }
-        if matches!(cmd, 'A' | 'B' | 'E' | 'F' | 'H' | 'f' | 'd' | 'e' | 'k') {
-            self.note_output_cursor_reposition(true);
-        } else if matches!(cmd, 'C' | 'D' | 'G' | '`' | 'I' | 'Z' | 'a' | 'j') {
-            self.note_output_cursor_reposition(false);
-        }
         // xterm semantics: an explicit 0 count means 1 for every movement,
         // insert/delete, erase-character and scroll control below.
         let count = params.first().copied().unwrap_or(1).max(1) as usize;
         match cmd {
-            'A' | 'k' => {
-                // CUU / VPB - Cursor Up:仅移动光标,绝不滚动。
-                // 区内止于上边距,区外(上边距上方)止于屏幕顶部。
-                let n = count;
-                let floor = if self.cursor_row >= self.scroll_region_top {
-                    self.scroll_region_top
-                } else {
-                    0
-                };
-                self.cursor_row = self.cursor_row.saturating_sub(n).max(floor);
-            }
-            'B' | 'e' => {
-                // CUD / VPR - Cursor Down:区内止于底边距,区外止于屏幕底部;不滚动。
-                let n = count;
-                let ceil = if self.cursor_row <= self.scroll_region_bottom {
-                    self.scroll_region_bottom
-                } else {
-                    self.grid.rows().saturating_sub(1)
-                };
-                self.cursor_row = (self.cursor_row + n).min(ceil);
-            }
-            'C' | 'a' => {
-                // CUF / HPR
-                let n = count;
-                self.cursor_col = (self.cursor_col + n).min(self.grid.row_len() - 1);
-            }
-            'D' | 'j' => {
-                // CUB / HPB
-                let n = count;
-                self.cursor_col = self.cursor_col.saturating_sub(n);
-            }
-            'E' => {
-                // CNL - Cursor Next Line:下移并到行首,受底边距约束;不滚动。
-                let n = count;
-                let ceil = if self.cursor_row <= self.scroll_region_bottom {
-                    self.scroll_region_bottom
-                } else {
-                    self.grid.rows().saturating_sub(1)
-                };
-                self.cursor_row = (self.cursor_row + n).min(ceil);
-                self.cursor_col = 0;
-            }
-            'F' => {
-                // CPL - Cursor Previous Line:上移并到行首,受上边距约束;不滚动。
-                let n = count;
-                let floor = if self.cursor_row >= self.scroll_region_top {
-                    self.scroll_region_top
-                } else {
-                    0
-                };
-                self.cursor_row = self.cursor_row.saturating_sub(n).max(floor);
-                self.cursor_col = 0;
-            }
-            'G' => {
-                // CHA - Move cursor to column (1-based)
-                let col = params.first().copied().unwrap_or(1) as usize;
-                self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
-            }
-            '`' => {
-                // HPA - Horizontal Position Absolute(列绝对,等价 CHA)
-                let col = params.first().copied().unwrap_or(1) as usize;
-                self.cursor_col = col
-                    .saturating_sub(1)
-                    .min(self.grid.row_len().saturating_sub(1));
-            }
-            'd' => {
-                // VPA - Vertical Position Absolute(行绝对,1 基)。
-                // 原点模式下相对滚动区域顶端并限制在区域内。
-                let row = params.first().copied().unwrap_or(1) as usize;
-                let row0 = row.saturating_sub(1);
-                self.cursor_row = if self.origin_mode {
-                    (self.scroll_region_top + row0).min(self.scroll_region_bottom)
-                } else {
-                    row0.min(self.grid.rows().saturating_sub(1))
-                };
-            }
-            'H' => {
-                let row = params.first().copied().unwrap_or(1) as usize;
-                let col = params.get(1).copied().unwrap_or(1) as usize;
-                self.set_cursor_position(row, col);
-            }
-            'f' => {
-                if private_prefix == Some(b'>') && intermediates.is_empty() {
-                    let resource = params.first().copied().unwrap_or(0);
-                    let value = params.get(1).copied().unwrap_or(0);
-                    if resource == 4 {
-                        crate::debug_log!(
-                            "[XTFMTKEYS] formatOtherKeys={} previous={}",
-                            value,
-                            self.xterm_format_other_keys
-                        );
-                        self.xterm_format_other_keys = value;
-                    }
-                } else {
-                    let row = params.first().copied().unwrap_or(1) as usize;
-                    let col = params.get(1).copied().unwrap_or(1) as usize;
-                    self.set_cursor_position(row, col);
-                }
-            }
             'J' if intermediates.is_empty() && matches!(private_prefix, None | Some(b'?')) => {
                 let selective = private_prefix == Some(b'?');
                 match params.first().copied().unwrap_or(0) {
                     0 => {
-                        if !selective && self.cursor_row == 0 && self.cursor_col == 0 {
+                        if !selective && self.screen.cursor_row == 0 && self.screen.cursor_col == 0
+                        {
                             self.inline_cli_screen_erased();
                         }
                         // Clear from cursor to end of display
                         // ClearRight cancels wrap even if the tail is protected.
-                        self.pending_wrap = false;
-                        let cols = self.grid.row_len();
-                        self.erase_grid_span(self.cursor_row, self.cursor_col, cols, selective);
-                        for row in (self.cursor_row + 1)..self.grid.rows() {
+                        self.screen.pending_wrap = false;
+                        let cols = self.screen.grid.row_len();
+                        self.erase_grid_span(
+                            self.screen.cursor_row,
+                            self.screen.cursor_col,
+                            cols,
+                            selective,
+                        );
+                        for row in (self.screen.cursor_row + 1)..self.screen.grid.rows() {
                             self.erase_grid_span(row, 0, cols, selective);
                         }
                     }
                     1 => {
                         // Clear from start to cursor
-                        let cols = self.grid.row_len();
-                        for row in 0..=self.cursor_row {
-                            let end_col = if row == self.cursor_row {
-                                self.cursor_col + 1
+                        let cols = self.screen.grid.row_len();
+                        for row in 0..=self.screen.cursor_row {
+                            let end_col = if row == self.screen.cursor_row {
+                                self.screen.cursor_col + 1
                             } else {
                                 cols
                             };
@@ -1546,14 +650,14 @@ impl super::TerminalState {
                     2 if selective => {
                         // DECSED preserves protected text and does not archive
                         // a partially retained screen or delete Kitty images.
-                        for row in 0..self.grid.rows() {
-                            self.erase_grid_span(row, 0, self.grid.row_len(), true);
+                        for row in 0..self.screen.grid.rows() {
+                            self.erase_grid_span(row, 0, self.screen.grid.row_len(), true);
                         }
                     }
                     2 => {
                         // ED 擦除显示不移动光标(VT 规范)
                         if self.sync_output_active {
-                            if self.use_alt_buffer {
+                            if self.screen.use_alt_buffer {
                                 self.archive_visible_screen_to_scrollback_with_options(true, true);
                             } else {
                                 self.archive_primary_screen_unless_last_synced_snapshot();
@@ -1564,7 +668,7 @@ impl super::TerminalState {
                         self.inline_cli_screen_erased();
                         self.erase_screen();
                     }
-                    3 if self.use_alt_buffer && self.inline_cli_owner_active() => {
+                    3 if self.screen.use_alt_buffer && self.inline_cli_owner_active() => {
                         // A temporary CLI screen cannot erase its primary
                         // conversation's saved lines.
                     }
@@ -1578,185 +682,45 @@ impl super::TerminalState {
                     _ => {}
                 }
             }
-            'K' if intermediates.is_empty() && matches!(private_prefix, None | Some(b'?')) => {
-                let (start, end) = match params.first().copied().unwrap_or(0) {
-                    0 => {
-                        self.pending_wrap = false;
-                        (self.cursor_col, self.grid.row_len())
-                    }
-                    1 => (0, self.cursor_col + 1),
-                    2 => (0, self.grid.row_len()),
-                    _ => return,
-                };
-                self.erase_grid_span(self.cursor_row, start, end, private_prefix == Some(b'?'));
-            }
             'L' => {
-                // IL — insert N blank lines at cursor. After (region_height)
-                // iterations the entire region is blank, so cap N there to
-                // avoid O(N · region · cols) work for adversarial N=65535.
-                let n = count;
-                if self.cursor_row >= self.scroll_region_top
-                    && self.cursor_row <= self.scroll_region_bottom
-                {
-                    let region_height = self.scroll_region_bottom - self.cursor_row + 1;
-                    let n = n.min(region_height);
-                    let blank = self.create_blank_cell();
-                    let cols = self.grid.row_len();
-                    self.forget_output_provenance_for_grid_rows(
-                        self.scroll_region_bottom + 1 - n,
-                        self.scroll_region_bottom,
-                    );
-                    for _ in 0..n {
-                        let src_start = self.cursor_row * cols;
-                        let src_end = self.scroll_region_bottom * cols;
-                        let dst = (self.cursor_row + 1) * cols;
-                        self.grid.cells.copy_within(src_start..src_end, dst);
-                        self.grid.cells[src_start..src_start + cols].fill(blank);
-                    }
-                    self.shift_row_id_region_down(self.cursor_row, self.scroll_region_bottom, n);
-                    self.kitty_graphics.scroll_region_down(
-                        self.cursor_row,
-                        self.scroll_region_bottom,
-                        n,
-                    );
-                }
-                self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
+                self.edit_grid_lines(RegionDirection::Down, count);
+                self.mark_rows_dirty(self.screen.cursor_row, self.screen.scroll_region_bottom);
             }
             'M' => {
-                // DL — delete N lines at cursor. Same cap logic as IL.
-                let n = count;
-                if self.cursor_row >= self.scroll_region_top
-                    && self.cursor_row <= self.scroll_region_bottom
-                {
-                    let region_height = self.scroll_region_bottom - self.cursor_row + 1;
-                    let n = n.min(region_height);
-                    let blank = self.create_blank_cell();
-                    let cols = self.grid.row_len();
-                    if n > 0 {
-                        self.forget_output_provenance_for_grid_rows(
-                            self.cursor_row,
-                            self.cursor_row + n - 1,
-                        );
-                    }
-                    for _ in 0..n {
-                        let src_start = (self.cursor_row + 1) * cols;
-                        let src_end = (self.scroll_region_bottom + 1) * cols;
-                        let dst = self.cursor_row * cols;
-                        self.grid.cells.copy_within(src_start..src_end, dst);
-                        let blank_start = self.scroll_region_bottom * cols;
-                        self.grid.cells[blank_start..blank_start + cols].fill(blank);
-                    }
-                    self.shift_row_id_region_up(self.cursor_row, self.scroll_region_bottom, n);
-                    self.kitty_graphics.scroll_region_up(
-                        self.cursor_row,
-                        self.scroll_region_bottom,
-                        n,
-                        false,
-                    );
-                }
-                self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
-            }
-            'm' => {
-                if private_prefix == Some(b'>') && intermediates.is_empty() {
-                    let resource = params.first().copied().unwrap_or(0);
-                    let value = params.get(1).copied().unwrap_or(0);
-                    if resource == 4 {
-                        crate::debug_log!(
-                            "[XTMODKEYS] modifyOtherKeys={} previous={}",
-                            value,
-                            self.xterm_modify_other_keys
-                        );
-                        self.xterm_modify_other_keys = value;
-                    }
-                } else {
-                    // SGR - Select Graphic Rendition
-                    self.handle_sgr(params, colon_flags);
-                }
-            }
-            's' => {
-                if private_prefix.is_none() && intermediates.is_empty() {
-                    self.save_cursor_state();
-                }
-            }
-            'u' => {
-                if intermediates.is_empty() {
-                    match private_prefix {
-                        None => {
-                            self.restore_cursor_state();
-                        }
-                        Some(b'?') => {
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] query current kitty flags -> {}",
-                                self.keyboard_enhancement_flags
-                            );
-                            let response = format!("\x1b[?{}u", self.keyboard_enhancement_flags);
-                            self.output_buffer.extend_from_slice(response.as_bytes());
-                        }
-                        Some(b'=') => {
-                            let flags = params.first().copied().unwrap_or(0);
-                            let mode = params.get(1).copied().unwrap_or(1);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] set kitty flags flags={} mode={} previous={}",
-                                flags,
-                                mode,
-                                self.keyboard_enhancement_flags
-                            );
-                            self.set_keyboard_enhancement_flags(flags, mode);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] new kitty flags={}",
-                                self.keyboard_enhancement_flags
-                            );
-                        }
-                        Some(b'>') => {
-                            let flags = params.first().copied().unwrap_or(0);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] push kitty flags current={} new={}",
-                                self.keyboard_enhancement_flags,
-                                flags
-                            );
-                            self.push_keyboard_enhancement_flags(flags);
-                        }
-                        Some(b'<') => {
-                            let count = params.first().copied().unwrap_or(1) as usize;
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] pop kitty flags count={} current={} stack_depth={}",
-                                count,
-                                self.keyboard_enhancement_flags,
-                                self.keyboard_enhancement_stack.len()
-                            );
-                            self.pop_keyboard_enhancement_flags(count);
-                            crate::debug_log!(
-                                "[KEYBOARD_PROTO] new kitty flags={}",
-                                self.keyboard_enhancement_flags
-                            );
-                        }
-                        _ => {}
-                    }
-                }
+                self.edit_grid_lines(RegionDirection::Up, count);
+                self.mark_rows_dirty(self.screen.cursor_row, self.screen.scroll_region_bottom);
             }
             'S' => {
                 // SU — Scroll Up. Cap to region height: more would just blank
                 // an already-blank region while doing O(rows) work each step.
                 let n = count;
                 let region_height = self
+                    .screen
                     .scroll_region_bottom
-                    .saturating_sub(self.scroll_region_top)
+                    .saturating_sub(self.screen.scroll_region_top)
                     + 1;
                 let n = n.min(region_height);
                 for _ in 0..n {
-                    self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
+                    self.scroll_region_up(
+                        self.screen.scroll_region_top,
+                        self.screen.scroll_region_bottom,
+                    );
                 }
             }
             'T' => {
                 // SD — Scroll Down. Same cap as SU.
                 let n = count;
                 let region_height = self
+                    .screen
                     .scroll_region_bottom
-                    .saturating_sub(self.scroll_region_top)
+                    .saturating_sub(self.screen.scroll_region_top)
                     + 1;
                 let n = n.min(region_height);
                 for _ in 0..n {
-                    self.scroll_region_down(self.scroll_region_top, self.scroll_region_bottom);
+                    self.scroll_region_down(
+                        self.screen.scroll_region_top,
+                        self.screen.scroll_region_bottom,
+                    );
                 }
             }
             't' if private_prefix.is_none() && intermediates.is_empty() => {
@@ -1765,38 +729,9 @@ impl super::TerminalState {
                 // deliberately ignored, as frost ignores them.
                 self.handle_window_ops(params);
             }
-            'n' if private_prefix == Some(b'?') => match params.first().copied().unwrap_or(0) {
-                // DECXCPR: like CPR, but the reply carries the `?`.
-                6 => {
-                    let (row, col) = self.reported_cursor_position();
-                    let response = format!("\x1b[?{row};{col}R");
-                    self.output_buffer.extend(response.as_bytes());
-                }
-                // Colour-scheme query (contour/kitty/foot): 1 = dark, 2 = light.
-                996 => {
-                    let response = format!("\x1b[?997;{}n", self.color_scheme_report());
-                    self.output_buffer.extend(response.as_bytes());
-                }
-                _ => {}
-            },
-            'n' if private_prefix.is_none() => {
-                // DSR - Device Status Report
-                match params.first().copied().unwrap_or(0) {
-                    5 => {
-                        // ESC[5n asks whether the terminal is OK. This is the
-                        // standard liveness probe: a caller sends it before
-                        // committing to an interactive mode and blocks on the
-                        // reply, so answering nothing costs it a timeout.
-                        self.output_buffer.extend_from_slice(b"\x1b[0n");
-                    }
-                    6 => {
-                        // Respond with CPR (Cursor Position Report): ESC[row;colR
-                        let (row, col) = self.reported_cursor_position();
-                        let response = format!("\x1b[{row};{col}R");
-                        self.output_buffer.extend(response.as_bytes());
-                    }
-                    _ => {}
-                }
+            'n' if private_prefix == Some(b'?') && params.first() == Some(&996) => {
+                let response = format!("\x1b[?997;{}n", self.color_scheme_report());
+                self.output_buffer.extend(response.as_bytes());
             }
             'c' => {
                 if intermediates.is_empty() {
@@ -1864,122 +799,6 @@ impl super::TerminalState {
                 }
                 _ => {}
             },
-            'r' if private_prefix.is_none() && intermediates.is_empty() => {
-                // Set scroll region (DECSTBM)。带私有前缀(如 CSI ? Pm r 的 XTRESTORE)
-                // 不是 DECSTBM,不能误设滚动区域,故仅在无前缀时处理。An
-                // intermediate makes it DECCARA (`CSI Pt;Pl;Pb;Pr;Ps $ r`),
-                // whose first two parameters would otherwise become margins.
-                let top = match params.first().copied().unwrap_or(1) {
-                    0 => 1,
-                    v => v as usize,
-                };
-                let bottom = match params.get(1).copied().unwrap_or(self.grid.rows() as u16) {
-                    0 => self.grid.rows(),
-                    v => v as usize,
-                };
-
-                // Convert from 1-indexed to 0-indexed, and clamp to valid range
-                self.scroll_region_top = top
-                    .saturating_sub(1)
-                    .min(self.grid.rows().saturating_sub(1));
-                self.scroll_region_bottom = bottom
-                    .saturating_sub(1)
-                    .min(self.grid.rows().saturating_sub(1));
-
-                // If range is invalid, reset to full screen
-                if self.scroll_region_top > self.scroll_region_bottom {
-                    self.scroll_region_top = 0;
-                    self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
-                }
-
-                // Move cursor to home position when setting scroll region. In
-                // origin mode (DECOM) home is the top of the scroll region, not
-                // the absolute top of the screen.
-                self.cursor_row = if self.origin_mode {
-                    self.scroll_region_top
-                } else {
-                    0
-                };
-                self.cursor_col = 0;
-                self.pending_wrap = false;
-            }
-            '@' if private_prefix.is_none() && intermediates.is_empty() => {
-                // ICH - Insert Character(s). Cap N to remaining columns; further
-                // iterations would just keep dropping the rightmost cell.
-                let n = count;
-                let cols = self.grid.row_len();
-                let blank_cell = self.create_blank_cell();
-                if self.cursor_col < cols {
-                    let n = n.min(cols - self.cursor_col);
-                    if n == 0 {
-                        return;
-                    }
-                    self.pending_wrap = false;
-                    self.invalidate_grid_mutation_spans(&[(
-                        self.cursor_row,
-                        self.cursor_col,
-                        cols,
-                    )]);
-                    // A double-width character split by the insertion point
-                    // cannot survive the shift — its halves would end up n
-                    // columns apart — so clear both of them first.
-                    if self
-                        .grid
-                        .get(self.cursor_row, self.cursor_col)
-                        .flags
-                        .wide_continuation()
-                    {
-                        self.clear_cell_unchecked(self.cursor_row, self.cursor_col);
-                    }
-                    for _ in 0..n {
-                        self.grid
-                            .insert_cell_in_row(self.cursor_row, self.cursor_col, blank_cell);
-                    }
-                    self.grid
-                        .clear_dangling_wide_at_row_end(self.cursor_row, blank_cell);
-                    self.mark_row_dirty(self.cursor_row);
-                }
-            }
-            'P' if private_prefix.is_none() && intermediates.is_empty() => {
-                // DCH - Delete Character(s). Cap N to remaining columns.
-                let n = count;
-                let cols = self.grid.row_len();
-                let blank_cell = self.create_blank_cell();
-                if self.cursor_col < cols {
-                    let n = n.min(cols - self.cursor_col);
-                    if n == 0 {
-                        return;
-                    }
-                    self.pending_wrap = false;
-                    self.invalidate_grid_mutation_spans(&[(
-                        self.cursor_row,
-                        self.cursor_col,
-                        cols,
-                    )]);
-                    // Deleting one half of a double-width character has to take
-                    // the other half with it, at both edges of the window: the
-                    // lead left standing to the left, and the continuation that
-                    // the shift would pull in from the right.
-                    self.split_wide_pairs_around(
-                        self.cursor_row,
-                        self.cursor_col,
-                        self.cursor_col + n,
-                    );
-                    for _ in 0..n {
-                        self.grid
-                            .remove_cell_from_row(self.cursor_row, self.cursor_col);
-                        let last_col = cols - 1;
-                        *self.grid.get_mut(self.cursor_row, last_col) = blank_cell;
-                    }
-                    self.mark_row_dirty(self.cursor_row);
-                }
-            }
-            'X' if private_prefix.is_none() && intermediates.is_empty() => {
-                // ECH - Erase Character(s)
-                let n = count;
-                let end = self.cursor_col.saturating_add(n).min(self.grid.row_len());
-                self.erase_grid_span(self.cursor_row, self.cursor_col, end, false);
-            }
             'q' => {
                 if private_prefix == Some(b'>')
                     && intermediates.is_empty()
@@ -1987,43 +806,6 @@ impl super::TerminalState {
                 {
                     crate::debug_log!("[XTVERSION] report terminal version request");
                     self.output_buffer.extend_from_slice(XTERM_VERSION_RESPONSE);
-                }
-
-                // DECSCUSR - Set cursor style
-                if private_prefix.is_none() && intermediates == *b" " {
-                    // Odd values blink, even values are steady; ember draws
-                    // no per-shape blink, so only the shape is kept.
-                    let shape = params.first().copied().unwrap_or(0);
-                    self.cursor_shape = match shape {
-                        3 | 4 => CursorShape::Underline,
-                        5 | 6 => CursorShape::Beam,
-                        _ => CursorShape::Block,
-                    };
-                }
-
-                // DECSCA - Select Character Protection Attribute.
-                if private_prefix.is_none() && intermediates == *b"\"" {
-                    match params.first().copied().unwrap_or(0) {
-                        0 | 2 => self.current_flags.set_protected(false),
-                        1 => self.current_flags.set_protected(true),
-                        _ => {}
-                    }
-                }
-            }
-            'I' => {
-                // CHT - cursor forward tabulation (n tab stops)
-                let n = count;
-                for _ in 0..n {
-                    self.cursor_col = self.next_tab_stop(self.cursor_col);
-                }
-            }
-            'Z' => {
-                // CBT - cursor backward tabulation (n tab stops). terminfo
-                // advertises cbt=\E[Z for the TERM we hand every child, so
-                // back-tab is reached by any form or menu that uses it.
-                let n = count;
-                for _ in 0..n {
-                    self.cursor_col = self.prev_tab_stop(self.cursor_col);
                 }
             }
             'b' => {
@@ -2033,28 +815,10 @@ impl super::TerminalState {
                 // identical cells — a rule, a bar, a box border — as one glyph
                 // followed by blanks.
                 let n = count;
-                if let Some(ch) = self.last_printed_char {
+                if let Some(ch) = self.screen.last_printed_char {
                     for _ in 0..n {
                         self.put_char(ch);
                     }
-                }
-            }
-            'g' => {
-                // TBC - Tab Clear
-                match params.first().copied().unwrap_or(0) {
-                    0 => {
-                        // Clear tab stop at cursor
-                        if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
-                            *stop = false;
-                        }
-                    }
-                    3 => {
-                        // Clear all tab stops
-                        for stop in self.tab_stops.iter_mut() {
-                            *stop = false;
-                        }
-                    }
-                    _ => {}
                 }
             }
             _ => {}
@@ -2062,199 +826,17 @@ impl super::TerminalState {
         self.observe_chat_native_takeover();
     }
 
-    /// 解析从下标 `i`(38/48/58)开始的扩展颜色子序列,返回 `(颜色, 最后消费的下标)`。
-    /// 同时支持分号传统形式(`38;2;r;g;b`)与冒号 ITU 形式(`38:2:r:g:b` 或
-    /// 带颜色空间字段的 `38:2:cs:r:g:b`)。冒号形式靠 colon_flags 识别,并据子参数
-    /// 个数决定是否跳过颜色空间字段,避免把 cs 当成 r 而整体错位。
-    pub(super) fn parse_sgr_extended_color(
-        params: &[u16],
-        colon_flags: &[bool],
-        i: usize,
-    ) -> Option<(Color, usize)> {
-        match params.get(i + 1).copied()? {
-            5 => {
-                let idx = params.get(i + 2).copied()? as u8;
-                Some((Color::Indexed(idx), i + 2))
-            }
-            2 => {
-                // 计算从 i 起的冒号连续子参数组长度(组内各参数 colon_flag 为 true)。
-                let mut end = i + 1;
-                while end < params.len() && colon_flags.get(end).copied().unwrap_or(false) {
-                    end += 1;
-                }
-                let colon_form = colon_flags.get(i + 1).copied().unwrap_or(false);
-                // 冒号形式且组长 >=6 表示存在颜色空间字段(38,2,cs,r,g,b),r 偏移为 3;
-                // 否则(传统分号形式或无 cs 的冒号形式)r 偏移为 2。
-                let r_off = if colon_form && (end - i) >= 6 { 3 } else { 2 };
-                let r = params.get(i + r_off).copied()?;
-                let g = params.get(i + r_off + 1).copied()?;
-                let b = params.get(i + r_off + 2).copied()?;
-                Some((Color::Rgb(r as u8, g as u8, b as u8), i + r_off + 2))
-            }
-            _ => None,
-        }
-    }
-
-    pub(super) fn handle_sgr(&mut self, params: &[u16], colon_flags: &[bool]) {
-        // DECSCA is independent of the visual rendition reset by SGR 0.
-        let protected = self.current_flags.protected();
-        if params.is_empty() {
-            self.current_flags = StyleFlags::default();
-            self.current_flags.set_protected(protected);
-            self.current_fg = Color::Default;
-            self.current_bg = Color::Default;
-            return;
-        }
-
-        let mut i = 0;
-        while i < params.len() {
-            let param = params[i];
-            match param {
-                0 => {
-                    self.current_flags = StyleFlags::default();
-                    self.current_flags.set_protected(protected);
-                    self.current_fg = Color::Default;
-                    self.current_bg = Color::Default;
-                }
-                1 => self.current_flags.set_bold(true),
-                2 => self.current_flags.set_dim(true),
-                3 => self.current_flags.set_italic(true),
-                4 => {
-                    // 仅当下一个参数是冒号子参数(`4:x`)时才作为扩展下划线样式;
-                    // 分号分隔的 `4;x` 中 x 是独立 SGR(如 4;1 = 下划线+粗体),不能吞。
-                    let next_is_substyle = i + 1 < params.len()
-                        && colon_flags.get(i + 1).copied().unwrap_or(false)
-                        && params[i + 1] <= 5;
-                    if next_is_substyle {
-                        let style = params[i + 1];
-                        self.current_flags.set_underline(match style {
-                            0 => UnderlineStyle::None,
-                            1 => UnderlineStyle::Single,
-                            2 => UnderlineStyle::Double,
-                            3 => UnderlineStyle::Curly,
-                            4 => UnderlineStyle::Dotted,
-                            5 => UnderlineStyle::Dashed,
-                            _ => UnderlineStyle::Single,
-                        });
-                        i += 1;
-                    } else {
-                        self.current_flags.set_underline(UnderlineStyle::Single);
-                    }
-                }
-                5 => self.current_flags.set_blink(true),
-                7 => self.current_flags.set_inverse(true),
-                9 => self.current_flags.set_strikethrough(true),
-                21 => self.current_flags.set_underline(UnderlineStyle::Double),
-                22 => {
-                    self.current_flags.set_bold(false);
-                    self.current_flags.set_dim(false);
-                }
-                23 => self.current_flags.set_italic(false),
-                24 => self.current_flags.set_underline(UnderlineStyle::None),
-                25 => self.current_flags.set_blink(false),
-                27 => self.current_flags.set_inverse(false),
-                29 => self.current_flags.set_strikethrough(false),
-                39 => self.current_fg = Color::Default,
-                30..=37 => {
-                    self.current_fg = match param {
-                        30 => Color::Black,
-                        31 => Color::Red,
-                        32 => Color::Green,
-                        33 => Color::Yellow,
-                        34 => Color::Blue,
-                        35 => Color::Magenta,
-                        36 => Color::Cyan,
-                        37 => Color::White,
-                        _ => Color::Default,
-                    };
-                }
-                49 => self.current_bg = Color::Default,
-                40..=47 => {
-                    self.current_bg = match param {
-                        40 => Color::Black,
-                        41 => Color::Red,
-                        42 => Color::Green,
-                        43 => Color::Yellow,
-                        44 => Color::Blue,
-                        45 => Color::Magenta,
-                        46 => Color::Cyan,
-                        47 => Color::White,
-                        _ => Color::Default,
-                    };
-                    self.global_bg = self.current_bg; // Update global background
-                    crate::debug_log!("[CSI] Background color set to: {:?}", self.current_bg);
-                }
-                90..=97 => {
-                    self.current_fg = match param {
-                        90 => Color::BrightBlack,
-                        91 => Color::BrightRed,
-                        92 => Color::BrightGreen,
-                        93 => Color::BrightYellow,
-                        94 => Color::BrightBlue,
-                        95 => Color::BrightMagenta,
-                        96 => Color::BrightCyan,
-                        97 => Color::BrightWhite,
-                        _ => Color::Default,
-                    };
-                }
-                100..=107 => {
-                    self.current_bg = match param {
-                        100 => Color::BrightBlack,
-                        101 => Color::BrightRed,
-                        102 => Color::BrightGreen,
-                        103 => Color::BrightYellow,
-                        104 => Color::BrightBlue,
-                        105 => Color::BrightMagenta,
-                        106 => Color::BrightCyan,
-                        107 => Color::BrightWhite,
-                        _ => Color::Default,
-                    };
-                    self.global_bg = self.current_bg; // Update global background
-                }
-                // 扩展前景色:38;5;n / 38;2;r;g;b 及对应冒号形式
-                38 => {
-                    if let Some((color, last)) =
-                        Self::parse_sgr_extended_color(params, colon_flags, i)
-                    {
-                        self.current_fg = color;
-                        i = last;
-                    }
-                }
-                // 扩展背景色
-                48 => {
-                    if let Some((color, last)) =
-                        Self::parse_sgr_extended_color(params, colon_flags, i)
-                    {
-                        self.current_bg = color;
-                        self.global_bg = self.current_bg;
-                        i = last;
-                    }
-                }
-                // 58 设置下划线颜色 / 59 复位。当前渲染管线未存储独立下划线颜色,
-                // 故仅正确消费其子参数,避免颜色分量泄漏成后续 SGR 码被误解析。
-                58 => {
-                    if let Some((_color, last)) =
-                        Self::parse_sgr_extended_color(params, colon_flags, i)
-                    {
-                        i = last;
-                    }
-                }
-                59 => {}
-                _ => {}
-            }
-            i += 1;
-        }
-    }
-
     /// 擦除整个屏幕单元格(保留当前背景色),不移动光标。
     /// 供 ED(`CSI 2J`)使用 —— 按 VT 规范擦除显示不得移动光标。
     pub(super) fn erase_screen(&mut self) {
-        self.pending_wrap = false;
-        let bg_color = self.current_bg;
-        let cols = self.grid.row_len();
-        let spans: Vec<_> = (0..self.grid.rows()).map(|row| (row, 0, cols)).collect();
+        self.screen.pending_wrap = false;
+        let bg_color = self.screen.current_bg;
+        let cols = self.screen.grid.row_len();
+        let spans: Vec<_> = (0..self.screen.grid.rows())
+            .map(|row| (row, 0, cols))
+            .collect();
         self.invalidate_grid_mutation_spans(&spans);
-        for row in self.grid.iter_mut() {
+        for row in self.screen.grid.iter_mut() {
             for cell in row.iter_mut() {
                 *cell = TerminalCell {
                     character: ' ',
@@ -2266,18 +848,20 @@ impl super::TerminalState {
             }
         }
         // Mark all rows as dirty
-        self.dirty_region.mark_all(self.grid.rows());
-        self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+        self.dirty_region.mark_all(self.screen.grid.rows());
+        self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
         self.kitty_graphics.clear_placements();
     }
 
     /// 擦除屏幕并把光标归位到左上角。供切换备用缓冲区等场景使用。
     pub(super) fn clear_screen(&mut self) {
-        let bg_color = self.current_bg;
-        let cols = self.grid.row_len();
-        let spans: Vec<_> = (0..self.grid.rows()).map(|row| (row, 0, cols)).collect();
+        let bg_color = self.screen.current_bg;
+        let cols = self.screen.grid.row_len();
+        let spans: Vec<_> = (0..self.screen.grid.rows())
+            .map(|row| (row, 0, cols))
+            .collect();
         self.invalidate_grid_mutation_spans(&spans);
-        for row in self.grid.iter_mut() {
+        for row in self.screen.grid.iter_mut() {
             for cell in row.iter_mut() {
                 *cell = TerminalCell {
                     character: ' ',
@@ -2288,17 +872,17 @@ impl super::TerminalState {
                 };
             }
         }
-        self.dirty_region.mark_all(self.grid.rows());
-        self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+        self.dirty_region.mark_all(self.screen.grid.rows());
+        self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
         self.kitty_graphics.clear_placements();
-        self.cursor_row = 0;
-        self.cursor_col = 0;
+        self.screen.cursor_row = 0;
+        self.screen.cursor_col = 0;
     }
 
     /// 切入备用屏幕缓冲。`save_cursor` 控制是否保存主屏光标(1049/1048 语义),
     /// `clear` 控制切入后是否清屏(1047/1049 语义)。已在备用屏则无操作。
     pub(super) fn enter_alt_screen(&mut self, save_cursor: bool, clear: bool) {
-        if self.use_alt_buffer {
+        if self.screen.use_alt_buffer {
             return;
         }
         // A selection belongs to the screen on which it was made. Keeping its
@@ -2306,52 +890,45 @@ impl super::TerminalState {
         // rectangle at the same viewport position in Vim/less.
         self.selection = None;
         if save_cursor {
-            self.saved_cursor_row = self.cursor_row;
-            self.saved_cursor_col = self.cursor_col;
+            self.screen.saved_cursor_row = self.screen.cursor_row;
+            self.screen.saved_cursor_col = self.screen.cursor_col;
             // Snapshot the whole drawing state, not just the cursor: exiting
             // restores it instead of zeroing SGR.
-            self.saved_primary_screen_state = Some(SavedCursorState {
-                row: self.cursor_row,
-                col: self.cursor_col,
-                fg: self.current_fg,
-                bg: self.current_bg,
-                flags: self.current_flags,
-                g0: self.g0_charset,
-                g1: self.g1_charset,
-                active: self.active_charset,
-                origin_mode: self.origin_mode,
-                autowrap: self.modes.contains(&7),
-                pending_wrap: self.pending_wrap,
+            self.screen.saved_primary_screen_state = Some(SavedCursorState {
+                row: self.screen.cursor_row,
+                col: self.screen.cursor_col,
+                fg: self.screen.current_fg,
+                bg: self.screen.current_bg,
+                flags: self.screen.current_flags,
+                g0: self.screen.g0_charset,
+                g1: self.screen.g1_charset,
+                active: self.screen.active_charset,
+                origin_mode: self.screen.origin_mode,
+                autowrap: self.protocol.modes().contains(&7),
+                pending_wrap: self.screen.pending_wrap,
             });
         }
-        self.saved_primary_cursor_shape = Some(self.cursor_shape.clone());
+        self.screen.saved_primary_cursor_shape = Some(self.screen.cursor_shape);
         // 备用屏不显示 scrollback
         self.scroll_offset = 0;
-        std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        std::mem::swap(&mut self.screen.grid, &mut self.screen.alt_grid);
         self.mark_row_identity_changed();
         self.kitty_graphics.switch_screen();
-        self.alt_cursor_row = self.cursor_row;
-        self.alt_cursor_col = self.cursor_col;
-        std::mem::swap(
-            &mut self.keyboard_enhancement_flags,
-            &mut self.alt_keyboard_enhancement_flags,
-        );
-        std::mem::swap(
-            &mut self.keyboard_enhancement_stack,
-            &mut self.alt_keyboard_enhancement_stack,
-        );
+        self.screen.alt_cursor_row = self.screen.cursor_row;
+        self.screen.alt_cursor_col = self.screen.cursor_col;
+        self.protocol.switch_screen();
         self.watch.boundary();
         self.invalidate_search_scrollback_seals();
-        self.use_alt_buffer = true;
+        self.screen.use_alt_buffer = true;
         self.organism_working_dir = None;
         // Retained cells keep their own keys, but an unterminated primary-screen
         // OSC 8 link must not arm alternate-screen text.
-        self.current_hyperlink = HyperlinkId::NONE;
+        self.screen.current_hyperlink = HyperlinkId::NONE;
         // DECSTBM is per-buffer. Carrying the primary screen's partial scroll
         // region into the alternate buffer makes a TUI that never issues its
         // own DECSTBM draw inside somebody else's region.
-        self.scroll_region_top = 0;
-        self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
+        self.screen.scroll_region_top = 0;
+        self.screen.scroll_region_bottom = self.screen.grid.rows().saturating_sub(1);
         if clear {
             self.clear_screen();
             // ED2 only removes placements intersecting the visible viewport so
@@ -2365,71 +942,64 @@ impl super::TerminalState {
     /// 切回主屏幕缓冲。`restore_cursor` 控制是否恢复进入备用屏前保存的光标(1049 语义)。
     /// 不在备用屏则无操作。
     pub(super) fn exit_alt_screen(&mut self, restore_cursor: bool) {
-        if !self.use_alt_buffer {
+        if !self.screen.use_alt_buffer {
             return;
         }
         self.selection = None;
-        self.alt_cursor_row = self.cursor_row;
-        self.alt_cursor_col = self.cursor_col;
-        std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        self.screen.alt_cursor_row = self.screen.cursor_row;
+        self.screen.alt_cursor_col = self.screen.cursor_col;
+        std::mem::swap(&mut self.screen.grid, &mut self.screen.alt_grid);
         self.mark_row_identity_changed();
         self.kitty_graphics.switch_screen();
         if restore_cursor {
-            self.cursor_row = self.saved_cursor_row;
-            self.cursor_col = self.saved_cursor_col;
+            self.screen.cursor_row = self.screen.saved_cursor_row;
+            self.screen.cursor_col = self.screen.saved_cursor_col;
         }
-        std::mem::swap(
-            &mut self.keyboard_enhancement_flags,
-            &mut self.alt_keyboard_enhancement_flags,
-        );
-        std::mem::swap(
-            &mut self.keyboard_enhancement_stack,
-            &mut self.alt_keyboard_enhancement_stack,
-        );
+        self.protocol.switch_screen();
         self.watch.boundary();
         self.invalidate_search_scrollback_seals();
-        self.use_alt_buffer = false;
+        self.screen.use_alt_buffer = false;
         // A TUI's DECSCUSR (vim's insert-mode beam) belongs to its screen.
-        if let Some(shape) = self.saved_primary_cursor_shape.take() {
-            self.cursor_shape = shape;
+        if let Some(shape) = self.screen.saved_primary_cursor_shape.take() {
+            self.screen.cursor_shape = shape;
         }
         // Alt-screen OSC 8 state never leaks back onto newly printed
         // primary-screen cells, and the alt buffer's scroll region does not
         // carry back into the main one.
-        self.current_hyperlink = HyperlinkId::NONE;
-        self.scroll_region_top = 0;
-        self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
+        self.screen.current_hyperlink = HyperlinkId::NONE;
+        self.screen.scroll_region_top = 0;
+        self.screen.scroll_region_bottom = self.screen.grid.rows().saturating_sub(1);
 
         // Restore the primary screen's drawing state rather than zeroing it:
         // the shell's own SGR, charsets and modes were in force before the
         // fullscreen app started and must be in force again after it exits.
         // Falling back to Default keeps 1047-style entries (no save) safe.
-        if let Some(saved) = self.saved_primary_screen_state.take() {
-            self.current_fg = saved.fg;
-            self.current_bg = saved.bg;
+        if let Some(saved) = self.screen.saved_primary_screen_state.take() {
+            self.screen.current_fg = saved.fg;
+            self.screen.current_bg = saved.bg;
             self.global_bg = saved.bg;
-            self.current_flags = saved.flags;
-            self.g0_charset = saved.g0;
-            self.g1_charset = saved.g1;
-            self.active_charset = saved.active;
-            self.origin_mode = saved.origin_mode;
+            self.screen.current_flags = saved.flags;
+            self.screen.g0_charset = saved.g0;
+            self.screen.g1_charset = saved.g1;
+            self.screen.active_charset = saved.active;
+            self.screen.origin_mode = saved.origin_mode;
             if saved.autowrap {
-                self.modes.insert(7);
+                self.protocol.modes_mut().insert(7);
             } else {
-                self.modes.remove(&7);
+                self.protocol.modes_mut().remove(&7);
             }
         } else {
-            self.current_fg = Color::Default;
-            self.current_bg = Color::Default;
+            self.screen.current_fg = Color::Default;
+            self.screen.current_bg = Color::Default;
             self.global_bg = Color::Default;
-            self.current_flags = StyleFlags::default();
+            self.screen.current_flags = StyleFlags::default();
         }
-        self.pending_wrap = false;
+        self.screen.pending_wrap = false;
 
         // 交换缓冲后强制整屏重绘(+rows+1 触发 ui.rs 的 grid_version_jumped)
-        self.grid_version += self.grid.rows() as u64 + 1;
+        self.grid_version += self.screen.grid.rows() as u64 + 1;
         self.row_versions.fill(self.grid_version);
-        self.dirty_region.mark_all(self.grid.rows());
+        self.dirty_region.mark_all(self.screen.grid.rows());
     }
 
     /// Titles are rendered in trusted app chrome (tabs, window manager,
@@ -2482,8 +1052,8 @@ impl super::TerminalState {
     /// set it to.
     fn handle_window_ops(&mut self, params: &[u16]) {
         let op = params.first().copied().unwrap_or(0);
-        let rows = self.grid.rows();
-        let cols = self.grid.row_len();
+        let rows = self.screen.grid.rows();
+        let cols = self.screen.grid.row_len();
         match op {
             // Report window state: normal/non-iconified.
             11 => self.output_buffer.extend_from_slice(b"\x1b[1t"),
@@ -2571,77 +1141,77 @@ impl super::TerminalState {
         match mode {
             25 => {
                 // Show cursor (mode 25)
-                self.modes.insert(25);
+                self.protocol.modes_mut().insert(25);
             }
             1004 => {
                 // Focus event reporting (CSI I / CSI O). If the window is
                 // already focused, report that immediately so a client that
                 // probes then waits for the first I is not stuck until Alt-Tab.
-                let newly = !self.modes.contains(&1004);
-                self.modes.insert(1004);
+                let newly = !self.protocol.modes().contains(&1004);
+                self.protocol.modes_mut().insert(1004);
                 if newly && self.host_window_focused {
                     self.output_buffer.extend_from_slice(b"\x1b[I");
                 }
             }
             2004 => {
                 // Bracketed paste mode
-                self.modes.insert(2004);
+                self.protocol.modes_mut().insert(2004);
             }
             1000..=1003 => {
                 // Mouse reporting modes
-                self.modes.insert(mode);
+                self.protocol.modes_mut().insert(mode);
             }
             1006 => {
                 // SGR mouse reporting format
-                self.modes.insert(mode);
+                self.protocol.modes_mut().insert(mode);
             }
             47 => {
                 // 备用屏(无保存光标、无清屏)
                 self.enter_alt_screen(false, false);
-                self.modes.insert(47);
+                self.protocol.modes_mut().insert(47);
             }
             1047 => {
                 // 备用屏(切入时清屏)
                 self.enter_alt_screen(false, true);
-                self.modes.insert(1047);
+                self.protocol.modes_mut().insert(1047);
             }
             1048 => {
                 // 仅保存光标(等价 DECSC). It shares DECSC's slot, as in xterm,
                 // not the one 1049 keeps for the primary screen, so a 1048
                 // inside a 1049 session cannot move the cursor 1049l restores.
                 self.save_cursor_state();
-                self.modes.insert(1048);
+                self.protocol.modes_mut().insert(1048);
             }
             1049 => {
                 // 备用屏:保存光标 + 切入 + 清屏
                 self.enter_alt_screen(true, true);
-                self.modes.insert(1049);
+                self.protocol.modes_mut().insert(1049);
             }
             2026 => {
                 // Synchronized output: suppress rendering until cleared
-                self.modes.insert(2026);
+                self.protocol.modes_mut().insert(2026);
                 self.sync_output_active = true;
-                self.sync_output_start = Some(std::time::Instant::now());
+                self.sync_output_start = Some(self.sync_output_clock.now());
             }
             7 => {
                 // Autowrap mode
-                self.modes.insert(7);
+                self.protocol.modes_mut().insert(7);
             }
             6 => {
                 // DECOM - 原点模式:寻址相对滚动区域,光标移到区域原点
-                self.origin_mode = true;
-                self.cursor_row = self.scroll_region_top;
-                self.cursor_col = 0;
+                self.screen.origin_mode = true;
+                self.screen.cursor_row = self.screen.scroll_region_top;
+                self.screen.cursor_col = 0;
             }
             66 => {
-                self.modes.insert(66);
+                self.protocol.modes_mut().insert(66);
             }
             1007 => {
-                self.modes.insert(1007);
+                self.protocol.modes_mut().insert(1007);
             }
             _ => {
                 // Unknown mode, just store it
-                self.modes.insert(mode);
+                self.protocol.modes_mut().insert(mode);
             }
         }
     }
@@ -2650,13 +1220,13 @@ impl super::TerminalState {
     pub(super) fn set_ansi_mode(&mut self, mode: u16) {
         if mode == 4 {
             // IRM - 插入替换模式
-            self.insert_mode = true;
+            self.screen.insert_mode = true;
         }
     }
 
     pub(super) fn reset_ansi_mode(&mut self, mode: u16) {
         if mode == 4 {
-            self.insert_mode = false;
+            self.screen.insert_mode = false;
         }
     }
 
@@ -2664,83 +1234,83 @@ impl super::TerminalState {
         match mode {
             25 => {
                 // Hide cursor
-                self.modes.remove(&25);
+                self.protocol.modes_mut().remove(&25);
             }
             1004 => {
                 // Disable focus event reporting
-                self.modes.remove(&1004);
+                self.protocol.modes_mut().remove(&1004);
             }
             2004 => {
                 // Disable bracketed paste mode
-                self.modes.remove(&2004);
+                self.protocol.modes_mut().remove(&2004);
             }
             5522 => {
                 // A paste capability is valid only while the application keeps
                 // paste-event mode enabled. Revocation must be immediate.
-                self.modes.remove(&5522);
+                self.protocol.modes_mut().remove(&5522);
                 self.pending_paste_grant = None;
             }
             1000..=1003 => {
                 // Disable mouse reporting
-                self.modes.remove(&mode);
+                self.protocol.modes_mut().remove(&mode);
             }
             1006 => {
                 // Disable SGR mouse reporting format
-                self.modes.remove(&mode);
+                self.protocol.modes_mut().remove(&mode);
             }
             47 => {
                 // 退出备用屏(不恢复光标)
                 self.exit_alt_screen(false);
-                self.modes.remove(&47);
+                self.protocol.modes_mut().remove(&47);
             }
             1047 => {
                 // 退出备用屏(不恢复光标)
                 self.exit_alt_screen(false);
-                self.modes.remove(&1047);
+                self.protocol.modes_mut().remove(&1047);
             }
             1048 => {
                 // 仅恢复光标(等价 DECRC)
                 self.restore_cursor_state();
-                self.modes.remove(&1048);
+                self.protocol.modes_mut().remove(&1048);
             }
             1049 => {
                 // 退出备用屏并恢复进入前保存的光标
                 self.exit_alt_screen(true);
-                self.modes.remove(&1049);
+                self.protocol.modes_mut().remove(&1049);
             }
             2026 => {
                 // End synchronized output: force full render
-                if self.use_alt_buffer {
+                if self.screen.use_alt_buffer {
                     self.archive_visible_screen_to_scrollback_with_options(true, true);
                 } else {
                     self.last_synced_primary_screen_snapshot =
                         self.visible_screen_snapshot().unwrap_or_default();
                 }
-                self.modes.remove(&2026);
+                self.protocol.modes_mut().remove(&2026);
                 self.sync_output_active = false;
                 self.sync_output_start = None;
-                self.dirty_region.mark_all(self.grid.rows());
-                self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+                self.dirty_region.mark_all(self.screen.grid.rows());
+                self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
             }
             7 => {
                 // Disable autowrap
-                self.modes.remove(&7);
+                self.protocol.modes_mut().remove(&7);
             }
             6 => {
                 // DECOM 关闭:恢复绝对寻址,光标移到屏幕原点
-                self.origin_mode = false;
-                self.cursor_row = 0;
-                self.cursor_col = 0;
+                self.screen.origin_mode = false;
+                self.screen.cursor_row = 0;
+                self.screen.cursor_col = 0;
             }
             66 => {
-                self.modes.remove(&66);
+                self.protocol.modes_mut().remove(&66);
             }
             1007 => {
-                self.modes.remove(&1007);
+                self.protocol.modes_mut().remove(&1007);
             }
             _ => {
                 // Unknown mode, just remove it
-                self.modes.remove(&mode);
+                self.protocol.modes_mut().remove(&mode);
             }
         }
     }

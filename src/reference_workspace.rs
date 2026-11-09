@@ -1695,8 +1695,8 @@ impl TerminalApp {
                 .find(|record| record.start_mark_seen || record.complete);
             (
                 terminal.current_working_dir.clone(),
-                terminal.grid.row_len(),
-                terminal.grid.rows(),
+                terminal.screen.grid.row_len(),
+                terminal.screen.grid.rows(),
                 latest.map(|record| {
                     (
                         inspector_context_text(

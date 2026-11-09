@@ -1968,8 +1968,8 @@ impl TerminalApp {
                     let records = terminal.command_records();
                     let last = records.iter().rev().find(|record| record.complete);
                     (
-                        terminal.grid.row_len() as u16,
-                        terminal.grid.rows() as u16,
+                        terminal.screen.grid.row_len() as u16,
+                        terminal.screen.grid.rows() as u16,
                         last.and_then(|record| record.exit_code),
                         last.and_then(|record| record.duration_ms),
                         records.back().is_some_and(|record| {
@@ -2796,8 +2796,8 @@ impl TerminalApp {
                     let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                     let terminal_arc = std::sync::Arc::clone(&session.terminal);
                     let mut terminal_guard = terminal_arc.lock();
-                    if pane_cols != terminal_guard.grid.row_len()
-                        || pane_rows != terminal_guard.grid.rows()
+                    if pane_cols != terminal_guard.screen.grid.row_len()
+                        || pane_rows != terminal_guard.screen.grid.rows()
                     {
                         terminal_guard.on_resize(pane_cols, pane_rows);
                         let _ = session.shell.resize(pane_cols, pane_rows);
@@ -4637,8 +4637,8 @@ impl TerminalApp {
         if self.debug_panel.is_open {
             let session = self.session_manager.get_active_session_mut();
             let terminal = session.terminal.lock();
-            let grid_cols = terminal.grid.cols();
-            let grid_rows = terminal.grid.rows();
+            let grid_cols = terminal.screen.grid.cols();
+            let grid_rows = terminal.screen.grid.rows();
             let scrollback_used = terminal.scrollback.len();
             let kitty_images_count = terminal.kitty_graphics.image_count();
             let kitty_memory_mb = terminal.kitty_graphics.image_memory_mb();
@@ -7890,7 +7890,7 @@ mod tests {
                             }
                             terminal
                         });
-                        let raw_grid = format!("{:?}", terminal.grid.to_vec());
+                        let raw_grid = format!("{:?}", terminal.screen.grid.to_vec());
                         let raw_cursor = terminal.get_cursor_pos();
                         let mut policy = crate::terminal::ProjectionPolicy::default();
                         policy.set_block_spacing(spacing);
@@ -7904,9 +7904,9 @@ mod tests {
                         }
                         renderer.set_projection_frame(terminal, viewport, &policy);
                         renderer.render(ui, terminal, true, true, &crate::search::SearchState::default(), &[], &None);
-                        assert_eq!(format!("{:?}", terminal.grid.to_vec()), raw_grid);
+                        assert_eq!(format!("{:?}", terminal.screen.grid.to_vec()), raw_grid);
                         assert_eq!(terminal.get_cursor_pos(), raw_cursor);
-                        assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (cols, rows));
+                        assert_eq!((terminal.screen.grid.row_len(), terminal.screen.grid.rows()), (cols, rows));
                     });
                     if let Some(path) = &destination {
                         capture.save(

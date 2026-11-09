@@ -579,7 +579,7 @@ impl SearchEngine {
             }
         }
 
-        for (line_idx, line) in terminal.grid.iter().enumerate() {
+        for (line_idx, line) in terminal.screen.grid.iter().enumerate() {
             if scanned >= scan_budget {
                 return true;
             }
@@ -1202,8 +1202,8 @@ mod tests {
     #[test]
     fn case_insensitive_search_keeps_columns_after_unicode_case_expansion() {
         let mut terminal = crate::terminal::TerminalState::new(3, 1);
-        terminal.grid.get_mut(0, 0).character = 'İ';
-        terminal.grid.get_mut(0, 1).character = 'x';
+        terminal.screen.grid.get_mut(0, 0).character = 'İ';
+        terminal.screen.grid.get_mut(0, 1).character = 'x';
 
         let (matches, error, truncated) =
             SearchEngine::search(&terminal, "x", false, false, &mut None);
@@ -1224,7 +1224,7 @@ mod tests {
     fn plaintext_search_still_finds_overlapping_matches() {
         let mut terminal = crate::terminal::TerminalState::new(3, 1);
         for col in 0..3 {
-            terminal.grid.get_mut(0, col).character = 'a';
+            terminal.screen.grid.get_mut(0, col).character = 'a';
         }
 
         let (matches, error, truncated) =
@@ -1324,7 +1324,7 @@ mod tests {
     #[test]
     fn regex_cache_invalidates_only_on_pattern_or_case_change() {
         let mut terminal = crate::terminal::TerminalState::new(4, 1);
-        terminal.grid.get_mut(0, 0).character = 'a';
+        terminal.screen.grid.get_mut(0, 0).character = 'a';
         let mut cache = None;
 
         // Case-sensitive plaintext never compiles a regex at all.
@@ -1431,7 +1431,7 @@ mod tests {
         let mut terminal = crate::terminal::TerminalState::new(cols, rows);
         for row in 0..rows {
             for col in 0..cols {
-                terminal.grid.get_mut(row, col).character = 'x';
+                terminal.screen.grid.get_mut(row, col).character = 'x';
             }
         }
 

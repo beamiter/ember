@@ -2,7 +2,7 @@ use crate::output_batch::{OutputBuffer, OutputSource};
 use crate::pty::Pty;
 use crate::terminal::clamp_terminal_dimensions;
 use crossbeam_channel::{bounded, Receiver};
-use eframe::egui;
+use jterm_core::runtime_wake::WakeSink;
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::fmt;
@@ -375,7 +375,7 @@ impl ShellSession {
         cols: usize,
         rows: usize,
         configured_shell: Option<&str>,
-        repaint_ctx: egui::Context,
+        repaint_ctx: WakeSink,
     ) -> std::result::Result<Self, String> {
         Self::new_with_cwd(cols, rows, None, None, configured_shell, None, repaint_ctx)
     }
@@ -390,7 +390,7 @@ impl ShellSession {
         session_id: Option<&str>,
         configured_shell: Option<&str>,
         command_argv: Option<&[String]>,
-        repaint_ctx: egui::Context,
+        repaint_ctx: WakeSink,
     ) -> std::result::Result<Self, String> {
         Self::new_with_pinned_cwd(
             cols,
@@ -413,7 +413,7 @@ impl ShellSession {
         configured_shell: Option<&str>,
         command_argv: Option<&[String]>,
         pinned_cwd: Option<crate::pty::PinnedDirectory>,
-        repaint_ctx: egui::Context,
+        repaint_ctx: WakeSink,
     ) -> std::result::Result<Self, String> {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
         let shell_program = if command_argv.is_none() {
@@ -558,13 +558,13 @@ impl ShellSession {
 
     fn send_event(
         event_tx: &crossbeam_channel::Sender<ShellEvent>,
-        repaint_ctx: &egui::Context,
+        repaint_ctx: &WakeSink,
         event: ShellEvent,
     ) -> bool {
         if event_tx.send(event).is_err() {
             return false;
         }
-        repaint_ctx.request_repaint();
+        repaint_ctx.wake();
         true
     }
 
@@ -576,7 +576,7 @@ impl ShellSession {
     fn send_final_io_event(
         pty: &Arc<Mutex<Pty>>,
         event_tx: &crossbeam_channel::Sender<ShellEvent>,
-        repaint_ctx: &egui::Context,
+        repaint_ctx: &WakeSink,
         shutdown: &AtomicBool,
         buffer: &mut [u8],
         source: &mut OutputSource,
@@ -601,7 +601,7 @@ impl ShellSession {
     fn io_loop(
         pty: Arc<Mutex<Pty>>,
         event_tx: crossbeam_channel::Sender<ShellEvent>,
-        repaint_ctx: egui::Context,
+        repaint_ctx: WakeSink,
         shutdown: Arc<AtomicBool>,
         mut source: OutputSource,
     ) {
@@ -1100,6 +1100,31 @@ impl Drop for ShellSession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_wake_follows_successful_publication_only() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let wake_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = wake_count.clone();
+        let wake = jterm_core::runtime_wake::WakeSink::new(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        assert!(super::ShellSession::send_event(
+            &tx,
+            &wake,
+            super::ShellEvent::Exit(0)
+        ));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        assert!(matches!(rx.recv().unwrap(), super::ShellEvent::Exit(0)));
+        drop(rx);
+        assert!(!super::ShellSession::send_event(
+            &tx,
+            &wake,
+            super::ShellEvent::Exit(0)
+        ));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+    }
+
     use super::*;
 
     enum ExitDrainStep {
@@ -1451,7 +1476,7 @@ mod tests {
             None,
             None,
             Some(&argv),
-            egui::Context::default(),
+            crate::runtime_wake::egui_wake(eframe::egui::Context::default()),
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1504,7 +1529,7 @@ mod tests {
             foreground,
             None,
             &crate::session_manager::SessionInputBarriers::default(),
-            &crate::session_manager::ProtocolResponseSender::new(egui::Context::default())
+            &crate::session_manager::ProtocolResponseSender::new(eframe::egui::Context::default())
         ));
         assert!(session.pending_input.is_empty());
         assert!(
@@ -1528,7 +1553,7 @@ mod tests {
             None,
             None,
             Some(&argv),
-            egui::Context::default(),
+            crate::runtime_wake::egui_wake(eframe::egui::Context::default()),
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1558,7 +1583,7 @@ mod tests {
         let foreground = session.shell.foreground_pgid().unwrap();
         let barriers = crate::session_manager::SessionInputBarriers::default();
         let responses =
-            crate::session_manager::ProtocolResponseSender::new(egui::Context::default());
+            crate::session_manager::ProtocolResponseSender::new(eframe::egui::Context::default());
         let set_flags = |flags: libc::c_int| {
             let pty = session.shell.pty.lock();
             // SAFETY: the live guard pins this idle fixture's master fd.
@@ -1627,7 +1652,7 @@ mod tests {
             None,
             None,
             Some(&argv),
-            egui::Context::default(),
+            crate::runtime_wake::egui_wake(eframe::egui::Context::default()),
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1677,7 +1702,7 @@ mod tests {
             None,
             None,
             Some(&argv),
-            egui::Context::default(),
+            crate::runtime_wake::egui_wake(eframe::egui::Context::default()),
         )
         .unwrap();
 
@@ -1733,7 +1758,7 @@ mod tests {
             None,
             None,
             Some(&argv),
-            egui::Context::default(),
+            crate::runtime_wake::egui_wake(eframe::egui::Context::default()),
         )
         .unwrap();
 
@@ -1790,7 +1815,12 @@ mod tests {
         // test's subject, so retry briefly instead of failing the run.
         let spawn_deadline = Instant::now() + Duration::from_secs(5);
         let session = loop {
-            match ShellSession::new(80, 24, Some(&script), egui::Context::default()) {
+            match ShellSession::new(
+                80,
+                24,
+                Some(&script),
+                crate::runtime_wake::egui_wake(eframe::egui::Context::default()),
+            ) {
                 Ok(session) => break session,
                 Err(error)
                     if error.contains("Text file busy") && Instant::now() < spawn_deadline =>

@@ -710,7 +710,7 @@ mod tests {
             Some(&session_id),
             Some("/bin/sh"),
             None,
-            repaint.clone(),
+            crate::runtime_wake::egui_wake(repaint.clone()),
         )
         .expect("interactive fixture shell starts");
         let session = crate::session::Session::new_with_session_id(

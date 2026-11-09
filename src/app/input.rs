@@ -2163,7 +2163,7 @@ impl TerminalApp {
         }
         .map(|anchor| anchor.line_id)
         .unwrap_or(terminal.total_lines_scrolled);
-        let cols = terminal.grid.row_len();
+        let cols = terminal.screen.grid.row_len();
         let target = if next {
             terminal.command_records().iter().find(|record| {
                 crate::block_mode::prompt_row_line_id(

@@ -253,15 +253,12 @@ impl super::TerminalState {
                     .running
                     .is_some_and(|(sequence, _)| sequence == record.sequence)
         });
-        (!self.use_alt_buffer && actual_running)
+        (!self.screen.use_alt_buffer && actual_running)
             .then(|| self.watch.command())
             .flatten()
     }
     fn watch_pending_control(&self) -> bool {
-        !self.pending_escape.is_empty()
-            || !self.pending_osc.is_empty()
-            || !self.pending_apc.is_empty()
-            || !self.pending_string.is_empty()
+        self.parser.legacy_pending_control()
     }
     pub fn process_output_buffer(
         &mut self,
@@ -281,7 +278,7 @@ impl super::TerminalState {
             let pending = self.watch_pending_control();
             let mut update = self
                 .watch
-                .end_fragment(pending, self.use_alt_buffer, accepted);
+                .end_fragment(pending, self.screen.use_alt_buffer, accepted);
             if self.watch_command().is_none() {
                 update.command = None;
                 update.trusted_start = false;

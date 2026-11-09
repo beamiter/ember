@@ -49,6 +49,7 @@ mod reference_workspace;
 mod remote_fs;
 mod remote_picker;
 mod review_text;
+mod runtime_wake;
 mod search;
 mod search_replace;
 mod search_replace_panel;
@@ -2685,7 +2686,7 @@ impl TerminalApp {
             Some(&first_session_id),
             configured_shell.as_deref(),
             startup_argv.as_deref(),
-            repaint_ctx.clone(),
+            crate::runtime_wake::egui_wake(repaint_ctx.clone()),
         ) {
             Ok(session) => {
                 eprintln!("✓ Shell session started successfully");
@@ -2706,7 +2707,7 @@ impl TerminalApp {
                     Some(&first_session_id),
                     configured_shell.as_deref(),
                     None,
-                    repaint_ctx.clone(),
+                    crate::runtime_wake::egui_wake(repaint_ctx.clone()),
                 ) {
                     Ok(session) => session,
                     Err(e2) => {

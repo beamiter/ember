@@ -4,6 +4,10 @@ mod watch;
 use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use jterm_core::click_cursor;
+use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
+use jterm_engine::screen::{
+    Charset, RegionDirection, RegionMutation, RowMutation, SavedCursorState, ScreenState,
+};
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 pub use watch::{WatchCommand, WatchParsed};
@@ -66,7 +70,7 @@ fn is_token_suffix_wrapper(c: char) -> bool {
 const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?65;1;9c";
 const SECONDARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[>1;7802;0c";
 const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
-pub const MAX_TERMINAL_COLS: usize = 1024;
+pub use jterm_engine::MAX_TERMINAL_COLS;
 pub const MAX_TERMINAL_ROWS: usize = 512;
 /// Hard cap on bytes carried across PTY read batches inside an unfinished
 /// OSC/DCS/CSI escape. Any well-formed sequence is far below this; a
@@ -312,11 +316,21 @@ pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
 #[cfg(test)]
 mod fragmentation_tests;
 mod grid;
+mod host_context;
 mod hyperlink;
+#[cfg(test)]
+mod oracle_fixture;
+mod sync_output_clock;
+pub use host_context::TerminalHostContext;
+pub use sync_output_clock::SyncOutputClock;
 mod parser;
 #[allow(dead_code)] // Public in the library; the binary mirrors modules privately.
 mod projection;
+#[cfg(test)]
+mod resize_parity_tests;
 mod state;
+#[cfg(test)]
+mod structural_parity_tests;
 #[cfg(test)]
 mod tests;
 
@@ -429,13 +443,6 @@ struct ProjectedSelectionEndpoint {
     anchor: ProjectedSelectionAnchor,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Charset {
-    #[default]
-    Ascii,
-    DecSpecialGraphics,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardReadKind {
     MimeData(String),
@@ -451,98 +458,6 @@ struct PendingPasteGrant {
     token: String,
     offered_mimes: HashSet<String>,
     expires_at: std::time::Instant,
-}
-
-#[derive(Clone, Debug, Default)]
-struct TerminalModes {
-    bits: u32,
-}
-
-impl TerminalModes {
-    const fn bit_index(mode: u16) -> Option<u32> {
-        match mode {
-            // DECCKM — application cursor keys. Keep this independent from
-            // alternate-screen modes: full-screen applications explicitly
-            // opt into the SS3 cursor-key sequences with CSI ? 1 h.
-            1 => Some(13),
-            7 => Some(0),
-            25 => Some(1),
-            1000 => Some(2),
-            1001 => Some(3),
-            1002 => Some(4),
-            1003 => Some(5),
-            1004 => Some(6),
-            1006 => Some(7),
-            1049 => Some(8),
-            2004 => Some(9),
-            2026 => Some(10),
-            2031 => Some(11),
-            5522 => Some(12),
-            // Kept as bits so DECRQM can answer them truthfully: 47/1047 enter
-            // the alternate screen, 1048 is the DECSC-style save, and 1005/1015
-            // select the UTF-8 and urxvt mouse encodings.
-            47 => Some(14),
-            1047 => Some(15),
-            1048 => Some(16),
-            1005 => Some(17),
-            1015 => Some(18),
-            66 => Some(19),
-            // Alternate Scroll: wheel on the alt screen becomes cursor keys
-            // when mouse reporting is off (xterm 1007 / alternateScroll).
-            1007 => Some(20),
-            // ATT610 / DECSET 12: cursor blink. Ember stores the request so
-            // DECRQM answers truthfully even though the renderer is steady.
-            12 => Some(21),
-            // 1036 metaSendsEscape: Alt/Meta prefixes ESC. Default on, as in xterm.
-            1036 => Some(22),
-            // 1034 eightBitInput: we stay UTF-8 7-bit C1, but DECRQM must answer.
-            1034 => Some(23),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn contains(&self, mode: &u16) -> bool {
-        match Self::bit_index(*mode) {
-            Some(bit) => self.bits & (1 << bit) != 0,
-            None => false,
-        }
-    }
-
-    #[inline]
-    fn insert(&mut self, mode: u16) {
-        if let Some(bit) = Self::bit_index(mode) {
-            self.bits |= 1 << bit;
-        }
-    }
-
-    #[inline]
-    fn remove(&mut self, mode: &u16) {
-        if let Some(bit) = Self::bit_index(*mode) {
-            self.bits &= !(1 << bit);
-        }
-    }
-}
-
-/// DECSC/DECRC 保存的完整光标状态(含 SGR 属性、字符集、模式),
-/// 与备用屏幕缓冲使用的 saved_cursor_row/col 解耦。
-#[derive(Clone)]
-struct SavedCursorState {
-    row: usize,
-    col: usize,
-    fg: Color,
-    bg: Color,
-    flags: StyleFlags,
-    g0: Charset,
-    g1: Charset,
-    active: Charset,
-    origin_mode: bool,
-    autowrap: bool,
-    // VT510: DECSC 须保存 Last Column Flag(延迟换行标志),DECRC 须恢复。
-    // 否则右 prompt(如 starship cmd_duration)写到末列后 pending_wrap=true,
-    // 经 CSI u/ESC 8 恢复光标到 prompt 之后,下一字符(如 zsh-autosuggestions 的
-    // ghost 文本)会立刻触发换行,在屏底触发滚动,光标看似下移一行。
-    pending_wrap: bool,
 }
 
 /// 256-slot dynamic palette: `None` slots fall through to the theme/default.
@@ -577,53 +492,20 @@ impl Default for TerminalDefaultColors {
 }
 
 pub struct TerminalState {
+    /// Live VT storage and drawing state; history and host effects remain here.
+    pub screen: ScreenState,
+    host_context: TerminalHostContext,
     #[cfg(test)]
     search_source_epoch: u64,
     search_source_revision: u64,
     search_scrollback_epoch: u64,
-    pub grid: TerminalGrid,
-    alt_grid: TerminalGrid,
     pub scrollback: VecDeque<ScrollbackLine>,
     pub selection: Option<Selection>,
     projected_selection: Option<ProjectedSelection>,
     selection_revision: u64,
     pub scroll_offset: usize,
     max_scrollback: usize,
-    use_alt_buffer: bool,
 
-    pub cursor_row: usize,
-    pub cursor_col: usize,
-    saved_cursor_row: usize,
-    saved_cursor_col: usize,
-    alt_cursor_row: usize,
-    alt_cursor_col: usize,
-    pub cursor_shape: CursorShape,
-    /// The primary screen's cursor shape, restored when the alternate screen
-    /// is left so a TUI's insert-mode beam does not outlive it (as frost).
-    saved_primary_cursor_shape: Option<CursorShape>,
-
-    // DECSC/DECRC 完整保存状态
-    saved_state: Option<SavedCursorState>,
-    /// The primary screen's drawing state, snapshotted on the way into the
-    /// alternate buffer so leaving it restores what the shell had rather than
-    /// zeroing SGR. `printf '\e[31m'; vim` must come back red, as it does in
-    /// VTE and in frost.
-    saved_primary_screen_state: Option<SavedCursorState>,
-    // IRM 插入模式 (ANSI mode 4):写字符时右移而非覆盖
-    insert_mode: bool,
-    /// The last graphic character written, kept pre-translation so REP
-    /// (`CSI Pn b`) can reprint it through the charset in force at repeat time.
-    last_printed_char: Option<char>,
-    // DECOM 原点模式 (DEC private ?6):光标寻址相对滚动区域顶端
-    origin_mode: bool,
-    // 自定义制表位 (HTS/TBC),index 为列,true 表示该列是制表位
-    tab_stops: Vec<bool>,
-    // DEC 延迟换行 (Last Column Flag):写满最后一列后置位,下一个可打印字符才换行
-    pending_wrap: bool,
-
-    current_fg: Color,
-    current_bg: Color,
-    current_flags: StyleFlags,
     /// Window title from OSC 0/2, bounded at ingest to
     /// [`MAX_WINDOW_TITLE_CHARS`]. Still untrusted text — the window-manager
     /// sanitiser owns bidi/control filtering — but no longer unbounded.
@@ -657,42 +539,14 @@ pub struct TerminalState {
     // Global background color set by vim (CSI ... m)
     pub global_bg: Color,
 
-    // Scrolling region (DECSTBM)
-    scroll_region_top: usize,
-    scroll_region_bottom: usize,
-
-    // UTF-8 decoding buffer
-    utf8_buf: [u8; 4],
-    utf8_len: u8,
-    utf8_expected: u8,
-
-    // Incomplete escape sequence buffer across PTY reads
-    pending_escape: Vec<u8>,
-    // Kitty APCs are streamed separately so fragmented multi-megabyte payloads
-    // are appended and scanned once instead of rebuilding/rescanning the whole
-    // escape on every PTY read.
-    pending_apc: Vec<u8>,
-    pending_apc_scan_from: usize,
-    discarding_oversized_apc: bool,
-    discarding_apc_prev_escape: bool,
-    // OSC and DCS/SOS/PM use the same streaming pattern: large string payloads
-    // (e.g. OSC 52 clipboard data) would otherwise be merged and rescanned
-    // from byte 0 on every PTY read, which is quadratic on the UI thread.
-    pending_osc: Vec<u8>,
-    pending_osc_scan_from: usize,
-    pending_string: Vec<u8>,
-    pending_string_scan_from: usize,
-
-    g0_charset: Charset,
-    g1_charset: Charset,
-    active_charset: Charset,
+    parser: jterm_engine::parser::Parser,
 
     // IME support
     pub ime_enabled: bool,
     pub preedit_text: String,
     pub preedit_cursor: usize,
 
-    modes: TerminalModes,
+    protocol: ProtocolState,
     /// Last observed host-window focus. DECSET 1004 reports CSI I/O against
     /// this, and enabling 1004 while focused emits CSI I immediately.
     host_window_focused: bool,
@@ -700,12 +554,6 @@ pub struct TerminalState {
     // Output buffer for DSR/CPR responses to be sent back to PTY
     pub output_buffer: Vec<u8>,
 
-    keyboard_enhancement_flags: u16,
-    keyboard_enhancement_stack: Vec<u16>,
-    alt_keyboard_enhancement_flags: u16,
-    alt_keyboard_enhancement_stack: Vec<u16>,
-    xterm_modify_other_keys: u16,
-    xterm_format_other_keys: u16,
     pending_clipboard_requests: Vec<ClipboardReadRequest>,
     pending_paste_grant: Option<PendingPasteGrant>,
 
@@ -743,11 +591,11 @@ pub struct TerminalState {
     // OSC 8 hyperlink tracking. Cells retain only the compact id; the URI is
     // stored once in a bounded table rather than cloned into every cell.
     hyperlinks: hyperlink::HyperlinkTable,
-    current_hyperlink: HyperlinkId,
 
     // Synchronized output (mode 2026): suppress rendering until mode is cleared
     pub sync_output_active: bool,
     sync_output_start: Option<std::time::Instant>,
+    sync_output_clock: SyncOutputClock,
     last_archived_screen_snapshot: Vec<String>,
     last_synced_primary_screen_snapshot: Vec<String>,
 

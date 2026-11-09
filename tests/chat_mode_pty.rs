@@ -125,7 +125,7 @@ fn chat_mode_keeps_cwd_environment_completion_multiline_hidden_input_and_interru
             "--norc".into(),
             "-i".into(),
         ]),
-        egui::Context::default(),
+        ember::runtime_wake::egui_wake(egui::Context::default()),
     )
     .expect("real Bash PTY");
     let terminal = Arc::new(Mutex::new(TerminalState::new(100, 30)));
@@ -277,7 +277,7 @@ fn chat_review_foreground_spoof_and_barrier_never_deliver_a_late_control() {
             "--norc".into(),
             "-i".into(),
         ]),
-        egui::Context::default(),
+        ember::runtime_wake::egui_wake(egui::Context::default()),
     )
     .unwrap();
     let terminal = Arc::new(Mutex::new(TerminalState::new(100, 30)));

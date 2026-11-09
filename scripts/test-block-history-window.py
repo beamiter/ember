@@ -20,7 +20,7 @@ helpers=helpers.replace('pub(super) fn','fn')
 start=commands.index('fn defer_same_session_block_search_rebuild_if_invalid(');end=commands.index('\n}\n',start)+3;helpers+=commands[start:end]
 helpers+=section('fn block_search_output_source(', '/// OSC prompt metadata')
 source='#![allow(dead_code)]\npub use jterm_core::char_width;\n'+f'const COMPOSITOR_PROBE: bool = {str(a.compositor_probe).lower()};\n'
-for m in ['terminal','block_mode','block_search','kitty_graphics','output_batch','review_text','fold_preview','debug']:
+for m in ['immersive_command','agent_cli','terminal','block_mode','block_search','kitty_graphics','output_batch','review_text','fold_preview','debug']:
  path=r/'src'/('terminal/mod.rs' if m=='terminal' else m+'.rs');source+=f'#[path="{path}"] mod {m};\n'
 source+=r'''
 use block_search::*;
@@ -231,7 +231,7 @@ unsafe impl std::alloc::GlobalAlloc for AllocationTracking {
 with tempfile.TemporaryDirectory(prefix='ember-ui-history-') as temp:
  t=Path(temp);(t/'test.rs').write_text(source)
  cmd=[os.environ.get('RUSTC','rustc'),'--edition=2021','--test','-C','debuginfo=0',str(t/'test.rs'),'-L','dependency='+str(deps)]
- for crate in ['unicode_normalization','uuid','parking_lot','jterm_core','base64','smallvec','unicode_width','regex','log','image','flate2','serde','serde_json','memchr','libc']:
+ for crate in ['unicode_normalization','uuid','parking_lot','jterm_core','jterm_engine','dirs','base64','smallvec','unicode_width','regex','log','image','flate2','serde','serde_json','memchr','libc']:
   choices=sorted(deps.glob('lib'+crate+'-*.rlib'),key=lambda p:p.stat().st_mtime,reverse=True);cmd+=['--extern',crate+'='+str(choices[0])]
- cmd+=['-o',str(t/'tests')];subprocess.run(cmd,check=True)
+ cmd+=['-o',str(t/'tests')];subprocess.run(cmd,check=True,env={**os.environ, 'CARGO_MANIFEST_DIR': str(r)})
  subprocess.run([str(t/'tests'),'full_100000','--test-threads=1','--nocapture'] if a.compositor_probe else [str(t/'tests'),'controller_allocation','--test-threads=1','--nocapture'] if a.allocation_probe else [str(t/'tests'),'--test-threads=1','--nocapture'] if a.regression else [str(t/'tests'),'--skip','terminal::','--skip','block_mode::','--test-threads=1','--nocapture'],check=True)

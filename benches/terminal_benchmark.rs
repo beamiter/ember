@@ -163,7 +163,7 @@ fn bench_dense_search(c: &mut Criterion) {
     for cols in [128, 512, ember::terminal::MAX_TERMINAL_COLS] {
         let mut terminal = TerminalState::new(cols, 1);
         for col in 0..cols {
-            terminal.grid.get_mut(0, col).character = 'µ';
+            terminal.screen.grid.get_mut(0, col).character = 'µ';
         }
         for (name, regex, sensitive) in [
             ("literal", false, true),
