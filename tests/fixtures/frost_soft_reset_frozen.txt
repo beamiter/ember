@@ -1,0 +1,19 @@
+    fn soft_reset(&mut self) {
+        self.current_fg = Color::Default;
+        self.current_bg = Color::Default;
+        self.global_bg = Color::Default;
+        self.current_flags = StyleFlags::default();
+        self.g0_charset = Charset::Ascii;
+        self.g1_charset = Charset::Ascii;
+        self.active_charset = Charset::Ascii;
+        self.scroll_region_top = 0;
+        self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
+        self.saved_cursor = None;
+        // Reset the modes DECSTR is defined to touch: DECOM (6) off, IRM (4) off,
+        // DECTCEM (25) on, DECAWM (7) on. Leave everything else as-is.
+        self.modes.remove(&6);
+        self.modes.remove(&4);
+        self.modes.insert(25);
+        self.modes.insert(7);
+        self.pending_wrap = false;
+    }

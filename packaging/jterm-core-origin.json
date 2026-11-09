@@ -1,16 +1,12 @@
 {
-  "published_core_commit": "d7387fce27bf2b1e60ff2652ab04239a0b809dd3",
-  "published_core_tree": "e93b2c09d47067e4a4351bed59fd86e7ab95784a",
-  "archive_sha256": "e8504be96788ff2cf3dc78a7a5035c94ef4f99e75bb93bec91eb4df9b256d129",
-  "archive_members": 257,
-  "archive_files": 235,
-  "omitted_paths": 47,
-  "scope": "Cargo files, README.md, src/, runtime/, scripts/, tests/ and assets/ exported from the exact pinned local commit. Repository docs and CI files are excluded.",
-  "verification": "Every exported blob and executable bit was checked against the exact local Git tree. Archive timestamps and owner IDs are normalized; archive SHA-256 and contents were verified locally.",
-  "publication_boundary": "The legacy published_core_* keys name the intended release commit/tree. Remote publication was not verified: this commit is currently local and must be pushed before remote dependency acquisition. Deterministic source bundle and dependency manifests only; GUI behavior is verified separately.",
-  "source_nar_sha256": "sha256-owTvwSiWSmlqrl6Lz5+a98Cz0eP+2qTTLocY33pz+r0=",
-  "source_nar_verification": "Nix nix-hash 2.18.1 --type sha256 --base64 over the complete exact Git export, excluding .git. The same method reproduced the existing GTK flake hash for the previous public core commit; this is a recursive NAR hash, distinct from archive_sha256. No Nix or Flatpak application build was run.",
-  "nar_baseline_commit": "10120c3aa690ff5e1a66ae15f2418b753e2053f1",
-  "nar_baseline_sha256": "sha256-pWlvnbcgGitlQ+Hm30ONIB0z6NgGGWu7sJvlH4UuZB0=",
-  "nar_baseline_reproduced": true
+  "published_core_commit": "4b189cb7d55fe00d4ee39e74a143fc09d044c772",
+  "published_core_tree": "8bcb8f32d5cf06d58f9bb24e9bdfd22940eaee92",
+  "archive_sha256": "bb30ff187e5f328c6d2f1e0f4fb56a72cda0f7db0e3d9c207bf2d3b79daf9bfc",
+  "archive_members": 311,
+  "archive_files": 282,
+  "omitted_paths": 53,
+  "scope": "Cargo files, README.md, src/, runtime/, scripts/, tests/, assets/ and crates/ (including the independent engine) from the exact pinned Git commit. Other repository files are excluded.",
+  "verification": "Every exported blob hash and executable bit was checked against the exact pinned Git tree. Archive timestamps and owner IDs are normalized. The generator exports Git objects, not working-tree files.",
+  "publication_boundary": "The published_core_* keys identify the Cargo-pinned release commit/tree. This local exporter does not verify remote availability or perform application builds.",
+  "source_nar_verification": "No NAR hash is asserted. This subset archive is not a complete Git export; its SHA-256 is not a recursive NAR hash."
 }

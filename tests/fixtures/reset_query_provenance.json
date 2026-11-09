@@ -1,0 +1,16 @@
+{
+  "ember_head": "025d157631f33c0dc367f75117d0d847055731d7",
+  "ember_candidate_tree": "cdee016cf2383b813c8520342be9a1e996f0947f",
+  "core_head": "a6e47726d02bed2ca4a6ba1a682511f970853527",
+  "sha256": {
+    "ember-alternate/src/terminal/parser.rs": "8a837ed823465332d0c273e8b3fe40dd764eab2db29c3a38c503f6deea61f57d",
+    "ember-alternate/src/terminal/alternate_parity_tests.rs": "22d190df1a0d64086cc59d11d35e70bda47eb9d6ecd70d748a2628e3bf77edea",
+    "ember-alternate/src/terminal/structural_parity_tests.rs": "7bae4eff68a78e113ce86eb76f0a228f1a89ed192165331e7809c69e7acda4fb",
+    "ember-alternate/Cargo.toml": "a85f4d68d835ac25e947c4c4be85918a38db29945bf3f3e2eca7b8dfafbff86f",
+    "ember-alternate/Cargo.lock": "c2c5bafd31ccbfce7cb1403ba1c8d5c492493fc49dbaab9b76be90fd75414cbc",
+    "frost/src/terminal.rs": "b2317ca98a5353086a130927397f5647459346158d9738923c189178de1d4218",
+    "core-review/crates/jterm_engine/src/semantics.rs": "f597a223b7158211885658abd6407fc65d40b08b90fa7c2f4480da695dec3522"
+  },
+  "ember_published_base": "708099ed024e90de80cd7a61a9e364317496c290",
+  "frost_observed_head": "1f69facea3b6c1cb1fcdd56e37ff6605e36f2486"
+}

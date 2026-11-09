@@ -153,7 +153,7 @@ impl TerminalState {
     }
 }
 
-fn snapshot(t: &TerminalState) -> std::collections::BTreeMap<String, String> {
+pub(super) fn snapshot(t: &TerminalState) -> std::collections::BTreeMap<String, String> {
     let mut out = super::structural_parity_tests::snapshot(t);
     macro_rules! host {
         ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), format!("{:?}", t.$field));)*};
@@ -182,7 +182,7 @@ fn snapshot(t: &TerminalState) -> std::collections::BTreeMap<String, String> {
     out
 }
 
-fn seeded(seed: usize) -> TerminalState {
+pub(super) fn seeded(seed: usize) -> TerminalState {
     let mut t = super::structural_parity_tests::seeded();
     t.process_input(b"\x1b[1;1H\x1b]133;A\x07\x1b]133;C;id=finished\x07AA\x1b]133;D;0;id=finished\x07\x1b[2;1H\x1b]133;A\x07\x1b]133;C;id=active\x07BB");
     t.process_input(b"\x1b[1;1H\x1b_Ga=T,i=41,f=32,s=1,v=1,r=2,c=1,C=1;/wAA/w==\x1b\\");

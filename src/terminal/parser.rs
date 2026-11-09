@@ -222,121 +222,6 @@ impl super::TerminalState {
         }
     }
 
-    /// DCS `$q` is DECRQSS. Other DCS payloads stay opaque (no reply).
-    fn handle_dcs_payload(&mut self, payload: &[u8]) {
-        if let Some(pt) = payload.strip_prefix(b"$q") {
-            self.handle_decrqss(pt);
-        }
-    }
-
-    fn handle_decrqss(&mut self, pt: &[u8]) {
-        let reply = match pt {
-            b" q" => {
-                let n = match self.screen.cursor_shape {
-                    CursorShape::Underline => 4,
-                    CursorShape::Beam => 6,
-                    _ => 2,
-                };
-                format!("\x1bP1$r{n} q\x1b\\")
-            }
-            b"r" => format!(
-                "\x1bP1$r{};{}r\x1b\\",
-                self.screen.scroll_region_top + 1,
-                self.screen.scroll_region_bottom + 1
-            ),
-            b"\"q" => {
-                let n = if self.screen.current_flags.protected() {
-                    1
-                } else {
-                    0
-                };
-                format!("\x1bP1$r{n}\"q\x1b\\")
-            }
-            b"m" => format!("\x1bP1$r{}\x1b\\", self.decrqss_sgr_payload()),
-            b"\"p" => "\x1bP1$r65;1\"p\x1b\\".to_string(),
-            _ => "\x1bP0$r\x1b\\".to_string(),
-        };
-        self.output_buffer.extend_from_slice(reply.as_bytes());
-    }
-
-    fn decrqss_sgr_payload(&self) -> String {
-        let mut params: Vec<String> = Vec::new();
-        if self.screen.current_flags.bold() {
-            params.push("1".into());
-        }
-        if self.screen.current_flags.dim() {
-            params.push("2".into());
-        }
-        if self.screen.current_flags.italic() {
-            params.push("3".into());
-        }
-        match self.screen.current_flags.underline() {
-            UnderlineStyle::None => {}
-            UnderlineStyle::Single => params.push("4".into()),
-            UnderlineStyle::Double => params.push("21".into()),
-            UnderlineStyle::Curly => params.push("4:3".into()),
-            UnderlineStyle::Dotted => params.push("4:4".into()),
-            UnderlineStyle::Dashed => params.push("4:5".into()),
-        }
-        if self.screen.current_flags.blink() {
-            params.push("5".into());
-        }
-        if self.screen.current_flags.inverse() {
-            params.push("7".into());
-        }
-        if self.screen.current_flags.strikethrough() {
-            params.push("9".into());
-        }
-        params.extend(Self::sgr_color_params(self.screen.current_fg, true));
-        params.extend(Self::sgr_color_params(self.screen.current_bg, false));
-        if params.is_empty() {
-            "0m".into()
-        } else {
-            format!("{}m", params.join(";"))
-        }
-    }
-
-    fn sgr_color_params(color: Color, foreground: bool) -> Vec<String> {
-        let named = |n: u8| {
-            vec![if foreground {
-                n.to_string()
-            } else {
-                (n + 10).to_string()
-            }]
-        };
-        match color {
-            Color::Default => Vec::new(),
-            Color::Black => named(30),
-            Color::Red => named(31),
-            Color::Green => named(32),
-            Color::Yellow => named(33),
-            Color::Blue => named(34),
-            Color::Magenta => named(35),
-            Color::Cyan => named(36),
-            Color::White => named(37),
-            Color::BrightBlack => named(90),
-            Color::BrightRed => named(91),
-            Color::BrightGreen => named(92),
-            Color::BrightYellow => named(93),
-            Color::BrightBlue => named(94),
-            Color::BrightMagenta => named(95),
-            Color::BrightCyan => named(96),
-            Color::BrightWhite => named(97),
-            Color::Indexed(index) => vec![
-                if foreground { "38" } else { "48" }.into(),
-                "5".into(),
-                index.to_string(),
-            ],
-            Color::Rgb(red, green, blue) => vec![
-                if foreground { "38" } else { "48" }.into(),
-                "2".into(),
-                red.to_string(),
-                green.to_string(),
-                blue.to_string(),
-            ],
-        }
-    }
-
     /// LF / IND (and VT, FF, NEL's second half): move down one row, scrolling
     /// only when exactly on the bottom margin; below the region the cursor
     /// just moves down and never scrolls.
@@ -400,32 +285,6 @@ impl super::TerminalState {
         self.note_output_cursor_reposition(true);
         self.dirty_region.mark_all(rows);
         self.mark_rows_dirty(0, rows.saturating_sub(1));
-    }
-
-    /// DECSTR (`CSI ! p`): soft reset of the modes and drawing state DECSTR
-    /// is defined to touch, leaving the screen and cursor position alone.
-    fn soft_reset(&mut self) {
-        self.screen.current_fg = Color::Default;
-        self.screen.current_bg = Color::Default;
-        self.global_bg = Color::Default;
-        self.screen.current_flags = StyleFlags::default();
-        self.screen.g0_charset = Charset::Ascii;
-        self.screen.g1_charset = Charset::Ascii;
-        self.screen.active_charset = Charset::Ascii;
-        self.screen.scroll_region_top = 0;
-        self.screen.scroll_region_bottom = self.screen.grid.rows().saturating_sub(1);
-        self.screen.saved_state = None;
-        self.screen.origin_mode = false;
-        self.screen.insert_mode = false;
-        // DECTCEM and DECAWM on, DECCKM (application cursor keys) off,
-        // DECKPAM (application keypad) off. Alternate Scroll returns to the
-        // xterm-resource default (enabled).
-        self.protocol.modes_mut().insert(25);
-        self.protocol.modes_mut().insert(7);
-        self.protocol.modes_mut().insert(1007);
-        self.protocol.modes_mut().remove(&1);
-        self.protocol.modes_mut().remove(&66);
-        self.screen.pending_wrap = false;
     }
 
     /// DECRQM answer for a DEC private mode: 1 set, 2 reset, 0 unrecognised.
@@ -581,7 +440,7 @@ impl super::TerminalState {
                     bel_terminated,
                 } => match kind {
                     StringKind::Osc => self.handle_osc_payload(&payload, bel_terminated),
-                    StringKind::Dcs => self.handle_dcs_payload(&payload),
+                    StringKind::Dcs => {} // Non-DECRQSS DCS remains opaque.
                     StringKind::Apc => self.handle_kitty_apc_payload(&payload),
                     StringKind::Sos | StringKind::Pm => {}
                 },
@@ -751,9 +610,7 @@ impl super::TerminalState {
                 }
             }
             'p' => {
-                if intermediates == *b"!" && private_prefix.is_none() {
-                    self.soft_reset();
-                } else if intermediates == *b"$" {
+                if intermediates == *b"$" {
                     // DECRQM. Apps probe before enabling a mode (Claude Code
                     // asks for ?2026 and ?1016 at startup) and a silent
                     // terminal costs each probe a timeout.
@@ -1224,3 +1081,11 @@ impl super::TerminalState {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "reset_query_oracles.rs"]
+mod reset_query_oracles;
+
+#[cfg(test)]
+#[path = "reset_query_engine_test_adapter.rs"]
+mod reset_query_engine_test_adapter;
