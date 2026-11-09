@@ -5,9 +5,7 @@ use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use jterm_core::click_cursor;
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
-use jterm_engine::screen::{
-    Charset, RegionDirection, RegionMutation, RowMutation, SavedCursorState, ScreenState,
-};
+use jterm_engine::screen::{Charset, RegionDirection, RegionMutation, RowMutation, ScreenState};
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 pub use watch::{WatchCommand, WatchParsed};
@@ -684,3 +682,6 @@ struct ClearedBlocksStash {
     provenance: Vec<FinishedOutputProvenance>,
     captured_output_bytes: usize,
 }
+
+#[cfg(test)]
+mod alternate_parity_tests;

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 type Snapshot = BTreeMap<String, String>;
 
-fn seeded() -> TerminalState {
+pub(super) fn seeded() -> TerminalState {
     let mut t = TerminalState::new(6, 5);
     seed_active(&mut t);
     for row in 0..5 {
@@ -38,7 +38,7 @@ fn seed_active(t: &mut TerminalState) {
     t.screen.pending_wrap = true;
 }
 
-fn prime(t: &mut TerminalState) {
+pub(super) fn prime(t: &mut TerminalState) {
     t.get_visible_cells();
     t.projected_viewport(HistoryProjection::identity(), true);
     t.dirty_region.clear();
@@ -46,7 +46,7 @@ fn prime(t: &mut TerminalState) {
     t.row_versions.fill(3);
 }
 
-fn snapshot(t: &TerminalState) -> Snapshot {
+pub(super) fn snapshot(t: &TerminalState) -> Snapshot {
     let mut out = Snapshot::new();
     macro_rules! host {
         ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), format!("{:?}", t.$field));)*};

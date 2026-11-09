@@ -56,3 +56,23 @@ expected values. `scripts/intern-oracle-fixture.py unpack INPUT NEW_OUTPUT`
 independently checks the original length and SHA-256. The test-only decoder
 supports the original arrays and the packed representation, with explicit
 invalid-reference, invalid-tag and non-object-patch rejection tests.
+
+## Reconstructed alternate-screen adapter
+
+The production adapter delegates physical alternate entry/exit to the pinned
+engine's `ScreenState::enter_alternate_screen` and `leave_alternate_screen`.
+Selection, graphics/keyboard screen switching, watch boundaries, search seals,
+working directory, provenance invalidation, dirty rows, revisions and global
+background remain host effects. RIS remains host-owned. Engine entry/exit
+finishes screen mutations before host hooks; the retained hooks only mutate
+their own state/revision/cache records and do not read intermediate screen
+fields. Clear effects are consumed after graphics/keyboard/watch switching.
+
+`alternate_parity_tests.rs` preserves the pre-migration Ember transition and
+clear algorithms as independent test-only controls. It compares 422 deterministic
+snapshots and 12,000 generated transitions, with drawing, DECSC/DECRC, keyboard,
+hyperlink, margins and RIS input interleaved. Snapshots cover both grids/IDs/wraps,
+saved and live drawing state, selection, populated graphics/provenance, keyboard
+stacks, watch, cache and dirty/search revisions. Seal epoch changes are compared
+without equating process-global epoch identifiers. These are reconstructed
+controls, not a recovered copy of the historical lost golden snapshot artifact.
