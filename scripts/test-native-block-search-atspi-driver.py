@@ -372,4 +372,118 @@ class ContinueTests(unittest.TestCase):
     self.assertEqual(driver.smoke.screenshot.call_count,2 if continued else 1)
     self.assertEqual(invoke.call_count,1 if continued else 0)
 
+class StableStopCaptureTests(unittest.TestCase):
+ def tree(self,height=200):
+  tree=Tests().button_tree()
+  tree['nodes'][1]['screen_extents']=[0,0,500,500]
+  tree['nodes'][2]['screen_extents']=[0,0,200,height]
+  return tree
+ def driver(self,directory,trees):
+  driver=Tests().driver(directory)
+  sequence=iter(trees)
+  def read(label):
+   driver.serial+=1
+   tree=next(sequence)
+   return tree,p.public.controls(tree,driver.expected)
+  driver.read=Mock(side_effect=read)
+  driver.smoke.run.return_value.stdout='1280 900'
+  driver.smoke.screenshot.side_effect=lambda label:(driver.smoke.out/(label+'.png')).write_bytes(label.encode())
+  return driver
+ def test_recapture_discards_geometry_race_and_invokes_stop_once(self):
+  with tempfile.TemporaryDirectory() as directory:
+   after=self.tree(220);driver=self.driver(directory,[self.tree(),after,after,after])
+   with patch.object(p,'invoke_button',return_value={}) as invoke,patch.object(p.time,'sleep'):
+    screenshot=driver.smoke.screenshot.side_effect
+    def checked_capture(label):
+     invoke.assert_not_called();screenshot(label)
+    driver.smoke.screenshot.side_effect=checked_capture
+    driver.button('Stop search','stop')
+   invoke.assert_called_once_with(after,driver.expected,'Stop search')
+   self.assertEqual(driver.smoke.screenshot.call_count,2)
+   self.assertEqual(len(list(driver.smoke.out.glob('*.png'))),2)
+   records=list(driver.out.glob('public-evidence*.json'));self.assertEqual(len(records),1)
+   self.assertTrue(json.loads(records[0].read_text())['after_verified'])
+   self.assertEqual(sum(e['event']=='discarded-pre-stop-capture' for e in driver.smoke.events),1)
+ def test_continuous_instability_exhausts_three_captures_without_action(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory,[self.tree(h) for h in [200,220,220,240,240,260]])
+   with patch.object(p,'invoke_button') as invoke,patch.object(p.time,'sleep'):
+    with self.assertRaisesRegex(RuntimeError,'budget exhausted'):driver.button('Stop search','stop')
+   invoke.assert_not_called();self.assertEqual(driver.smoke.screenshot.call_count,3)
+   self.assertEqual(list(driver.out.glob('public-evidence*.json')),[])
+ def test_target_owner_query_and_scope_changes_between_attempts_are_fatal(self):
+  for case in ['target-bounds','target-path','owner','query','scope','missing']:
+   with self.subTest(case=case),tempfile.TemporaryDirectory() as directory:
+    after=self.tree(220);changed=copy.deepcopy(after)
+    if case=='target-bounds':changed['nodes'][-1]['screen_extents'][0]+=1
+    elif case=='target-path':
+     old=changed['nodes'][-1]['path'];changed['nodes'][-1]['path']+='new'
+     changed['nodes'][2]['children']=[changed['nodes'][-1]['path'] if v==old else v for v in changed['nodes'][2]['children']]
+    elif case=='owner':
+     changed['owner']=':9.9'
+     for node in changed['nodes']:node['owner']=':9.9'
+    elif case=='query':changed['nodes'][-2]['text']='OTHER'
+    elif case=='scope':
+     changed['nodes'][3]['states'][0]&=~(1<<20)
+     changed['nodes'][5]['states'][0]|=1<<20
+    else:
+     old=changed['nodes'].pop()['path'];changed['nodes'][2]['children'].remove(old)
+    driver=self.driver(directory,[self.tree(),after,changed])
+    with patch.object(p,'invoke_button') as invoke,patch.object(p.time,'sleep'):
+     with self.assertRaises(RuntimeError):driver.button('Stop search','stop')
+    invoke.assert_not_called();self.assertEqual(driver.smoke.screenshot.call_count,1)
+    self.assertEqual(list(driver.out.glob('public-evidence*.json')),[])
+ def test_target_change_during_capture_is_not_retryable(self):
+  with tempfile.TemporaryDirectory() as directory:
+   after=self.tree(220);after['nodes'][-1]['screen_extents'][0]+=1
+   driver=self.driver(directory,[self.tree(),after])
+   with patch.object(p,'invoke_button') as invoke,patch.object(p.time,'sleep'):
+    with self.assertRaisesRegex(RuntimeError,'changed'):driver.button('Stop search','stop')
+   invoke.assert_not_called();self.assertEqual(driver.read.call_count,2)
+ def test_image_corruption_is_fatal_even_with_container_geometry_change(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory,[self.tree(),self.tree(220)])
+   read=driver.read.side_effect
+   def corrupt_after(label):
+    result=read(label)
+    if label.endswith('-after'):next(driver.smoke.out.glob('*.png')).write_bytes(b'corrupted')
+    return result
+   driver.read.side_effect=corrupt_after
+   with patch.object(p,'invoke_button') as invoke:
+    with self.assertRaisesRegex(RuntimeError,'Screenshot changed'):driver.button('Stop search','stop')
+   invoke.assert_not_called();self.assertEqual(driver.smoke.screenshot.call_count,1)
+ def test_retry_consumes_shared_deadline_without_action(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory,[self.tree(),self.tree(220)]);clock=[0]
+   with patch.object(p,'invoke_button') as invoke,patch.object(p.time,'monotonic',side_effect=lambda:clock[0]),patch.object(p.time,'sleep',side_effect=lambda _:clock.__setitem__(0,8)):
+    with self.assertRaisesRegex(RuntimeError,'budget exhausted'):driver.button('Stop search','stop')
+   invoke.assert_not_called();self.assertEqual(driver.smoke.screenshot.call_count,1)
+ def test_raw_operation_deadline_is_not_extended(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory,[self.tree(),self.tree()]);driver.raw_deadline=.5;clock=[0]
+   capture=driver.smoke.screenshot.side_effect
+   def slow_capture(label):capture(label);clock[0]=1
+   driver.smoke.screenshot.side_effect=slow_capture
+   with patch.object(p,'invoke_button') as invoke,patch.object(p.time,'monotonic',side_effect=lambda:clock[0]):
+    with self.assertRaisesRegex(RuntimeError,'deadline exhausted'):driver.button('Stop search','stop')
+   invoke.assert_not_called()
+ def test_deadline_rechecked_immediately_before_action(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=Tests().driver(directory);driver.stop_evidence=Mock(return_value=(self.tree(),{}))
+   with patch.object(p,'invoke_button') as invoke,patch.object(p.time,'monotonic',side_effect=[0,9]):
+    with self.assertRaisesRegex(RuntimeError,'deadline exhausted'):driver.button('Stop search','stop')
+   invoke.assert_not_called()
+ def test_action_failure_is_never_retried(self):
+  with tempfile.TemporaryDirectory() as directory:
+   tree=self.tree();driver=self.driver(directory,[tree,tree])
+   with patch.object(p,'invoke_button',side_effect=RuntimeError('action failed')) as invoke:
+    with self.assertRaisesRegex(RuntimeError,'action failed'):driver.button('Stop search','stop')
+   invoke.assert_called_once();self.assertEqual(driver.smoke.screenshot.call_count,1)
+ def test_other_evidence_still_fails_closed_on_geometry_change(self):
+  with tempfile.TemporaryDirectory() as directory:
+   driver=self.driver(directory,[self.tree(),self.tree(220)])
+   with self.assertRaises(p.PickerGeometryChanged):
+    driver.wait_evidence(lambda t:p.action_button(t,driver.expected,'Stop search'),'not-a-stop-action')
+   self.assertEqual(driver.smoke.screenshot.call_count,1)
+
 if __name__=='__main__':unittest.main()

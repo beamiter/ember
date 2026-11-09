@@ -21,6 +21,13 @@ class MissingTarget(RuntimeError):
     pass
 
 
+class PickerGeometryChanged(RuntimeError):
+    """Rejected observation, never evidence or permission to invoke an action."""
+    def __init__(self, anchor):
+        super().__init__('Public evidence changed across screenshot: picker bounds')
+        self.anchor=anchor
+
+
 def action_button(tree, expected, name):
     found=public.controls(tree,expected)
     picker=found['editor']['parent']
@@ -135,8 +142,14 @@ def evidence_identity(tree, expected, node):
     found=public.controls(tree,expected)
     nodes={n['path']:n for n in tree['nodes']}
     picker=nodes[found['editor']['parent']];window=nodes[picker['parent']]
-    return {'controls':public.control_identity(tree,found), 'window':window,
-            'picker_bounds':picker['screen_extents'], 'node':node}
+    return {'controls':public.control_identity(tree,found), 'control_states':found,
+            'window':window, 'picker_bounds':picker['screen_extents'], 'node':node}
+
+
+def capture_anchor(identity):
+    # Only the containing picker rectangle may settle before Stop. Ownership,
+    # query/scope/focus, window, target identity, actions and target bounds may not.
+    return {key:value for key,value in identity.items() if key!='picker_bounds'}
 
 
 def invoke_button(tree, expected, name):
@@ -239,12 +252,15 @@ class Driver:
         (self.out/(label+'.json')).write_text(json.dumps(record,indent=2))
         self.smoke.screenshot('public-query-'+str(self.serial))
 
-    def evidence(self, select, label, timeout=8):
+    def evidence(self, select, label, timeout=8, expected_anchor=None):
         """Fresh public tree / immutable pixels / public tree bracket."""
         deadline=time.monotonic()+timeout
         tree,_=self.read(label+'-evidence-before')
         node=select(tree)
         before=evidence_identity(tree,self.expected,node)
+        anchor=capture_anchor(before)
+        if expected_anchor is not None and anchor!=expected_anchor:
+            raise RuntimeError('Public target identity changed before recapture')
         image_label=f'public-evidence-{self.serial:04d}-{label}'
         image=self.smoke.out/(image_label+'.png')
         if image.exists():raise RuntimeError('Refusing to reuse prior screenshot')
@@ -261,11 +277,14 @@ class Driver:
             after_node=select(after_tree)
         except MissingTarget as error:
             raise RuntimeError('Public target disappeared across screenshot') from error
-        if evidence_identity(after_tree,self.expected,after_node)!=before:
-            raise RuntimeError('Public evidence changed across screenshot')
+        after=evidence_identity(after_tree,self.expected,after_node)
         if hashlib.sha256(image.read_bytes()).hexdigest()!=digest:
             raise RuntimeError('Screenshot changed during public evidence')
         if time.monotonic()>=deadline:raise RuntimeError('Public evidence deadline exhausted')
+        if after!=before:
+            if capture_anchor(after)==anchor:
+                raise PickerGeometryChanged(anchor)
+            raise RuntimeError('Public evidence changed across screenshot')
         record=dict(label=label,pid=tree['pid'],owner=tree['owner'],window=self.window,
                     image=str(image),image_sha256=digest,dimensions=[width,height],
                     before=before,after_verified=True,oracle='exact public label; pixels retained separately')
@@ -353,10 +372,45 @@ class Driver:
             require_resumed=True
         raise RuntimeError('Raw completion deadline exhausted')
 
+    def stop_evidence(self, select, label, deadline):
+        """Bounded observation-only recapture before Stop; never retry an action.
+
+        A progress label can resize its picker during capture. Retain that
+        rejected PNG/tree pair, but do not accept it or invoke anything. Only
+        this container-geometry mismatch can request a wholly fresh bracket.
+        All other comparisons stay fatal, including target changes between
+        attempts. Result/navigation evidence does not use this retry path.
+        """
+        anchor=None
+        rejected=0
+        while time.monotonic()<deadline and rejected<3:
+            try:
+                return self.evidence(select,label,timeout=max(0,deadline-time.monotonic()),
+                                     expected_anchor=anchor)
+            except MissingTarget as error:
+                if anchor is not None:
+                    raise RuntimeError('Public target disappeared before recapture') from error
+            except PickerGeometryChanged as error:
+                anchor=error.anchor
+                rejected+=1
+                self.event(event='discarded-pre-stop-capture',label=label,
+                           attempt=rejected,reason='picker bounds changed; no action invoked')
+            if rejected<3:
+                time.sleep(min(.1,max(0,deadline-time.monotonic())))
+        raise RuntimeError('Stable pre-Stop evidence budget exhausted')
+
     def button(self, name, label):
         allowed=('Search this retained output','Stop search','Restart this output','Earlier history')
         if name not in allowed:raise RuntimeError('Unapproved operation in bounded adapter')
-        tree,_=self.wait_evidence(lambda t:action_button(t,self.expected,name),label)
+        select=lambda t:action_button(t,self.expected,name)
+        if name=='Stop search':
+            deadline=time.monotonic()+8
+            if self.raw_deadline is not None:deadline=min(deadline,self.raw_deadline)
+            tree,_=self.stop_evidence(select,label,deadline)
+            if time.monotonic()>=deadline:
+                raise RuntimeError('Stable pre-Stop evidence deadline exhausted')
+        else:
+            tree,_=self.wait_evidence(select,label)
         if name in ('Search this retained output','Restart this output'):
             self.raw_deadline=time.monotonic()+9.5
         result=invoke_button(tree,self.expected,name)
