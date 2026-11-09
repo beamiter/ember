@@ -48,7 +48,7 @@ manifest.append({'source': 'src/config_panel.rs', 'marker': 'font group regressi
                  'sha256': hashlib.sha256(tests.encode()).hexdigest()})
 sidebar_type = '#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]\n#[serde(rename_all = "snake_case")]\n' + block(sidebar, 'pub enum SidebarView {', source='src/sidebar.rs')
 terminal_clamp = block(terminal, 'pub fn clamp_terminal_dimensions(', source='src/terminal/mod.rs')
-terminal_constants = '\n'.join(line for line in terminal.splitlines() if line.startswith(('pub const MAX_TERMINAL_COLS:', 'pub const MAX_TERMINAL_ROWS:')))
+terminal_constants = '\n'.join(line for line in terminal.splitlines() if line.startswith(('pub const MAX_TERMINAL_COLS:', 'pub const MAX_TERMINAL_ROWS:', 'pub use jterm_engine::MAX_TERMINAL_COLS;')))
 panel_width_names = ('NAVIGATION_MIN_WIDTH', 'NAVIGATION_MAX_WIDTH',
                      'INSPECTOR_MIN_WIDTH', 'INSPECTOR_MAX_WIDTH')
 panel_width_lines = [line for line in glass_source.splitlines()

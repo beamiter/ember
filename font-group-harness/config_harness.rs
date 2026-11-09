@@ -93,7 +93,7 @@ pub enum SidebarView {
 }
 }
 mod terminal {
-pub const MAX_TERMINAL_COLS: usize = 1024;
+pub use jterm_engine::MAX_TERMINAL_COLS;
 pub const MAX_TERMINAL_ROWS: usize = 512;
 pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
     (

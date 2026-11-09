@@ -11,6 +11,7 @@ egui = "=0.36.1"
 path = "lib.rs"
 
 [dev-dependencies]
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a6e47726d02bed2ca4a6ba1a682511f970853527" }
 shared_core = { package = "jterm_core", version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "d3b1eb6180ea0e3bd4f6e0d1a09ef129ab3d442b" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"

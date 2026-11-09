@@ -175,6 +175,7 @@ dependencies = [
  "dirs",
  "egui",
  "jterm_core",
+ "jterm_engine",
  "libc",
  "once_cell",
  "serde",
@@ -417,6 +418,14 @@ dependencies = [
  "toml",
  "unicode-width",
  "uuid",
+]
+
+[[package]]
+name = "jterm_engine"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=a6e47726d02bed2ca4a6ba1a682511f970853527#a6e47726d02bed2ca4a6ba1a682511f970853527"
+dependencies = [
+ "smallvec",
 ]
 
 [[package]]
