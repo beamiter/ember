@@ -227,31 +227,21 @@ impl super::TerminalState {
     /// only when exactly on the bottom margin; below the region the cursor
     /// just moves down and never scrolls.
     fn line_feed(&mut self) {
-        self.screen.pending_wrap = false;
-        let departed_row_id = self.screen.grid.row_id(self.screen.cursor_row);
+        let prior_total = self.total_lines_scrolled;
+        let departure = self
+            .apply_vertical_motion(VerticalMotion::LineFeed)
+            .unwrap();
         let departed_boundary = BufferAnchor {
-            line_id: self
-                .total_lines_scrolled
-                .saturating_add(self.screen.cursor_row as u64),
-            column: self.screen.grid.row_len(),
+            line_id: prior_total.saturating_add(departure.row as u64),
+            column: departure.width,
         };
-        if self.screen.cursor_row == self.screen.scroll_region_bottom {
-            // 恰在滚动区底边距:向上滚动区域,光标保持在底行
-            self.scroll_region_up(
-                self.screen.scroll_region_top,
-                self.screen.scroll_region_bottom,
-            );
-        } else if self.screen.cursor_row + 1 < self.screen.grid.rows() {
-            // 区内或区外(底边距下方)正常下移,不滚动
-            self.screen.cursor_row += 1;
-        }
         let next_boundary = BufferAnchor {
             line_id: self
                 .total_lines_scrolled
                 .saturating_add(self.screen.cursor_row as u64),
             column: 0,
         };
-        self.note_output_hard_line_advance(departed_row_id, departed_boundary, next_boundary);
+        self.note_output_hard_line_advance(departure.row_id, departed_boundary, next_boundary);
     }
 
     /// Two-byte-and-longer ESC sequences without a dedicated arm in
@@ -340,25 +330,11 @@ impl super::TerminalState {
                         match final_byte {
                             b'c' => self.hard_reset(),
                             b'M' => {
-                                self.screen.pending_wrap = false;
-                                if self.screen.cursor_row == self.screen.scroll_region_top {
-                                    if self.screen.scroll_region_bottom < self.screen.grid.rows()
-                                        && self.screen.scroll_region_top
-                                            <= self.screen.scroll_region_bottom
-                                    {
-                                        self.scroll_region_down(
-                                            self.screen.scroll_region_top,
-                                            self.screen.scroll_region_bottom,
-                                        );
-                                    }
-                                } else {
-                                    self.screen.cursor_row =
-                                        self.screen.cursor_row.saturating_sub(1);
-                                }
+                                self.apply_vertical_motion(VerticalMotion::ReverseIndex);
                             }
                             b'D' => self.line_feed(),
                             b'E' => {
-                                self.screen.cursor_col = 0;
+                                self.screen.begin_next_line();
                                 self.note_output_cursor_reposition(false);
                                 self.line_feed();
                             }
@@ -980,3 +956,7 @@ mod mode_mutation_oracles;
 #[cfg(test)]
 #[path = "fullscreen_fill_oracles.rs"]
 mod fullscreen_fill_oracles;
+
+#[cfg(test)]
+#[path = "vertical_motion_oracles.rs"]
+pub(super) mod vertical_motion_oracles;

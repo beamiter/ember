@@ -5,7 +5,10 @@ use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use jterm_core::click_cursor;
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
-use jterm_engine::screen::{Charset, RegionDirection, RegionMutation, RowMutation, ScreenState};
+use jterm_engine::screen::{
+    Charset, RegionDirection, RegionMutation, RowMutation, ScreenState, VerticalDeparture,
+    VerticalMotion,
+};
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 pub use watch::{WatchCommand, WatchParsed};

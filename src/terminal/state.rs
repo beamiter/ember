@@ -868,18 +868,26 @@ impl super::TerminalState {
     /// 此前换行只与 grid.rows() 比较并调用全屏 scroll_down(),会让区内文本溢出到
     /// 底边距下方,破坏 pager/分屏 TUI 布局。
     pub(super) fn wrap_to_next_line(&mut self) {
-        let departed_row_id = self.screen.grid.row_id(self.screen.cursor_row);
-        self.screen.grid.row_wrapped[self.screen.cursor_row] = true;
-        self.screen.cursor_col = 0;
-        if self.screen.cursor_row == self.screen.scroll_region_bottom {
-            self.scroll_region_up(
-                self.screen.scroll_region_top,
-                self.screen.scroll_region_bottom,
-            );
-        } else if self.screen.cursor_row + 1 < self.screen.grid.rows() {
-            self.screen.cursor_row += 1;
+        let departure = self.apply_vertical_motion(VerticalMotion::Wrap).unwrap();
+        self.rebase_active_output_start_after_initial_wrap(departure.row_id);
+    }
+
+    /// The engine owns physical cursor motion and row replacement. Complete
+    /// every host region effect before returning to LF ownership or wrap rebase.
+    pub(super) fn apply_vertical_motion(
+        &mut self,
+        motion: VerticalMotion,
+    ) -> Option<VerticalDeparture> {
+        let (transfer_outgoing, allow_alt_scrollback) =
+            self.vertical_archive_admission(self.screen.scroll_region_top);
+        let next = &mut self.next_raw_row_id;
+        let effect = self
+            .screen
+            .vertical_motion(motion, transfer_outgoing, || allocate_raw_row_id_from(next));
+        if let Some(region) = effect.region {
+            self.apply_vertical_region_effects(region, transfer_outgoing, allow_alt_scrollback);
         }
-        self.rebase_active_output_start_after_initial_wrap(departed_row_id);
+        effect.departure
     }
 
     pub(super) fn create_blank_cell(&self) -> TerminalCell {
@@ -1135,6 +1143,12 @@ impl super::TerminalState {
     }
 
     fn push_scrollback_line(&mut self, line: ScrollbackLine, allow_alt_buffer: bool) {
+        #[cfg(test)]
+        super::parser::vertical_motion_oracles::observe(
+            self,
+            "history-enter",
+            format!("{:?}", line.raw_row_id()),
+        );
         if self.screen.use_alt_buffer && !allow_alt_buffer {
             return;
         }
@@ -1160,6 +1174,8 @@ impl super::TerminalState {
         }
         self.mark_row_identity_changed_preserving_scroll_journal();
         self.invalidate_scrollback_view_cache();
+        #[cfg(test)]
+        super::parser::vertical_motion_oracles::observe(self, "history-complete", String::new());
     }
 
     pub(super) fn scroll_region_down(&mut self, top: usize, bottom: usize) {
@@ -1172,14 +1188,10 @@ impl super::TerminalState {
         else {
             return;
         };
-        self.apply_region_identity_effects(&effect);
-        self.kitty_graphics
-            .scroll_region_down(effect.top, effect.bottom, effect.count);
-        self.dirty_region.mark_rows(effect.top, effect.bottom);
-        self.mark_rows_dirty(effect.top, effect.bottom);
+        self.apply_vertical_region_effects(effect, false, false);
     }
 
-    pub(super) fn scroll_region_up(&mut self, top: usize, bottom: usize) {
+    fn vertical_archive_admission(&self, top: usize) -> (bool, bool) {
         // Real primary top-margin transfers remain eligible during an inline
         // CLI session. Alternate rows transfer only during sync output without
         // an inline owner; copied frame archival has its separate host policy.
@@ -1187,6 +1199,11 @@ impl super::TerminalState {
             && self.sync_output_active
             && !self.inline_cli_owner_active();
         let transfer_outgoing = top == 0 && (!self.screen.use_alt_buffer || allow_alt_scrollback);
+        (transfer_outgoing, allow_alt_scrollback)
+    }
+
+    pub(super) fn scroll_region_up(&mut self, top: usize, bottom: usize) {
+        let (transfer_outgoing, allow_alt_scrollback) = self.vertical_archive_admission(top);
         let next = &mut self.next_raw_row_id;
         let Some(effect) = self.screen.scroll_region_one(
             RegionDirection::Up,
@@ -1197,22 +1214,39 @@ impl super::TerminalState {
         ) else {
             return;
         };
+        self.apply_vertical_region_effects(effect, transfer_outgoing, allow_alt_scrollback);
+    }
+
+    fn apply_vertical_region_effects(
+        &mut self,
+        effect: RegionMutation,
+        transfer_outgoing: bool,
+        allow_alt_scrollback: bool,
+    ) {
         self.apply_region_identity_effects(&effect);
-        self.kitty_graphics.scroll_region_up(
-            effect.top,
-            effect.bottom,
-            effect.count,
-            transfer_outgoing,
-        );
+        match effect.direction {
+            RegionDirection::Up => self.kitty_graphics.scroll_region_up(
+                effect.top,
+                effect.bottom,
+                effect.count,
+                transfer_outgoing,
+            ),
+            RegionDirection::Down => {
+                self.kitty_graphics
+                    .scroll_region_down(effect.top, effect.bottom, effect.count)
+            }
+        }
+
+        #[cfg(test)]
+        super::parser::vertical_motion_oracles::observe(self, "kitty-complete", String::new());
         self.dirty_region.mark_rows(effect.top, effect.bottom);
         self.mark_rows_dirty(effect.top, effect.bottom);
         for removed in effect.removed {
             if let Some(line) = removed.captured {
-                // Consume a removed row with its original identity. Never route
-                // this through the copied-snapshot helper that allocates an ID.
+                // Transfer the original ID, never allocate a copied-snapshot ID.
                 self.push_scrollback_transferred_with_options(line, allow_alt_scrollback);
                 if !self.screen.use_alt_buffer
-                    && bottom + 1 == self.screen.grid.rows()
+                    && effect.bottom + 1 == self.screen.grid.rows()
                     && self.full_screen_scroll_revision != 0
                 {
                     self.full_screen_scroll_revision =
@@ -1226,6 +1260,8 @@ impl super::TerminalState {
     /// shifts are atomic to the host, so invalidation never resolves an outgoing
     /// identity from the already-shifted grid. A transferred row keeps ownership.
     fn apply_region_identity_effects(&mut self, effect: &RegionMutation) {
+        #[cfg(test)]
+        super::parser::vertical_motion_oracles::observe(self, "identity", format!("{:?}", effect));
         for removed in &effect.removed {
             if removed.captured.is_none() {
                 self.forget_output_provenance_for_raw_row(removed.row_id);
@@ -1317,6 +1353,12 @@ impl super::TerminalState {
 
     #[inline]
     pub(super) fn mark_rows_dirty(&mut self, start: usize, end: usize) {
+        #[cfg(test)]
+        super::parser::vertical_motion_oracles::observe(
+            self,
+            "dirty",
+            format!("{:?}", (start, end)),
+        );
         for row in start..=end.min(self.row_versions.len().saturating_sub(1)) {
             self.row_versions[row] = self.grid_version;
         }
@@ -1863,6 +1905,12 @@ impl super::TerminalState {
         departed_boundary: BufferAnchor,
         next_boundary: BufferAnchor,
     ) {
+        #[cfg(test)]
+        super::parser::vertical_motion_oracles::observe(
+            self,
+            "hard-boundary",
+            format!("{:?}", (departed_row_id, departed_boundary, next_boundary)),
+        );
         if self.screen.use_alt_buffer {
             return;
         }
@@ -1938,6 +1986,12 @@ impl super::TerminalState {
     /// conservatively ineligible because a single contiguous raw range cannot
     /// prove that skipped or revisited rows belong to command output.
     pub(super) fn note_output_cursor_reposition(&mut self, non_linear: bool) {
+        #[cfg(test)]
+        super::parser::vertical_motion_oracles::observe(
+            self,
+            "reposition",
+            format!("{}", non_linear),
+        );
         if self.screen.use_alt_buffer {
             return;
         }
@@ -1951,6 +2005,12 @@ impl super::TerminalState {
     /// already-full command/header row part of the output. Rebase C to the new
     /// physical row; later wraps retain the original output start.
     fn rebase_active_output_start_after_initial_wrap(&mut self, departed_row_id: RawRowId) {
+        #[cfg(test)]
+        super::parser::vertical_motion_oracles::observe(
+            self,
+            "wrap-rebase",
+            format!("{:?}", departed_row_id),
+        );
         if self.screen.use_alt_buffer {
             return;
         }
@@ -7238,3 +7298,7 @@ impl super::TerminalState {
 
 #[path = "chat.rs"]
 mod chat;
+
+#[cfg(test)]
+#[path = "vertical_motion_frozen.rs"]
+mod vertical_motion_frozen;

@@ -1,0 +1,92 @@
+{
+  "ember": "28923917579531d99511353993f6873facc14f1a",
+  "core": "6ed85cafcd1b1f8011182baa4fec10bf8e2ed107",
+  "original_sha256": {
+    "parser.rs": "da07f0a576bd66068400eecd52b56fcd91ceb8367d2976693d1a9ff23c41142d",
+    "state.rs": "32a2ac3e3fba92d8f04ca2f717a17b193be928e439ee3eb134325c4fd8209f18",
+    "chat.rs": "a7e07f44ace3b247f73f4da13dc3e14be90909a1388ba4083512db63da29a031",
+    "search_chunk.rs": "4d0988b07a43310f6f7adf31a66652d374359d42370dd3759bfb0810d08a7f39"
+  },
+  "records": 35792,
+  "unique_values": 5584,
+  "lanes": 88,
+  "raw_sha256": "e982ae2a3fcc4572bdf16252fc84f93758d0fbbc199919f6566640fed5541cc9",
+  "golden_sha256": "4012a7af5a2820cbbfb26f25cd1d9668b2c190fbfb90615d4cb9e1baeaca68b9",
+  "capture": "Original published production plus cfg(test)-only scoped observation. No replacement implementation exists. Frozen algorithm copies are supplemental only.",
+  "harness_sha256": "d4fc3603746d5b5dcf0ace41f265e3c2bf24323e4ebed7f09c9d78feef205eba",
+  "frozen_sha256": "bcaccc480b25d4caeee16d80007dea071795c969abfa6e47e64d13fa45f760cb",
+  "runtime_mutants": [
+    {
+      "mutant": "omit_successful_wrap_rebase",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: first_c0_g0_r0_soft_ascii_after: active_output_provenance"
+    },
+    {
+      "mutant": "scroll_below_margin",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c0_g1_r3_LF_0: active_output_provenance"
+    },
+    {
+      "mutant": "omit_lf_wrap_clear",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c0_g0_r0_LF_0: callbacks"
+    },
+    {
+      "mutant": "omit_ri_wrap_clear",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c0_g0_r0_RI_0: callbacks"
+    },
+    {
+      "mutant": "conflate_hard_soft",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c0_g0_r0_LF_1: wraps"
+    },
+    {
+      "mutant": "drop_outgoing_id",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c0_g0_r0_LF_seed: finished_output_revision"
+    },
+    {
+      "mutant": "allocate_noop",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c0_g0_r0_LF_seed: grid_ids"
+    },
+    {
+      "mutant": "archive_admission",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c3_g0_r3_LF_1: active_output_provenance"
+    },
+    {
+      "mutant": "second_revision_drop",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c0_g0_r0_LF_seed: row_identity_revision"
+    },
+    {
+      "mutant": "nel_notification_after",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c0_g0_r0_NEL_0: active_output_provenance"
+    },
+    {
+      "mutant": "hard_boundary_before_history",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c0_g0_r0_LF_0: active_output_provenance"
+    },
+    {
+      "mutant": "hard_boundary_before_history_on_scroll",
+      "exit": 101,
+      "killed_by_runtime_assertion": true,
+      "assertion": "assertion `left == right` failed: c0_g0_r3_LF_1: callbacks"
+    }
+  ]
+}

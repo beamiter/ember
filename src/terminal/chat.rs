@@ -61,6 +61,8 @@ impl super::TerminalState {
     /// Observe parsed operations even for hidden panes, before a later reset
     /// in the same input batch can erase the evidence of native takeover.
     pub(in crate::terminal) fn observe_chat_native_takeover(&mut self) {
+        #[cfg(test)]
+        super::parser::vertical_motion_oracles::observe(self, "native-takeover", String::new());
         if self.chat_native_takeover_sequence.is_none()
             && self
                 .command_records

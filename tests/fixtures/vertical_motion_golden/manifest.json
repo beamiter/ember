@@ -1,0 +1,57 @@
+{
+  "format": "ordered-utf8-shards-v1",
+  "original_bytes": 28821908,
+  "original_sha256": "4012a7af5a2820cbbfb26f25cd1d9668b2c190fbfb90615d4cb9e1baeaca68b9",
+  "original_capture": "Original published production. Concatenate the fixed ordered parts without separators; do not regenerate expectations.",
+  "parts": [
+    {
+      "file": "part-00.json-fragment",
+      "bytes": 4194304,
+      "sha256": "e8c2502a18af4cd655b7750075049f17049c8fceef5248d70437347a19efa7a5",
+      "utf8_inline_request_upper_bound_bytes": 4229218,
+      "base64_inline_request_upper_bound_bytes": 5592487
+    },
+    {
+      "file": "part-01.json-fragment",
+      "bytes": 4194304,
+      "sha256": "a200fd28576a83342dbecf4ccfd53363aa0d92fedf0da2af1d7995e0759a1fba",
+      "utf8_inline_request_upper_bound_bytes": 4250652,
+      "base64_inline_request_upper_bound_bytes": 5592487
+    },
+    {
+      "file": "part-02.json-fragment",
+      "bytes": 4194304,
+      "sha256": "e766d1c255126bf2ca4d43e0b9c25a3a3588d5e49a6007f60b3ecefe4b7920d7",
+      "utf8_inline_request_upper_bound_bytes": 4233897,
+      "base64_inline_request_upper_bound_bytes": 5592487
+    },
+    {
+      "file": "part-03.json-fragment",
+      "bytes": 4194304,
+      "sha256": "4781bcd79c263960535c898139ec2b95bfcccb8c16e65ac41a167eaeb9bae878",
+      "utf8_inline_request_upper_bound_bytes": 4255409,
+      "base64_inline_request_upper_bound_bytes": 5592487
+    },
+    {
+      "file": "part-04.json-fragment",
+      "bytes": 4194304,
+      "sha256": "5edfd502e44292d4446ddff9c0a64ce57e53e7b4d39a852078bc952ab9ebe1ca",
+      "utf8_inline_request_upper_bound_bytes": 4251930,
+      "base64_inline_request_upper_bound_bytes": 5592487
+    },
+    {
+      "file": "part-05.json-fragment",
+      "bytes": 4194304,
+      "sha256": "57d34769a19fd0066026086389bb068d1aa99465e3cd6da3e20fc9f6b1667383",
+      "utf8_inline_request_upper_bound_bytes": 4251312,
+      "base64_inline_request_upper_bound_bytes": 5592487
+    },
+    {
+      "file": "part-06.json-fragment",
+      "bytes": 3656084,
+      "sha256": "3e2692555cc7ea2bc58c1e830831ea374dc07c9bd56e29437ba8c1e35a74708e",
+      "utf8_inline_request_upper_bound_bytes": 3697944,
+      "base64_inline_request_upper_bound_bytes": 4874859
+    }
+  ]
+}

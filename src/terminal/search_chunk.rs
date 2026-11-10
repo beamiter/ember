@@ -145,6 +145,12 @@ pub type SearchChunkOutcome = Result<RawSearchChunk, SearchChunkError>;
 
 impl TerminalState {
     pub(super) fn invalidate_search_scrollback_seals(&mut self) {
+        #[cfg(test)]
+        super::parser::vertical_motion_oracles::observe(
+            self,
+            "search-seal-invalidate",
+            String::new(),
+        );
         // Globally unique epochs prevent reset/cross-pane ABA. Exhaustion is
         // sticky: no old seal may become valid after the allocator runs out.
         self.search_scrollback_epoch = next_source_epoch();
