@@ -1,5 +1,6 @@
 use super::*;
 
+use jterm_engine::mode_mutation::{apply_ember_mode, ModeNamespace};
 use jterm_engine::parser::{Event, RejectReason, StringKind};
 
 impl super::TerminalState {
@@ -843,11 +844,16 @@ impl super::TerminalState {
     }
 
     pub(super) fn set_mode(&mut self, mode: u16) {
+        if apply_ember_mode(
+            &mut self.screen,
+            &mut self.protocol,
+            ModeNamespace::DecPrivate,
+            mode,
+            true,
+        ) {
+            return;
+        }
         match mode {
-            25 => {
-                // Show cursor (mode 25)
-                self.protocol.modes_mut().insert(25);
-            }
             1004 => {
                 // Focus event reporting (CSI I / CSI O). If the window is
                 // already focused, report that immediately so a client that
@@ -857,18 +863,6 @@ impl super::TerminalState {
                 if newly && self.host_window_focused {
                     self.output_buffer.extend_from_slice(b"\x1b[I");
                 }
-            }
-            2004 => {
-                // Bracketed paste mode
-                self.protocol.modes_mut().insert(2004);
-            }
-            1000..=1003 => {
-                // Mouse reporting modes
-                self.protocol.modes_mut().insert(mode);
-            }
-            1006 => {
-                // SGR mouse reporting format
-                self.protocol.modes_mut().insert(mode);
             }
             47 => {
                 // 备用屏(无保存光标、无清屏)
@@ -898,70 +892,53 @@ impl super::TerminalState {
                 self.sync_output_active = true;
                 self.sync_output_start = Some(self.sync_output_clock.now());
             }
-            7 => {
-                // Autowrap mode
-                self.protocol.modes_mut().insert(7);
+            5522 => {
+                self.protocol.modes_mut().insert(5522);
             }
-            6 => {
-                // DECOM - 原点模式:寻址相对滚动区域,光标移到区域原点
-                self.screen.origin_mode = true;
-                self.screen.cursor_row = self.screen.scroll_region_top;
-                self.screen.cursor_col = 0;
-            }
-            66 => {
-                self.protocol.modes_mut().insert(66);
-            }
-            1007 => {
-                self.protocol.modes_mut().insert(1007);
-            }
-            _ => {
-                // Unknown mode, just store it
-                self.protocol.modes_mut().insert(mode);
-            }
+            _ => unreachable!("engine returned an unknown host mode"),
         }
     }
-
-    /// ANSI 标准模式 (CSI Pn h,无 ? 前缀)。目前仅 IRM(4) 有实际效果。
+    /// ANSI modes have no host lifecycle hooks.
     pub(super) fn set_ansi_mode(&mut self, mode: u16) {
-        if mode == 4 {
-            // IRM - 插入替换模式
-            self.screen.insert_mode = true;
-        }
+        apply_ember_mode(
+            &mut self.screen,
+            &mut self.protocol,
+            ModeNamespace::Ansi,
+            mode,
+            true,
+        );
     }
 
     pub(super) fn reset_ansi_mode(&mut self, mode: u16) {
-        if mode == 4 {
-            self.screen.insert_mode = false;
-        }
+        apply_ember_mode(
+            &mut self.screen,
+            &mut self.protocol,
+            ModeNamespace::Ansi,
+            mode,
+            false,
+        );
     }
 
     pub(super) fn reset_mode(&mut self, mode: u16) {
+        if apply_ember_mode(
+            &mut self.screen,
+            &mut self.protocol,
+            ModeNamespace::DecPrivate,
+            mode,
+            false,
+        ) {
+            return;
+        }
         match mode {
-            25 => {
-                // Hide cursor
-                self.protocol.modes_mut().remove(&25);
-            }
             1004 => {
                 // Disable focus event reporting
                 self.protocol.modes_mut().remove(&1004);
-            }
-            2004 => {
-                // Disable bracketed paste mode
-                self.protocol.modes_mut().remove(&2004);
             }
             5522 => {
                 // A paste capability is valid only while the application keeps
                 // paste-event mode enabled. Revocation must be immediate.
                 self.protocol.modes_mut().remove(&5522);
                 self.pending_paste_grant = None;
-            }
-            1000..=1003 => {
-                // Disable mouse reporting
-                self.protocol.modes_mut().remove(&mode);
-            }
-            1006 => {
-                // Disable SGR mouse reporting format
-                self.protocol.modes_mut().remove(&mode);
             }
             47 => {
                 // 退出备用屏(不恢复光标)
@@ -997,26 +974,7 @@ impl super::TerminalState {
                 self.dirty_region.mark_all(self.screen.grid.rows());
                 self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
             }
-            7 => {
-                // Disable autowrap
-                self.protocol.modes_mut().remove(&7);
-            }
-            6 => {
-                // DECOM 关闭:恢复绝对寻址,光标移到屏幕原点
-                self.screen.origin_mode = false;
-                self.screen.cursor_row = 0;
-                self.screen.cursor_col = 0;
-            }
-            66 => {
-                self.protocol.modes_mut().remove(&66);
-            }
-            1007 => {
-                self.protocol.modes_mut().remove(&1007);
-            }
-            _ => {
-                // Unknown mode, just remove it
-                self.protocol.modes_mut().remove(&mode);
-            }
+            _ => unreachable!("engine returned an unknown host mode"),
         }
     }
 }
@@ -1036,3 +994,7 @@ mod decrqm_oracles;
 #[cfg(test)]
 #[path = "decrqm_engine_test_adapter.rs"]
 mod decrqm_engine_test_adapter;
+
+#[cfg(test)]
+#[path = "mode_mutation_oracles.rs"]
+mod mode_mutation_oracles;

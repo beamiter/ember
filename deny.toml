@@ -46,5 +46,5 @@ unknown-git = "deny"
 allow-git = [
   "https://github.com/beamiter/jagent.git?rev=f269c3c6afafcf9b6d60b3cccd741649fdb74576",
   "https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b",
-  "https://github.com/beamiter/jterm_core.git?rev=598f15808086dbea14d56fc1b86e77b6cb2e3201",
+  "https://github.com/beamiter/jterm_core.git?rev=a7c0bc9d308ae0bed9cc6d431fddf988b821ff8a",
 ]
