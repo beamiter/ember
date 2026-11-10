@@ -271,18 +271,7 @@ impl super::TerminalState {
         let rows = self.screen.grid.rows();
         let spans: Vec<_> = (0..rows).map(|row| (row, 0, cols)).collect();
         self.invalidate_grid_mutation_spans(&spans);
-        let filled = TerminalCell {
-            character: 'E',
-            ..TerminalCell::default()
-        };
-        for row in self.screen.grid.iter_mut() {
-            row.fill(filled);
-        }
-        self.screen.scroll_region_top = 0;
-        self.screen.scroll_region_bottom = rows.saturating_sub(1);
-        self.screen.cursor_row = 0;
-        self.screen.cursor_col = 0;
-        self.screen.pending_wrap = false;
+        self.screen.screen_alignment_test();
         self.note_output_cursor_reposition(true);
         self.dirty_region.mark_all(rows);
         self.mark_rows_dirty(0, rows.saturating_sub(1));
@@ -627,23 +616,12 @@ impl super::TerminalState {
     /// 供 ED(`CSI 2J`)使用 —— 按 VT 规范擦除显示不得移动光标。
     pub(super) fn erase_screen(&mut self) {
         self.screen.pending_wrap = false;
-        let bg_color = self.screen.current_bg;
         let cols = self.screen.grid.row_len();
         let spans: Vec<_> = (0..self.screen.grid.rows())
             .map(|row| (row, 0, cols))
             .collect();
         self.invalidate_grid_mutation_spans(&spans);
-        for row in self.screen.grid.iter_mut() {
-            for cell in row.iter_mut() {
-                *cell = TerminalCell {
-                    character: ' ',
-                    foreground: Color::Default,
-                    background: bg_color,
-                    flags: StyleFlags::default(),
-                    hyperlink_id: HyperlinkId::NONE,
-                };
-            }
-        }
+        self.screen.erase_screen();
         // Mark all rows as dirty
         self.dirty_region.mark_all(self.screen.grid.rows());
         self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
@@ -998,3 +976,7 @@ mod decrqm_engine_test_adapter;
 #[cfg(test)]
 #[path = "mode_mutation_oracles.rs"]
 mod mode_mutation_oracles;
+
+#[cfg(test)]
+#[path = "fullscreen_fill_oracles.rs"]
+mod fullscreen_fill_oracles;

@@ -1,0 +1,19 @@
+{
+  "ember_commit": "fc5bd956472223218ec06c9cb208287fb43b2fb6",
+  "core_commit": "a7c0bc9d308ae0bed9cc6d431fddf988b821ff8a",
+  "parser_sha256": "f05bb3a6e909ef5804f6e4ffdc3f4d0107c6aac4655c00076849067adfda2960",
+  "bodies": {
+    "erase_screen": "5357a9fe7979ce6455f7741348512e059fd390780f5d6160519f4904985c31b0",
+    "screen_alignment_test": "34f399b533541484ba11e79ddd83c9d1ee1fffb5e7b307bb6a3549ea3d1e6be7"
+  },
+  "ember_tree": "4ce950222e08ff5c29476f3d0da3e940650c2bce",
+  "golden_sha256": "d484bee1faf4fdac2f364d766c4fff22139166467daabbc715760ddde63a73b7",
+  "decoded_sha256": "89e854995933868bccf1f21e1fbe044c7f12cde96d9428d8493f2abc08542cd4",
+  "records": 4128,
+  "parser_partitions": 1432,
+  "parser_feed_records": 4072,
+  "direct_records": 48,
+  "seed_records": 8,
+  "capture": "Ignored stdout-only test executes unchanged original production wrappers and parser; expected values never generated from candidate or frozen copies.",
+  "seed_revision": "final provenance flags reset to observable false before original capture"
+}

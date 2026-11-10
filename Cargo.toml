@@ -11,11 +11,11 @@ categories = ["command-line-utilities", "gui"]
 
 [dependencies]
 # Shared engine and compatibility core resolve one published source tree.
-jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a7c0bc9d308ae0bed9cc6d431fddf988b821ff8a" }
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "6ed85cafcd1b1f8011182baa4fec10bf8e2ed107" }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 libc = "0.2"
 # Immutable shared release; local candidates require an explicit Cargo --config override.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a7c0bc9d308ae0bed9cc6d431fddf988b821ff8a" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "6ed85cafcd1b1f8011182baa4fec10bf8e2ed107" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -54,7 +54,7 @@ mundy = { version = "=0.2.3", default-features = false, features = ["async-io", 
 harfrust = "0.14.0"
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "a7c0bc9d308ae0bed9cc6d431fddf988b821ff8a" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "6ed85cafcd1b1f8011182baa4fec10bf8e2ed107" }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
