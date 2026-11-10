@@ -19,9 +19,9 @@ jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
-parking_lot = "0.12"
+parking_lot = "0.13"
 anyhow = "1.0"
-egui = "0.36.1"
+egui = "0.37.0"
 winit = { version = "=0.30.13", default-features = false }
 eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "glow", "wayland", "x11"] }
 egui-wgpu = "0.36.1"
@@ -43,7 +43,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 toml = "1.1.3"
 # YAML loading lives in the pinned jterm_core; ember has no separate YAML parser.
 dirs = "7.0.0"
-lru = "0.18"
+lru = "0.19"
 smallvec = "1.15"
 once_cell = "1.21"
 # Read-only, event-driven desktop accessibility preference subscription.
@@ -51,7 +51,7 @@ mundy = { version = "=0.2.3", default-features = false, features = ["async-io", 
 
 # HarfRust is the maintained RustyBuzz successor. It is already shared with
 # egui's font stack, and uses read-fonts instead of adding another parser.
-harfrust = "0.14.0"
+harfrust = "0.15.0"
 
 [dev-dependencies]
 jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "6ed85cafcd1b1f8011182baa4fec10bf8e2ed107" }
