@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "type": "object",
+  "description": "Logical snapshot shape before value interning. Exactly one record per seed and per feed, including repeated prefixes in distinct partitions.",
+  "expected_record_count": 67944,
+  "required_seed_keys": [
+    "seed_0",
+    "seed_1",
+    "seed_2",
+    "seed_3"
+  ],
+  "record_key_pattern": "seed_<0..3>_<corpus-id>_partition_<index>_feed_<index> OR seed_<0..3>",
+  "lane_sources": [
+    "alternate_parity_tests::snapshot -> structural_parity_tests::snapshot",
+    "copied reset_query_oracles::snapshot host lanes",
+    "parser.snapshot()"
+  ],
+  "additionalProperties": {
+    "type": "object",
+    "additionalProperties": {
+      "type": "string"
+    }
+  },
+  "excluded_and_direct_checks": {
+    "sync_output_start": "presence serialized; exact Instant identity checked directly after every feed",
+    "process_global_epochs": "inherited existing snapshot conventions; do not claim all opaque state serialized"
+  },
+  "status": "Original production captured and verified before extraction; do not regenerate expected values against candidate",
+  "transport": {
+    "format": "values: unique strings; cases: map of case key to lane-name/value-index map",
+    "lossless": true,
+    "reason": "avoid replicating large identical grid snapshots in memory",
+    "values_not_generated": "intern exact strings parsed from original runtime output only"
+  }
+}

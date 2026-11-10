@@ -1,0 +1,28 @@
+{
+  "baseline_ember": "4f8f829e5d22a746f9654be44282989b394486ef",
+  "baseline_core": "4b189cb7d55fe00d4ee39e74a143fc09d044c772",
+  "records": 67944,
+  "golden_origin": "Actual unmodified Ember production process_input; only cfg(test) harness added. Capture printed each seed and each feed snapshot. No candidate semantic code used.",
+  "transport": "jterm-oracle-intern-v1; exact raw bytes verified independently on unpack",
+  "original_golden_bytes": 118729033,
+  "original_golden_sha256": "d9901aaf729e3e9ce1feae9943cf267a151aa1770db940781828fff9194a7329",
+  "packed_golden_bytes": 4214630,
+  "packed_golden_sha256": "e1174cffc78998fce6239ea43d7f9834a39c385fa33c261d101889016b56586c",
+  "sha256": {
+    "src/terminal/parser.rs": "c3d139810c09e4dc28fbada8574f48b9be294d430e74caef7a96c7ca9a66c810",
+    "src/terminal/decrqm_oracles.rs": "c88b2b4ac1c8a084194370435099a296f3a5bb6998f5e3e0cd942d812e5c4da4",
+    "src/terminal/reset_query_oracles.rs": "d811ab774c5b84c67e59208e55242528a4b7e799bc4e8db2d6094505c2e00778",
+    "src/terminal/alternate_parity_tests.rs": "45e7663b5c5ef6d5bc4b66045b11f27c961a0cd3dbe15998cd8dd21e40ffc9e5",
+    "src/terminal/structural_parity_tests.rs": "7bae4eff68a78e113ce86eb76f0a228f1a89ed192165331e7809c69e7acda4fb",
+    "tests/fixtures/decrqm_corpus.json": "d4f418704cac7d5754e99458c5add80048955773227c546e59d937384b4c9fc5",
+    "tests/fixtures/decrqm_before_engine.json": "e1174cffc78998fce6239ea43d7f9834a39c385fa33c261d101889016b56586c",
+    "Cargo.toml": "b9e69a6670678114eb455ace25070cff589b72e13f56afda8bc94b4ec3df17e9",
+    "Cargo.lock": "6d12cda73286a1995b4e91b5589d3b6aef5f4ada8f626dbc7dcb7a2956d59189"
+  },
+  "validation": [
+    "original capture1 test passed",
+    "unchanged raw golden4 tests passed1 capture ignored",
+    "unchanged packed golden4 tests passed1 capture ignored",
+    "packed-to-raw exact byte roundtrip verified"
+  ]
+}

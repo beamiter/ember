@@ -1,7 +1,7 @@
 # Shared terminal engine checkpoint
 
 Ember now resolves `jterm_engine` and `jterm_core` from the same immutable
-published Git revision, 4b189cb7d55fe00d4ee39e74a143fc09d044c772. Normal builds
+published Git revision, 0dd2563b7a0387649cffd1cdbaef4374b860f650. Normal builds
 need no sibling checkout. `scripts/check-shared-core-pin.py` validates both
 packages, the lockfile, and the absence of checked-in source overrides.
 

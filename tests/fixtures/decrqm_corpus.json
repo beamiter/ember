@@ -1,0 +1,386 @@
+{
+  "status": "INPUTS ONLY: no runtime output has been captured",
+  "seeds": [
+    "rich primary sync inactive; origin/insert true",
+    "rich alternate sync inactive; origin false insert true",
+    "rich primary sync active; origin true insert false",
+    "rich alternate sync active; origin/insert false"
+  ],
+  "cases": [
+    {
+      "id": "ansi-0",
+      "bytes_hex": "1b5b302470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1",
+      "bytes_hex": "1b5b312470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-4",
+      "bytes_hex": "1b5b342470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-6",
+      "bytes_hex": "1b5b362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-7",
+      "bytes_hex": "1b5b372470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-12",
+      "bytes_hex": "1b5b31322470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-20",
+      "bytes_hex": "1b5b32302470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-25",
+      "bytes_hex": "1b5b32352470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-47",
+      "bytes_hex": "1b5b34372470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-66",
+      "bytes_hex": "1b5b36362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1000",
+      "bytes_hex": "1b5b313030302470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1001",
+      "bytes_hex": "1b5b313030312470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1002",
+      "bytes_hex": "1b5b313030322470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1003",
+      "bytes_hex": "1b5b313030332470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1004",
+      "bytes_hex": "1b5b313030342470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1005",
+      "bytes_hex": "1b5b313030352470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1006",
+      "bytes_hex": "1b5b313030362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1007",
+      "bytes_hex": "1b5b313030372470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1015",
+      "bytes_hex": "1b5b313031352470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1016",
+      "bytes_hex": "1b5b313031362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1034",
+      "bytes_hex": "1b5b313033342470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1036",
+      "bytes_hex": "1b5b313033362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1047",
+      "bytes_hex": "1b5b313034372470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1048",
+      "bytes_hex": "1b5b313034382470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-1049",
+      "bytes_hex": "1b5b313034392470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-2004",
+      "bytes_hex": "1b5b323030342470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-2026",
+      "bytes_hex": "1b5b323032362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-2031",
+      "bytes_hex": "1b5b323033312470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-5522",
+      "bytes_hex": "1b5b353532322470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "ansi-65535",
+      "bytes_hex": "1b5b36353533352470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-0",
+      "bytes_hex": "1b5b3f302470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1",
+      "bytes_hex": "1b5b3f312470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-4",
+      "bytes_hex": "1b5b3f342470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-6",
+      "bytes_hex": "1b5b3f362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-7",
+      "bytes_hex": "1b5b3f372470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-12",
+      "bytes_hex": "1b5b3f31322470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-20",
+      "bytes_hex": "1b5b3f32302470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-25",
+      "bytes_hex": "1b5b3f32352470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-47",
+      "bytes_hex": "1b5b3f34372470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-66",
+      "bytes_hex": "1b5b3f36362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1000",
+      "bytes_hex": "1b5b3f313030302470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1001",
+      "bytes_hex": "1b5b3f313030312470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1002",
+      "bytes_hex": "1b5b3f313030322470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1003",
+      "bytes_hex": "1b5b3f313030332470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1004",
+      "bytes_hex": "1b5b3f313030342470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1005",
+      "bytes_hex": "1b5b3f313030352470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1006",
+      "bytes_hex": "1b5b3f313030362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1007",
+      "bytes_hex": "1b5b3f313030372470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1015",
+      "bytes_hex": "1b5b3f313031352470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1016",
+      "bytes_hex": "1b5b3f313031362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1034",
+      "bytes_hex": "1b5b3f313033342470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1036",
+      "bytes_hex": "1b5b3f313033362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1047",
+      "bytes_hex": "1b5b3f313034372470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1048",
+      "bytes_hex": "1b5b3f313034382470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-1049",
+      "bytes_hex": "1b5b3f313034392470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-2004",
+      "bytes_hex": "1b5b3f323030342470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-2026",
+      "bytes_hex": "1b5b3f323032362470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-2031",
+      "bytes_hex": "1b5b3f323033312470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-5522",
+      "bytes_hex": "1b5b3f353532322470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "private-65535",
+      "bytes_hex": "1b5b3f36353533352470",
+      "partitions": "whole and every single split; bounded subset below"
+    },
+    {
+      "id": "empty-ansi",
+      "bytes_hex": "1b5b2470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "empty-private",
+      "bytes_hex": "1b5b3f2470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "extra-ansi",
+      "bytes_hex": "1b5b343b32302470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "extra-private",
+      "bytes_hex": "1b5b3f363b372470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "colon-private",
+      "bytes_hex": "1b5b3f363a372470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "overflow",
+      "bytes_hex": "1b5b3f3939393939392470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "wrong-prefix",
+      "bytes_hex": "1b5b3e362470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "wrong-intermediate",
+      "bytes_hex": "1b5b3f362170",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "two-intermediates",
+      "bytes_hex": "1b5b3f36202470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "wrong-final",
+      "bytes_hex": "1b5b3f362471",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "reset-query",
+      "bytes_hex": "1b5b21701b5b3f362470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "mode-query",
+      "bytes_hex": "1b5b3f36681b5b3f3624701b5b3f366c1b5b3f362470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "insert-query",
+      "bytes_hex": "1b5b34681b5b3424701b5b346c1b5b342470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "cancel",
+      "bytes_hex": "1b5b3f36241870",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    },
+    {
+      "id": "replace",
+      "bytes_hex": "1b5b3f36241b5b342470",
+      "partitions": "every byte-boundary subset for length <= 8; whole and every single split otherwise"
+    }
+  ]
+}

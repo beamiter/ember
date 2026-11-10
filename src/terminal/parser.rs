@@ -287,50 +287,6 @@ impl super::TerminalState {
         self.mark_rows_dirty(0, rows.saturating_sub(1));
     }
 
-    /// DECRQM answer for a DEC private mode: 1 set, 2 reset, 0 unrecognised.
-    /// Only modes ember acts on are claimed; answering 2 for one it ignores
-    /// (1016 SGR-pixels, say) would invite the app to enable it and then
-    /// misread the replies.
-    fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
-        let set = match mode {
-            6 => self.screen.origin_mode,
-            1
-            | 7
-            | 12
-            | 25
-            | 47
-            | 66
-            | 1000..=1007
-            | 1015
-            | 1034
-            | 1036
-            | 1047..=1049
-            | 2004
-            | 2026
-            | 2031
-            | 5522 => self.protocol.modes().contains(&mode),
-            _ => return 0,
-        };
-        if set {
-            1
-        } else {
-            2
-        }
-    }
-
-    /// DECRQM answer for an ANSI mode. IRM is the only one ember switches;
-    /// LNM is answered as permanently reset (4) because a line feed here
-    /// never implies a carriage return — matching frost and avoiding the
-    /// silent-timeout Claude Code hits when an unimplemented mode replies 0.
-    fn decrqm_ansi_mode_state(&self, mode: u16) -> u8 {
-        match mode {
-            4 if self.screen.insert_mode => 1,
-            4 => 2,
-            20 => 4,
-            _ => 0,
-        }
-    }
-
     fn apply_local_semantic_effects(&mut self, effects: jterm_engine::semantics::Effects) {
         use jterm_engine::semantics::Effect;
         for effect in effects {
@@ -607,23 +563,6 @@ impl super::TerminalState {
                         }
                         _ => {}
                     }
-                }
-            }
-            'p' => {
-                if intermediates == *b"$" {
-                    // DECRQM. Apps probe before enabling a mode (Claude Code
-                    // asks for ?2026 and ?1016 at startup) and a silent
-                    // terminal costs each probe a timeout.
-                    let mode = params.first().copied().unwrap_or(0);
-                    let response = match private_prefix {
-                        Some(b'?') => {
-                            format!("\x1b[?{};{}$y", mode, self.decrqm_private_mode_state(mode))
-                        }
-                        None => format!("\x1b[{};{}$y", mode, self.decrqm_ansi_mode_state(mode)),
-                        _ => return,
-                    };
-                    crate::debug_log!("[DECRQM] query -> {}", response);
-                    self.output_buffer.extend_from_slice(response.as_bytes());
                 }
             }
             'h' => {
@@ -1089,3 +1028,11 @@ mod reset_query_oracles;
 #[cfg(test)]
 #[path = "reset_query_engine_test_adapter.rs"]
 mod reset_query_engine_test_adapter;
+
+#[cfg(test)]
+#[path = "decrqm_oracles.rs"]
+mod decrqm_oracles;
+
+#[cfg(test)]
+#[path = "decrqm_engine_test_adapter.rs"]
+mod decrqm_engine_test_adapter;
