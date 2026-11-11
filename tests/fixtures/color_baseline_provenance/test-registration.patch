@@ -1,0 +1,12 @@
+diff --git a/src/terminal/parser.rs b/src/terminal/parser.rs
+index 3b4d332..ae99c2b 100644
+--- a/src/terminal/parser.rs
++++ b/src/terminal/parser.rs
+@@ -960,3 +960,7 @@ mod fullscreen_fill_oracles;
+ #[cfg(test)]
+ #[path = "vertical_motion_oracles.rs"]
+ pub(super) mod vertical_motion_oracles;
++
++#[cfg(test)]
++#[path = "color_oracles.rs"]
++mod color_oracles;

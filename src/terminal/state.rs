@@ -288,11 +288,7 @@ impl super::TerminalState {
             pending_osc52_clipboard_set: None,
             pending_osc52_clipboard_queries: VecDeque::new(),
             osc_reply_terminator: b"\x1b\\",
-            default_colors: TerminalDefaultColors::default(),
-            dynamic_fg: None,
-            dynamic_bg: None,
-            dynamic_cursor_color: None,
-            dynamic_palette: [None; 256],
+            colors: ColorState::new(TerminalDefaultColors::default()),
             pending_notifications: Vec::new(),
             pending_bell: false,
             total_lines_scrolled: 0,
@@ -338,35 +334,21 @@ impl super::TerminalState {
         }
     }
 
-    /// Theme colours for OSC 10/11/12/4 queries and DSR 996. The app calls
-    /// this when a session is created and whenever the theme changes.
+    /// Apply application theme inputs; only subscribed scheme changes reply.
     pub fn set_default_colors(&mut self, colors: TerminalDefaultColors) {
-        let before = self.color_scheme_report();
-        self.default_colors = colors;
-        // Mode 2031 subscribers learn about a dark/light flip unprompted, with
-        // the same report DSR 996 answers.
-        if self.protocol.modes().contains(&2031) && self.color_scheme_report() != before {
-            let report = format!("\x1b[?997;{}n", self.color_scheme_report());
-            self.output_buffer.extend_from_slice(report.as_bytes());
-        }
+        let effects = self
+            .colors
+            .set_theme(colors, self.protocol.modes().contains(&2031));
+        self.apply_local_semantic_effects(effects);
     }
 
-    /// The background actually painted behind `Color::Default` cells: an
-    /// OSC 11 override, else the theme default.
+    #[cfg(test)]
     pub(super) fn effective_default_background(&self) -> (u8, u8, u8) {
-        self.dynamic_bg.unwrap_or(self.default_colors.background)
+        self.colors.effective_background()
     }
 
-    /// DSR 996 colour-scheme classification (1 = dark, 2 = light), by the
-    /// relative luminance of the effective default background.
     pub(super) fn color_scheme_report(&self) -> u8 {
-        let (r, g, b) = self.effective_default_background();
-        let luma = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
-        if luma < 128.0 {
-            1
-        } else {
-            2
-        }
+        self.colors.color_scheme_report()
     }
 
     pub(super) fn append_osc_5522_status(&mut self, metadata: &str, payload: Option<&str>) {
@@ -381,135 +363,22 @@ impl super::TerminalState {
     }
 
     pub(super) fn handle_osc_color(&mut self, command: &str, value: &str) {
-        if value == "?" {
-            // Query: report what is painted — the OSC override if one is set,
-            // else the theme default the app pushed in.
-            let color = match command {
-                "10" => self.dynamic_fg.unwrap_or(self.default_colors.foreground),
-                "11" => self.effective_default_background(),
-                "12" => self
-                    .dynamic_cursor_color
-                    .unwrap_or(self.default_colors.cursor),
-                _ => return,
-            };
-            let response = format!(
-                "\x1b]{};rgb:{:04x}/{:04x}/{:04x}",
-                command,
-                (color.0 as u16) * 257,
-                (color.1 as u16) * 257,
-                (color.2 as u16) * 257,
-            );
-            self.output_buffer.extend_from_slice(response.as_bytes());
-            self.output_buffer
-                .extend_from_slice(self.osc_reply_terminator);
-        } else if let Some(rgb) = Self::parse_color_spec(value) {
-            match command {
-                "10" => self.dynamic_fg = Some(rgb),
-                "11" => self.dynamic_bg = Some(rgb),
-                "12" => self.dynamic_cursor_color = Some(rgb),
-                _ => {}
-            }
-        }
+        let effects = self
+            .colors
+            .apply_ember_osc(command, value, self.osc_reply_terminator);
+        self.apply_local_semantic_effects(effects);
     }
 
-    /// OSC 110/111/112: reset one dynamic color back to the theme default.
     pub(super) fn reset_osc_color(&mut self, command: &str) {
-        match command {
-            "110" => self.dynamic_fg = None,
-            "111" => self.dynamic_bg = None,
-            "112" => self.dynamic_cursor_color = None,
-            _ => {}
-        }
+        self.handle_osc_color(command, "");
     }
 
-    /// OSC 4: set or query 256-palette entries (`idx;spec` pairs; `?` queries).
     pub(super) fn handle_osc_palette(&mut self, value: &str) {
-        let mut parts = value.split(';');
-        while let Some(idx_s) = parts.next() {
-            let Some(color_s) = parts.next() else {
-                break;
-            };
-            let Ok(idx) = idx_s.parse::<u8>() else {
-                continue;
-            };
-            if color_s == "?" {
-                let color = self.dynamic_palette[idx as usize].unwrap_or_else(|| {
-                    // The 16 ANSI slots are theme colours; the cube and
-                    // grey ramp are not themed.
-                    self.default_colors
-                        .ansi
-                        .get(idx as usize)
-                        .copied()
-                        .unwrap_or_else(|| Self::default_256_color(idx))
-                });
-                self.append_osc_palette_response(idx, color);
-            } else if let Some(rgb) = Self::parse_color_spec(color_s) {
-                self.dynamic_palette[idx as usize] = Some(rgb);
-            }
-        }
+        self.handle_osc_color("4", value);
     }
 
-    /// OSC 104: reset the whole palette (empty payload) or the listed indices.
     pub(super) fn reset_osc_palette(&mut self, value: &str) {
-        if value.is_empty() {
-            self.dynamic_palette = [None; 256];
-            return;
-        }
-        for idx_s in value.split(';').filter(|s| !s.is_empty()) {
-            if let Ok(idx) = idx_s.parse::<u8>() {
-                self.dynamic_palette[idx as usize] = None;
-            }
-        }
-    }
-
-    fn append_osc_palette_response(&mut self, idx: u8, color: (u8, u8, u8)) {
-        let response = format!(
-            "\x1b]4;{};rgb:{:04x}/{:04x}/{:04x}",
-            idx,
-            (color.0 as u16) * 257,
-            (color.1 as u16) * 257,
-            (color.2 as u16) * 257,
-        );
-        self.output_buffer.extend_from_slice(response.as_bytes());
-        self.output_buffer
-            .extend_from_slice(self.osc_reply_terminator);
-    }
-
-    /// Standard xterm defaults for palette queries when no override is set.
-    pub(super) fn default_256_color(idx: u8) -> (u8, u8, u8) {
-        const ANSI: [(u8, u8, u8); 16] = [
-            (0, 0, 0),
-            (205, 0, 0),
-            (0, 205, 0),
-            (205, 205, 0),
-            (0, 0, 238),
-            (205, 0, 205),
-            (0, 205, 205),
-            (229, 229, 229),
-            (127, 127, 127),
-            (255, 0, 0),
-            (0, 255, 0),
-            (255, 255, 0),
-            (92, 92, 255),
-            (255, 0, 255),
-            (0, 255, 255),
-            (255, 255, 255),
-        ];
-        match idx {
-            0..=15 => ANSI[idx as usize],
-            16..=231 => {
-                let idx = idx - 16;
-                let r_idx = idx / 36;
-                let g_idx = (idx % 36) / 6;
-                let b_idx = idx % 6;
-                let scale = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-                (scale(r_idx), scale(g_idx), scale(b_idx))
-            }
-            232..=255 => {
-                let gray = 8 + (idx - 232) * 10;
-                (gray, gray, gray)
-            }
-        }
+        self.handle_osc_color("104", value);
     }
 
     /// An OSC 7 payload longer than this cannot percent-decode to a directory
@@ -574,47 +443,9 @@ impl super::TerminalState {
             .filter(|cwd| jterm_core::execution_journal::is_valid_jsh_cwd(cwd))
     }
 
+    #[cfg(test)]
     pub(super) fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
-        // Parse rgb:RR/GG/BB / rgb:RRRR/GGGG/BBBB / rgb:R/G/B / rgb:RRR/GGG/BBB / #RRGGBB
-        // Per XParseColor, each component is 1..=4 hex digits and is left-aligned
-        // into a 16-bit field (i.e. component value * (2^16-1) / (2^bits-1)),
-        // then truncated to 8 bits. The previous scale=1 fallback for 1/3-digit
-        // components produced a u8 cast of e.g. 0xFFF=4095, which wraps to 255
-        // for full-on but is wrong for any partial value.
-        fn scale_to_u8(value: u16, hex_digits: usize) -> u8 {
-            // Range of n hex digits is [0, 16^n - 1].
-            let max_n: u32 = (1u32 << (hex_digits * 4)).saturating_sub(1).max(1);
-            // Scale value to 0..=255, rounding to nearest.
-            (((value as u32) * 255 + max_n / 2) / max_n) as u8
-        }
-        if let Some(hex) = spec.strip_prefix('#') {
-            // OSC payloads are UTF-8, not necessarily ASCII. Reject non-ASCII
-            // before byte slicing so a six-byte malformed color cannot panic.
-            if hex.len() == 6 && hex.is_ascii() {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                return Some((r, g, b));
-            }
-        } else if let Some(rgb) = spec.strip_prefix("rgb:") {
-            let parts: Vec<&str> = rgb.split('/').collect();
-            if parts.len() == 3
-                && (1..=4).contains(&parts[0].len())
-                && parts[0].len() == parts[1].len()
-                && parts[1].len() == parts[2].len()
-            {
-                let digits = parts[0].len();
-                let r = u16::from_str_radix(parts[0], 16).ok()?;
-                let g = u16::from_str_radix(parts[1], 16).ok()?;
-                let b = u16::from_str_radix(parts[2], 16).ok()?;
-                return Some((
-                    scale_to_u8(r, digits),
-                    scale_to_u8(g, digits),
-                    scale_to_u8(b, digits),
-                ));
-            }
-        }
-        None
+        ColorState::parse_color_spec(spec)
     }
 
     pub(super) fn handle_osc_52(&mut self, value: &str) {
@@ -1441,7 +1272,7 @@ impl super::TerminalState {
         let max_scrollback = self.max_scrollback;
         let cell_size = self.kitty_graphics.cell_size_pixels();
         // Theme colours belong to the app, not to the program that sent RIS.
-        let default_colors = self.default_colors;
+        let default_colors = self.colors.defaults();
         let next_raw_row_id = self.next_raw_row_id;
         let row_identity_revision = self.row_identity_revision;
         let next_command_sequence = self.next_command_sequence;
@@ -1457,7 +1288,7 @@ impl super::TerminalState {
         self.watch = watch;
         self.pending_completed_command_outputs = pending_completed_command_outputs;
         self.consumed_command_ids = consumed_command_ids;
-        self.default_colors = default_colors;
+        self.colors = ColorState::new(default_colors);
         // A reset replaces every physical row but must never restart the
         // allocator and let an old external origin retarget into the new grid.
         self.next_raw_row_id = next_raw_row_id;

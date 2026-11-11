@@ -6217,8 +6217,8 @@ fn osc_4_sets_queries_and_resets_palette_entries() {
 
     // Set index 1 via hex spec and index 2 via rgb spec in one sequence.
     terminal.process_input(b"\x1b]4;1;#ff0000;2;rgb:00/ff/00\x1b\\");
-    assert_eq!(terminal.dynamic_palette[1], Some((255, 0, 0)));
-    assert_eq!(terminal.dynamic_palette[2], Some((0, 255, 0)));
+    assert_eq!(terminal.colors.dynamic_palette[1], Some((255, 0, 0)));
+    assert_eq!(terminal.colors.dynamic_palette[2], Some((0, 255, 0)));
 
     // Query returns the override for set slots and xterm defaults otherwise.
     std::mem::take(&mut terminal.output_buffer);
@@ -6237,10 +6237,14 @@ fn osc_4_sets_queries_and_resets_palette_entries() {
 
     // OSC 104 with indices resets only those; empty resets everything.
     terminal.process_input(b"\x1b]104;1\x1b\\");
-    assert_eq!(terminal.dynamic_palette[1], None);
-    assert_eq!(terminal.dynamic_palette[2], Some((0, 255, 0)));
+    assert_eq!(terminal.colors.dynamic_palette[1], None);
+    assert_eq!(terminal.colors.dynamic_palette[2], Some((0, 255, 0)));
     terminal.process_input(b"\x1b]104\x1b\\");
-    assert!(terminal.dynamic_palette.iter().all(|slot| slot.is_none()));
+    assert!(terminal
+        .colors
+        .dynamic_palette
+        .iter()
+        .all(|slot| slot.is_none()));
 }
 
 #[test]
@@ -6249,16 +6253,16 @@ fn osc_110_to_112_reset_dynamic_colors() {
     terminal.process_input(b"\x1b]10;#010203\x1b\\");
     terminal.process_input(b"\x1b]11;#040506\x1b\\");
     terminal.process_input(b"\x1b]12;#070809\x1b\\");
-    assert_eq!(terminal.dynamic_fg, Some((1, 2, 3)));
-    assert_eq!(terminal.dynamic_bg, Some((4, 5, 6)));
-    assert_eq!(terminal.dynamic_cursor_color, Some((7, 8, 9)));
+    assert_eq!(terminal.colors.dynamic_fg, Some((1, 2, 3)));
+    assert_eq!(terminal.colors.dynamic_bg, Some((4, 5, 6)));
+    assert_eq!(terminal.colors.dynamic_cursor_color, Some((7, 8, 9)));
 
     terminal.process_input(b"\x1b]110\x1b\\");
     terminal.process_input(b"\x1b]111\x1b\\");
     terminal.process_input(b"\x1b]112\x1b\\");
-    assert_eq!(terminal.dynamic_fg, None);
-    assert_eq!(terminal.dynamic_bg, None);
-    assert_eq!(terminal.dynamic_cursor_color, None);
+    assert_eq!(terminal.colors.dynamic_fg, None);
+    assert_eq!(terminal.colors.dynamic_bg, None);
+    assert_eq!(terminal.colors.dynamic_cursor_color, None);
 }
 
 // --- click-to-place-cursor ------------------------------------------------

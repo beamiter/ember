@@ -1,0 +1,14 @@
+{
+  "drop_palette_reply": {
+    "returncode": 101,
+    "detected": true
+  },
+  "ignore_palette_reset": {
+    "returncode": 101,
+    "detected": true
+  },
+  "suppress_theme_notification": {
+    "returncode": 101,
+    "detected": true
+  }
+}

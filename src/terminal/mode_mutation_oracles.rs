@@ -183,6 +183,12 @@ impl TerminalState {
 type Snapshot = BTreeMap<String, String>;
 fn snapshot(t: &TerminalState) -> Snapshot {
     let mut out = super::super::alternate_parity_tests::snapshot(t);
+    out.insert("dynamic_fg".into(), format!("{:?}", t.colors.dynamic_fg));
+    out.insert("dynamic_bg".into(), format!("{:?}", t.colors.dynamic_bg));
+    out.insert(
+        "dynamic_cursor_color".into(),
+        format!("{:?}", t.colors.dynamic_cursor_color),
+    );
     macro_rules! host {
         ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
     }
@@ -200,9 +206,6 @@ fn snapshot(t: &TerminalState) -> Snapshot {
         pending_osc52_clipboard_queries,
         pending_notifications,
         pending_bell,
-        dynamic_fg,
-        dynamic_bg,
-        dynamic_cursor_color,
         chat_pending_submit,
         chat_native_takeover_sequence,
         inline_cli_launch_floor,
@@ -298,9 +301,9 @@ fn seeded(seed: usize) -> TerminalState {
     t.pending_osc52_clipboard_set = Some("clipboard sentinel".into());
     t.pending_osc52_clipboard_queries.push_back(b"\x07");
     t.pending_notifications = vec![("title sentinel".into(), "body sentinel".into())];
-    t.dynamic_fg = Some((1, 2, 3));
-    t.dynamic_bg = Some((4, 5, 6));
-    t.dynamic_cursor_color = Some((7, 8, 9));
+    t.colors.dynamic_fg = Some((1, 2, 3));
+    t.colors.dynamic_bg = Some((4, 5, 6));
+    t.colors.dynamic_cursor_color = Some((7, 8, 9));
     t.pending_bell = true;
     t.pending_paste_grant = Some(super::super::PendingPasteGrant {
         token: "mode-mutation-grant".into(),

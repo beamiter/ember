@@ -1,0 +1,21 @@
+{
+  "capture_ready": true,
+  "capture_base_commit": "23f0040401cf92820bcb16b4599efde9bed34759",
+  "capture_corpus_sha256": "7aa606ed297ae4d7c32173d97c559dbf150a8158b02f0d0fda98199e9930aa9d",
+  "source_sha256": {
+    "Cargo.toml": "61a06cfeb3797069ea69152bdf659ec3c7aab4cbb75a00abc01160c947cc7abc",
+    "Cargo.lock": "7208e3d72cd151caa6446ca9eb8c9f1c3c9eb795637a743803a7e35dfe01cf60",
+    "src/terminal/mod.rs": "ff3caa1355f4d05c6fcfe9084eb3be155bbdbd3375acabf271f95d0d6f4a30ec",
+    "src/terminal/state.rs": "3d0170929d36589194bdcc658d34011efd66a67335ef800ef8e2702a723094d1",
+    "src/terminal/parser.rs": "46696163ac06686def4b8102d25e2f585482d2391bef2e4b1a134f44795fa305",
+    "src/terminal/alternate_parity_tests.rs": "45e7663b5c5ef6d5bc4b66045b11f27c961a0cd3dbe15998cd8dd21e40ffc9e5",
+    "src/terminal/structural_parity_tests.rs": "7bae4eff68a78e113ce86eb76f0a228f1a89ed192165331e7809c69e7acda4fb",
+    "src/terminal/oracle_fixture.rs": "1cd05b07172ccf99682cc8ba620e2c3ef867d45f5d2a5aafbf35f55d2af996b1",
+    "src/terminal/color_oracles.rs": "5d0f0bf95e9aa57b3e7ca1366ca64e97181a457845917855e9484d9789054f2c",
+    "tests/fixtures/color_corpus.json": "7aa606ed297ae4d7c32173d97c559dbf150a8158b02f0d0fda98199e9930aa9d",
+    "tests/fixtures/capture_color_baseline.py": "2a905bcdc9e573431b86f3d6236b2935462364bcfaa426b6e3a88a0928132622",
+    "tests/fixtures/shard_color_capture.py": "82c586412731edb5cb5c7d96174dfb2e8809562d88cef5d30e73cd4a81b37c5d"
+  },
+  "engine_revision": "e64d69d08ea257539ef412f3349e1ce349f38e7f",
+  "note": "Original pre-extraction live TerminalState. Only test registration/observer overlay; UTF8 color safety fix published. No candidate engine semantics."
+}

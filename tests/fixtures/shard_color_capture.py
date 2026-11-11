@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Transport-only ordered UTF-8 sharding of frozen lossless JSON; no expectations."""
+import hashlib,json,pathlib,sys
+source,dest=map(pathlib.Path,sys.argv[1:]);raw=source.read_bytes()
+json.loads(raw);dest.mkdir() # Refuse overwriting any existing capture.
+parts=[];at=0
+while at<len(raw):
+ end=min(at+4*1024*1024,len(raw))
+ while end<len(raw) and raw[end]&0xc0==0x80:end-=1
+ payload=raw[at:end];payload.decode('utf-8')
+ name=f'part-{len(parts):02}.json-fragment';(dest/name).write_bytes(payload)
+ parts.append({'file':name,'bytes':len(payload),'sha256':hashlib.sha256(payload).hexdigest()});at=end
+manifest={'format':'ordered-utf8-shards-v1','original_bytes':len(raw),'original_sha256':hashlib.sha256(raw).hexdigest(),'parts':parts}
+assert b''.join((dest/p['file']).read_bytes() for p in parts)==raw
+(dest/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+print(json.dumps({k:v for k,v in manifest.items() if k!='parts'}))

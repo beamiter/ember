@@ -267,7 +267,10 @@ impl super::TerminalState {
         self.mark_rows_dirty(0, rows.saturating_sub(1));
     }
 
-    fn apply_local_semantic_effects(&mut self, effects: jterm_engine::semantics::Effects) {
+    pub(super) fn apply_local_semantic_effects(
+        &mut self,
+        effects: jterm_engine::semantics::Effects,
+    ) {
         use jterm_engine::semantics::Effect;
         for effect in effects {
             match effect {
@@ -960,3 +963,7 @@ mod fullscreen_fill_oracles;
 #[cfg(test)]
 #[path = "vertical_motion_oracles.rs"]
 pub(super) mod vertical_motion_oracles;
+
+#[cfg(test)]
+#[path = "color_oracles.rs"]
+mod color_oracles;

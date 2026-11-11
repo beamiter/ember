@@ -4875,7 +4875,8 @@ impl TerminalRenderer {
         let painter = ui.painter_at(rect);
         // OSC 11 dynamic background wins over the theme for the whole widget.
         let bg = terminal
-            .dynamic_bg
+            .colors
+            .background_override()
             .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
             .unwrap_or_else(|| self.theme.terminal_background());
         let bg_with_opacity = egui::Color32::from_rgba_unmultiplied(
@@ -4949,7 +4950,7 @@ impl TerminalRenderer {
         // gutter hit test below and the chrome painting after the grid.
         // `None` while chrome is gated off (config, alt screen, reflow).
         let summaries = Self::projected_summary_rows(terminal, &viewport);
-        if self.chat_mode && terminal.dynamic_bg.is_none() {
+        if self.chat_mode && terminal.colors.background_override().is_none() {
             let history_end = viewport
                 .chat_composer_rows()
                 .map_or(rows, |range| range.start);
@@ -5912,7 +5913,8 @@ impl TerminalRenderer {
                     cell_rect.shrink2(egui::vec2((cell_width * 0.24).clamp(1.5, 3.0), 0.5));
 
                 let dynamic_cursor = terminal
-                    .dynamic_cursor_color
+                    .colors
+                    .cursor_override()
                     .map(|(r, g, b)| Color32::from_rgb(r, g, b));
                 match &terminal.screen.cursor_shape {
                     crate::terminal::CursorShape::Block => {
@@ -6229,7 +6231,8 @@ impl TerminalRenderer {
         let ppp = ui.ctx().pixels_per_point();
         // OSC 11 dynamic background wins over the theme for the whole grid.
         let default_bg = terminal
-            .dynamic_bg
+            .colors
+            .background_override()
             .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
             .unwrap_or_else(|| self.theme.terminal_background());
         // Gate on is_open. `SearchState::close` deliberately keeps `matches`
@@ -6782,8 +6785,8 @@ impl TerminalRenderer {
                 color::resolve_fg_with_palette(
                     cell.foreground,
                     theme,
-                    Some(&terminal.dynamic_palette),
-                    terminal.dynamic_fg,
+                    Some(terminal.colors.palette_overrides()),
+                    terminal.colors.foreground_override(),
                     bold,
                     dim,
                 )
@@ -6791,8 +6794,8 @@ impl TerminalRenderer {
                 color::resolve_bg_with_palette(
                     cell.background,
                     theme,
-                    Some(&terminal.dynamic_palette),
-                    terminal.dynamic_bg,
+                    Some(terminal.colors.palette_overrides()),
+                    terminal.colors.background_override(),
                 )
             };
 
@@ -6806,8 +6809,8 @@ impl TerminalRenderer {
                             bg_color = color::resolve_fg_with_palette(
                                 cell.foreground,
                                 theme,
-                                Some(&terminal.dynamic_palette),
-                                terminal.dynamic_fg,
+                                Some(terminal.colors.palette_overrides()),
+                                terminal.colors.foreground_override(),
                                 bold,
                                 dim,
                             );
@@ -6840,15 +6843,15 @@ impl TerminalRenderer {
                 color::resolve_bg_with_palette(
                     cell.background,
                     theme,
-                    Some(&terminal.dynamic_palette),
-                    terminal.dynamic_bg,
+                    Some(terminal.colors.palette_overrides()),
+                    terminal.colors.background_override(),
                 )
             } else {
                 color::resolve_fg_with_palette(
                     cell.foreground,
                     theme,
-                    Some(&terminal.dynamic_palette),
-                    terminal.dynamic_fg,
+                    Some(terminal.colors.palette_overrides()),
+                    terminal.colors.foreground_override(),
                     bold,
                     dim,
                 )
@@ -7054,8 +7057,8 @@ impl TerminalRenderer {
                     color::resolve_fg_with_palette(
                         cell.foreground,
                         &self.theme,
-                        Some(&terminal.dynamic_palette),
-                        terminal.dynamic_fg,
+                        Some(terminal.colors.palette_overrides()),
+                        terminal.colors.foreground_override(),
                         bold,
                         dim,
                     )
@@ -7063,8 +7066,8 @@ impl TerminalRenderer {
                     color::resolve_bg_with_palette(
                         cell.background,
                         &self.theme,
-                        Some(&terminal.dynamic_palette),
-                        terminal.dynamic_bg,
+                        Some(terminal.colors.palette_overrides()),
+                        terminal.colors.background_override(),
                     )
                 };
 
@@ -7077,8 +7080,8 @@ impl TerminalRenderer {
                             bg_color = color::resolve_fg_with_palette(
                                 cell.foreground,
                                 &self.theme,
-                                Some(&terminal.dynamic_palette),
-                                terminal.dynamic_fg,
+                                Some(terminal.colors.palette_overrides()),
+                                terminal.colors.foreground_override(),
                                 bold,
                                 dim,
                             );
@@ -7165,15 +7168,15 @@ impl TerminalRenderer {
                     color::resolve_bg_with_palette(
                         cell.background,
                         &self.theme,
-                        Some(&terminal.dynamic_palette),
-                        terminal.dynamic_bg,
+                        Some(terminal.colors.palette_overrides()),
+                        terminal.colors.background_override(),
                     )
                 } else {
                     color::resolve_fg_with_palette(
                         cell.foreground,
                         &self.theme,
-                        Some(&terminal.dynamic_palette),
-                        terminal.dynamic_fg,
+                        Some(terminal.colors.palette_overrides()),
+                        terminal.colors.foreground_override(),
                         bold,
                         dim,
                     )

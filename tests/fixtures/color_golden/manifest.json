@@ -1,0 +1,27 @@
+{
+  "format": "ordered-utf8-shards-v1",
+  "original_bytes": 13099063,
+  "original_sha256": "04edcd7541838201e585d0505d2898e56a22f82fda2abfa917701255a558dfc7",
+  "parts": [
+    {
+      "file": "part-00.json-fragment",
+      "bytes": 4194304,
+      "sha256": "2f16f6723e3384a5050b4ae607710f1bb69dd9250ca9450b7f2a655c3035262e"
+    },
+    {
+      "file": "part-01.json-fragment",
+      "bytes": 4194304,
+      "sha256": "022c35f8097c001db04f8007c7f4e4d41f0c8d7c0ed56338d4cccb23a975432a"
+    },
+    {
+      "file": "part-02.json-fragment",
+      "bytes": 4194304,
+      "sha256": "9937e599f622697e87818890ef9f26c916e47fca049e5040617bb332b15622da"
+    },
+    {
+      "file": "part-03.json-fragment",
+      "bytes": 516151,
+      "sha256": "e0872ea0ad4660005e2d93150e384b4eab6051ea9c86c68048cb22db80858957"
+    }
+  ]
+}

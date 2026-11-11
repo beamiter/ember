@@ -46,6 +46,13 @@ const CASES: &[(&str, &[u8])] = &[
 // these legitimately vary between equivalent runs. This is not serialization.
 fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
     let mut result = BTreeMap::new();
+    result.insert("dynamic_fg", format!("{:?}", t.colors.dynamic_fg));
+    result.insert("dynamic_bg", format!("{:?}", t.colors.dynamic_bg));
+    result.insert(
+        "dynamic_cursor_color",
+        format!("{:?}", t.colors.dynamic_cursor_color),
+    );
+    result.insert("dynamic_palette", format!("{:?}", t.colors.dynamic_palette));
     macro_rules! fields {
         ($($field:ident),* $(,)?) => {$(result.insert(stringify!($field), format!("{:?}", t.$field));)*};
     }
@@ -63,10 +70,6 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
         pending_clipboard_requests,
         pending_notifications,
         pending_bell,
-        dynamic_fg,
-        dynamic_bg,
-        dynamic_cursor_color,
-        dynamic_palette,
         command_marks,
         next_command_sequence,
         consumed_command_ids,
@@ -319,18 +322,18 @@ fn osc_non_ascii_hash_colors_preserve_values_and_recover_across_partitions() {
                 );
                 let expected_color = (0xab, 0xcd, 0xef);
                 assert_eq!(
-                    terminal.dynamic_fg,
+                    terminal.colors.dynamic_fg,
                     (command == "10").then_some(expected_color)
                 );
                 assert_eq!(
-                    terminal.dynamic_bg,
+                    terminal.colors.dynamic_bg,
                     (command == "11").then_some(expected_color)
                 );
                 assert_eq!(
-                    terminal.dynamic_cursor_color,
+                    terminal.colors.dynamic_cursor_color,
                     (command == "12").then_some(expected_color)
                 );
-                for (index, color) in terminal.dynamic_palette.iter().enumerate() {
+                for (index, color) in terminal.colors.dynamic_palette.iter().enumerate() {
                     assert_eq!(
                         *color,
                         (command == "4;1" && index == 1).then_some(expected_color)

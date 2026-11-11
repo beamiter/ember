@@ -461,36 +461,7 @@ struct PendingPasteGrant {
     expires_at: std::time::Instant,
 }
 
-/// 256-slot dynamic palette: `None` slots fall through to the theme/default.
-pub type DynamicColorPalette = [Option<(u8, u8, u8)>; 256];
-
-/// The theme colours the renderer paints `Color::Default` and the 16 ANSI
-/// slots with. The app pushes them in (`TerminalState::set_default_colors`) so
-/// OSC 10/11/12/4 queries and DSR 996 describe what is actually on screen:
-/// answering a fixed white-on-black made light-theme users' TUIs pick dark
-/// palettes. OSC 10/11/12/4 overrides still win over these.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TerminalDefaultColors {
-    pub foreground: (u8, u8, u8),
-    pub background: (u8, u8, u8),
-    pub cursor: (u8, u8, u8),
-    pub ansi: [(u8, u8, u8); 16],
-}
-
-impl Default for TerminalDefaultColors {
-    fn default() -> Self {
-        let mut ansi = [(0, 0, 0); 16];
-        for (idx, slot) in ansi.iter_mut().enumerate() {
-            *slot = TerminalState::default_256_color(idx as u8);
-        }
-        Self {
-            foreground: (255, 255, 255),
-            background: (0, 0, 0),
-            cursor: (255, 255, 255),
-            ansi,
-        }
-    }
-}
+pub use jterm_engine::colors::{ColorState, DynamicColorPalette, TerminalDefaultColors};
 
 pub struct TerminalState {
     /// Live VT storage and drawing state; history and host effects remain here.
@@ -609,15 +580,8 @@ pub struct TerminalState {
     /// Terminator of the OSC being dispatched. xterm and VTE end a reply the
     /// way the query ended, and BEL-only parsers never see an ST reply end.
     osc_reply_terminator: &'static [u8],
-    /// Theme colours reported by queries when no OSC override is set.
-    default_colors: TerminalDefaultColors,
-
-    // OSC 10/11/12 dynamic colors
-    pub dynamic_fg: Option<(u8, u8, u8)>,
-    pub dynamic_bg: Option<(u8, u8, u8)>,
-    pub dynamic_cursor_color: Option<(u8, u8, u8)>,
-    /// OSC 4 per-index palette overrides; OSC 104 resets (all or listed).
-    pub dynamic_palette: DynamicColorPalette,
+    /// Sole live owner of terminal theme inputs and OSC color overrides.
+    pub colors: ColorState,
 
     // OSC 9/777 pending notifications
     pub pending_notifications: Vec<(String, String)>,

@@ -1,0 +1,34 @@
+{
+  "base": "23f0040401cf92820bcb16b4599efde9bed34759",
+  "records": 61964,
+  "original_sha256": "f1ba70935de0f091d9b353eb6f1ee66d8ddde6aa32ef8c157c31936bf2d4f23a",
+  "packed_sha256": "04edcd7541838201e585d0505d2898e56a22f82fda2abfa917701255a558dfc7",
+  "replay": "two pre-mutation + one final restored passed",
+  "mutations": {
+    "drop_palette_reply": {
+      "returncode": 101,
+      "detected": true
+    },
+    "ignore_palette_reset": {
+      "returncode": 101,
+      "detected": true
+    },
+    "suppress_theme_notification": {
+      "returncode": 101,
+      "detected": true
+    }
+  },
+  "transport_note": "Fixed sharder path typo after capture; original frozen sources retained. Changed only transport script and hardcoded frozen transport identity; production unchanged.",
+  "files_sha256": {
+    "src/terminal/parser.rs": "46696163ac06686def4b8102d25e2f585482d2391bef2e4b1a134f44795fa305",
+    "src/terminal/color_oracles.rs": "fa6470c0c7cc0463b0f0fffe203cb448a0e003e969d1a82309356eeb39429668",
+    "tests/fixtures/color_corpus.json": "7aa606ed297ae4d7c32173d97c559dbf150a8158b02f0d0fda98199e9930aa9d",
+    "tests/fixtures/capture_color_baseline.py": "2a905bcdc9e573431b86f3d6236b2935462364bcfaa426b6e3a88a0928132622",
+    "tests/fixtures/shard_color_capture.py": "2d3a0119484760e15c1e7d65d637315467d4b5d67718e48af894bdb46d4f4e4c",
+    "tests/fixtures/color_golden/manifest.json": "e1700f36f7e8a5b7780d09281c80bf763fdc72bd6f09042fc26626ccea383055",
+    "tests/fixtures/color_golden/part-00.json-fragment": "2f16f6723e3384a5050b4ae607710f1bb69dd9250ca9450b7f2a655c3035262e",
+    "tests/fixtures/color_golden/part-01.json-fragment": "022c35f8097c001db04f8007c7f4e4d41f0c8d7c0ed56338d4cccb23a975432a",
+    "tests/fixtures/color_golden/part-02.json-fragment": "9937e599f622697e87818890ef9f26c916e47fca049e5040617bb332b15622da",
+    "tests/fixtures/color_golden/part-03.json-fragment": "e0872ea0ad4660005e2d93150e384b4eab6051ea9c86c68048cb22db80858957"
+  }
+}

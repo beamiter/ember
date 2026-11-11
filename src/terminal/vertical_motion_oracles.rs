@@ -4,6 +4,12 @@ use std::collections::BTreeMap;
 type Snapshot = BTreeMap<String, String>;
 fn snapshot(t: &TerminalState) -> Snapshot {
     let mut out = super::super::alternate_parity_tests::snapshot(t);
+    out.insert("dynamic_fg".into(), format!("{:?}", t.colors.dynamic_fg));
+    out.insert("dynamic_bg".into(), format!("{:?}", t.colors.dynamic_bg));
+    out.insert(
+        "dynamic_cursor_color".into(),
+        format!("{:?}", t.colors.dynamic_cursor_color),
+    );
     macro_rules! host {
         ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
     }
@@ -21,9 +27,6 @@ fn snapshot(t: &TerminalState) -> Snapshot {
         pending_osc52_clipboard_queries,
         pending_notifications,
         pending_bell,
-        dynamic_fg,
-        dynamic_bg,
-        dynamic_cursor_color,
         chat_pending_submit,
         chat_native_takeover_sequence,
         inline_cli_launch_floor,
