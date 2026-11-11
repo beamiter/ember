@@ -297,6 +297,71 @@ fn random_ends(len: usize, seed: u64, max_chunk: usize) -> Vec<usize> {
 }
 
 #[test]
+fn osc_non_ascii_hash_colors_preserve_values_and_recover_across_partitions() {
+    for command in ["10", "11", "12", "4;1"] {
+        for terminator in ["\x07", "\x1b\\"] {
+            // The first two put a two-byte scalar across either slicing
+            // boundary; the third crosses both with a four-byte scalar.
+            for malformed in ["#aéabc", "#abcéd", "#a💡b"] {
+                let input = format!(
+                    "\x1b]{command};#123456{terminator}\x1b]{command};{malformed}{terminator}\x1b]{command};?{terminator}\x1b]{command};#abcdef{terminator}\x1b]{command};?{terminator}OK"
+                );
+                let bytes = input.as_bytes();
+                let terminal = run(bytes, [bytes.len()]);
+                // Explicit expected effects prevent partition equivalence
+                // alone from accepting a parser that drops every color OSC.
+                assert_eq!(
+                    terminal.output_buffer,
+                    format!(
+                        "\x1b]{command};rgb:1212/3434/5656{terminator}\x1b]{command};rgb:abab/cdcd/efef{terminator}"
+                    )
+                    .as_bytes(),
+                );
+                let expected_color = (0xab, 0xcd, 0xef);
+                assert_eq!(
+                    terminal.dynamic_fg,
+                    (command == "10").then_some(expected_color)
+                );
+                assert_eq!(
+                    terminal.dynamic_bg,
+                    (command == "11").then_some(expected_color)
+                );
+                assert_eq!(
+                    terminal.dynamic_cursor_color,
+                    (command == "12").then_some(expected_color)
+                );
+                for (index, color) in terminal.dynamic_palette.iter().enumerate() {
+                    assert_eq!(
+                        *color,
+                        (command == "4;1" && index == 1).then_some(expected_color)
+                    );
+                }
+                assert_eq!(terminal.screen.grid[0][0].character, 'O');
+                assert_eq!(terminal.screen.grid[0][1].character, 'K');
+                let expected = snapshot(&terminal);
+                for cut in 0..=bytes.len() {
+                    assert_partition(&input, bytes, &expected, &[cut, bytes.len()]);
+                }
+                assert_partition(
+                    &input,
+                    bytes,
+                    &expected,
+                    &(1..=bytes.len()).collect::<Vec<_>>(),
+                );
+                for seed in 0..16 {
+                    assert_partition(
+                        &input,
+                        bytes,
+                        &expected,
+                        &random_ends(bytes.len(), seed, 11),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn corpus_every_two_way_cut_and_one_byte_reads() {
     for &(name, bytes) in CASES {
         let expected = snapshot(&run(bytes, [bytes.len()]));

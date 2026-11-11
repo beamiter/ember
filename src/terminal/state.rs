@@ -588,7 +588,9 @@ impl super::TerminalState {
             (((value as u32) * 255 + max_n / 2) / max_n) as u8
         }
         if let Some(hex) = spec.strip_prefix('#') {
-            if hex.len() == 6 {
+            // OSC payloads are UTF-8, not necessarily ASCII. Reject non-ASCII
+            // before byte slicing so a six-byte malformed color cannot panic.
+            if hex.len() == 6 && hex.is_ascii() {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
                 let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
                 let b = u8::from_str_radix(&hex[4..6], 16).ok()?;

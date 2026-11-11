@@ -6194,6 +6194,24 @@ fn decrc_restores_pending_wrap_so_right_prompt_does_not_drop_cursor() {
 }
 
 #[test]
+fn osc_hash_color_specs_reject_non_ascii_without_changing_ascii_parsing() {
+    for spec in ["#aéabc", "#abcéd", "#a💡b", "#界abc", "#éabcd"] {
+        assert_eq!(spec.len(), 7, "exercise six-byte color payloads");
+        assert_eq!(TerminalState::parse_color_spec(spec), None, "{spec}");
+    }
+    for (spec, expected) in [
+        ("#0123aB", Some((1, 35, 171))),
+        ("#ABCDEF", Some((171, 205, 239))),
+        ("#+1+2+3", Some((1, 2, 3))),
+        ("#12345", None),
+        ("#1234567", None),
+        ("#gg0000", None),
+    ] {
+        assert_eq!(TerminalState::parse_color_spec(spec), expected, "{spec}");
+    }
+}
+
+#[test]
 fn osc_4_sets_queries_and_resets_palette_entries() {
     let mut terminal = TerminalState::new(8, 2);
 
