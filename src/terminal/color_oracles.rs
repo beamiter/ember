@@ -24,14 +24,17 @@ fn snapshot(t: &TerminalState, previous_epoch: Option<u64>) -> Snapshot {
         "default_colors".into(),
         format!("{:?}", t.colors.default_colors),
     );
+    out.insert(
+        "window_title".into(),
+        format!("{:?}", t.titles.window_title),
+    );
+    out.insert("icon_title".into(), format!("{:?}", t.titles.icon_title));
+    out.insert("title_stack".into(), format!("{:?}", t.titles.title_stack));
     macro_rules! host {
         ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
     }
     host!(
         sync_output_active,
-        window_title,
-        icon_title,
-        title_stack,
         current_working_dir,
         ime_enabled,
         preedit_text,

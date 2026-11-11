@@ -1646,12 +1646,12 @@ fn osc_window_title_survives_every_input_batch_boundary() {
             let mut terminal = TerminalState::new(8, 2);
             terminal.process_input(&sequence.as_bytes()[..split_at]);
             assert!(
-                terminal.window_title.is_empty(),
+                terminal.titles.window_title.is_empty(),
                 "incomplete OSC was applied at split {split_at}"
             );
             terminal.process_input(&sequence.as_bytes()[split_at..]);
             assert_eq!(
-                terminal.window_title, "fragmented title",
+                terminal.titles.window_title, "fragmented title",
                 "OSC was lost at input split {split_at}"
             );
             assert!(terminal.parser.snapshot().pending_osc.is_empty());
@@ -1695,7 +1695,7 @@ fn fragmented_osc_advances_its_scan_cursor_and_stays_bounded() {
     // trailing byte is ordinary terminal input, not OSC payload.
     terminal.process_input(b"\x07Z");
     assert!(terminal.parser.snapshot().pending_osc.is_empty());
-    assert_eq!(terminal.window_title, "streamed-title");
+    assert_eq!(terminal.titles.window_title, "streamed-title");
     assert_eq!(terminal.screen.grid[0][0].character, 'Z');
 }
 
@@ -1708,7 +1708,7 @@ fn osc_terminators_straddling_chunks_complete_the_sequence() {
     assert!(!terminal.parser.snapshot().pending_osc.is_empty());
     terminal.process_input(b"\\Y");
     assert!(terminal.parser.snapshot().pending_osc.is_empty());
-    assert_eq!(terminal.window_title, "straddle");
+    assert_eq!(terminal.titles.window_title, "straddle");
     assert_eq!(terminal.screen.grid[0][0].character, 'Y');
 
     // A non-ST ESC abandons OSC and starts the next escape. Here ESC c
@@ -1716,14 +1716,14 @@ fn osc_terminators_straddling_chunks_complete_the_sequence() {
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b]0;ab\x1b");
     terminal.process_input(b"cd\x07");
-    assert!(terminal.window_title.is_empty());
+    assert!(terminal.titles.window_title.is_empty());
     assert_eq!(terminal.screen.grid[0][0].character, 'd');
 
     // ESC ESC \: the first non-ST escape abandons OSC; ST cannot revive it.
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b]0;ab\x1b");
     terminal.process_input(b"\x1b\\");
-    assert!(terminal.window_title.is_empty());
+    assert!(terminal.titles.window_title.is_empty());
 }
 
 #[test]
@@ -1750,7 +1750,7 @@ fn oversized_osc_is_dropped_and_parsing_resumes_in_ground_state() {
     terminal.process_input(&chunk);
     assert!(terminal.parser.snapshot().pending_osc.is_empty());
     terminal.process_input(b"\x1b]0;new\x07");
-    assert_eq!(terminal.window_title, "new");
+    assert_eq!(terminal.titles.window_title, "new");
 }
 
 #[test]
@@ -3039,10 +3039,10 @@ fn xtwinops_pushes_and_pops_the_title() {
 
     terminal.process_input(b"\x1b[22;0t");
     terminal.process_input(b"\x1b]2;during a command\x07");
-    assert_eq!(terminal.window_title, "during a command");
+    assert_eq!(terminal.titles.window_title, "during a command");
 
     terminal.process_input(b"\x1b[23;0t");
-    assert_eq!(terminal.window_title, "before");
+    assert_eq!(terminal.titles.window_title, "before");
 }
 
 /// OSC 0 sets both titles, 1 the icon title, 2 the window title — which is what
@@ -3052,16 +3052,16 @@ fn osc_title_commands_address_the_two_titles_separately() {
     let mut terminal = TerminalState::new(20, 4);
 
     terminal.process_input(b"\x1b]0;both\x07");
-    assert_eq!(terminal.window_title, "both");
-    assert_eq!(terminal.icon_title, "both");
+    assert_eq!(terminal.titles.window_title, "both");
+    assert_eq!(terminal.titles.icon_title, "both");
 
     terminal.process_input(b"\x1b]1;icon only\x07");
-    assert_eq!(terminal.window_title, "both");
-    assert_eq!(terminal.icon_title, "icon only");
+    assert_eq!(terminal.titles.window_title, "both");
+    assert_eq!(terminal.titles.icon_title, "icon only");
 
     terminal.process_input(b"\x1b]2;window only\x07");
-    assert_eq!(terminal.window_title, "window only");
-    assert_eq!(terminal.icon_title, "icon only");
+    assert_eq!(terminal.titles.window_title, "window only");
+    assert_eq!(terminal.titles.icon_title, "icon only");
 }
 
 /// A title report goes back out to the PTY, so it must not carry anything that
@@ -3070,8 +3070,8 @@ fn osc_title_commands_address_the_two_titles_separately() {
 fn a_reported_title_cannot_break_its_own_framing() {
     let mut terminal = TerminalState::new(20, 4);
     terminal.process_input(b"\x1b]2;ok\x07");
-    terminal.window_title.push('\u{202e}');
-    terminal.window_title.push('\u{7}');
+    terminal.titles.window_title.push('\u{202e}');
+    terminal.titles.window_title.push('\u{7}');
 
     terminal.process_input(b"\x1b[21t");
 
@@ -3092,7 +3092,7 @@ fn the_title_stack_is_depth_capped() {
     for _ in 0..(MAX_TITLE_STACK_DEPTH * 3) {
         terminal.process_input(b"\x1b[23;0t");
     }
-    assert!(terminal.window_title.starts_with('t'));
+    assert!(terminal.titles.window_title.starts_with('t'));
 }
 
 /// `CSI 5 n` is the standard liveness probe. Answering nothing makes the caller
@@ -7174,20 +7174,20 @@ fn the_window_title_is_bounded_where_it_enters_terminal_state() {
     let long = "t".repeat(MAX_WINDOW_TITLE_CHARS * 4);
     terminal.process_input(format!("\x1b]2;{long}\x07").as_bytes());
     assert_eq!(
-        terminal.window_title.chars().count(),
+        terminal.titles.window_title.chars().count(),
         MAX_WINDOW_TITLE_CHARS
     );
 
     terminal.process_input(b"\x1b]0;short\x07");
-    assert_eq!(terminal.window_title, "short");
+    assert_eq!(terminal.titles.window_title, "short");
 }
 
 #[test]
 fn osc_titles_drop_controls_and_replace_visual_spoofing() {
     let mut terminal = TerminalState::new(24, 4);
     terminal.process_input("\x1b]2;ok\u{0}\u{202e}done\x07".as_bytes());
-    assert_eq!(terminal.window_title, "ok\u{fffd}done");
-    assert!(terminal.icon_title.is_empty());
+    assert_eq!(terminal.titles.window_title, "ok\u{fffd}done");
+    assert!(terminal.titles.icon_title.is_empty());
 }
 
 fn row_text(terminal: &TerminalState, row: usize) -> String {
@@ -7687,7 +7687,7 @@ fn cancelled_control_strings_resume_visible_text_at_every_split() {
                     "prefix={prefix:?}, cancel={cancel}, split={split}"
                 );
                 assert_eq!(terminal.screen.grid[0][1].character, 'k');
-                assert!(terminal.window_title.is_empty());
+                assert!(terminal.titles.window_title.is_empty());
             }
         }
     }
@@ -7719,7 +7719,7 @@ fn a_real_reset_interrupts_control_strings_at_every_split() {
                 "prefix={prefix:?}, split={split}"
             );
             assert!(!terminal.protocol.modes().contains(&2004));
-            assert!(terminal.window_title.is_empty());
+            assert!(terminal.titles.window_title.is_empty());
         }
     }
 }

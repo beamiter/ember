@@ -1,0 +1,3 @@
+tests/fixtures/title_baseline_provenance/replay1.log whitespace=-blank-at-eof
+tests/fixtures/title_baseline_provenance/replay2.log whitespace=-blank-at-eof
+tests/fixtures/title_baseline_provenance/replay3_restored.log whitespace=-blank-at-eof

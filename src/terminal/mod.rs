@@ -108,9 +108,10 @@ pub const MAX_COMMAND_MARKS: usize = 1024;
 /// title at the same number, but it can only cap the string it is handed, and
 /// an OSC 0/2 payload arrives from a pending-escape buffer that tolerates
 /// megabytes.
-pub(crate) const MAX_WINDOW_TITLE_CHARS: usize = 200;
+pub(crate) const MAX_WINDOW_TITLE_CHARS: usize = jterm_engine::titles::MAX_WINDOW_TITLE_CHARS;
 /// Depth of the XTWINOPS title stack (ops 22/23), matching frost.
-pub(crate) const MAX_TITLE_STACK_DEPTH: usize = 16;
+#[cfg(test)]
+pub(crate) const MAX_TITLE_STACK_DEPTH: usize = jterm_engine::titles::MAX_TITLE_STACK_DEPTH;
 /// OSC 133 per-field byte budgets are the shared protocol's constants, not a
 /// fourth per-app set. Ember's decoder and `jterm_core::parser::CommandMeta`
 /// read the same packets, so a cap that differs makes the two disagree about
@@ -478,17 +479,8 @@ pub struct TerminalState {
     pub scroll_offset: usize,
     max_scrollback: usize,
 
-    /// Window title from OSC 0/2, bounded at ingest to
-    /// [`MAX_WINDOW_TITLE_CHARS`]. Still untrusted text — the window-manager
-    /// sanitiser owns bidi/control filtering — but no longer unbounded.
-    pub window_title: String,
-    /// The icon title, kept separately from the window title because XTWINOPS
-    /// reports and saves them independently (ops 20/21, 22/23). OSC 0 sets
-    /// both, OSC 1 only this one, OSC 2 only the window title.
-    pub icon_title: String,
-    /// xterm's title save/restore stack, depth-capped so a program that only
-    /// ever pushes cannot grow it without bound.
-    title_stack: Vec<(Option<String>, Option<String>)>,
+    /// Engine-owned titles; host sanitizes incoming trusted-chrome text.
+    pub titles: jterm_engine::titles::TitleState,
     /// jsh's own session identity as announced over OSC 7770, when the shell
     /// in this pane announced one.
     ///

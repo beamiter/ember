@@ -10,14 +10,17 @@ fn snapshot(t: &TerminalState) -> Snapshot {
         "dynamic_cursor_color".into(),
         format!("{:?}", t.colors.dynamic_cursor_color),
     );
+    out.insert(
+        "window_title".into(),
+        format!("{:?}", t.titles.window_title),
+    );
+    out.insert("icon_title".into(), format!("{:?}", t.titles.icon_title));
+    out.insert("title_stack".into(), format!("{:?}", t.titles.title_stack));
     macro_rules! host {
         ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
     }
     host!(
         sync_output_active,
-        window_title,
-        icon_title,
-        title_stack,
         current_working_dir,
         ime_enabled,
         preedit_text,

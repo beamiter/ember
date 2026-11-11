@@ -1,0 +1,17 @@
+{
+  "format": "ordered-utf8-shards-v1",
+  "original_bytes": 4885527,
+  "original_sha256": "08d235c774c108c3444d4e0c72f070dfb52577c220e17688cb654592c7af0baa",
+  "parts": [
+    {
+      "file": "part-00.json-fragment",
+      "bytes": 4194304,
+      "sha256": "f06bc79e3a5d8c3d31562c37f2779d1a1b55a80141ce1ddc2dfbd453c8fac9e5"
+    },
+    {
+      "file": "part-01.json-fragment",
+      "bytes": 691223,
+      "sha256": "ed4584f0980689ed1299f8c345395481c562f76482ff1b7554df3d770c2aa6a1"
+    }
+  ]
+}

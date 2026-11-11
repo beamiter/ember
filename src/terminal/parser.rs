@@ -109,12 +109,7 @@ impl super::TerminalState {
                     // Per xterm: 0 sets both titles, 1 the icon title only,
                     // 2 the window title only. The icon title is separate
                     // because XTWINOPS reports and saves the two independently.
-                    if command != "1" {
-                        self.window_title = Self::sanitized_title(value);
-                    }
-                    if command != "2" {
-                        self.icon_title = Self::sanitized_title(value);
-                    }
+                    self.titles.set_osc(command, &Self::sanitized_title(value));
                 } else if command == "7" {
                     // OSC 7 — current working directory.
                     // Format: file://hostname/path (path is %-encoded).
@@ -684,27 +679,6 @@ impl super::TerminalState {
             .collect()
     }
 
-    /// A title on its way back out to the PTY, with anything that could break
-    /// the reply's own framing or reorder it removed. The ingest path caps
-    /// length; this caps what the bytes can *do*.
-    fn reportable_title(title: &str) -> String {
-        title
-            .chars()
-            .filter(|&ch| {
-                !ch.is_control()
-                    && !matches!(
-                        ch,
-                        '\u{061c}'
-                            | '\u{200e}'
-                            | '\u{200f}'
-                            | '\u{202a}'..='\u{202e}'
-                            | '\u{2066}'..='\u{2069}'
-                    )
-            })
-            .take(MAX_WINDOW_TITLE_CHARS)
-            .collect()
-    }
-
     /// XTWINOPS (`CSI Ps ; … t`), reporting ops and the title stack only.
     ///
     /// Dropping these entirely left two holes: a program probing cell geometry
@@ -751,52 +725,12 @@ impl super::TerminalState {
                 let response = format!("\x1b[9;{rows};{cols}t");
                 self.output_buffer.extend(response.as_bytes());
             }
-            // Report icon label / window title.
-            20 => {
-                let response = format!("\x1b]L{}\x1b\\", Self::reportable_title(&self.icon_title));
-                self.output_buffer.extend(response.as_bytes());
+            // Title semantics live in the engine; geometry stays host-owned.
+            20..=23 => {
+                let effects = self.titles.apply_window_op(params);
+                self.apply_local_semantic_effects(effects);
             }
-            21 => {
-                let response =
-                    format!("\x1b]l{}\x1b\\", Self::reportable_title(&self.window_title));
-                self.output_buffer.extend(response.as_bytes());
-            }
-            // Save/restore titles. 1 = icon, 2 = window, anything else = both.
-            22 => self.save_titles(params.get(1).copied().unwrap_or(0)),
-            23 => self.restore_titles(params.get(1).copied().unwrap_or(0)),
             _ => {}
-        }
-    }
-
-    fn save_titles(&mut self, target: u16) {
-        if self.title_stack.len() >= MAX_TITLE_STACK_DEPTH {
-            self.title_stack.remove(0);
-        }
-        match target {
-            1 => self.title_stack.push((Some(self.icon_title.clone()), None)),
-            2 => self
-                .title_stack
-                .push((None, Some(self.window_title.clone()))),
-            _ => self.title_stack.push((
-                Some(self.icon_title.clone()),
-                Some(self.window_title.clone()),
-            )),
-        }
-    }
-
-    fn restore_titles(&mut self, target: u16) {
-        let Some((icon_title, window_title)) = self.title_stack.pop() else {
-            return;
-        };
-        if target != 2 {
-            if let Some(icon_title) = icon_title {
-                self.icon_title = icon_title;
-            }
-        }
-        if target != 1 {
-            if let Some(window_title) = window_title {
-                self.window_title = window_title;
-            }
         }
     }
 
@@ -967,3 +901,7 @@ pub(super) mod vertical_motion_oracles;
 #[cfg(test)]
 #[path = "color_oracles.rs"]
 mod color_oracles;
+
+#[cfg(test)]
+#[path = "title_oracles.rs"]
+mod title_oracles;

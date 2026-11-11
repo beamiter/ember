@@ -53,13 +53,13 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
         format!("{:?}", t.colors.dynamic_cursor_color),
     );
     result.insert("dynamic_palette", format!("{:?}", t.colors.dynamic_palette));
+    result.insert("window_title", format!("{:?}", t.titles.window_title));
+    result.insert("icon_title", format!("{:?}", t.titles.icon_title));
+    result.insert("title_stack", format!("{:?}", t.titles.title_stack));
     macro_rules! fields {
         ($($field:ident),* $(,)?) => {$(result.insert(stringify!($field), format!("{:?}", t.$field));)*};
     }
     fields!(
-        window_title,
-        icon_title,
-        title_stack,
         announced_jsh_session_id,
         current_working_dir,
         global_bg,

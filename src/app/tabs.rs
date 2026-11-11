@@ -468,7 +468,7 @@ impl TerminalApp {
                     return fallback;
                 }
                 let terminal = session.terminal.lock();
-                jterm_core::title_bar::tab_label(&terminal.window_title, &fallback)
+                jterm_core::title_bar::tab_label(&terminal.titles.window_title, &fallback)
             })
             .unwrap_or_default()
     }

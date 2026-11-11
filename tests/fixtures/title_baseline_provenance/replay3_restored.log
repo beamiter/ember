@@ -1,0 +1,9 @@
+   Compiling ember v0.4.0 (/workspace/scratch/9226dcee068a/recovery/resumed-family/title-capture)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.63s
+     Running unittests src/lib.rs (recovery/resumed-family/ember/target/debug/deps/ember-3cb87570991eead0)
+
+running 1 test
+test terminal::parser::title_oracles::title_original_production_golden ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1481 filtered out; finished in 17.86s
+

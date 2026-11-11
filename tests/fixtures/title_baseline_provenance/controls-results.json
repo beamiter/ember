@@ -1,0 +1,22 @@
+{
+  "replay2": {
+    "exit": 0,
+    "sha256": "e98c47177d56fe516e9ae988ddd6d8d7fc3318a5b498262407e5f61b23b73827"
+  },
+  "mutation_terminator": {
+    "exit": 101,
+    "sha256": "d4c444d69dbf8d25c448e56159d258893d607a917dcd67aa8da43439ac115640"
+  },
+  "mutation_stack_pop": {
+    "exit": 101,
+    "sha256": "d91c95c26e67d8f87d69fc54a4b450e07f66f06f39eaef1a29e485dd04f2a490"
+  },
+  "mutation_title_bound": {
+    "exit": 101,
+    "sha256": "6bc4c1013c0f6ddfff2ccbe3a0de2737f5eb61c9cf3682d989267241d8607c69"
+  },
+  "replay3_restored": {
+    "exit": 0,
+    "sha256": "ff42e9bf4aff324177c1f5721c089a4a0272cad740c8f4a7c19ef15311a54913"
+  }
+}

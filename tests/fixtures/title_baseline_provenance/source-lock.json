@@ -1,0 +1,19 @@
+{
+  "capture_ready": true,
+  "capture_base_commit": "53170edb13cfc7ea2340a0b4c1046472db1bc11b",
+  "source_sha256": {
+    "src/terminal/state.rs": "cf1493bc634a407fd0d51dd9918f3ebe731bfc09c4dcb26d6fee27ae68ed6b6c",
+    "src/terminal/parser.rs": "a0f5e94bf24acca547fe3cc985702e2fc82c3f83f467f747114bea12baa94cbd",
+    "src/terminal/mod.rs": "ee7c849d5d44f227b653c3530873e0aac2840885a679d6c166de841a47c579cc",
+    "src/terminal/alternate_parity_tests.rs": "45e7663b5c5ef6d5bc4b66045b11f27c961a0cd3dbe15998cd8dd21e40ffc9e5",
+    "Cargo.toml": "ad35ca29d29d31f24eb8d707a3528616895f4c09699081499b76fd3866b8934e",
+    "Cargo.lock": "94e93e9dffe9cf60737307de30eb84b6bc27b0a413b1309a3dcf4e4e1664431a"
+  },
+  "capture_corpus_sha256": "38180e3cb0429cf7fc140a843a09c669337471e358ac7cb62c5f760dc9853dd3",
+  "external_source_sha256": {
+    "src/review_input.rs": "c21aaabcfa1396d9932718f0530d0c5bd3e73ee2ebc44a07a473473f87705b4a",
+    "crates/jterm_engine/src/colors.rs": "3f21cdfa73ebc3477f563d72f62347a53c86756bf164e9b52b3faa8e5e79bfb5"
+  },
+  "note": "Original production source and test-only overlay verified; final no-run compile and independent review passed.",
+  "observer_sha256": "55e0c403709cdcbf7792af57bb6f7b98dd5c6dde49dab18bba8e2cf179ae2de6"
+}

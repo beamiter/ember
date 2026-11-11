@@ -1,0 +1,12 @@
+diff --git a/src/terminal/parser.rs b/src/terminal/parser.rs
+index 60ded13..e8365e4 100644
+--- a/src/terminal/parser.rs
++++ b/src/terminal/parser.rs
+@@ -967,3 +967,7 @@ pub(super) mod vertical_motion_oracles;
+ #[cfg(test)]
+ #[path = "color_oracles.rs"]
+ mod color_oracles;
++
++#[cfg(test)]
++#[path = "title_oracles.rs"]
++mod title_oracles;

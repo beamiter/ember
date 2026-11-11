@@ -1,0 +1,48 @@
+{
+  "base_commit": "53170edb13cfc7ea2340a0b4c1046472db1bc11b",
+  "record_count": 36184,
+  "tests": {
+    "original_replays": 3,
+    "mutation_controls_failed": 3
+  },
+  "sha256": {
+    "original.json": "c9f1ea4440fd05d46ac33531309ce7a0ca6d8fd794961beb906a1a0abc4d072b",
+    "packed.json": "08d235c774c108c3444d4e0c72f070dfb52577c220e17688cb654592c7af0baa",
+    "unpacked.json": "c9f1ea4440fd05d46ac33531309ce7a0ca6d8fd794961beb906a1a0abc4d072b",
+    "original.stdout": "633f58e11017cdc0459f92f66e5284d46f7ee2e3e5e72dae66d511cb8a839e57",
+    "original.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "original.json.capture.json": "3e9d6c5119ea8600a821f7036e9151821b0713dbb8cdb4425bb21052d8fcb1b5",
+    "source-lock.json": "204fc2ba745502b25818a2f8f9ed6559e1dad32995b8e2d38cd213d605fe023c",
+    "title_oracles.original.rs": "55e0c403709cdcbf7792af57bb6f7b98dd5c6dde49dab18bba8e2cf179ae2de6",
+    "title_oracles.replay.rs": "576f0f3574a787343cde2a6a805c5bb748cb2d4e3c03dd592a14f56dff13689c",
+    "title_corpus.json": "38180e3cb0429cf7fc140a843a09c669337471e358ac7cb62c5f760dc9853dd3",
+    "registration.diff": "62b64a62616e54f7a84feb12a7a1aed7388d0a80b5a54ccca3f79c5543ab794f",
+    "original-parser.rs": "a0f5e94bf24acca547fe3cc985702e2fc82c3f83f467f747114bea12baa94cbd",
+    "original-state.rs": "cf1493bc634a407fd0d51dd9918f3ebe731bfc09c4dcb26d6fee27ae68ed6b6c",
+    "original-mod.rs": "ee7c849d5d44f227b653c3530873e0aac2840885a679d6c166de841a47c579cc",
+    "replay1.log": "49a99d8aedfac98ee035c0bc62aa7f8ebb84b4e65485c3c129da69cd82561cc9",
+    "replay2.log": "e98c47177d56fe516e9ae988ddd6d8d7fc3318a5b498262407e5f61b23b73827",
+    "replay3_restored.log": "ff42e9bf4aff324177c1f5721c089a4a0272cad740c8f4a7c19ef15311a54913",
+    "mutation_terminator.log": "d4c444d69dbf8d25c448e56159d258893d607a917dcd67aa8da43439ac115640",
+    "mutation_stack_pop.log": "d91c95c26e67d8f87d69fc54a4b450e07f66f06f39eaef1a29e485dd04f2a490",
+    "mutation_title_bound.log": "6bc4c1013c0f6ddfff2ccbe3a0de2737f5eb61c9cf3682d989267241d8607c69",
+    "controls-results.json": "cc24145c44336f73e8d8e7f78242eeb845c6f7cefc08e73314c506844c24a3e5"
+  },
+  "transport_manifest": {
+    "format": "ordered-utf8-shards-v1",
+    "original_bytes": 4885527,
+    "original_sha256": "08d235c774c108c3444d4e0c72f070dfb52577c220e17688cb654592c7af0baa",
+    "parts": [
+      {
+        "file": "part-00.json-fragment",
+        "bytes": 4194304,
+        "sha256": "f06bc79e3a5d8c3d31562c37f2779d1a1b55a80141ce1ddc2dfbd453c8fac9e5"
+      },
+      {
+        "file": "part-01.json-fragment",
+        "bytes": 691223,
+        "sha256": "ed4584f0980689ed1299f8c345395481c562f76482ff1b7554df3d770c2aa6a1"
+      }
+    ]
+  }
+}

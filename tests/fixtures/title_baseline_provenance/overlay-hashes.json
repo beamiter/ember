@@ -1,0 +1,5 @@
+{
+  "overlay/src/terminal/title_oracles.rs": "55e0c403709cdcbf7792af57bb6f7b98dd5c6dde49dab18bba8e2cf179ae2de6",
+  "overlay/tests/fixtures/capture_title_baseline.py": "ff6f1a3b8561f3ad1dc67d9a5717c18e8d48105c77d11c7e846771c2004f4025",
+  "overlay/tests/fixtures/title_corpus.json": "38180e3cb0429cf7fc140a843a09c669337471e358ac7cb62c5f760dc9853dd3"
+}
