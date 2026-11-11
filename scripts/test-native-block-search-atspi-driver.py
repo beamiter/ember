@@ -486,4 +486,143 @@ class StableStopCaptureTests(unittest.TestCase):
     driver.wait_evidence(lambda t:p.action_button(t,driver.expected,'Stop search'),'not-a-stop-action')
    self.assertEqual(driver.smoke.screenshot.call_count,1)
 
+class StableSnapshotCaptureTests(unittest.TestCase):
+ line='E03SNAPSHOT00 ROW000016 ....'
+ def tree(self,height=200):
+  tree=EvidenceTests().result_tree()
+  tree['nodes'][1]['screen_extents']=[0,0,500,500]
+  tree['nodes'][2]['screen_extents']=[0,0,200,height]
+  return tree
+ def driver(self,directory,trees):
+  driver=StableStopCaptureTests().driver(directory,trees)
+  read=driver.read.side_effect
+  def retained_read(label):
+   result=read(label)
+   (driver.out/f'{driver.serial:04d}-{label}.json').write_text(json.dumps(result[0]))
+   return result
+  driver.read.side_effect=retained_read
+  return driver
+ def test_one_or_two_rejections_then_fresh_complete_bracket(self):
+  for rejected in (0,1,2):
+   with self.subTest(rejected=rejected),tempfile.TemporaryDirectory() as td:
+    trees=[]
+    for i in range(rejected):trees.extend([self.tree(200+i*20),self.tree(220+i*20)])
+    final=self.tree(200+rejected*20);trees.extend([final,final])
+    d=self.driver(td,trees)
+    with patch.object(p.time,'sleep'),patch.object(p,'invoke_button') as invoke:
+     node=d.snapshot_result(self.line,'snapshot')
+    self.assertEqual(node,final['nodes'][-1]);invoke.assert_not_called()
+    d.smoke.click.assert_not_called();d.smoke.key.assert_not_called()
+    self.assertEqual(len(list(d.smoke.out.glob('*.png'))),rejected+1)
+    self.assertEqual(len(list(d.out.glob('[0-9]*evidence-*.json'))),2*(rejected+1))
+    receipts=list(d.out.glob('public-evidence*.json'));self.assertEqual(len(receipts),1)
+    receipt=json.loads(receipts[0].read_text());self.assertTrue(receipt['after_verified'])
+    self.assertEqual(receipt['before']['picker_bounds'],final['nodes'][2]['screen_extents'])
+    self.assertEqual(receipt['image_sha256'],p.hashlib.sha256(Path(receipt['image']).read_bytes()).hexdigest())
+    self.assertEqual(sum(e['event']=='discarded-snapshot-capture' for e in d.smoke.events),rejected)
+ def test_third_rejection_is_terminal_even_if_next_bracket_would_stabilize(self):
+  with tempfile.TemporaryDirectory() as td:
+   d=self.driver(td,[self.tree(h) for h in [200,220,220,240,240,260,260,260]])
+   with patch.object(p.time,'sleep'),self.assertRaisesRegex(RuntimeError,'budget exhausted'):
+    d.snapshot_result(self.line,'snapshot')
+   self.assertEqual(d.read.call_count,6);self.assertEqual(d.smoke.screenshot.call_count,3)
+   self.assertEqual(len(list(d.smoke.out.glob('*.png'))),3)
+   self.assertEqual(len(list(d.out.glob('[0-9]*evidence-*.json'))),6)
+   self.assertEqual(list(d.out.glob('public-evidence*.json')),[])
+ def test_every_non_container_anchor_change_is_fatal_between_and_within_captures(self):
+  for where in ('between','within'):
+   for case in ('target-bounds','target-name','target-path','owner','pid','query','scope','focus','actions','window','missing'):
+    with self.subTest(where=where,case=case),tempfile.TemporaryDirectory() as td:
+     after=self.tree(220);bad=copy.deepcopy(after);found=p.public.controls(bad,'E03DISCOVERY')
+     if case=='target-bounds':bad['nodes'][-1]['screen_extents'][0]+=1
+     elif case=='target-name':bad['nodes'][-1]['name']+=' changed'
+     elif case=='target-path':
+      old=bad['nodes'][-1]['path'];bad['nodes'][-1]['path']+='new'
+      bad['nodes'][2]['children']=[bad['nodes'][-1]['path'] if x==old else x for x in bad['nodes'][2]['children']]
+     elif case in ('owner','pid'):
+      bad[case]=':9.9' if case=='owner' else 99
+      for n in bad['nodes']:n[case]=bad[case]
+     elif case=='query':found['editor']['text']='OTHER'
+     elif case=='scope':found['Out']['states'][0]&=~(1<<20);found['All']['states'][0]|=1<<20
+     elif case=='focus':found['editor']['states'][0]^=1<<12
+     elif case=='actions':bad['nodes'][-1]['actions']=[['click','changed','']]
+     elif case=='window':bad['nodes'][1]['screen_extents'][2]+=1
+     else:
+      old=bad['nodes'].pop()['path'];bad['nodes'][2]['children'].remove(old)
+     trees=[self.tree(),after,bad] if where=='between' else [self.tree(),bad]
+     d=self.driver(td,trees)
+     with patch.object(p.time,'sleep'),patch.object(p,'invoke_button') as invoke,self.assertRaises(RuntimeError):
+      d.snapshot_result(self.line,'snapshot')
+     invoke.assert_not_called();self.assertEqual(d.smoke.screenshot.call_count,1)
+     self.assertEqual(list(d.out.glob('public-evidence*.json')),[])
+ def test_picker_x_y_width_changes_are_fatal_within_and_between_captures(self):
+  for dimension in range(3):
+   for where in ('within','between'):
+    with self.subTest(dimension=dimension,where=where),tempfile.TemporaryDirectory() as td:
+     before=self.tree();after=self.tree(220)
+     for tree in (before,after):
+      for node in tree['nodes'][2:]:
+       if 'screen_extents' in node:
+        node['screen_extents'][0]+=10;node['screen_extents'][1]+=10
+     bad=copy.deepcopy(after)
+     # Move x/y outward so all controls stay visibly contained.
+     bad['nodes'][2]['screen_extents'][dimension]+= -1 if dimension<2 else 1
+     p.public.controls(bad,'E03DISCOVERY')
+     trees=[before,bad] if where=='within' else [before,after,bad,bad]
+     d=self.driver(td,trees)
+     message='^Public snapshot picker position or width changed'
+     message+= ' before recapture$' if where=='between' else '$'
+     with patch.object(p.time,'sleep'),self.assertRaisesRegex(RuntimeError,message):
+      d.snapshot_result(self.line,'snapshot')
+     self.assertEqual(d.smoke.screenshot.call_count,1)
+     self.assertEqual(list(d.out.glob('public-evidence*.json')),[])
+     d.smoke.click.assert_not_called()
+ def test_missing_initial_target_can_be_observed_without_action(self):
+  with tempfile.TemporaryDirectory() as td:
+   absent=self.tree();old=absent['nodes'].pop()['path'];absent['nodes'][2]['children'].remove(old)
+   d=self.driver(td,[absent,self.tree(),self.tree()])
+   with patch.object(p.time,'sleep'):d.snapshot_result(self.line,'snapshot')
+   self.assertEqual(d.smoke.screenshot.call_count,1);d.smoke.click.assert_not_called()
+ def test_corrupt_screenshot_with_geometry_change_is_fatal(self):
+  with tempfile.TemporaryDirectory() as td:
+   d=self.driver(td,[self.tree(),self.tree(220)]);read=d.read.side_effect
+   def corrupt(label):
+    result=read(label)
+    if label.endswith('-after'):next(d.smoke.out.glob('*.png')).write_bytes(b'corrupt')
+    return result
+   d.read.side_effect=corrupt
+   with self.assertRaisesRegex(RuntimeError,'Screenshot changed'):d.snapshot_result(self.line,'snapshot')
+   self.assertEqual(d.smoke.screenshot.call_count,1)
+ def test_absolute_deadline_including_recapture_never_restarts(self):
+  with tempfile.TemporaryDirectory() as td:
+   d=self.driver(td,[]);clock=[0.0];timeouts=[]
+   def evidence(*args,**kw):
+    timeouts.append(kw['timeout']);clock[0]+=15
+    raise p.PickerGeometryChanged({'same':'anchor'},[0,0,200,200],[0,0,200,220])
+   d.evidence=Mock(side_effect=evidence)
+   def sleep(delay):clock[0]+=delay
+   with patch.object(p.time,'monotonic',side_effect=lambda:clock[0]),patch.object(p.time,'sleep',side_effect=sleep):
+    with self.assertRaisesRegex(RuntimeError,'budget exhausted'):d.snapshot_result(self.line,'snapshot')
+   self.assertEqual(d.evidence.call_count,2);self.assertEqual(timeouts[0],30)
+   self.assertLess(timeouts[1],15)
+   self.assertEqual(d.evidence.call_args.kwargs['expected_anchor'],{'same':'anchor'})
+ def test_success_at_deadline_rejected_just_before_deadline_accepted(self):
+  for elapsed in (29.999,30,30.001):
+   with self.subTest(elapsed=elapsed),tempfile.TemporaryDirectory() as td:
+    d=self.driver(td,[]);clock=[0.0]
+    def evidence(*args,**kw):clock[0]=elapsed;return ('tree','node')
+    d.evidence=Mock(side_effect=evidence)
+    with patch.object(p.time,'monotonic',side_effect=lambda:clock[0]):
+     if elapsed<30:self.assertEqual(d.snapshot_result(self.line,'snapshot'),'node')
+     else:
+      with self.assertRaisesRegex(RuntimeError,'deadline exhausted'):d.snapshot_result(self.line,'snapshot')
+ def test_missing_target_observation_exhausts_original_deadline(self):
+  with tempfile.TemporaryDirectory() as td:
+   d=self.driver(td,[]);clock=[0.0]
+   def evidence(*args,**kw):clock[0]=30;raise p.MissingTarget('absent')
+   d.evidence=Mock(side_effect=evidence)
+   with patch.object(p.time,'monotonic',side_effect=lambda:clock[0]),patch.object(p.time,'sleep'):
+    with self.assertRaisesRegex(RuntimeError,'budget exhausted'):d.snapshot_result(self.line,'snapshot')
+   self.assertEqual(d.evidence.call_count,1)
+
 if __name__=='__main__':unittest.main()

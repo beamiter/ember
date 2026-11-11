@@ -23,9 +23,11 @@ class MissingTarget(RuntimeError):
 
 class PickerGeometryChanged(RuntimeError):
     """Rejected observation, never evidence or permission to invoke an action."""
-    def __init__(self, anchor):
+    def __init__(self, anchor, before_bounds=None, after_bounds=None):
         super().__init__('Public evidence changed across screenshot: picker bounds')
         self.anchor=anchor
+        self.before_bounds=before_bounds
+        self.after_bounds=after_bounds
 
 
 def action_button(tree, expected, name):
@@ -147,7 +149,7 @@ def evidence_identity(tree, expected, node):
 
 
 def capture_anchor(identity):
-    # Only the containing picker rectangle may settle before Stop. Ownership,
+    # Only the containing picker rectangle may settle before Stop or snapshot capture. Ownership,
     # query/scope/focus, window, target identity, actions and target bounds may not.
     return {key:value for key,value in identity.items() if key!='picker_bounds'}
 
@@ -252,13 +254,16 @@ class Driver:
         (self.out/(label+'.json')).write_text(json.dumps(record,indent=2))
         self.smoke.screenshot('public-query-'+str(self.serial))
 
-    def evidence(self, select, label, timeout=8, expected_anchor=None):
+    def evidence(self, select, label, timeout=8, expected_anchor=None, expected_picker_frame=None):
         """Fresh public tree / immutable pixels / public tree bracket."""
         deadline=time.monotonic()+timeout
         tree,_=self.read(label+'-evidence-before')
         node=select(tree)
         before=evidence_identity(tree,self.expected,node)
         anchor=capture_anchor(before)
+        if (expected_picker_frame is not None
+                and before['picker_bounds'][:3]!=expected_picker_frame):
+            raise RuntimeError('Public snapshot picker position or width changed before recapture')
         if expected_anchor is not None and anchor!=expected_anchor:
             raise RuntimeError('Public target identity changed before recapture')
         image_label=f'public-evidence-{self.serial:04d}-{label}'
@@ -283,7 +288,7 @@ class Driver:
         if time.monotonic()>=deadline:raise RuntimeError('Public evidence deadline exhausted')
         if after!=before:
             if capture_anchor(after)==anchor:
-                raise PickerGeometryChanged(anchor)
+                raise PickerGeometryChanged(anchor,before['picker_bounds'],after['picker_bounds'])
             raise RuntimeError('Public evidence changed across screenshot')
         record=dict(label=label,pid=tree['pid'],owner=tree['owner'],window=self.window,
                     image=str(image),image_sha256=digest,dimensions=[width,height],
@@ -302,8 +307,37 @@ class Driver:
         raise RuntimeError('Exact public target deadline exhausted: '+label)
 
     def snapshot_result(self, line, label):
-        _,node=self.wait_evidence(lambda t:snapshot_hit(t,self.expected,line),label)
-        return node
+        # Earlier history can expose the result before its containing picker
+        # finishes layout. Rejected brackets never authorize navigation. Only
+        # container height may settle; x/y/width and all target/control identity remains
+        # pinned across fresh captures, within the original observation budget.
+        deadline=time.monotonic()+30
+        anchor=None
+        picker_frame=None
+        rejected=0
+        while time.monotonic()<deadline and rejected<3:
+            try:
+                _,node=self.evidence(lambda t:snapshot_hit(t,self.expected,line),label,
+                                     timeout=max(0,deadline-time.monotonic()),
+                                     expected_anchor=anchor,expected_picker_frame=picker_frame)
+                if time.monotonic()>=deadline:
+                    raise RuntimeError('Stable snapshot evidence deadline exhausted')
+                return node
+            except MissingTarget as error:
+                if anchor is not None:
+                    raise RuntimeError('Public snapshot target disappeared before recapture') from error
+            except PickerGeometryChanged as error:
+                if (error.before_bounds is None or error.after_bounds is None
+                        or error.before_bounds[:3]!=error.after_bounds[:3]):
+                    raise RuntimeError('Public snapshot picker position or width changed') from error
+                picker_frame=error.before_bounds[:3]
+                anchor=error.anchor
+                rejected+=1
+                self.event(event='discarded-snapshot-capture',label=label,
+                           attempt=rejected,reason='picker bounds changed; no action invoked')
+            if rejected<3:
+                time.sleep(min(.1,max(0,deadline-time.monotonic())))
+        raise RuntimeError('Stable snapshot evidence budget exhausted')
 
     def raw_result(self, phase, label):
         timeout=30
