@@ -46,27 +46,32 @@ failures are the known trusted-system-Git sandbox preconditions:
 checks or expected snapshots were weakened to pass these checks.
 
 The release resolves root and font-harness core/engine from published revision
-`4db2e5fe9d8fd6e27856df9b65ccb847147df5b9`, with Cargo-generated Git lockfiles
+`e23a2efa3a1c1faeb1867e7b94ec7ad1c8823b22`, with Cargo-generated Git lockfiles
 and no local patch. The exact deny source allowlist and host-bundle public base
-match; adapter-source identity and bundled bytes are unchanged. Only historical
-title documentation and frozen provenance retain the previous revision.
+match; adapter-source identity and bundled bytes are unchanged. Historical
+title documentation and frozen provenance retain their original
+source revisions. This repin adds the Frost title profile without changing
+Ember production code or frozen expectations.
 
-The source exporter verifies 292 Git files and reproduces identical outputs in
+The source exporter verifies 293 Git files and reproduces identical outputs in
 two runs. Archive SHA-256:
-`c3ce85c16a4a466360314910290990d1258a58540ee8578fbf43fc8925b2a4e8`.
+`487b2ea6f41851cb56c70b6be643fea49aa4d1137f91bd33ae7bc6bf587ad3d0`.
 Archive checksum, pin gate and seven self-tests, host-bundle 24-file checks,
 strict all-target Clippy, native-feedback harness seven tests/format/Clippy,
 font harness 58 Rust tests plus 23 Python wiring tests, and the complete
-`security-check.sh --policy` gate pass.
+`security-check.sh --policy` gate pass. Cargo-audit 0.22.2 with
+`--deny warnings` also passes the root, font, native-feedback and EVA harness
+lockfiles; vendored standalone lockfiles are not used by these build graphs.
 
-Published engine tests on Rust 1.86 pass 122 tests in a fresh target directory.
+At the original ASCII publication, engine tests on Rust 1.86 passed 122 tests
+in a fresh target directory.
 An initial reuse of the earlier title-engine target resolved stale API artifacts;
 the failure log and clean-target success are retained in validation records.
 The published Git source contains the new API. No production workaround was added.
 
 Final published-source terminal validation completes with 493 passed, 0 failed
-and 11 ignored (154.81 seconds), including the sealed 70,940-snapshot ASCII
-golden and previous frozen suites. Independent review confirms the full adapter,
-provenance, live pins and generated archive. Complete diff whitespace checking
-against `a93b37a033218ee2a818dd9adc2cd0db350e6ee5` passes with the narrow
+and 11 ignored (151.93 seconds), including the sealed 70,940-snapshot ASCII
+golden and previous frozen suites. The repin leaves production source, adapter
+bytes and all frozen fixtures unchanged. Complete diff whitespace checking
+against `2360fe7347483e29ca096e17124d7bd08c3109f1` passes with the narrow
 artifact attributes above.
