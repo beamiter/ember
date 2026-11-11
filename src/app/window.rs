@@ -753,17 +753,28 @@ mod tests {
             }
         }
         let interactive = &manager.sessions()[0];
-        // The spawn handshake proves exec, not that shell startup helpers
-        // have finished. Wait for the actual empty session before supplying
-        // the synthetic prompt used by this parser/role test.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while interactive.shell.session_activity() != companion_host::pty_session::Activity::Idle {
-            assert!(
-                Instant::now() < deadline,
-                "fixture shell still has attached startup work"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // Exec and a single Idle observation do not prove startup helpers have
+        // settled: the next process scan can legitimately see attached work.
+        // Wait on the actual close predicate, not an earlier partial snapshot.
+        // This is fixture synchronization only; production stays fail-closed.
+        let wait_for_unblocked_interactive = || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let blocker = super::session_window_close_blocker(interactive);
+                if blocker.is_none() {
+                    assert!(
+                        interactive.shell.matches_interactive_shell_program(),
+                        "fixture must still be a live interactive shell, not an exited child"
+                    );
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "interactive fixture did not settle; last close blocker: {blocker:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
         assert!(
             super::session_window_close_blocker(interactive).is_some(),
             "an uninstrumented live shell does not prove idle"
@@ -772,7 +783,7 @@ mod tests {
             .terminal
             .lock()
             .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
-        assert!(super::session_window_close_blocker(interactive).is_none());
+        wait_for_unblocked_interactive();
         interactive.terminal.lock().note_user_input(b"read value\r");
         assert!(
             super::session_window_close_blocker(interactive).is_some(),
@@ -795,7 +806,7 @@ mod tests {
             .terminal
             .lock()
             .process_input(b"\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
-        assert!(super::session_window_close_blocker(interactive).is_none());
+        wait_for_unblocked_interactive();
         let owned = &manager.sessions()[command.session_index];
         assert_eq!(
             owned.purpose,
