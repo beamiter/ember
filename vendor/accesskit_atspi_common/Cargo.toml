@@ -42,17 +42,17 @@ name = "accesskit_atspi_common"
 path = "src/lib.rs"
 
 [dependencies.accesskit]
-version = "0.24.0"
+version = "0.25.2"
 
 [dependencies.accesskit_consumer]
-version = "0.36.0"
+version = "0.38.0"
 
 [dependencies.atspi-common]
 version = "0.13"
 default-features = false
 
 [dependencies.phf]
-version = "0.13.1"
+version = "0.14.0"
 features = ["macros"]
 
 [dependencies.serde]
