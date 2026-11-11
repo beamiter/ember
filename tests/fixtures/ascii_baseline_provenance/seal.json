@@ -1,0 +1,58 @@
+{
+  "base_commit": "a93b37a033218ee2a818dd9adc2cd0db350e6ee5",
+  "record_count": 70940,
+  "source_verification": "Production terminal sources restored; parser has only test registration. Original captured Cargo files retained separately; current Cargo changes limited to test flate2 and root lock dependency.",
+  "tests": {
+    "original_replays": 4,
+    "mutation_controls_failed": 4
+  },
+  "sha256": {
+    "original.json": "a748121d6e84c0d2fcf4fde66e4f464eeaf253e453415848913684725f46eef0",
+    "packed.json": "bda820552f4e39cb3ff16dd6f2f3bc4d69ba8a9fa7f1ad796c6d2217b549b28c",
+    "unpacked.json": "a748121d6e84c0d2fcf4fde66e4f464eeaf253e453415848913684725f46eef0",
+    "original.stdout": "60dafbac7c96102d01abc070aaea19281b5d8b14aa1e14f9278530b90f3807cd",
+    "original.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "original.json.capture.json": "3531304c91a078a3c9f2557c1b5ff585f4a1a2e16bdbd7d626d3957e9b4f86eb",
+    "source-lock.json": "9853aaf5b9f14fa6f7082fc55b5dd2611631c66fcf32d25916a243c02129c114",
+    "ascii_oracles.original.rs": "f8b12d4b38a76e00e29f3f0b23aecd1b5f45bbe9445aa1720ca2bd8c053d026a",
+    "ascii_oracles.replay.rs": "b301c5600b459e2c8553548c534fd72c1fa9188199ac6c16d61d50bf8d500f93",
+    "ascii_corpus.json": "d94165597a6af061f1851e105af7fb464c3e3be0f845daf47bb907c26c2d6f88",
+    "registration.diff": "865202f7e6a6f4abfe5d895822b14bf90ef8bb64c2dc0ccb4b0d3aceb92b6605",
+    "original-parser.rs": "0b83c73cef358234d95ec73e1e62985219de9bce6f0bc0cb1cd63e952fdeec54",
+    "original-state.rs": "0fd6cbbfba15add7167719cb10f70b22a7f275ca19850f74c33a0fb6e5053ffc",
+    "original-mod.rs": "ea4959bd4211f045f1977991c84bd43c792107edc220717249c54b33a91848c4",
+    "replay1.log": "80de10e15903db8b70137af8afcc643315181d36265b65a006088b3ad2acc719",
+    "replay2.log": "43b0e4f0e30a9e2d5b7f3f086f206daf5ba5b2a0c1d2088fc37841f02926b3f9",
+    "replay3_restored.log": "db0f7bc2b092523893ded6b4b4192a1ea63ce6342dda3e6d15a2da559255acf0",
+    "mutation_pending_latch.log": "309263ceb776930cc3030593c49e9792b346fc55d4f93d0907bd91abcaf8e3ab",
+    "mutation_consumed.log": "1325a064e215d41bd5466abe62aedecf2a1deefa49e2a7d4d5033a6290b079fc",
+    "mutation_last_printed.log": "0b90551cd3b5c95dff6dd206f7bba85a3c45eb7bf1c81a5cea2f3bba225a34fa",
+    "mutation_effect_order.log": "c7d84710c71306e46ba0a9d62663a618aa82ff75aff4e6f5abe8b9cb8a07ed63",
+    "original.json.gz": "d184a50c0962de6f4990d849496b9098030b67908ffef33e61bc9167e40d0161",
+    "test-transport-source.json": "f4656e962449d536017fd1b770f91f6fb19fe485b84b4d15fc32a15bb84f76eb",
+    "original-Cargo.toml": "807866c43726876a38733196c1f3268f2a370974a2524db296dac7c8f1fe934f",
+    "original-Cargo.lock": "214ca2e652ad4743e3b813b75d20a7b7c7b7b7da9417fc769482093835aff633",
+    "controls-results.json": "9fc6104a17c1ab7a553546dc54a0e836861565e64b5a51e51d522525ed060078",
+    "test-dependency.diff": "52e59024d0a9183c1ec4280bcaf4dd40aa65c000277dd2fb5a85c9f8bc9d4c02",
+    "replay4_bounded_loader.log": "46429da1f683824a191e0d762228663e38dbd3d231be785fbd579fde82a6f7f0"
+  },
+  "transport_manifest": {
+    "format": "ordered-gzip-shards-v1",
+    "original_bytes": 967963975,
+    "original_sha256": "a748121d6e84c0d2fcf4fde66e4f464eeaf253e453415848913684725f46eef0",
+    "compressed_bytes": 6768207,
+    "compressed_sha256": "d184a50c0962de6f4990d849496b9098030b67908ffef33e61bc9167e40d0161",
+    "parts": [
+      {
+        "file": "part-00.gz-fragment",
+        "bytes": 4194304,
+        "sha256": "501752376b31897de4cda54ae71aa6579aac0c80e5276ace0e86df168adc1196"
+      },
+      {
+        "file": "part-01.gz-fragment",
+        "bytes": 2573903,
+        "sha256": "85d6acad67267a4bb33ae9aa92881f1c3a8b834e40477d8c9a19c6f3ebe5294c"
+      }
+    ]
+  }
+}

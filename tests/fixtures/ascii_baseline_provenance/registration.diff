@@ -1,0 +1,12 @@
+diff --git a/src/terminal/parser.rs b/src/terminal/parser.rs
+index 2766f63..fb6a891 100644
+--- a/src/terminal/parser.rs
++++ b/src/terminal/parser.rs
+@@ -905,3 +905,7 @@ mod color_oracles;
+ #[cfg(test)]
+ #[path = "title_oracles.rs"]
+ mod title_oracles;
++
++#[cfg(test)]
++#[path = "ascii_oracles.rs"]
++mod ascii_oracles;

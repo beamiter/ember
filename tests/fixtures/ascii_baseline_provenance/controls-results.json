@@ -1,0 +1,30 @@
+{
+  "replay1": {
+    "exit": 0,
+    "sha256": "80de10e15903db8b70137af8afcc643315181d36265b65a006088b3ad2acc719"
+  },
+  "replay2": {
+    "exit": 0,
+    "sha256": "43b0e4f0e30a9e2d5b7f3f086f206daf5ba5b2a0c1d2088fc37841f02926b3f9"
+  },
+  "mutation_pending_latch": {
+    "exit": 101,
+    "sha256": "309263ceb776930cc3030593c49e9792b346fc55d4f93d0907bd91abcaf8e3ab"
+  },
+  "mutation_consumed": {
+    "exit": 101,
+    "sha256": "1325a064e215d41bd5466abe62aedecf2a1deefa49e2a7d4d5033a6290b079fc"
+  },
+  "mutation_last_printed": {
+    "exit": 101,
+    "sha256": "0b90551cd3b5c95dff6dd206f7bba85a3c45eb7bf1c81a5cea2f3bba225a34fa"
+  },
+  "mutation_effect_order": {
+    "exit": 101,
+    "sha256": "c7d84710c71306e46ba0a9d62663a618aa82ff75aff4e6f5abe8b9cb8a07ed63"
+  },
+  "replay3_restored": {
+    "exit": 0,
+    "sha256": "db0f7bc2b092523893ded6b4b4192a1ea63ce6342dda3e6d15a2da559255acf0"
+  }
+}

@@ -11,11 +11,11 @@ categories = ["command-line-utilities", "gui"]
 
 [dependencies]
 # Shared engine and compatibility core resolve one published source tree.
-jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "25226a726eb595a723872a1b0381bba7643f2e20" }
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "4db2e5fe9d8fd6e27856df9b65ccb847147df5b9" }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 libc = "0.2"
 # Immutable shared release; local candidates require an explicit Cargo --config override.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "25226a726eb595a723872a1b0381bba7643f2e20" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "4db2e5fe9d8fd6e27856df9b65ccb847147df5b9" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -56,7 +56,9 @@ harfrust = "0.14.0"
 [dev-dependencies]
 # Test-only integrity check for losslessly sharded original-production evidence.
 sha2 = "0.10"
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "25226a726eb595a723872a1b0381bba7643f2e20" }
+# Test-only lossless original-production oracle transport.
+flate2 = "=1.1.9"
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "4db2e5fe9d8fd6e27856df9b65ccb847147df5b9" }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]

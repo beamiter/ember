@@ -1,0 +1,24 @@
+   Compiling ember v0.4.0 (/workspace/scratch/9226dcee068a/recovery/resumed-family/ascii-capture)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.43s
+     Running unittests src/lib.rs (recovery/resumed-family/ember/target/debug/deps/ember-d120f28a5db8cdeb)
+
+running 1 test
+test terminal::parser::ascii_oracles::ascii_original_production_golden ... FAILED
+
+failures:
+
+---- terminal::parser::ascii_oracles::ascii_original_production_golden stdout ----
+
+thread 'terminal::parser::ascii_oracles::ascii_original_production_golden' (1470) panicked at src/terminal/ascii_oracles.rs:448:13:
+assertion `left == right` failed: 1x1_seed_0_run_2_partition_0_feed_0:active_output_provenance
+  left: "Some(ActiveOutputProvenance { zone_id: 3, start: BufferAnchor { line_id: 49, column: 0 }, start_row_id: RawRowId(59), extent: None, extent_row_id: None, last_write_end: None, semantic_end: None, cursor_moved_since_output: false, invalid: true })"
+ right: "Some(ActiveOutputProvenance { zone_id: 3, start: BufferAnchor { line_id: 48, column: 0 }, start_row_id: RawRowId(58), extent: Some(BufferAnchor { line_id: 49, column: 1 }), extent_row_id: Some(RawRowId(59)), last_write_end: Some(BufferAnchor { line_id: 49, column: 1 }), semantic_end: Some(BufferAnchor { line_id: 49, column: 1 }), cursor_moved_since_output: false, invalid: false })"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    terminal::parser::ascii_oracles::ascii_original_production_golden
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1484 filtered out; finished in 7.88s
+
+error: test failed, to rerun pass `--lib`

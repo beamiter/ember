@@ -1,0 +1,26 @@
+{
+  "note": "Test-only direct flate2 dependency; original production manifests preserved separately",
+  "new_sha256": {
+    "Cargo.toml": "9db1e93f53399cc28e97ce208e2a726e1dcda87c25229b90bbdfb0ff4fabf9d1",
+    "Cargo.lock": "01504eb795d89b4ce3439137aa3049d9f66f9ec907841849113ed0e07505f61f"
+  },
+  "transport": {
+    "format": "ordered-gzip-shards-v1",
+    "original_bytes": 967963975,
+    "original_sha256": "a748121d6e84c0d2fcf4fde66e4f464eeaf253e453415848913684725f46eef0",
+    "compressed_bytes": 6768207,
+    "compressed_sha256": "d184a50c0962de6f4990d849496b9098030b67908ffef33e61bc9167e40d0161",
+    "parts": [
+      {
+        "file": "part-00.gz-fragment",
+        "bytes": 4194304,
+        "sha256": "501752376b31897de4cda54ae71aa6579aac0c80e5276ace0e86df168adc1196"
+      },
+      {
+        "file": "part-01.gz-fragment",
+        "bytes": 2573903,
+        "sha256": "85d6acad67267a4bb33ae9aa92881f1c3a8b834e40477d8c9a19c6f3ebe5294c"
+      }
+    ]
+  }
+}

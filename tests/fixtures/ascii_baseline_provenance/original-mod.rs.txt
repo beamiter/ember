@@ -1,0 +1,646 @@
+pub mod search_chunk;
+pub mod search_worker;
+mod watch;
+use crate::kitty_graphics::KittyGraphicsState;
+use base64::Engine;
+use jterm_core::click_cursor;
+use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
+use jterm_engine::screen::{
+    Charset, RegionDirection, RegionMutation, RowMutation, ScreenState, VerticalDeparture,
+    VerticalMotion,
+};
+use smallvec::SmallVec;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+pub use watch::{WatchCommand, WatchParsed};
+
+/// An explicit Chat button action bound to one observed shell lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatInputAction {
+    Submit { sequence: u64 },
+    Interrupt { sequence: u64 },
+}
+
+/// Character class for word selection boundaries.
+#[derive(PartialEq)]
+enum CharClass {
+    Word,
+    Whitespace,
+    Symbol,
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn is_whitespace_char(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\0'
+}
+
+fn char_class(c: char) -> CharClass {
+    if is_word_char(c) {
+        CharClass::Word
+    } else if is_whitespace_char(c) {
+        CharClass::Whitespace
+    } else {
+        CharClass::Symbol
+    }
+}
+
+fn is_extended_token_separator(c: char) -> bool {
+    matches!(
+        c,
+        '/' | '\\' | '.' | ':' | '-' | '~' | '?' | '&' | '=' | '#' | '%' | '+' | '@'
+    )
+}
+
+fn is_extended_token_char(c: char) -> bool {
+    is_word_char(c) || is_extended_token_separator(c)
+}
+
+fn is_token_prefix_wrapper(c: char) -> bool {
+    matches!(c, '"' | '\'' | '`' | '(' | '[' | '{' | '<')
+}
+
+fn is_token_suffix_wrapper(c: char) -> bool {
+    matches!(
+        c,
+        '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ';' | '!'
+    )
+}
+
+const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?65;1;9c";
+const SECONDARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[>1;7802;0c";
+const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
+pub use jterm_engine::MAX_TERMINAL_COLS;
+pub const MAX_TERMINAL_ROWS: usize = 512;
+/// Hard cap on bytes carried across PTY read batches inside an unfinished
+/// OSC/DCS/CSI escape. Any well-formed sequence is far below this; a
+/// runaway/binary stream that never sends a terminator (BEL/ST/final byte)
+/// would otherwise grow the pending escape buffers without bound.
+pub const MAX_PENDING_ESCAPE: usize = 4 * 1024 * 1024;
+
+/// Clipboard reads triggered by Kitty paste events are capabilities, not a
+/// general permission to inspect the host clipboard. Keep the capability
+/// short-lived and bound all protocol-controlled collections.
+const OSC_5522_PASTE_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_PENDING_CLIPBOARD_REQUESTS: usize = 8;
+const MAX_OSC_5522_MIME_TYPES: usize = 64;
+const MAX_OSC_5522_MIME_LEN: usize = 256;
+
+type VisibleCellsCache = (u64, usize, std::sync::Arc<Vec<Vec<TerminalCell>>>);
+
+#[derive(Clone, Copy)]
+struct ViewportMappingExactCache {
+    cols: usize,
+    rows: usize,
+    scroll_offset: usize,
+    scrollback_len: usize,
+    total_lines_scrolled: u64,
+    exact: bool,
+}
+
+/// Hard cap on tracked OSC 133 command records. Protocol strings are bounded
+/// separately, so even an untrusted process attached to the PTY cannot grow
+/// terminal state without limit.
+pub const MAX_COMMAND_MARKS: usize = 1024;
+/// Window titles are bounded where they enter terminal state, not only where
+/// they are drawn: `app::window::safe_window_title` caps the *displayed*
+/// title at the same number, but it can only cap the string it is handed, and
+/// an OSC 0/2 payload arrives from a pending-escape buffer that tolerates
+/// megabytes.
+pub(crate) const MAX_WINDOW_TITLE_CHARS: usize = jterm_engine::titles::MAX_WINDOW_TITLE_CHARS;
+/// Depth of the XTWINOPS title stack (ops 22/23), matching frost.
+#[cfg(test)]
+pub(crate) const MAX_TITLE_STACK_DEPTH: usize = jterm_engine::titles::MAX_TITLE_STACK_DEPTH;
+/// OSC 133 per-field byte budgets are the shared protocol's constants, not a
+/// fourth per-app set. Ember's decoder and `jterm_core::parser::CommandMeta`
+/// read the same packets, so a cap that differs makes the two disagree about
+/// whether a packet carried a command, a cwd or an id at all — and the journal
+/// lifecycle token minted from ember's decode would then bind durable output to
+/// identity the core writer re-derives differently. Ember's own numbers were
+/// looser than anything jsh emits (64 KiB command, 16 KiB cwd).
+///
+/// The id budget is core's generic-FinalTerm one, deliberately wider than the
+/// 192-byte `is_valid_jsh_execution_id` grammar: an opaque id from a non-jsh
+/// shell still names a block in the timeline, and only the journal path is
+/// gated on the narrower jsh token.
+const MAX_OSC_133_COMMAND_BYTES: usize = jterm_core::parser::MAX_OSC133_COMMAND_BYTES;
+const MAX_OSC_133_ID_BYTES: usize = jterm_core::parser::MAX_OSC133_ID_BYTES;
+const MAX_OSC_133_CWD_BYTES: usize = jterm_core::parser::MAX_OSC133_CWD_BYTES;
+const MAX_OSC_133_SESSION_ID_BYTES: usize = jterm_core::parser::MAX_OSC133_SESSION_ID_BYTES;
+const MAX_PENDING_COMPLETED_COMMANDS: usize = 32;
+const MAX_CONSUMED_COMMAND_IDS: usize = MAX_COMMAND_MARKS;
+pub const MAX_COMPLETED_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_CAPTURED_COMMAND_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// One entry recorded by an OSC 133-aware shell. `line_id` is the monotonic
+/// id of the row where the prompt began; we resolve it to a current
+/// scrollback/grid row at navigation time, since scrollback indices shift
+/// when old lines get evicted.
+#[derive(Clone, Copy, Debug)]
+pub struct CommandMark {
+    /// Monotonic line id of the prompt row, equal to total_lines_scrolled
+    /// at record time plus the prompt's viewport row.
+    pub line_id: u64,
+    /// Exit code reported by `OSC 133;D;<n>`. None until the command exits.
+    pub exit_code: Option<i32>,
+}
+
+/// Stable terminal-buffer coordinate used by semantic command records.
+///
+/// `line_id` is monotonic for the lifetime of the primary screen. Unlike a
+/// scrollback index it does not change when old scrollback rows are evicted.
+/// An anchor can nevertheless become unavailable once its row is evicted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BufferAnchor {
+    pub line_id: u64,
+    pub column: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandState {
+    Prompt,
+    Editing,
+    Running,
+    Complete,
+}
+
+/// A complete OSC 133 A/B/C/D lifecycle. The legacy [`CommandMark`] list is
+/// retained for source compatibility, while this is the canonical semantic
+/// representation used by command-history UI and AI context capture.
+#[derive(Clone, Debug)]
+pub struct CommandRecord {
+    /// Shell supplied `jsh_id`/`id`, or a terminal-local stable fallback.
+    pub id: String,
+    pub sequence: u64,
+    /// Exact command supplied as `cmdline_url`, when available. For generic
+    /// shells this may be reconstructed from the final displayed input.
+    pub command: Option<String>,
+    /// True only when the shell supplied exact command metadata. Screen
+    /// reconstruction is useful for display, but must not authorize rerun.
+    pub command_exact: bool,
+    /// The producer explicitly omitted or shortened an oversized command.
+    pub command_truncated: bool,
+    /// Working directory in which the command started (OSC 133 C).
+    pub cwd: Option<String>,
+    /// Working directory reported after the command finished (OSC 133 D).
+    /// Kept separate so a stateful `cd` cannot rewrite execution provenance.
+    pub cwd_after: Option<String>,
+    /// jsh's persistent session identity, observed on the OSC 133 `C` mark.
+    ///
+    /// This and the two fields below are the Start-identity triple that
+    /// [`jterm_core::execution_journal::ExecutionLifecycle`] demands alongside
+    /// `id` before durable output may be written. jsh emits all three on `C`
+    /// and none of them on `D`, and the shared parser accepts them only there,
+    /// so they are captured at output start and never minted or replaced at
+    /// completion: a token assembled from metadata seen at two different times
+    /// would bind captured output to a Start generation nobody observed.
+    pub session_id: Option<String>,
+    /// Shell-local sequence number of this exact Start generation.
+    pub seq: Option<u64>,
+    /// Wall-clock start identity copied from jsh's own journal Start.
+    pub started_at_ms: Option<u64>,
+    pub prompt_start: BufferAnchor,
+    pub command_start: Option<BufferAnchor>,
+    pub output_start: Option<BufferAnchor>,
+    pub output_end: Option<BufferAnchor>,
+    pub end: Option<BufferAnchor>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub state: CommandState,
+    pub complete: bool,
+    /// Whether the matching OSC 133 `C` execution-start mark was observed.
+    /// This survives scrollback eviction independently of row anchors.
+    pub start_mark_seen: bool,
+    /// Evidence that closed the lifecycle. Outcome (`exit_code`) remains a
+    /// separate fact and is never synthesized from this value.
+    pub completion_provenance: crate::block_mode::CompletionProvenance,
+    pub started_at: Option<std::time::SystemTime>,
+    pub finished_at: Option<std::time::SystemTime>,
+    /// Locally armed Agent approval associated with this exact command
+    /// lifecycle. This value never comes from PTY-controlled OSC metadata.
+    pub agent_generation: Option<u64>,
+    /// Bounded normalized output captured at D. This survives scrollback
+    /// eviction; `truncated`/`total_bytes` describe the original range.
+    pub captured_output: Option<ExtractedText>,
+    /// Display-only bounded preview, cached with the finalized capture.
+    pub output_preview: String,
+    started_instant: Option<std::time::Instant>,
+}
+
+/// Plain-text terminal extraction with explicit capacity/truncation metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtractedText {
+    pub text: String,
+    pub truncated: bool,
+    /// UTF-8 byte length the normalized text would have without the cap.
+    pub total_bytes: usize,
+}
+
+/// Completed-command event drained by the app/session pump. Capturing happens
+/// at OSC 133;D while the output anchors are still likely to be retained; file
+/// IO and journal persistence intentionally stay outside `TerminalState`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedCommandOutput {
+    pub id: String,
+    /// Start identity observed on this execution's OSC 133 `C` mark. All three
+    /// must be present, together with a jsh-shaped `id`, before the execution
+    /// journal will accept the captured output; see [`CommandRecord::session_id`].
+    pub session_id: Option<String>,
+    pub seq: Option<u64>,
+    pub started_at_ms: Option<u64>,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub output: String,
+    pub output_available: bool,
+    pub truncated: bool,
+    pub total_bytes: usize,
+    /// One-shot local Agent approval generation. `None` for every command
+    /// that was not armed by the application before its bytes were queued.
+    pub agent_generation: Option<u64>,
+}
+
+/// Additive lifecycle envelope around the source-compatible completed-output
+/// payload. Existing integrations may keep constructing and draining
+/// [`CompletedCommandOutput`]; provenance-aware consumers use this event so a
+/// boundary-inferred termination cannot masquerade as shell-reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedCommandEvent {
+    pub completed: CompletedCommandOutput,
+    pub start_mark_seen: bool,
+    pub completion_provenance: crate::block_mode::CompletionProvenance,
+}
+
+impl CompletedCommandEvent {
+    pub fn lifecycle_health(&self) -> crate::block_mode::BlockLifecycleHealth {
+        crate::block_mode::assess_lifecycle(self.start_mark_seen, self.completion_provenance)
+    }
+
+    pub fn is_trusted_completion(&self) -> bool {
+        matches!(
+            self.lifecycle_health(),
+            crate::block_mode::BlockLifecycleHealth::Healthy
+                | crate::block_mode::BlockLifecycleHealth::Recovered
+        )
+    }
+}
+
+impl std::ops::Deref for CompletedCommandEvent {
+    type Target = CompletedCommandOutput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.completed
+    }
+}
+
+impl std::ops::DerefMut for CompletedCommandEvent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.completed
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ArmedAgentExecution {
+    generation: u64,
+    command_sequence: u64,
+    command: String,
+}
+
+pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
+    (
+        cols.clamp(1, MAX_TERMINAL_COLS),
+        rows.clamp(1, MAX_TERMINAL_ROWS),
+    )
+}
+
+#[cfg(test)]
+mod fragmentation_tests;
+mod grid;
+mod host_context;
+mod hyperlink;
+#[cfg(test)]
+mod oracle_fixture;
+mod sync_output_clock;
+pub use host_context::TerminalHostContext;
+pub use sync_output_clock::SyncOutputClock;
+mod parser;
+#[allow(dead_code)] // Public in the library; the binary mirrors modules privately.
+mod projection;
+#[cfg(test)]
+mod resize_parity_tests;
+mod state;
+#[cfg(test)]
+mod structural_parity_tests;
+#[cfg(test)]
+mod tests;
+
+pub use grid::*;
+pub(crate) use hyperlink::is_supported_hyperlink_uri;
+pub use hyperlink::HyperlinkId;
+#[allow(unused_imports)] // Public P1 contract; UI consumers land in the next slice.
+pub use projection::{
+    ChatCommandSpan, DisplayPoint, FinishedOutputRange, HistoryProjection,
+    ProjectedBufferAnchorLocation, ProjectedRowKind, ProjectedViewport, ProjectionCacheKey,
+    ProjectionLayoutKey, ProjectionPolicy, ProjectionViewState, RawCellAnchor, RawCellBoundary,
+    SyntheticRowKey,
+};
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Consumed by the transformed projection slice.
+struct FinishedOutputProvenance {
+    range: FinishedOutputRange,
+    start_line_id: u64,
+    rows: Vec<FinishedOutputRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FinishedOutputRow {
+    row_id: RawRowId,
+    start_col: usize,
+    end_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FinishedOutputOwner {
+    zone_id: u64,
+    start_col: usize,
+    end_col: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FINISHED_OUTPUT_EVICTION_ROW_CHECKS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveOutputProvenance {
+    zone_id: u64,
+    start: BufferAnchor,
+    start_row_id: RawRowId,
+    extent: Option<BufferAnchor>,
+    extent_row_id: Option<RawRowId>,
+    last_write_end: Option<BufferAnchor>,
+    /// Boundary produced by real terminal output events. Printable writes use
+    /// their cell end; LF/IND use the following row at column zero. Explicit
+    /// cursor positioning never updates this value.
+    semantic_end: Option<BufferAnchor>,
+    /// CR/BS/tab and other horizontal cursor controls are only exact when a
+    /// subsequent output event resolves them. A D immediately after the move
+    /// must fail closed rather than infer cells from cursor position alone.
+    cursor_moved_since_output: bool,
+    /// Unsupported non-linear output (for example a write above OSC 133 C)
+    /// must fail closed instead of claiming prompt/header cells.
+    invalid: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionMode {
+    Normal,
+    Block,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (usize, usize),
+    pub active: (usize, usize),
+    pub mode: SelectionMode,
+}
+
+/// Selection coordinates in a transformed projected document. These cannot
+/// be mixed with raw scrollback indices because collapse summaries introduce
+/// holes and synthetic rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectedSelection {
+    plan_revision: u64,
+    /// Width at which endpoint columns were minted. Reflowing to another
+    /// width can change the characters between two otherwise-live anchors.
+    plan_cols: usize,
+    /// Effective hidden set, not merely requested collapse policy. A collapse
+    /// can become ineffective after history churn without a policy revision.
+    hidden: BTreeSet<u64>,
+    anchor: ProjectedSelectionEndpoint,
+    active: ProjectedSelectionEndpoint,
+    mode: SelectionMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectedSelectionAnchor {
+    Cell(RawCellAnchor),
+    /// A blank row or a column beyond retained text has row identity but no
+    /// exact raw-cell origin. The column is valid only at `plan_cols`.
+    Row {
+        row: RawRowId,
+        column: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectedSelectionEndpoint {
+    /// `(document row, projected column)` in `plan_revision`.
+    point: (usize, usize),
+    anchor: ProjectedSelectionAnchor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardReadKind {
+    MimeData(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardReadRequest {
+    pub kind: ClipboardReadKind,
+}
+
+#[derive(Debug)]
+struct PendingPasteGrant {
+    token: String,
+    offered_mimes: HashSet<String>,
+    expires_at: std::time::Instant,
+}
+
+pub use jterm_engine::colors::{ColorState, DynamicColorPalette, TerminalDefaultColors};
+
+pub struct TerminalState {
+    /// Live VT storage and drawing state; history and host effects remain here.
+    pub screen: ScreenState,
+    host_context: TerminalHostContext,
+    #[cfg(test)]
+    search_source_epoch: u64,
+    search_source_revision: u64,
+    search_scrollback_epoch: u64,
+    pub scrollback: VecDeque<ScrollbackLine>,
+    pub selection: Option<Selection>,
+    projected_selection: Option<ProjectedSelection>,
+    selection_revision: u64,
+    pub scroll_offset: usize,
+    max_scrollback: usize,
+
+    /// Engine-owned titles; host sanitizes incoming trusted-chrome text.
+    pub titles: jterm_engine::titles::TitleState,
+    /// jsh's own session identity as announced over OSC 7770, when the shell
+    /// in this pane announced one.
+    ///
+    /// Ember passes `--session <its own id>` when *it* spawns jsh, so this is
+    /// normally the same value. It is not when the shell reached jsh some
+    /// other way — a jsh started by hand inside bash, or over ssh — and then
+    /// this is the only key under which that pane's execution journal exists.
+    pub announced_jsh_session_id: Option<String>,
+    /// Working directory reported by the shell via OSC 7
+    /// (`ESC ] 7 ; file://host/path ST`). Optional because many shells need
+    /// PROMPT_COMMAND wiring to emit it. When absent the session manager
+    /// falls back to `/proc/<pid>/cwd`. Survives across shell PWD changes —
+    /// each prompt re-emits OSC 7.
+    pub current_working_dir: Option<String>,
+    /// Bounded companion-only directory evidence in parser wire order. A
+    /// first command Start can supersede an older OSC 7 without changing the
+    /// general shell cwd cache or history's command-start attribution.
+    organism_working_dir: Option<String>,
+
+    // Global background color set by vim (CSI ... m)
+    pub global_bg: Color,
+
+    parser: jterm_engine::parser::Parser,
+
+    // IME support
+    pub ime_enabled: bool,
+    pub preedit_text: String,
+    pub preedit_cursor: usize,
+
+    protocol: ProtocolState,
+    /// Last observed host-window focus. DECSET 1004 reports CSI I/O against
+    /// this, and enabling 1004 while focused emits CSI I immediately.
+    host_window_focused: bool,
+
+    // Output buffer for DSR/CPR responses to be sent back to PTY
+    pub output_buffer: Vec<u8>,
+
+    pending_clipboard_requests: Vec<ClipboardReadRequest>,
+    pending_paste_grant: Option<PendingPasteGrant>,
+
+    // Kitty graphics protocol support
+    pub kitty_graphics: KittyGraphicsState,
+
+    // Dirty rectangle tracking for optimized rendering
+    pub dirty_region: DirtyRegion,
+
+    // P4 优化：行版本化追踪
+    pub grid_version: u64, // 全局网格版本号
+    chat_pending_submit: Option<u64>,
+    // A main-screen takeover stays native for this foreground command.
+    chat_native_takeover_sequence: Option<u64>,
+    inline_cli_launch_floor: Option<u64>,
+    inline_cli_command_scope: Option<(u64, u64)>,
+    pub row_versions: Vec<u64>, // 每行的修改版本号
+
+    // Cached visible cells to avoid per-frame cloning
+    visible_cells_cache: Option<VisibleCellsCache>,
+    /// Projection metadata is versioned independently from the terminal grid.
+    /// P0 is an identity projection over `visible_cells_cache`, so the cell
+    /// allocation is shared and only the stable-origin index is cached here.
+    projected_viewport_cache: Option<ProjectedViewport>,
+    /// Cell-free full-document plan and late-materialized transformed slice.
+    /// Their exact keys intentionally have different invalidation domains.
+    projection_plan_cache: Option<projection::ProjectionPlanCache>,
+    transformed_viewport_cache: Option<projection::TransformedViewportCache>,
+    next_projection_plan_revision: u64,
+    /// Cached answer for whether raw buffer coordinates exactly match the
+    /// lazily reflowed viewport. Interior mutability keeps per-match lookup
+    /// O(1) while the first lookup for a new viewport performs one scan.
+    viewport_mapping_exact_cache: std::cell::Cell<Option<ViewportMappingExactCache>>,
+
+    // OSC 8 hyperlink tracking. Cells retain only the compact id; the URI is
+    // stored once in a bounded table rather than cloned into every cell.
+    hyperlinks: hyperlink::HyperlinkTable,
+
+    // Synchronized output (mode 2026): suppress rendering until mode is cleared
+    pub sync_output_active: bool,
+    sync_output_start: Option<std::time::Instant>,
+    sync_output_clock: SyncOutputClock,
+    last_archived_screen_snapshot: Vec<String>,
+    last_synced_primary_screen_snapshot: Vec<String>,
+
+    // OSC 52 clipboard set requests (selection_param, decoded_text)
+    pub pending_osc52_clipboard_set: Option<String>,
+    // OSC 52 clipboard queries pending (each needs one read/refusal response).
+    // Keep the terminator per request: a PTY batch may contain both BEL- and
+    // ST-terminated queries. Eight matches the extended-clipboard queue cap.
+    pending_osc52_clipboard_queries: VecDeque<&'static [u8]>,
+    /// Terminator of the OSC being dispatched. xterm and VTE end a reply the
+    /// way the query ended, and BEL-only parsers never see an ST reply end.
+    osc_reply_terminator: &'static [u8],
+    /// Sole live owner of terminal theme inputs and OSC color overrides.
+    pub colors: ColorState,
+
+    // OSC 9/777 pending notifications
+    pub pending_notifications: Vec<(String, String)>,
+    /// A BEL arrived since the last `take_pending_bell`. Multiple rings in
+    /// one batch collapse: the toast path is rate-limited per pane.
+    pending_bell: bool,
+
+    /// Total lines ever pushed into `scrollback` (does not decrement on
+    /// `pop_front`). Combined with current `scrollback.len()`, lets us
+    /// translate a stable `line_id` back to a current scrollback index even
+    /// after old lines have been evicted.
+    pub total_lines_scrolled: u64,
+
+    /// Checked monotonic allocator for projection-only physical row identity.
+    /// Zero is the exhausted sentinel and is never emitted as a tracked id.
+    next_raw_row_id: u64,
+    /// Independent generation for row moves/fresh-row creation. This is part
+    /// of `ProjectionCacheKey` even when PTY cell bytes did not otherwise bump
+    /// the terminal grid version.
+    row_identity_revision: u64,
+    /// Canonical primary full-screen row-transfer counter. Noncanonical row
+    /// moves advance only `row_identity_revision`, so the two key deltas fail
+    /// closed for that batch and a later full rebuild establishes a recoverable
+    /// baseline. Zero permanently disables advancement only after overflow.
+    full_screen_scroll_revision: u64,
+
+    /// OSC 133 command boundaries recorded by FinalTerm-aware shells. FIFO,
+    /// capped at `MAX_COMMAND_MARKS`. Marks pointing to lines that have been
+    /// evicted from scrollback are pruned lazily during navigation.
+    pub command_marks: VecDeque<CommandMark>,
+
+    watch: watch::ParserWatch,
+    command_records: VecDeque<CommandRecord>,
+    next_command_sequence: u64,
+    /// Recently closed OSC execution ids. Records can be evicted or cleared
+    /// by RIS, so this bounded authority prevents a delayed duplicate D from
+    /// being adopted by a later terminal-local placeholder.
+    consumed_command_ids: VecDeque<String>,
+    finished_output_provenance: HashMap<u64, FinishedOutputProvenance>,
+    finished_output_owners: HashMap<RawRowId, Vec<FinishedOutputOwner>>,
+    /// Monotonic structural revision for completed-range ownership. This is
+    /// independent from ordinary cell paint changes.
+    finished_output_revision: u64,
+    active_output_provenance: Option<ActiveOutputProvenance>,
+    pending_completed_command_outputs: VecDeque<CompletedCommandEvent>,
+    captured_command_output_bytes: usize,
+    /// Single-level undo stash for `clear_completed_blocks` (see state.rs).
+    /// Dropped by `hard_reset` together with the rest of the block history.
+    cleared_blocks_stash: Option<ClearedBlocksStash>,
+    agent_prompt_input_tainted: bool,
+    armed_agent_execution: Option<ArmedAgentExecution>,
+}
+
+/// Bounded snapshot of the records removed by one `clear_completed_blocks`,
+/// kept as data so `undo_clear_blocks` can reinsert them (anvil/forge
+/// semantics). Inherits the live deque's bounds — at most `MAX_COMMAND_MARKS`
+/// records and `MAX_CAPTURED_COMMAND_OUTPUT_BYTES` of captured output — so
+/// undo data never needs a second budget.
+#[derive(Clone, Debug)]
+struct ClearedBlocksStash {
+    records: Vec<CommandRecord>,
+    /// Finished-output sidecars for the stashed records, keyed implicitly by
+    /// each record's `sequence`. Restored alongside so exact output ranges
+    /// revalidate against the untouched buffer rows.
+    provenance: Vec<FinishedOutputProvenance>,
+    captured_output_bytes: usize,
+}
+
+#[cfg(test)]
+mod alternate_parity_tests;

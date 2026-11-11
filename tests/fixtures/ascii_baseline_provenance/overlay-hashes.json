@@ -1,0 +1,5 @@
+{
+  "overlay/src/terminal/ascii_oracles.rs": "f8b12d4b38a76e00e29f3f0b23aecd1b5f45bbe9445aa1720ca2bd8c053d026a",
+  "overlay/tests/fixtures/ascii_corpus.json": "d94165597a6af061f1851e105af7fb464c3e3be0f845daf47bb907c26c2d6f88",
+  "overlay/tests/fixtures/capture_ascii_baseline.py": "4f7d01641180bec9e4c8fbed978a7d908d9f0dae9d72b44cb2eb8d6636394505"
+}

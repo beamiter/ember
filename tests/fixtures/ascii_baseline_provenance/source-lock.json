@@ -1,0 +1,21 @@
+{
+  "capture_ready": true,
+  "capture_base_commit": "a93b37a033218ee2a818dd9adc2cd0db350e6ee5",
+  "source_sha256": {
+    "src/terminal/parser.rs": "0b83c73cef358234d95ec73e1e62985219de9bce6f0bc0cb1cd63e952fdeec54",
+    "src/terminal/state.rs": "0fd6cbbfba15add7167719cb10f70b22a7f275ca19850f74c33a0fb6e5053ffc",
+    "src/terminal/mod.rs": "ea4959bd4211f045f1977991c84bd43c792107edc220717249c54b33a91848c4",
+    "src/terminal/alternate_parity_tests.rs": "45e7663b5c5ef6d5bc4b66045b11f27c961a0cd3dbe15998cd8dd21e40ffc9e5",
+    "src/terminal/structural_parity_tests.rs": "7bae4eff68a78e113ce86eb76f0a228f1a89ed192165331e7809c69e7acda4fb",
+    "Cargo.toml": "807866c43726876a38733196c1f3268f2a370974a2524db296dac7c8f1fe934f",
+    "Cargo.lock": "214ca2e652ad4743e3b813b75d20a7b7c7b7b7da9417fc769482093835aff633"
+  },
+  "capture_corpus_sha256": "d94165597a6af061f1851e105af7fb464c3e3be0f845daf47bb907c26c2d6f88",
+  "engine_source_sha256": {
+    "screen.rs": "cc1114ae16c886a3bdb40a4f9953f89a0ea115e309b773d61e85a56abcb0f92b",
+    "semantics.rs": "9a38b9f767ec4a5f87f440b5380e3101d6ddc7d617f3fe633e989706c710590e",
+    "parser.rs": "922ad14f56a7514c624cb8094664d4169c5d204131338743e0ccd66e3f4dfcee"
+  },
+  "observer_sha256": "f8b12d4b38a76e00e29f3f0b23aecd1b5f45bbe9445aa1720ca2bd8c053d026a",
+  "verification": "Independent review, exact production/overlay hashes, compile, geometry invariants and full 70940-record original preflight passed."
+}

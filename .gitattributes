@@ -1,3 +1,8 @@
 tests/fixtures/title_baseline_provenance/replay1.log whitespace=-blank-at-eof
 tests/fixtures/title_baseline_provenance/replay2.log whitespace=-blank-at-eof
 tests/fixtures/title_baseline_provenance/replay3_restored.log whitespace=-blank-at-eof
+tests/fixtures/ascii_baseline_provenance/replay1.log whitespace=-blank-at-eof
+tests/fixtures/ascii_baseline_provenance/replay2.log whitespace=-blank-at-eof
+tests/fixtures/ascii_baseline_provenance/replay3_restored.log whitespace=-blank-at-eof
+tests/fixtures/ascii_baseline_provenance/replay4_bounded_loader.log whitespace=-blank-at-eof
+tests/fixtures/ascii_baseline_provenance/test-dependency.diff whitespace=-blank-at-eof,-blank-at-eol

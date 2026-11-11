@@ -905,3 +905,7 @@ mod color_oracles;
 #[cfg(test)]
 #[path = "title_oracles.rs"]
 mod title_oracles;
+
+#[cfg(test)]
+#[path = "ascii_oracles.rs"]
+mod ascii_oracles;

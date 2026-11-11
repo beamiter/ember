@@ -1,0 +1,380 @@
+//! Test-only original production ASCII write observations; never synthesize expectations.
+use super::*;
+use std::collections::BTreeMap;
+type Snapshot = BTreeMap<String, String>;
+fn snapshot(t: &TerminalState, previous_epoch: Option<u64>) -> Snapshot {
+    let mut out = super::super::alternate_parity_tests::snapshot(t);
+    out.insert(
+        "search_scrollback_epoch_changed".into(),
+        previous_epoch
+            .is_some_and(|old| old != t.search_scrollback_epoch)
+            .to_string(),
+    );
+    out.insert("dynamic_fg".into(), format!("{:?}", t.colors.dynamic_fg));
+    out.insert("dynamic_bg".into(), format!("{:?}", t.colors.dynamic_bg));
+    out.insert(
+        "dynamic_cursor_color".into(),
+        format!("{:?}", t.colors.dynamic_cursor_color),
+    );
+    out.insert(
+        "dynamic_palette".into(),
+        format!("{:?}", t.colors.dynamic_palette),
+    );
+    out.insert(
+        "default_colors".into(),
+        format!("{:?}", t.colors.default_colors),
+    );
+    out.insert(
+        "window_title".into(),
+        format!("{:?}", t.titles.window_title),
+    );
+    out.insert("icon_title".into(), format!("{:?}", t.titles.icon_title));
+    out.insert("title_stack".into(), format!("{:?}", t.titles.title_stack));
+    macro_rules! host {
+        ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
+    }
+    host!(
+        sync_output_active,
+        current_working_dir,
+        ime_enabled,
+        preedit_text,
+        preedit_cursor,
+        host_window_focused,
+        pending_osc52_clipboard_set,
+        pending_osc52_clipboard_queries,
+        pending_notifications,
+        pending_bell,
+        osc_reply_terminator,
+        chat_pending_submit,
+        chat_native_takeover_sequence,
+        inline_cli_launch_floor,
+        inline_cli_command_scope,
+        next_projection_plan_revision
+    );
+    out.insert(
+        "sync_start_present".into(),
+        t.sync_output_start.is_some().to_string(),
+    );
+    out.insert("parser".into(), format!("{:?}", t.parser.snapshot()));
+    out.insert(
+        "kitty_image_count".into(),
+        t.kitty_graphics.image_count().to_string(),
+    );
+    out.insert(
+        "paste_grant".into(),
+        format!(
+            "{:?}",
+            t.pending_paste_grant.as_ref().map(|g| (
+                &g.token,
+                g.offered_mimes
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+            ))
+        ),
+    );
+    out.insert(
+        "effective_default_background".into(),
+        format!("{:?}", t.effective_default_background()),
+    );
+    out.insert(
+        "color_scheme_report".into(),
+        t.color_scheme_report().to_string(),
+    );
+    let records = t
+        .command_records
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            r.started_at = None;
+            r.finished_at = None;
+            r.started_instant = None;
+            r.duration_ms = None;
+            r
+        })
+        .collect::<Vec<_>>();
+    out.insert("commands".into(), format!("{records:?}"));
+    let completed = t
+        .pending_completed_command_outputs
+        .iter()
+        .cloned()
+        .map(|mut e| {
+            e.completed.duration_ms = None;
+            e
+        })
+        .collect::<Vec<_>>();
+    out.insert("completed".into(), format!("{completed:?}"));
+    out
+}
+fn theme(light: bool) -> super::super::TerminalDefaultColors {
+    super::super::TerminalDefaultColors {
+        foreground: if light { (11, 22, 33) } else { (211, 222, 233) },
+        background: if light { (240, 230, 220) } else { (10, 20, 30) },
+        cursor: if light { (171, 182, 193) } else { (71, 82, 93) },
+        ansi: std::array::from_fn(|i| {
+            if light {
+                (255 - i as u8 * 13, i as u8 * 11, 255 - i as u8 * 7)
+            } else {
+                (i as u8 * 13, 255 - i as u8 * 11, i as u8 * 7)
+            }
+        }),
+    }
+}
+fn rich_seed(seed: usize) -> TerminalState {
+    let mut t = super::super::alternate_parity_tests::seeded(seed);
+    let now = std::time::Instant::now();
+    t.sync_output_clock = super::super::SyncOutputClock::new(move || now);
+    t.set_default_colors(theme(seed & 1 != 0));
+    if seed & 1 != 0 {
+        t.process_input(b"\x1b[?1049h");
+    }
+    if seed & 2 != 0 {
+        t.process_input(b"\x1b[?2026h");
+    }
+    t.colors.dynamic_fg = Some((13, 24, 35));
+    t.colors.dynamic_bg = Some((36, 47, 58));
+    t.colors.dynamic_cursor_color = Some((59, 60, 71));
+    t.colors.dynamic_palette = std::array::from_fn(|i| {
+        if seed & 1 != 0 || i % 17 == 0 {
+            Some((
+                i as u8,
+                (i as u8).wrapping_add(47),
+                (i as u8).wrapping_add(93),
+            ))
+        } else {
+            None
+        }
+    });
+    t.titles.window_title = format!("seed window {seed}");
+    t.titles.icon_title = format!("seed icon {seed}");
+    t.titles.title_stack = match seed {
+        0 => vec![],
+        1 => vec![(Some("saved icon".into()), None)],
+        2 => vec![(None, Some("saved window".into()))],
+        _ => (0..16)
+            .map(|i| (Some(format!("icon {i}")), Some(format!("window {i}"))))
+            .collect(),
+    };
+    // Raw restored/seeded state bypasses OSC ingest on purpose: outbound
+    // reportable_title has a different security policy from sanitized_title.
+    if seed >= 2 {
+        let poison = "\x1b\x07\u{0085}\u{061c}\u{202e}\u{2066}\u{200b}";
+        let raw = format!("raw{poison}{}tail", "界".repeat(205));
+        t.titles.window_title = format!("window {raw}");
+        t.titles.icon_title = format!("icon {raw}");
+        if seed == 2 {
+            t.titles.title_stack = vec![(None, Some(format!("saved window {raw}")))];
+        } else {
+            t.titles.title_stack = (0..16)
+                .map(|i| {
+                    (
+                        Some(format!("saved icon {i} {raw}")),
+                        Some(format!("saved window {i} {raw}")),
+                    )
+                })
+                .collect();
+        }
+    }
+    t.preedit_text = "输入中".into();
+    t.preedit_cursor = 1;
+    t.pending_osc52_clipboard_set = Some("clipboard sentinel".into());
+    t.pending_osc52_clipboard_queries.push_back(b"\x07");
+    t.pending_notifications = vec![("title sentinel".into(), "body sentinel".into())];
+    t.output_buffer = b"existing-reply".to_vec();
+    t
+}
+
+#[derive(serde::Deserialize)]
+struct Profile {
+    id: String,
+    cols: usize,
+    rows: usize,
+}
+#[derive(serde::Deserialize)]
+struct Corpus {
+    cases: Vec<Input>,
+    profiles: Vec<Profile>,
+    expected_record_count: usize,
+}
+#[derive(serde::Deserialize)]
+struct Input {
+    id: String,
+    profiles: Option<Vec<String>>,
+    setup_hex: String,
+    feed_hex: String,
+    snapshots_per_seed_profile: usize,
+}
+fn bytes(hex: &str) -> Vec<u8> {
+    assert!(hex.is_ascii() && hex.len() & 1 == 0);
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+fn ends(n: usize, schedule: usize) -> Vec<usize> {
+    if schedule == 0 {
+        return vec![n];
+    }
+    if schedule == 1 {
+        return (1..=n).collect();
+    }
+    let mut state = (schedule - 1) as u64;
+    let mut at = 0;
+    let mut out = Vec::new();
+    while at < n {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        at = (at + 1 + (state % 23) as usize).min(n);
+        out.push(at);
+    }
+    out
+}
+fn seeded(seed: usize, p: &Profile) -> TerminalState {
+    let mut t = rich_seed(seed);
+    // Resize through actual host behavior before measured inputs. Never leave
+    // stale6x5 region/cursor indices in a one-column/one-row geometry.
+    t.on_resize(p.cols, p.rows);
+    t.process_input(b"\x1b[?6l\x1b[r\x1b(B\x0f\x1b[4l\x1b[?7h\x1b[1;1H");
+    t.set_max_scrollback(3);
+    t.process_input(b"history0\r\nhistory1\r\nhistory2\r\nhistory3\r\nhistory4\r\nhistory5\r\n");
+    // New active output anchors are established at the actual resized grid.
+    t.process_input(b"\x1b[1;1H\x1b]133;A\x07\x1b]133;C;id=ascii-seeded\x07");
+    if seed & 1 != 0 {
+        t.process_input(b"\x1b[1;65535HX");
+    }
+    t.output_buffer = b"existing-reply".to_vec();
+    assert_eq!(t.screen.grid.row_len(), p.cols);
+    assert_eq!(t.screen.grid.rows(), p.rows);
+    assert!(t.screen.cursor_col < p.cols && t.screen.cursor_row < p.rows);
+    assert!(t.screen.scroll_region_top <= t.screen.scroll_region_bottom);
+    assert!(t.screen.scroll_region_bottom < p.rows);
+    assert_eq!(t.screen.active_charset, Charset::Ascii);
+    assert!(!t.screen.insert_mode);
+    assert_eq!(t.screen.use_alt_buffer, seed & 1 != 0);
+    assert_eq!(t.sync_output_active, seed & 2 != 0);
+    super::super::structural_parity_tests::prime(&mut t);
+    t
+}
+fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
+    let corpus: Corpus =
+        serde_json::from_str(include_str!("../../tests/fixtures/ascii_corpus.json")).unwrap();
+    let mut seen = 0;
+    for p in &corpus.profiles {
+        for seed in 0..4 {
+            visit(
+                format!("{}_seed_{seed}", p.id),
+                snapshot(&seeded(seed, p), None),
+            );
+            seen += 1;
+            for input in &corpus.cases {
+                if input
+                    .profiles
+                    .as_ref()
+                    .is_some_and(|ps| !ps.contains(&p.id))
+                {
+                    continue;
+                }
+                let mut count = 0;
+                for schedule in 0..6 {
+                    let mut t = seeded(seed, p);
+                    let epoch = t.search_scrollback_epoch;
+                    t.process_input(&bytes(&input.setup_hex));
+                    if input.id == "awm_l_pending" {
+                        assert!(
+                            t.screen.pending_wrap,
+                            "DECAWM-off case must start with true latch"
+                        );
+                        assert!(!t.protocol.modes().contains(&7));
+                        assert_eq!(t.screen.cursor_col, p.cols - 1);
+                    }
+
+                    visit(
+                        format!(
+                            "{}_seed_{seed}_{}_partition_{schedule}_setup",
+                            p.id, input.id
+                        ),
+                        snapshot(&t, Some(epoch)),
+                    );
+                    count += 1;
+
+                    if input.id == "initial_wrap_provenance" && !t.screen.use_alt_buffer {
+                        let active = t
+                            .active_output_provenance
+                            .expect("active initial-wrap output");
+                        assert!(t.screen.pending_wrap);
+                        assert!(!active.invalid);
+                        assert_eq!(
+                            active.start_row_id,
+                            t.screen.grid.row_id(t.screen.cursor_row)
+                        );
+                        assert!(active.extent.is_none() && active.last_write_end.is_none());
+                    }
+                    let scrolled_before = t.total_lines_scrolled;
+                    let data = bytes(&input.feed_hex);
+                    let mut start = 0;
+                    for (feed, end) in ends(data.len(), schedule).into_iter().enumerate() {
+                        let epoch = t.search_scrollback_epoch;
+                        t.process_input(&data[start..end]);
+                        start = end;
+                        visit(
+                            format!(
+                                "{}_seed_{seed}_{}_partition_{schedule}_feed_{feed}",
+                                p.id, input.id
+                            ),
+                            snapshot(&t, Some(epoch)),
+                        );
+                        count += 1;
+                    }
+                    assert_eq!(start, data.len());
+                    if input.id.starts_with("eviction_") && !t.screen.use_alt_buffer {
+                        assert!(t.total_lines_scrolled.saturating_sub(scrolled_before) > 3);
+                        assert_eq!(t.scrollback.len(), 3, "bounded history must actually evict");
+                    }
+                }
+                assert_eq!(count, input.snapshots_per_seed_profile);
+                seen += count;
+            }
+        }
+    }
+    assert_eq!(seen, corpus.expected_record_count);
+}
+#[test]
+#[ignore = "explicit original production capture, no candidate expectations"]
+fn print_ascii_baseline() {
+    for_each_case(|key, state| {
+        println!(
+            "\nASCII_BASELINE\t{}",
+            serde_json::to_string(&(key, state)).unwrap()
+        )
+    });
+}
+
+#[test]
+fn ascii_seed_geometry_invariants() {
+    let corpus: Corpus =
+        serde_json::from_str(include_str!("../../tests/fixtures/ascii_corpus.json")).unwrap();
+    for p in &corpus.profiles {
+        for seed in 0..4 {
+            let t = seeded(seed, p);
+            assert_eq!(t.screen.pending_wrap, seed & 1 != 0);
+            assert_eq!(t.max_scrollback, 3);
+            // Published ScreenState::resize_geometry resizes both stores and
+            // clamps alternate cursors; the6x5 no-op seed already has both6x5.
+            assert_eq!(t.screen.alt_grid.rows(), p.rows, "hidden rows {}", p.id);
+            assert_eq!(t.screen.alt_grid.row_len(), p.cols, "hidden cols {}", p.id);
+            assert!(t.screen.alt_cursor_row < t.screen.alt_grid.rows());
+            assert!(t.screen.alt_cursor_col < t.screen.alt_grid.row_len());
+            if !t.screen.use_alt_buffer {
+                assert!(!t.scrollback.is_empty(), "primary history {}", p.id);
+                assert!(t.scrollback.len() <= t.max_scrollback);
+                let active = t.active_output_provenance.expect("primary active output");
+                assert!(!active.invalid, "valid primary provenance {}", p.id);
+                assert_eq!(
+                    active.start_row_id,
+                    t.screen.grid.row_id(t.screen.cursor_row)
+                );
+                assert!(active.extent.is_none() && active.last_write_end.is_none());
+            }
+        }
+    }
+}

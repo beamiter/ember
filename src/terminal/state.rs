@@ -682,15 +682,14 @@ impl super::TerminalState {
         let autowrap = self.protocol.modes().contains(&7);
         let mut pos = 0;
         while pos < bytes.len() {
-            if self.screen.take_pending_wrap(autowrap) {
-                self.wrap_to_next_line();
+            match self.screen.step_ascii_write(&bytes[pos..], autowrap) {
+                jterm_engine::screen::AsciiWriteStep::NeedsWrap => self.wrap_to_next_line(),
+                jterm_engine::screen::AsciiWriteStep::Written { consumed, mutation } => {
+                    self.apply_screen_mutation(mutation);
+                    pos += consumed;
+                }
+                jterm_engine::screen::AsciiWriteStep::Stopped => break,
             }
-            let Some((count, effect)) = self.screen.write_ascii_in_row(&bytes[pos..], autowrap)
-            else {
-                break;
-            };
-            self.apply_screen_mutation(effect);
-            pos += count;
         }
     }
 
