@@ -541,7 +541,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=7da31cd1a9e915b85539bed38a14567cf41f9a49#7da31cd1a9e915b85539bed38a14567cf41f9a49"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=a20f57d05cb1941dbbbb96321dfb6408a78aa5e4#a20f57d05cb1941dbbbb96321dfb6408a78aa5e4"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -571,7 +571,7 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=7da31cd1a9e915b85539bed38a14567cf41f9a49#7da31cd1a9e915b85539bed38a14567cf41f9a49"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=a20f57d05cb1941dbbbb96321dfb6408a78aa5e4#a20f57d05cb1941dbbbb96321dfb6408a78aa5e4"
 dependencies = [
  "smallvec",
 ]

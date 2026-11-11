@@ -22,6 +22,7 @@ import traceback
 
 from PIL import Image, ImageChops, ImageGrab
 from native_x11_capture import X11StripCapture
+from native_x11_plain_key import resolve_plain_f5
 
 
 def wait_for(probe, label, process, timeout=25):
@@ -52,6 +53,42 @@ def read_vim_state(path, timeout=0.25):
             if remaining <= 0:
                 return {}
             time.sleep(min(0.005, remaining))
+
+
+class CompletionProbe:
+    """Retain bounded transition evidence without retrying or changing acceptance."""
+    def __init__(self, read_state, report):
+        self.read_state = read_state
+        self.report = report
+        self.started = time.monotonic()
+        self.last = None
+
+    def __call__(self, selected):
+        current = self.read_state()
+        completion = current.get("completion", {})
+        render = current.get("render", {})
+        observation = {
+            "expected_selected": selected,
+            "mode": current.get("mode"),
+            "text": current.get("text", "")[:160],
+            "line": current.get("line"), "column": current.get("column"),
+            "pum_visible": completion.get("pum_visible"),
+            "selected": completion.get("selected"),
+            "render_supported": render.get("supported"),
+            "render_completion_present": bool(render.get("completion")),
+            "render_reason": str(render.get("reason", ""))[:160],
+            "fixture_input": {key: str(current.get("fixture_input", {}).get(key, ""))[:limit]
+                              for key, limit in (("f5_mapping", 512), ("f5_termcode", 64),
+                                                 ("completeopt", 160), ("error", 160))},
+        }
+        if observation != self.last:
+            trace = self.report.setdefault("completion_observations", [])
+            trace.append(dict(elapsed=round(time.monotonic() - self.started, 3), **observation))
+            del trace[:-16]
+            self.last = observation
+        return (current if completion.get("pum_visible")
+                and completion.get("selected") == selected
+                and render.get("supported") and render.get("completion") else None)
 
 
 def fractional_wheel_positions(trace, start_y, end_y, row_height):
@@ -208,7 +245,7 @@ def main():
         "return {'cursor': get(frame, 'cursor', {}), 'completion': get(frame, 'completion', v:null), 'views': map(copy(get(frame, 'windows', [])), {_, w -> w.view}), 'supported': frame.supported, 'reason': frame.fallback_reason, 'rows': frame.rows, 'columns': frame.columns, 'leftcol': get(frame, 'leftcol', 0), 'native_pointer': get(get(get(frame, 'windows', []), 0, {}), 'native_pointer', 0), 'native_scroll': get(get(get(frame, 'windows', []), 0, {}), 'native_scroll', 0), 'scroll_ack': get(get(get(frame, 'windows', []), 0, {}), 'scroll_ack', 0)}\n"
         "endfunction\n"
         "function! NativeFixtureState(timer) abort\n"
-        f"call writefile([json_encode({{'pid': getpid(), 'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'completion': complete_info(['selected', 'pum_visible']), 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
+        f"call writefile([json_encode({{'pid': getpid(), 'termguicolors': &termguicolors, 'mode': mode(), 'windows': winnr('$'), 'screen_columns': &columns, 'screen_rows': &lines, 'line': line('.'), 'column': col('.'), 'topline': line('w0'), 'text': getline('.'), 'modified': &modified, 'leftcol': winsaveview().leftcol, 'completion': complete_info(['selected', 'pum_visible']), 'fixture_input': {{'f5_mapping': strpart(maparg('<F5>', 'i'), 0, 512), 'f5_termcode': strpart(&t_k5, 0, 64), 'completeopt': strpart(&completeopt, 0, 160), 'error': strpart(v:errmsg, 0, 160)}}, 'render': NativeFixtureRender()}})], {quoted(str(state_file) + '.tmp')})\n"
         f"call rename({quoted(str(state_file) + '.tmp')}, {quoted(state_file)})\n"
         "endfunction\n"
         f"autocmd VimLeavePre * call writefile([json_encode({{'pid': getpid(), 'modified': &modified, 'dying': v:dying}})], {quoted(out / 'vim-leave.json')})\n"
@@ -237,6 +274,10 @@ def main():
     app = subprocess.Popen([str(args.binary.resolve()), "--ide", str(source)], env=env, stdout=log, stderr=log)
     wheel_capture = None
     def xdo(*parts):
+        if parts[0] == "key" and "F5" in parts[1:]:
+            plain = resolve_plain_f5(env["DISPLAY"])
+            report.setdefault("plain_f5_input", []).append(plain)
+            parts = (parts[0], *(f"{plain['keycode']:03d}" if key == "F5" else key for key in parts[1:]))
         result = subprocess.run(["xdotool", *map(str, parts)], env=env, text=True, capture_output=True, timeout=4)
         if result.returncode and parts[0] != "search":
             raise RuntimeError("xdotool " + " ".join(map(str, parts)) + ": " + result.stderr)
@@ -636,12 +677,7 @@ def main():
         command("inoremap <silent> <F5> <Cmd>call complete(col('.'), [{'word':'alpha', 'abbr':'Alpha_Complete', 'kind':'f', 'menu':'[function]'}, {'word':'bravo', 'abbr':'Bravo_Complete', 'kind':'v', 'menu':'[value]'}, {'word':'charlie', 'abbr':nr2char(20013).nr2char(25991), 'kind':'t', 'menu':'[type]'}])<CR>")
         command("normal! 2G0")
         menu_bg, selected_bg = (0x28, 0x47, 0x63), (0xc2, 0x8a, 0x49)
-        def native_completion(selected):
-            current = state()
-            return (current if current.get("completion", {}).get("pum_visible")
-                    and current.get("completion", {}).get("selected") == selected
-                    and current.get("render", {}).get("supported")
-                    and current.get("render", {}).get("completion") else None)
+        native_completion = CompletionProbe(state, report)
         xdo("key", "A", "F5")
         wait_for(lambda: native_completion(-1), "unselected native completion menu", app)
         report["completion_menu_gui_pixels"] = wait_for(
