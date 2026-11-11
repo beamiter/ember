@@ -17,7 +17,7 @@
     "vendor/companion-host/src/lib.rs": "cc01e41c9e2d40083e4d9d4aeea032e4985f43505ede1637ba37b4502aedec7d",
     "vendor/companion-host/src/notice.rs": "a3e9ff16ecbc3d0c804796f00bab504c2625cf088001f67ac5ed10c7bac596d3",
     "vendor/companion-host/src/proposal.rs": "b9fa93d32cc960a710401e68e61cdf3cc6dc84943f77e95021b145e656fce5c4",
-    "vendor/companion-host/src/pty_session.rs": "34ef861a92c1afe27059f491664802f932b996306f09d5a04e91db94b8661a2f",
+    "vendor/companion-host/src/pty_session.rs": "935dd113b6de8038b3f11913cbd9613cbf416932d6bceabec9c01853140f9aee",
     "vendor/companion-host/src/shell_identity.rs": "19c9d4aaba33215546398bd8b3319bc3c625bdd896cffd444928b5d3fe85e116",
     "vendor/companion-host/src/voice_text.rs": "d20266a40437aeab448a915e4d974bc2bab5d3c2ace272608e3b0dee0e2e84cf",
     "vendor/companion-host/upstream-Cargo.toml": "0b8bdf1195c69bc1caa16a1d415f0a130529f3b95a5dfc4e9836473f300d2be7",

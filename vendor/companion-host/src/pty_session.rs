@@ -93,16 +93,25 @@ mod linux {
         if pid <= 1 {
             return Err(invalid());
         }
+        read_process_stat(File::open(root.join(pid.to_string()).join("stat"))?, pid)
+    }
+
+    fn read_process_stat(file: File, pid: i32) -> io::Result<State> {
         let mut text = String::new();
-        File::open(root.join(pid.to_string()).join("stat"))?
-            .take(MAX_STAT + 1)
-            .read_to_string(&mut text)?;
+        file.take(MAX_STAT + 1).read_to_string(&mut text)?;
         if text.len() as u64 > MAX_STAT {
             return Err(invalid());
         }
         parse(&text)
             .filter(|state| state.pid == pid)
             .ok_or_else(invalid)
+    }
+
+    fn process_disappeared(error: &io::Error) -> bool {
+        // A process can disappear before open (ENOENT) or after its procfs
+        // stat file was opened but before read (ESRCH). Only member scans
+        // may skip these errors; the owned session anchor must remain strict.
+        error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
     }
 
     fn anchor(session: &PtySession, root: &Path, exited: bool) -> io::Result<()> {
@@ -144,7 +153,7 @@ mod linux {
             }
             let state = match read_process(root, pid) {
                 Ok(state) => state,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if process_disappeared(&error) => continue,
                 Err(error) => return Err(error),
             };
             if state.live && state.session == session.pid {
@@ -349,6 +358,26 @@ mod linux {
             }
             assert!(child.0.wait().unwrap().success());
         }
+        #[test]
+        fn stat_open_before_reap_reports_a_disappeared_process() {
+            let mut child = Command::new("/bin/true").spawn().unwrap();
+            let pid = child.id() as i32;
+            // Keep the procfs descriptor open across reaping. Unlike a stress
+            // loop, this deterministically exercises disappearance at read.
+            let file = File::open(format!("/proc/{pid}/stat")).unwrap();
+            assert!(child.wait().unwrap().success());
+            let error = read_process_stat(file, pid).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+            assert!(process_disappeared(&error));
+            assert!(process_disappeared(&io::Error::from_raw_os_error(
+                libc::ENOENT
+            )));
+            for errno in [libc::EACCES, libc::EIO, libc::EINTR, libc::ECHILD] {
+                assert!(!process_disappeared(&io::Error::from_raw_os_error(errno)));
+            }
+            assert!(!process_disappeared(&invalid()));
+        }
+
         #[test]
         fn stat_parser_uses_last_parenthesis_and_rejects_truncation() {
             let text = format!("77 (a ) tricky) S 1 77 77 {} 900", "0 ".repeat(15));
