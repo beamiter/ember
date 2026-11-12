@@ -8,7 +8,7 @@ resize and closing remain available. Pointer, selection/copy, search navigation,
 links and file drops must not use unavailable geometry. The renderer explains
 that content is not being displayed and the terminal is still running.
 
-Limits: 101024 source rows, 131072 planned rows, 262144 raw slices and 1048576
+Limits: 131072 source rows, 131072 planned rows, 262144 raw slices and 1048576
 wide-continuation scratch entries. Raw materialization separately caps 1048576
 actual decoded cells, including visible output. Ember does not clone compressed
 history here, so it has no compressed-clone budget or unused allocation-failure
@@ -46,3 +46,10 @@ Raw admission is also cached by scalar source/offset/limits. Materialization
 rejection preserves numeric scroll/follow intent while discarding stale anchor
 authority; its cache includes the original request, effective mode and margin.
 An unchanged unavailable request does not silently jump to the live bottom.
+
+Source and planned-row caps share the 131072-row document envelope. This
+permits the native E03 search workload (64 x 2000 retained unwrapped output
+rows plus shell/flush rows); the previous independent 101024 source cap
+rejected it before planning despite fitting the view and slice caps. The
+262144 slice cap and all cell/wide budgets are unchanged. Boundary regression
+checks admit the exact source cap and reject cap + 1 without materialization.

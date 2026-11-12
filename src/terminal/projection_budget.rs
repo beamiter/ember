@@ -41,7 +41,10 @@ pub(super) struct ProjectionBudget {
 impl Default for ProjectionBudget {
     fn default() -> Self {
         Self {
-            source_rows: 101_024,
+            // A one-to-one source must fit the same bounded document envelope.
+            // In particular the native 64 x 2000-row snapshot search fixture
+            // retains more than 100k rows without exceeding the view budget.
+            source_rows: 131_072,
             view_rows: 131_072,
             raw_slices: 262_144,
             wide_scratch: 1_048_576,
@@ -687,6 +690,41 @@ mod tests {
         );
         assert!(t.copy_selection().is_none());
         assert!(!frame(&mut t, &p).is_available());
+    }
+    #[test]
+    fn native_snapshot_search_history_fits_bounded_document_envelope() {
+        let mut t = TerminalState::new(160, 48);
+        // E03 retains 64 finished 2000-line outputs plus shell/flush rows.
+        // Compact one-run rows model the real unwrapped 96-column payload;
+        // admission must not reject these merely at an unrelated 100k cap.
+        let cell = TerminalCell {
+            character: '.',
+            ..TerminalCell::default()
+        };
+        for _ in 0..(64 * 2000 + 1024) {
+            t.scrollback
+                .push_back(ScrollbackLine::compress(&[cell; 96], false));
+        }
+        let p = policy();
+        assert_eq!(t.source_budget(Some(&p)), Ok(()));
+        assert_eq!(t.plan_budget(160, &p), Ok(()));
+        let cap = t.projection_limits().source_rows;
+        while t.scrollback.len() + t.screen.grid.rows() < cap {
+            t.scrollback
+                .push_back(ScrollbackLine::compress(&[cell; 96], false));
+        }
+        assert_eq!(t.source_budget(Some(&p)), Ok(()));
+        assert_eq!(t.plan_budget_uncached(160, &p), Ok(()));
+        t.scrollback
+            .push_back(ScrollbackLine::compress(&[cell; 96], false));
+        assert_eq!(
+            t.source_budget(Some(&p)),
+            Err(ProjectionUnavailable::SourceRows)
+        );
+        assert_eq!(
+            frame(&mut t, &p).unavailable_reason(),
+            Some(ProjectionUnavailable::SourceRows)
+        );
     }
     #[test]
     fn budget_checked_arithmetic_never_wraps() {
