@@ -1278,7 +1278,26 @@ impl TerminalApp {
             })
     }
 
+    pub(crate) fn session_projection_unavailable(&self, session_id: &str) -> bool {
+        self.session_manager
+            .index_of(session_id)
+            .and_then(|index| self.session_manager.sessions().get(index))
+            .is_none_or(|session| session.terminal.lock().projection_unavailable().is_some())
+    }
+
+    pub(crate) fn active_projection_unavailable(&self) -> bool {
+        self.session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .is_some_and(|session| session.terminal.lock().projection_unavailable().is_some())
+    }
+
     fn copy_active_selection(&mut self) {
+        if self.active_projection_unavailable() {
+            self.block_selection = None;
+            self.set_status("Copy unavailable: terminal content is not displayed");
+            return;
+        }
         let selected = {
             let session = self.session_manager.get_active_session_mut();
             session.terminal.lock().copy_selection()
@@ -1997,7 +2016,12 @@ impl TerminalApp {
                 policy,
                 view_state,
             );
-            if viewport.is_transformed() {
+            if !viewport.is_available() {
+                (
+                    crate::terminal::ProjectedBufferAnchorLocation::Unmapped,
+                    policy_revision,
+                )
+            } else if viewport.is_transformed() {
                 (
                     terminal.reveal_buffer_anchor_in_projection(
                         policy,
@@ -2121,6 +2145,9 @@ impl TerminalApp {
             policy,
             view_state,
         );
+        if !viewport.is_available() {
+            return;
+        }
         if viewport.is_transformed() {
             view_state.scroll(lines, &viewport);
         } else if !terminal.is_alt_buffer_active() {
@@ -2141,6 +2168,9 @@ impl TerminalApp {
             policy,
             view_state,
         );
+        if !viewport.is_available() {
+            return false;
+        }
         if !viewport.is_transformed() {
             return if next {
                 terminal.jump_to_next_command()

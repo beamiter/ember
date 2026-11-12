@@ -1508,6 +1508,9 @@ fn middle_paste_event_eligible(
     pos: egui::Pos2,
     modifiers: Option<egui::Modifiers>,
 ) -> bool {
+    if terminal.projection_unavailable().is_some() || !viewport.is_available() {
+        return false;
+    }
     let Some(content_rect) = renderer.last_content_rect.filter(|rect| {
         rect.is_finite()
             && rect.contains(pos)
@@ -5905,7 +5908,9 @@ impl eframe::App for TerminalApp {
                 .collect::<Vec<_>>()
         };
         if !dropped_paths.is_empty() {
-            if ui_owns_clipboard {
+            if self.active_projection_unavailable() {
+                self.set_status("Image drop ignored: terminal content is not displayed");
+            } else if ui_owns_clipboard {
                 self.set_status("Image drop ignored: another panel is receiving input");
             } else {
                 match image_drop::prompt_payload(&dropped_paths) {
@@ -7323,6 +7328,16 @@ impl eframe::App for TerminalApp {
             projected_viewport_for_session(session, renderer)
         };
 
+        if !mouse_projection_viewport.is_available() {
+            terminal_pointer_input_blocked = true;
+            self.terminal_mouse_capture = None;
+            self.last_terminal_mouse_motion = None;
+            self.pending_link_activation = None;
+            self.hovered_link = None;
+            self.smooth_scroll_velocity = 0.0;
+            self.smooth_scroll_pixel_offset = 0.0;
+        }
+
         // Apply velocity already admitted by an earlier frame before taking
         // ownership decisions for this frame. A wheel event admitted below is
         // intentionally applied on the next frame, so no viewport mutation can
@@ -7468,6 +7483,15 @@ impl eframe::App for TerminalApp {
                 .and_then(|index| self.pane_renderers.get(index))
                 .unwrap_or(&self.renderer);
             mouse_projection_viewport = projected_viewport_for_session(session, renderer);
+            if !mouse_projection_viewport.is_available() {
+                terminal_pointer_input_blocked = true;
+                self.terminal_mouse_capture = None;
+                self.last_terminal_mouse_motion = None;
+                self.pending_link_activation = None;
+                self.hovered_link = None;
+                self.smooth_scroll_velocity = 0.0;
+                self.smooth_scroll_pixel_offset = 0.0;
+            }
         }
 
         // Mouse ownership, coordinate mapping and link hit-testing below all
@@ -7767,6 +7791,17 @@ impl eframe::App for TerminalApp {
                 // PRIMARY when the link opens.
                 local_selection_cancelled: link_press_override,
             });
+        }
+
+        // Captures can belong to an inactive pane. Never drain queued coordinates
+        // from that pane after its projection has become unavailable.
+        if self
+            .terminal_mouse_capture
+            .as_ref()
+            .is_some_and(|capture| capture.terminal.lock().projection_unavailable().is_some())
+        {
+            self.terminal_mouse_capture = None;
+            self.last_terminal_mouse_motion = None;
         }
 
         let pointer_any_down = ctx.input(|input| input.pointer.any_down());

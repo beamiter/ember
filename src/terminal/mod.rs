@@ -1,3 +1,5 @@
+mod projection_budget;
+pub use projection_budget::ProjectionUnavailable;
 pub mod search_chunk;
 pub mod search_worker;
 mod watch;
@@ -546,6 +548,33 @@ pub struct TerminalState {
     /// Cell-free full-document plan and late-materialized transformed slice.
     /// Their exact keys intentionally have different invalidation domains.
     projection_plan_cache: Option<projection::ProjectionPlanCache>,
+    projection_failure: Option<ProjectionUnavailable>,
+    projection_last_policy: Option<ProjectionPolicy>,
+    projection_frame_source: Option<projection_budget::ProjectionAssessmentKey>,
+    projection_budget_cache: std::cell::RefCell<
+        Option<(
+            projection::ProjectionPlanCacheKey,
+            Result<(), ProjectionUnavailable>,
+        )>,
+    >,
+    projection_raw_budget_cache: std::cell::Cell<Option<projection_budget::RawBudgetCache>>,
+    projection_materialization_failure: Option<(
+        projection_budget::MaterializationFailureKey,
+        ProjectionUnavailable,
+    )>,
+    projection_query_cache: std::cell::Cell<
+        Option<(
+            projection_budget::ProjectionAssessmentKey,
+            Option<ProjectionUnavailable>,
+        )>,
+    >,
+    #[cfg(test)]
+    projection_query_evaluations: std::cell::Cell<usize>,
+    #[cfg(test)]
+    projection_raw_evaluations: std::cell::Cell<usize>,
+    projection_frame_valid: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    projection_test_budget: Option<projection_budget::ProjectionBudget>,
     transformed_viewport_cache: Option<projection::TransformedViewportCache>,
     next_projection_plan_revision: u64,
     /// Cached answer for whether raw buffer coordinates exactly match the

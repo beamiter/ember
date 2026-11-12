@@ -278,6 +278,20 @@ impl super::TerminalState {
             visible_cells_cache: None,
             projected_viewport_cache: None,
             projection_plan_cache: None,
+            projection_failure: None,
+            projection_last_policy: None,
+            projection_frame_source: None,
+            projection_budget_cache: std::cell::RefCell::new(None),
+            projection_query_cache: std::cell::Cell::new(None),
+            projection_raw_budget_cache: std::cell::Cell::new(None),
+            projection_materialization_failure: None,
+            #[cfg(test)]
+            projection_query_evaluations: std::cell::Cell::new(0),
+            #[cfg(test)]
+            projection_raw_evaluations: std::cell::Cell::new(0),
+            projection_frame_valid: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            #[cfg(test)]
+            projection_test_budget: None,
             transformed_viewport_cache: None,
             next_projection_plan_revision: 1,
             viewport_mapping_exact_cache: std::cell::Cell::new(None),
@@ -3481,6 +3495,9 @@ impl super::TerminalState {
     /// drawing a raw-column search span there would confidently highlight the
     /// wrong cell. Callers should omit that overlay instead.
     pub fn viewport_buffer_mapping_is_exact(&self) -> bool {
+        if self.projection_failure.is_some() {
+            return false;
+        }
         if self.scroll_offset == 0 {
             return true;
         }
@@ -3542,6 +3559,9 @@ impl super::TerminalState {
         viewport: &ProjectedViewport,
         anchor: BufferAnchor,
     ) -> Option<DisplayPoint> {
+        if self.projection_unavailable().is_some() || !viewport.is_available() {
+            return None;
+        }
         let (absolute_row, column) = self.buffer_anchor_to_absolute(anchor)?;
         let row_id = self.raw_row_id_at_absolute(absolute_row)?;
         viewport.display_point_for(RawCellAnchor { row_id, column })
@@ -3554,6 +3574,9 @@ impl super::TerminalState {
         viewport: &ProjectedViewport,
         anchor: BufferAnchor,
     ) -> Option<usize> {
+        if self.projection_unavailable().is_some() || !viewport.is_available() {
+            return None;
+        }
         let (absolute, column) = self.buffer_anchor_to_absolute(anchor)?;
         if !viewport.is_transformed() {
             return Some(absolute);
@@ -3605,6 +3628,13 @@ impl super::TerminalState {
         view_state: &mut ProjectionViewState,
         anchor: BufferAnchor,
     ) -> ProjectedBufferAnchorLocation {
+        if self.projection_unavailable().is_some() {
+            return ProjectedBufferAnchorLocation::Unmapped;
+        }
+        if let Err(reason) = self.source_budget(Some(policy)) {
+            self.fail_projection(reason);
+            return ProjectedBufferAnchorLocation::Unmapped;
+        }
         if policy.is_identity() || self.screen.use_alt_buffer {
             return ProjectedBufferAnchorLocation::Identity;
         }
@@ -3617,7 +3647,7 @@ impl super::TerminalState {
         let raw = RawCellAnchor { row_id, column };
         let cols = self.screen.grid.row_len().max(1);
         let plan_key = self.projection_plan_cache_key(cols, policy);
-        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+        let Ok(Some(plan)) = self.cached_collapsed_projection_plan(cols, policy) else {
             return if self
                 .projection_plan_cache
                 .as_ref()
@@ -3666,12 +3696,19 @@ impl super::TerminalState {
         view_state: &mut ProjectionViewState,
         zone_id: u64,
     ) -> bool {
+        if self.projection_unavailable().is_some() {
+            return false;
+        }
+        if let Err(reason) = self.source_budget(Some(policy)) {
+            self.fail_projection(reason);
+            return false;
+        }
         if self.screen.use_alt_buffer || !policy.is_collapsed(zone_id) {
             return false;
         }
         let cols = self.screen.grid.row_len().max(1);
         let plan_key = self.projection_plan_cache_key(cols, policy);
-        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+        let Ok(Some(plan)) = self.cached_collapsed_projection_plan(cols, policy) else {
             return false;
         };
         let Some((document_row, hidden_range)) =
@@ -4555,7 +4592,7 @@ impl super::TerminalState {
             .min(self.screen.grid.rows() as u64) as usize
     }
 
-    fn projection_plan_cache_key(
+    pub(super) fn projection_plan_cache_key(
         &self,
         cols: usize,
         policy: &ProjectionPolicy,
@@ -4597,7 +4634,7 @@ impl super::TerminalState {
         .ok()
     }
 
-    fn projection_source_to_absolute(&self, source: usize) -> Option<usize> {
+    pub(super) fn projection_source_to_absolute(&self, source: usize) -> Option<usize> {
         let absolute = source.checked_sub(self.projection_source_base()?)?;
         (absolute
             < self
@@ -4610,6 +4647,22 @@ impl super::TerminalState {
     /// Return an exact cached full-document plan. A stale policy is resolved
     /// first and exits here without visiting historical layout metadata.
     fn cached_collapsed_projection_plan(
+        &mut self,
+        cols: usize,
+        policy: &ProjectionPolicy,
+    ) -> Result<Option<std::sync::Arc<ProjectionPlan>>, ProjectionUnavailable> {
+        if let Err(reason) = self.plan_budget(cols, policy) {
+            self.fail_projection(reason);
+            return Err(reason);
+        }
+        let plan = self.cached_collapsed_projection_plan_unchecked(cols, policy);
+        match self.projection_failure {
+            Some(reason) => Err(reason),
+            None => Ok(plan),
+        }
+    }
+
+    fn cached_collapsed_projection_plan_unchecked(
         &mut self,
         cols: usize,
         policy: &ProjectionPolicy,
@@ -4782,6 +4835,45 @@ impl super::TerminalState {
         let Some(expected_history) = old_key.scrollback_len.checked_add(appended) else {
             return false;
         };
+        // Incremental append precedes prefix eviction. Budget its transient
+        // peak, not merely the eventual current-document size; otherwise use
+        // the already-preflighted cold builder without mutating the old plan.
+        let limits = self.projection_limits();
+        let mut appended_upper = new_key.rows;
+        for row in self
+            .scrollback
+            .iter()
+            .rev()
+            .take(appended.min(self.scrollback.len()))
+        {
+            let extra = row
+                .reflow_content_len()
+                .div_ceil(new_key.cols.saturating_sub(1).max(1))
+                .max(1);
+            let Some(sum) = appended_upper.checked_add(extra) else {
+                return false;
+            };
+            appended_upper = sum;
+        }
+        if plan
+            .rows
+            .len()
+            .checked_add(appended_upper)
+            .is_none_or(|n| n > limits.view_rows)
+            || plan
+                .raw_slice_count
+                .checked_add(appended_upper)
+                .and_then(|n| n.checked_add(appended.min(self.scrollback.len())))
+                .is_none_or(|n| n > limits.raw_slices)
+            || plan
+                .raw_rows
+                .len()
+                .checked_add(appended.min(self.scrollback.len()))
+                .and_then(|n| n.checked_add(new_key.rows))
+                .is_none_or(|n| n > limits.source_rows)
+        {
+            return false;
+        }
         let evicted = expected_history.saturating_sub(new_key.scrollback_len);
         if expected_history < new_key.scrollback_len || evicted > old_key.scrollback_len {
             return false;
@@ -4971,7 +5063,7 @@ impl super::TerminalState {
             row_sources.push(None);
         }
 
-        let mut history_cache: HashMap<usize, Vec<TerminalCell>> = HashMap::new();
+        let mut history_cache: Option<(usize, Vec<TerminalCell>)> = None;
         for planned_row in plan.rows.iter().skip(document_start).take(visible_rows) {
             let display_row = cells.len();
             let mut line = vec![TerminalCell::default(); plan.cols];
@@ -4982,16 +5074,17 @@ impl super::TerminalState {
                     continue;
                 };
                 let source = if source_absolute < self.scrollback.len() {
-                    history_cache
-                        .entry(source_absolute)
-                        .or_insert_with(|| {
-                            #[cfg(test)]
-                            PROJECTION_VIEW_HISTORY_DECOMPRESSES.with(|count| {
-                                count.set(count.get().saturating_add(1));
-                            });
-                            self.scrollback[source_absolute].decompress()
-                        })
-                        .as_slice()
+                    if history_cache.as_ref().map(|(row, _)| *row) != Some(source_absolute) {
+                        #[cfg(test)]
+                        PROJECTION_VIEW_HISTORY_DECOMPRESSES.with(|count| {
+                            count.set(count.get().saturating_add(1));
+                        });
+                        history_cache = Some((
+                            source_absolute,
+                            self.scrollback[source_absolute].decompress(),
+                        ));
+                    }
+                    history_cache.as_ref().expect("decoded source").1.as_slice()
                 } else {
                     let Some(grid_row) = source_absolute
                         .checked_sub(self.scrollback.len())
@@ -5125,6 +5218,45 @@ impl super::TerminalState {
     ) -> ProjectedViewport {
         view_state.active_transformed = false;
         self.observe_chat_native_takeover();
+        let bypass = !block_mode
+            || self.screen.use_alt_buffer
+            || policy.chat_mode() && self.chat_native_takeover()
+            || policy.is_identity();
+        let request_key = projection_budget::MaterializationFailureKey {
+            source: self.projection_assessment_key(),
+            policy: policy.clone(),
+            intent: (
+                view_state.offset_from_bottom,
+                view_state.follow_bottom,
+                view_state.canvas_margin,
+                view_state.canvas_managed,
+            ),
+            presentation_rows,
+            bypass,
+        };
+        if let Some((cached, reason)) = &self.projection_materialization_failure {
+            if *cached == request_key {
+                let reason = *reason;
+                self.fail_projection(reason);
+                return self.unavailable_viewport(projection);
+            }
+        }
+        self.projection_materialization_failure = None;
+        let allowed = if bypass {
+            self.raw_budget()
+        } else {
+            self.plan_budget(self.screen.grid.row_len().max(1), policy)
+        };
+        if let Err(reason) = allowed {
+            self.fail_projection(reason);
+            view_state.top_anchor = None;
+            view_state.last_plan_key = None;
+            view_state.last_viewport_rows = None;
+            view_state.active_transformed = false;
+            return self.unavailable_viewport(projection);
+        }
+        self.begin_projection_frame(if bypass { None } else { Some(policy) });
+        self.resume_projection();
         if !block_mode
             || self.screen.use_alt_buffer
             || policy.chat_mode() && self.chat_native_takeover()
@@ -5136,12 +5268,15 @@ impl super::TerminalState {
             self.leave_transformed_selection_space();
             if view_state.last_plan_key.is_some() {
                 self.restore_identity_scroll_from_projection(view_state);
+                self.begin_projection_frame(None);
+                self.resume_projection();
                 view_state.last_plan_key = None;
             }
             return self.projected_viewport(projection, true);
         }
 
-        if view_state.last_plan_key.is_none() && self.scroll_offset > 0 {
+        if view_state.last_plan_key.is_none() && self.scroll_offset > 0 && self.raw_budget().is_ok()
+        {
             let identity = self.projected_viewport(projection, true);
             view_state.top_anchor = self.projected_top_anchor(&identity);
             view_state.follow_bottom = false;
@@ -5149,10 +5284,19 @@ impl super::TerminalState {
 
         let cols = self.screen.grid.row_len().max(1);
         let plan_key = self.projection_plan_cache_key(cols, policy);
-        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+        let Ok(Some(plan)) = self.cached_collapsed_projection_plan(cols, policy) else {
+            if self.projection_failure.is_some() {
+                view_state.top_anchor = None;
+                view_state.last_plan_key = None;
+                view_state.last_viewport_rows = None;
+                view_state.active_transformed = false;
+                return self.unavailable_viewport(projection);
+            }
             self.leave_transformed_selection_space();
             if view_state.last_plan_key.is_some() {
                 self.restore_identity_scroll_from_projection(view_state);
+                self.begin_projection_frame(Some(policy));
+                self.resume_projection();
                 view_state.last_plan_key = None;
             }
             return self.projected_viewport(projection, true);
@@ -5185,6 +5329,17 @@ impl super::TerminalState {
         let margin = view_state.canvas_margin && view_state.offset_from_bottom > 0;
         let viewport_rows = visible_rows + usize::from(margin);
         let document_start = max_offset.saturating_sub(view_state.offset_from_bottom);
+        if let Err(reason) = self.materialization_budget(&plan, document_start, viewport_rows) {
+            view_state.offset_from_bottom = request_key.intent.0;
+            view_state.follow_bottom = request_key.intent.1;
+            self.projection_materialization_failure = Some((request_key, reason));
+            self.fail_projection(reason);
+            view_state.top_anchor = None;
+            view_state.last_plan_key = None;
+            view_state.last_viewport_rows = None;
+            view_state.active_transformed = false;
+            return self.unavailable_viewport(projection);
+        }
         let cursor_row_id = self
             .screen
             .grid
@@ -5210,10 +5365,11 @@ impl super::TerminalState {
                 )
                 .with_canvas_margin(margin),
         };
+        let viewport = viewport.with_validity(std::sync::Arc::clone(&self.projection_frame_valid));
         if self
             .transformed_viewport_cache
             .as_ref()
-            .is_none_or(|(cached_key, _)| *cached_key != viewport_key)
+            .is_none_or(|(key, _)| *key != viewport_key)
         {
             self.transformed_viewport_cache = Some((viewport_key, viewport.clone()));
         }
@@ -5400,6 +5556,13 @@ impl super::TerminalState {
     }
 
     pub fn get_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
+        if self.projection_unavailable().is_some() {
+            return std::sync::Arc::new(Vec::new());
+        }
+        if let Err(reason) = self.raw_budget() {
+            self.fail_projection(reason);
+            return std::sync::Arc::new(Vec::new());
+        }
         // The alternate screen owns one native viewport. A stale host rail
         // offset must never make primary-shell history visible inside it.
         if self.screen.use_alt_buffer {
@@ -5728,6 +5891,13 @@ impl super::TerminalState {
         projection: HistoryProjection,
         block_mode: bool,
     ) -> ProjectedViewport {
+        if self.projection_failure.is_some() {
+            return self.unavailable_viewport(projection);
+        }
+        if let Err(reason) = self.raw_budget() {
+            self.fail_projection(reason);
+            return self.unavailable_viewport(projection);
+        }
         self.leave_transformed_selection_space();
         if self.screen.use_alt_buffer {
             self.scroll_offset = 0;
@@ -5780,6 +5950,7 @@ impl super::TerminalState {
             row_sources,
             DisplayPoint::new(self.screen.cursor_row, self.screen.cursor_col),
         );
+        let viewport = viewport.with_validity(std::sync::Arc::clone(&self.projection_frame_valid));
         self.projected_viewport_cache = Some(viewport.clone());
         viewport
     }
@@ -5937,6 +6108,9 @@ impl super::TerminalState {
     /// with the grid while the scrollback is at the bottom — the
     /// `scrolled_back` guard is what makes that assumption safe.
     pub fn click_cursor_move(&self, click_row: usize, click_col: usize, enabled: bool) -> Vec<u8> {
+        if self.projection_unavailable().is_some() {
+            return Vec::new();
+        }
         let guards = click_cursor::Guards {
             enabled,
             mouse_reporting: self.is_mouse_enabled(),
@@ -5984,6 +6158,9 @@ impl super::TerminalState {
 
     /// 获取当前可见行的wrapped状态，用于跨行链接检测
     pub fn get_visible_row_wrapped(&self) -> Vec<bool> {
+        if self.projection_unavailable().is_some() {
+            return Vec::new();
+        }
         let rows = self.screen.grid.rows();
 
         if self.scroll_offset == 0 {
@@ -6059,6 +6236,12 @@ impl super::TerminalState {
     }
 
     fn projected_selection_plan_revision(&self, viewport: &ProjectedViewport) -> Option<u64> {
+        if self.projection_unavailable().is_some() || !viewport.is_available() {
+            return None;
+        }
+        if self.projection_failure.is_some() {
+            return None;
+        }
         let revision = viewport.plan_revision()?;
         let (key, plan) = self.projection_plan_cache.as_ref()?;
         (plan.plan_revision == revision
@@ -6171,6 +6354,9 @@ impl super::TerminalState {
     /// Converts to absolute buffer coordinates internally.
     #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
     pub fn start_selection(&mut self, viewport_pos: (usize, usize)) {
+        if self.projection_unavailable().is_some() {
+            return;
+        }
         self.start_selection_with_mode(viewport_pos, SelectionMode::Normal);
     }
 
@@ -6179,6 +6365,9 @@ impl super::TerminalState {
         viewport: &ProjectedViewport,
         display_pos: (usize, usize),
     ) {
+        if self.projection_unavailable().is_some() || !viewport.is_available() {
+            return;
+        }
         self.start_selection_with_projected_mode(viewport, display_pos, SelectionMode::Normal);
     }
 
@@ -6192,6 +6381,9 @@ impl super::TerminalState {
         viewport: &ProjectedViewport,
         display_pos: (usize, usize),
     ) {
+        if self.projection_unavailable().is_some() || !viewport.is_available() {
+            return;
+        }
         self.start_selection_with_projected_mode(viewport, display_pos, SelectionMode::Block);
     }
 
@@ -6247,6 +6439,9 @@ impl super::TerminalState {
     /// Update the active end of the current selection with a viewport-relative position.
     #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
     pub fn update_selection(&mut self, viewport_pos: (usize, usize)) {
+        if self.projection_unavailable().is_some() {
+            return;
+        }
         let abs_row = self.viewport_row_to_absolute(viewport_pos.0);
         if let Some(ref mut sel) = self.selection {
             sel.active = (abs_row, viewport_pos.1);
@@ -6259,6 +6454,9 @@ impl super::TerminalState {
         viewport: &ProjectedViewport,
         display_pos: (usize, usize),
     ) {
+        if self.projection_unavailable().is_some() || !viewport.is_available() {
+            return;
+        }
         if viewport.is_transformed() {
             let Some(plan_revision) = self.projected_selection_plan_revision(viewport) else {
                 self.clear_text_selection();
@@ -6305,6 +6503,9 @@ impl super::TerminalState {
     /// whitespace, or punctuation/symbols.
     #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
     pub fn select_word_at(&mut self, row: usize, col: usize) {
+        if self.projection_unavailable().is_some() {
+            return;
+        }
         let visible = self.get_visible_cells();
         let wrapped = self.get_visible_row_wrapped();
         let viewport_base = self.viewport_row_to_absolute(0);
@@ -6319,6 +6520,9 @@ impl super::TerminalState {
         row: usize,
         col: usize,
     ) {
+        if self.projection_unavailable().is_some() || !viewport.is_available() {
+            return;
+        }
         if viewport.is_transformed() {
             let Some(plan_revision) = self.projected_selection_plan_revision(viewport) else {
                 self.clear_text_selection();
@@ -6472,6 +6676,9 @@ impl super::TerminalState {
 
     #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
     pub fn select_line_at(&mut self, row: usize) {
+        if self.projection_unavailable().is_some() {
+            return;
+        }
         let visible = self.get_visible_cells();
         let viewport_base = self.viewport_row_to_absolute(0);
         self.select_line_in_view(visible.as_ref(), row, |viewport_row| {
@@ -6480,6 +6687,9 @@ impl super::TerminalState {
     }
 
     pub fn select_line_at_projected(&mut self, viewport: &ProjectedViewport, row: usize) {
+        if self.projection_unavailable().is_some() || !viewport.is_available() {
+            return;
+        }
         if viewport.is_transformed() {
             let Some(plan_revision) = self.projected_selection_plan_revision(viewport) else {
                 self.clear_text_selection();
@@ -6651,6 +6861,9 @@ impl super::TerminalState {
     }
 
     fn copy_projected_selection(&self) -> Option<String> {
+        if self.projection_failure.is_some() {
+            return None;
+        }
         let selection = self.projected_selection.as_ref()?;
         let (plan_key, plan) = self.projection_plan_cache.as_ref()?;
         if selection.plan_revision == 0
@@ -6768,6 +6981,9 @@ impl super::TerminalState {
     }
 
     pub fn copy_selection(&self) -> Option<String> {
+        if self.projection_unavailable().is_some() {
+            return None;
+        }
         if self.projected_selection.is_some() {
             return self.copy_projected_selection();
         }

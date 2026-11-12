@@ -68,6 +68,9 @@ fn search_match_in_projection(
     viewport: &ProjectedViewport,
     search_match: crate::search::SearchMatch,
 ) -> Option<(usize, usize, usize)> {
+    if terminal.projection_unavailable().is_some() || !viewport.is_available() {
+        return None;
+    }
     if !viewport.is_transformed() {
         let row = search_match.viewport_row(terminal)?;
         return Some((row, search_match.col_start, search_match.col_end));
@@ -1946,6 +1949,13 @@ impl TerminalRenderer {
         ctx: &egui::Context,
     ) -> ProjectedViewport {
         let viewport = self.projected_viewport_with_state(terminal, policy, state);
+        if !viewport.is_available() {
+            canvas.reset();
+            state.clear_canvas();
+            self.canvas_geometry = Default::default();
+            self.scroll_pixel_offset = 0.0;
+            return viewport;
+        }
         if (!self.block_mode && terminal.inline_cli_scope_floor().is_none())
             || !viewport.is_transformed()
             || self.native_vim9_identity.is_some()
@@ -2048,6 +2058,12 @@ impl TerminalRenderer {
             return;
         }
         let viewport = self.projected_viewport_with_state(terminal, policy, state);
+        if !viewport.is_available() {
+            self.dragging_scrollbar = false;
+            self.projected_scroll_request = None;
+            canvas.reset();
+            return;
+        }
         // While captured, the pointer owns the presented coordinate even if a
         // queued wheel/page destination was admitted before this frame.
         if self.dragging_scrollbar {
@@ -3470,6 +3486,9 @@ impl TerminalRenderer {
     /// content is wholly app-owned.
     #[allow(dead_code)] // Public/test compatibility; application uses projected ownership.
     pub fn pointer_app_mouse_eligible(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
+        if terminal.projection_unavailable().is_some() {
+            return false;
+        }
         self.pointer_app_mouse_eligible_for_rows(terminal, None, pos, terminal.screen.grid.rows())
     }
 
@@ -3479,6 +3498,9 @@ impl TerminalRenderer {
         viewport: &ProjectedViewport,
         pos: egui::Pos2,
     ) -> bool {
+        if terminal.projection_unavailable().is_some() || !viewport.is_available() {
+            return false;
+        }
         if viewport.is_transformed() {
             let Some(content_rect) = self.last_content_rect.filter(|rect| rect.contains(pos))
             else {
@@ -3588,6 +3610,9 @@ impl TerminalRenderer {
     /// selection. Gutter, padding, and scrollbar remain outside this surface.
     #[allow(dead_code)] // Public/test compatibility; application uses projected ownership.
     pub fn pointer_link_eligible(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
+        if terminal.projection_unavailable().is_some() {
+            return false;
+        }
         self.pointer_link_eligible_for_rows(terminal, None, pos, terminal.screen.grid.rows())
     }
 
@@ -3597,6 +3622,9 @@ impl TerminalRenderer {
         viewport: &ProjectedViewport,
         pos: egui::Pos2,
     ) -> bool {
+        if terminal.projection_unavailable().is_some() || !viewport.is_available() {
+            return false;
+        }
         if viewport.is_transformed() {
             let Some(content_rect) = self.last_content_rect.filter(|rect| rect.contains(pos))
             else {
@@ -4825,6 +4853,61 @@ impl TerminalRenderer {
             .filter(|(source, _)| *source == terminal_ptr)
             .map(|(_, viewport)| viewport)
             .unwrap_or_else(|| self.projected_viewport(terminal));
+        if terminal.projection_unavailable().is_some() || !viewport.is_available() {
+            // No raw/native fallback: it could reveal content outside the scope
+            // that requested this projection. Drop all previously armed geometry.
+            self.last_content_rect = None;
+            self.chat_control_rect = None;
+            self.foreground_footer_rect = None;
+            self.dragging_scrollbar = false;
+            self.local_selection_terminal = None;
+            self.projected_scroll_request = None;
+            self.block_click = None;
+            self.block_menu_action = None;
+            self.block_primary_press = None;
+            self.summary_primary_press = None;
+            self.requested_block_context_menu = None;
+            self.context_block_id = None;
+            self.cursor_move_input.clear();
+            self.cursor_move_terminal_ptr = None;
+            self.click_tracker = Default::default();
+            self.click_tracker_terminal = None;
+            self.click_tracker_projection = None;
+            self.cached_links = Default::default();
+            self.cached_links_projection_key = None;
+            self.canvas_geometry = Default::default();
+            self.scroll_pixel_offset = 0.0;
+            if let Some(input) = &self.native_vim9_input {
+                input.lock().cancel();
+            }
+            // Preserve native keyboard ownership without inventing a cursor or
+            // content coordinate for pointer/IME candidate positioning.
+            if focus_enabled && (response.clicked() || !self.requested_initial_focus) {
+                response.request_focus();
+                self.requested_initial_focus = true;
+            }
+            if focus_enabled && response.has_focus() {
+                ui.ctx().memory_mut(|memory| {
+                    memory.set_focus_lock_filter(
+                        response.id,
+                        egui::EventFilter {
+                            tab: true,
+                            horizontal_arrows: true,
+                            vertical_arrows: true,
+                            escape: true,
+                        },
+                    )
+                });
+            }
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 0.0, self.theme.terminal_background());
+            painter.text(
+                rect.center(), egui::Align2::CENTER_CENTER,
+                "Terminal content is not displayed: projection resource limit.\nProcesses and keyboard input continue. Resize or reduce history to retry.",
+                FontId::proportional(self.font_size), Color32::WHITE,
+            );
+            return response;
+        }
         self.projected_kitty_rows_remaining = viewport
             .is_transformed()
             .then(|| projected_kitty_row_budget(viewport.rows()));
@@ -12680,6 +12763,68 @@ mod transcript_canvas_tests {
         policy.set_chat_mode(chat);
         policy.set_block_spacing(chat);
         (renderer, terminal, policy)
+    }
+
+    #[test]
+    fn unavailable_projection_disarms_pointer_geometry_and_retained_frames() {
+        let (mut renderer, mut terminal, policy) = fixture(false);
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let retained =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(retained.is_available());
+        terminal.set_projection_test_row_budget(0);
+        let unavailable =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(!unavailable.is_available());
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 320.0));
+        renderer.last_content_rect = Some(rect);
+        renderer.dragging_scrollbar = true;
+        renderer.scroll_pixel_offset = 3.0;
+        renderer.frame_projection = Some((&terminal as *const TerminalState as usize, unavailable));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                renderer.render(
+                    ui,
+                    &mut terminal,
+                    true,
+                    false,
+                    &crate::search::SearchState::default(),
+                    &[],
+                    &None,
+                );
+            },
+        );
+        output.textures_delta.clear();
+        assert!(renderer.last_content_rect.is_none());
+        assert!(!renderer.dragging_scrollbar);
+        assert_eq!(renderer.scroll_pixel_offset, 0.0);
+        assert!(!renderer.pointer_link_eligible_projected(&terminal, &retained, rect.center()));
+        assert!(!renderer.pointer_app_mouse_eligible_projected(
+            &terminal,
+            &retained,
+            rect.center()
+        ));
+        terminal.set_projection_test_row_budget(131_072);
+        let recovered =
+            renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert!(recovered.is_available());
+        assert!(
+            !retained.is_available(),
+            "recovery cannot resurrect old coordinates"
+        );
+        renderer.last_content_rect = Some(rect);
+        assert!(!renderer.pointer_link_eligible_projected(&terminal, &retained, rect.center()));
+        assert!(!renderer.pointer_app_mouse_eligible_projected(
+            &terminal,
+            &retained,
+            rect.center()
+        ));
     }
 
     #[test]

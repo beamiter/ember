@@ -1257,7 +1257,9 @@ impl TerminalApp {
             // 语义(以及 search reveal)一致。侧边栏点击行是明确的"带我过去"
             // 手势,仍然强制重新钉住。
             let minimal = reveal == BlockReveal::IfOffscreen;
-            if viewport.is_transformed() {
+            if !viewport.is_available() {
+                false
+            } else if viewport.is_transformed() {
                 if minimal && Self::projected_anchor_is_displayed(&terminal, &viewport, anchor) {
                     true
                 } else {
@@ -1566,6 +1568,10 @@ impl TerminalApp {
     }
 
     fn copy_sidebar_command_text(&mut self, target: &CommandTarget, kind: CopyKind) {
+        if self.session_projection_unavailable(&target.session_id) {
+            self.set_status("Copy unavailable: terminal content is not displayed");
+            return;
+        }
         if self.target_session_index(target).is_none() {
             self.set_status("Command session is no longer available");
             return;
@@ -1722,6 +1728,10 @@ impl TerminalApp {
         record_id: &str,
         gesture: crate::block_mode::BlockSelectionGesture,
     ) {
+        if self.session_projection_unavailable(session_id) {
+            self.clear_block_selection_for_session(session_id);
+            return;
+        }
         if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return;
@@ -1817,6 +1827,10 @@ impl TerminalApp {
         session_id: &str,
         request: crate::block_mode::BlockMenuRequest,
     ) {
+        if self.session_projection_unavailable(session_id) {
+            self.clear_block_selection_for_session(session_id);
+            return;
+        }
         let target_is_live_finished = self
             .session_manager
             .index_of(session_id)
@@ -1975,6 +1989,9 @@ impl TerminalApp {
                     policy,
                     view_state,
                 );
+                if !viewport.is_available() {
+                    return false;
+                }
                 if !viewport.is_transformed() {
                     return terminal.scroll_to_command_edge(&target.execution_id, bottom);
                 }
@@ -2446,6 +2463,13 @@ impl TerminalApp {
     }
 
     fn copy_block_targets(&mut self, targets: &[CommandTarget], kind: CopyKind) {
+        if targets
+            .iter()
+            .any(|target| self.session_projection_unavailable(&target.session_id))
+        {
+            self.set_status("Copy unavailable: terminal content is not displayed");
+            return;
+        }
         let separator = if matches!(kind, CopyKind::Command) {
             "\n"
         } else {
@@ -2679,6 +2703,10 @@ impl TerminalApp {
     }
 
     fn copy_block_json(&mut self, target: &CommandTarget) {
+        if self.session_projection_unavailable(&target.session_id) {
+            self.set_status("Copy unavailable: terminal content is not displayed");
+            return;
+        }
         let json = match self.block_json_for_target(target) {
             Ok(json) => json,
             Err(error) => {
@@ -2700,6 +2728,13 @@ impl TerminalApp {
     }
 
     fn copy_block_targets_markdown(&mut self, targets: &[CommandTarget]) {
+        if targets
+            .iter()
+            .any(|target| self.session_projection_unavailable(&target.session_id))
+        {
+            self.set_status("Copy unavailable: terminal content is not displayed");
+            return;
+        }
         let mut aggregate = String::new();
         let mut count = 0usize;
         for target in targets {
@@ -2745,6 +2780,10 @@ impl TerminalApp {
     /// `block:copy_command`: copy the selected block's command; with no
     /// selection, the most recent complete record with one.
     pub(crate) fn block_copy_command(&mut self) {
+        if self.active_projection_unavailable() {
+            self.set_status("Copy unavailable: terminal content is not displayed");
+            return;
+        }
         let Some(targets) =
             self.block_targets_or_newest(Self::record_has_command, "No command block to copy from")
         else {
@@ -2757,6 +2796,10 @@ impl TerminalApp {
     /// or extracted from its output anchors); with no selection, the most
     /// recent complete record with output.
     pub(crate) fn block_copy_output(&mut self) {
+        if self.active_projection_unavailable() {
+            self.set_status("Copy unavailable: terminal content is not displayed");
+            return;
+        }
         let Some(targets) = self.block_targets_or_newest(
             Self::record_has_output,
             "No command block with output to copy",
@@ -3330,6 +3373,10 @@ impl TerminalApp {
     /// The oldest id is the fixed range anchor and the newest id is the active
     /// edge, so the first Shift+Up contracts the range exactly like anvil.
     pub(crate) fn block_select_all(&mut self) {
+        if self.active_projection_unavailable() {
+            self.clear_block_selection();
+            return;
+        }
         let Some((session_id, ids)) = self.selectable_block_ids() else {
             return;
         };
@@ -3812,6 +3859,10 @@ impl TerminalApp {
     /// selection is kept silently; a dangling selected id counts as no
     /// selection and both directions restart at the newest selectable block.
     fn block_select_step(&mut self, step: crate::block_mode::SelectStep) {
+        if self.active_projection_unavailable() {
+            self.clear_block_selection();
+            return;
+        }
         let Some(navigation) = self.block_navigation(|outcomes, current| {
             crate::block_mode::next_selected_index(outcomes, current, step)
         }) else {
@@ -3927,6 +3978,10 @@ impl TerminalApp {
     /// Commands-sidebar row, and scroll to the block (the same jump path as
     /// `block:jump_first_failed`).
     fn apply_block_selection(&mut self, target: CommandTarget) -> bool {
+        if self.session_projection_unavailable(&target.session_id) {
+            self.clear_block_selection_for_session(&target.session_id);
+            return false;
+        }
         if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return false;
@@ -4780,15 +4835,15 @@ impl TerminalApp {
                             })
                     });
                     if let Some(anchor) = anchor {
-                        let transformed = terminal
-                            .projected_viewport_with_state(
-                                crate::terminal::HistoryProjection::identity(),
-                                self.config.command_cards_enabled(),
-                                policy,
-                                view_state,
-                            )
-                            .is_transformed();
-                        if transformed {
+                        let viewport = terminal.projected_viewport_with_state(
+                            crate::terminal::HistoryProjection::identity(),
+                            self.config.command_cards_enabled(),
+                            policy,
+                            view_state,
+                        );
+                        if !viewport.is_available() {
+                            output_revealed = false;
+                        } else if viewport.is_transformed() {
                             let location = terminal
                                 .reveal_buffer_anchor_in_projection(policy, view_state, anchor);
                             output_revealed = matches!(
@@ -4885,6 +4940,10 @@ impl TerminalApp {
     /// newline, output. Background blocks copy output only (anvil/forge
     /// `block_clipboard_text` family rule).
     pub(crate) fn block_copy_block(&mut self) {
+        if self.active_projection_unavailable() {
+            self.set_status("Copy unavailable: terminal content is not displayed");
+            return;
+        }
         let Some(targets) = self.block_targets_or_newest(
             |record| Self::record_has_command(record) || Self::record_has_output(record),
             "No command block to copy",
@@ -4898,6 +4957,10 @@ impl TerminalApp {
     /// shape (and its sanitization) is pinned in `block_mode` tests; frost
     /// ships the same format.
     pub(crate) fn block_copy_markdown(&mut self) {
+        if self.active_projection_unavailable() {
+            self.set_status("Copy unavailable: terminal content is not displayed");
+            return;
+        }
         let Some(targets) = self.block_targets_or_newest(
             |record| Self::record_has_command(record) || Self::record_has_output(record),
             "No command block to copy",

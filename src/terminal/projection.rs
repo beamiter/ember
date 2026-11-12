@@ -117,6 +117,9 @@ impl Default for ProjectionPolicy {
 }
 
 impl ProjectionPolicy {
+    pub(super) fn collapsed_count(&self) -> usize {
+        self.collapsed.len()
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -2294,6 +2297,8 @@ pub struct ChatCommandSpan {
 /// preserves every byte and geometry decision made by the existing reflow.
 #[derive(Clone, Debug)]
 pub struct ProjectedViewport {
+    failure: Option<super::ProjectionUnavailable>,
+    validity: Arc<std::sync::atomic::AtomicBool>,
     key: ProjectionCacheKey,
     cells: Arc<Vec<Vec<TerminalCell>>>,
     row_wrapped: Arc<Vec<bool>>,
@@ -2313,6 +2318,36 @@ pub struct ProjectedViewport {
 }
 
 impl ProjectedViewport {
+    pub fn is_available(&self) -> bool {
+        self.failure.is_none() && self.validity.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn unavailable_reason(&self) -> Option<super::ProjectionUnavailable> {
+        self.failure
+    }
+    pub(super) fn with_validity(mut self, validity: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.validity = validity;
+        self
+    }
+    pub(super) fn unavailable(
+        key: ProjectionCacheKey,
+        reason: super::ProjectionUnavailable,
+    ) -> Self {
+        let mut frame = Self::new(
+            key,
+            Arc::new(Vec::new()),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            DisplayPoint::new(0, 0),
+        );
+        frame.failure = Some(reason);
+        frame.document_rows = 0;
+        frame.document_start = 0;
+        frame.row_sources = Arc::new(Vec::new());
+        frame.row_kinds = Arc::new(Vec::new());
+        frame
+    }
+
     /// `row_sources` carries per-display-row provenance for the identity
     /// viewport. It must be reflow-aware and `key.rows` long; a shorter or
     /// absent vector is padded with `None`, which fails closed to "no
@@ -2336,6 +2371,8 @@ impl ProjectedViewport {
             )
         });
         Self {
+            failure: None,
+            validity: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             key,
             cells,
             row_wrapped: Arc::new(row_wrapped),
@@ -2383,6 +2420,8 @@ impl ProjectedViewport {
             )
         });
         Self {
+            failure: None,
+            validity: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             key,
             cells: Arc::new(cells),
             row_wrapped: Arc::new(row_wrapped),
@@ -2650,6 +2689,9 @@ impl ProjectedViewport {
 
     /// P0 mouse reporting remains in the application's displayed grid space.
     pub fn application_cell(&self, point: DisplayPoint) -> Option<(usize, usize)> {
+        if !self.is_available() {
+            return None;
+        }
         if !self.is_transformed() {
             return (point.row < self.rows() && point.column < self.columns())
                 .then_some((point.row, point.column));

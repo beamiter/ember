@@ -22,7 +22,7 @@ pub use jterm_core::block_contract::{
 
 /// Family finished-card notice when capture stopped at the byte budget.
 /// Ember currently has a single truncation flag (the tail is lost), so this
-/// is always [`FinishedOutputNotice::TextTruncated`], never the head-loss
+/// is always [`jterm_core::output_notice::FinishedOutputNotice::TextTruncated`], never the head-loss
 /// or both-ends variants.
 pub fn finished_output_notice(truncated: bool) -> Option<&'static str> {
     truncated.then_some(jterm_core::output_notice::FinishedOutputNotice::TextTruncated.as_str())
