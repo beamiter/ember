@@ -45,3 +45,11 @@ latency measurements. Native desktop, Vim and IME acceptance must be established
 by their real workflow runs for the published commit, not inferred from scanner
 tests, a successful build, or these microbenchmarks. The existing host PTY and
 protocol-response backpressure remains separate from this scanner policy.
+
+## In-flight Kitty transfers
+
+APC overflow, CAN/SUB cancellation, or a fresh ESC abandoning an APC now
+silently clears unfinished graphics assembly and its transfer metadata. A later
+`m=0` cannot complete bytes retained before the rejected/cancelled APC. Completed
+images and placements remain intact; a fresh valid transfer still works. The
+scanner signals this without exposing rejected payload bytes or creating a reply.

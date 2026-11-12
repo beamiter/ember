@@ -463,6 +463,15 @@ impl KittyGraphicsState {
         error
     }
 
+    /// Silently abandon only unfinished graphics state after scanner rejection
+    /// or cancellation. Completed images/placements and already queued replies
+    /// belong to earlier valid commands and are preserved.
+    pub(crate) fn abandon_pending_transfer(&mut self) {
+        self.abort_transfers();
+        self.response_image_id = None;
+        self.pending_cursor_movement = None;
+    }
+
     fn abort_transfers(&mut self) {
         self.assembler.reset();
         self.current_transfer = None;

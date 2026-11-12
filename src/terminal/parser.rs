@@ -289,6 +289,9 @@ impl super::TerminalState {
         loop {
             let rejected_before = self.parser.rejected_count();
             let step = self.parser.next(&input[at..]);
+            if step.abandoned_apc {
+                self.kitty_graphics.abandon_pending_transfer();
+            }
             if self.parser.rejected_count() != rejected_before {
                 // A rejected opaque string may have been an OSC 8 close/open.
                 // Fail closed without inspecting or reflecting its payload.

@@ -10320,3 +10320,54 @@ fn bounded_parser_normal_stream_matches_legacy_dispatch_at_every_split() {
         assert_eq!(strict.parser.rejected_count(), 0);
     }
 }
+
+#[test]
+fn bounded_apc_abandonment_never_completes_an_old_kitty_transfer() {
+    let mut overflow = b"\x1b_Gm=1;".to_vec();
+    overflow.resize(MAX_PENDING_ESCAPE + 3, b'A');
+    overflow.extend_from_slice(b"\x1b\\");
+    let aborted = [
+        b"\x1b_Gm=1;SECRET\x18".to_vec(),
+        b"\x1b_Gm=1;SECRET\x1a".to_vec(),
+        b"\x1b_Gm=1;SECRET\x1b[0m".to_vec(),
+        overflow,
+    ];
+    for (case, packet) in aborted.iter().enumerate() {
+        for cut in [0, 2, packet.len() / 2, packet.len() - 1, packet.len()] {
+            let mut terminal = TerminalState::new(20, 4);
+            terminal.process_input(b"\x1b_Ga=T,f=32,i=900,s=1,v=1,q=2;AQIDBA==\x1b\\");
+            assert!(terminal.kitty_graphics.get_image(900).is_some());
+            let placements = terminal.kitty_graphics.get_placements().len();
+            assert!(placements > 0);
+            terminal.process_input(b"\x1b_Gf=32,i=901,s=1,v=1,m=1,q=2;AQIDBA==\x1b\\");
+            assert!(terminal.kitty_graphics.get_image(901).is_none());
+            let _ = terminal.get_output();
+            terminal.process_input(&packet[..cut]);
+            terminal.process_input(&packet[cut..]);
+            assert!(terminal.get_output().is_empty(), "abort reflected input");
+            terminal.process_input(b"\x1b_Gm=0,q=2;\x1b\\");
+            assert!(
+                terminal.kitty_graphics.get_image(901).is_none(),
+                "abandoned transfer revived: case={case} cut={cut}"
+            );
+            assert!(terminal.kitty_graphics.get_image(900).is_some());
+            assert_eq!(terminal.kitty_graphics.get_placements().len(), placements);
+            terminal.process_input(
+                b"\x1b_Gf=32,i=902,s=1,v=1,m=1,q=2;AQIDBA==\x1b\\\x1b_Gm=0,q=2;\x1b\\",
+            );
+            assert!(
+                terminal.kitty_graphics.get_image(902).is_some(),
+                "fresh transfer failed"
+            );
+        }
+    }
+}
+
+#[test]
+fn bounded_non_apc_boundaries_preserve_pending_kitty_transfer() {
+    let mut terminal = TerminalState::new(20, 4);
+    terminal.process_input(b"\x1b_Gf=32,i=903,s=1,v=1,m=1,q=2;AQIDBA==\x1b\\");
+    terminal.process_input(b"\x1bPignored\x18\x1b]0;safe\x07");
+    terminal.process_input(b"\x1b_Gm=0,q=2;\x1b\\");
+    assert!(terminal.kitty_graphics.get_image(903).is_some());
+}
