@@ -260,7 +260,8 @@ fn run(bytes: &[u8], ends: impl IntoIterator<Item = usize>) -> TerminalState {
             &terminal.parser.snapshot().pending_osc,
             &terminal.parser.snapshot().pending_string,
         ] {
-            assert!(pending.len() <= MAX_PENDING_ESCAPE);
+            // Payload cap plus introducer and possible split-ST ESC.
+            assert!(pending.len() <= MAX_PENDING_ESCAPE + 3);
         }
         assert!(terminal.command_records.len() <= MAX_COMMAND_MARKS);
         start = end;
@@ -453,7 +454,7 @@ fn corpus_known_effects_and_abnormal_reset_recovery() {
 #[test]
 fn oversized_kitty_packet_partition_invariance() {
     let mut bytes = b"\x1b_Ga=p,i=99,q=0;".to_vec();
-    bytes.resize(MAX_PENDING_ESCAPE + 1, b'A');
+    bytes.resize(MAX_PENDING_ESCAPE + 3, b'A');
     bytes.extend_from_slice(b"\x1b\\Z\x1b[6n");
     let expected = snapshot(&run(&bytes, [bytes.len()]));
     // All cuts would be quadratic on a 4 MiB input. Exercise introducer,
@@ -482,33 +483,17 @@ fn oversized_kitty_packet_partition_invariance() {
 }
 
 #[test]
-fn oversized_osc_and_dcs_characterize_batch_scoped_drop_then_reset() {
-    // Existing documented policy differs from Kitty: pending OSC/DCS overflow
-    // drops the current read and returns to ground. Thus it is deliberately NOT
-    // partition invariant beyond the cap. Keep that distinction visible rather
-    // than silently claiming equivalence or changing production behavior here.
+fn oversized_osc_and_dcs_are_partition_invariant_and_recover_after_st() {
     for prefix in [b"\x1b]0;".as_slice(), b"\x1bP".as_slice()] {
         let mut bytes = prefix.to_vec();
         bytes.resize(MAX_PENDING_ESCAPE + 33, b'A');
-        bytes.extend_from_slice(b"\x1b\\Z");
-        let mut whole = run(&bytes, [bytes.len()]);
-        let mut split = run(&bytes, [MAX_PENDING_ESCAPE + 1, bytes.len()]);
-        assert!(
-            whole.parser.snapshot().pending_osc.is_empty()
-                && whole.parser.snapshot().pending_string.is_empty()
-        );
-        assert!(
-            split.parser.snapshot().pending_osc.is_empty()
-                && split.parser.snapshot().pending_string.is_empty()
-        );
-        assert_ne!(
-            snapshot(&whole)["grid"],
-            snapshot(&split)["grid"],
-            "revisit this characterization if the overflow policy changes"
-        );
-        whole.process_input(b"\x1bcRESTORED\x1b[6n");
-        split.process_input(b"\x1bcRESTORED\x1b[6n");
+        bytes.extend_from_slice(b"\x1b[2JSECRET\x1b\\Z");
+        let whole = run(&bytes, [bytes.len()]);
+        let split = run(&bytes, [MAX_PENDING_ESCAPE + 3, bytes.len()]);
+        assert_eq!(whole.parser.rejected_count(), 1);
+        assert_eq!(split.parser.rejected_count(), 1);
         assert_eq!(snapshot(&whole), snapshot(&split));
+        assert_eq!(whole.screen.grid[0][0].character, 'Z');
     }
 }
 
@@ -524,10 +509,10 @@ fn minimal_interrupted_utf8_prefix_has_one_replacement() {
 }
 
 #[test]
-fn minimal_kitty_cancel_after_introducer_preserves_reply() {
+fn minimal_kitty_cancel_after_introducer_is_opaque_without_reply() {
     let bytes = b"\x1b_Gi=99;\x18Z";
     let whole = run(bytes, [bytes.len()]);
-    assert!(whole.output_buffer.starts_with(b"\x1b_Gi=99;EINVAL:"));
+    assert!(whole.output_buffer.is_empty());
     assert_partition(
         "early-kitty-cancel",
         bytes,
@@ -600,7 +585,7 @@ fn utf8_replacement_matches_standard_library_for_all_partitions() {
 }
 
 #[test]
-fn kitty_recovery_controls_at_cap_keep_quiet_and_identity() {
+fn cancelled_kitty_controls_at_cap_remain_opaque_for_all_quiet_modes() {
     for quiet in [0, 2] {
         let suffix = format!(",i=99,q={quiet}");
         let mut bytes = b"\x1b_G".to_vec();
@@ -611,10 +596,7 @@ fn kitty_recovery_controls_at_cap_keep_quiet_and_identity() {
         bytes.extend_from_slice(suffix.as_bytes());
         bytes.extend_from_slice(b";\x18Z");
         let whole = run(&bytes, [bytes.len()]);
-        assert_eq!(whole.output_buffer.is_empty(), quiet == 2);
-        if quiet == 0 {
-            assert!(whole.output_buffer.starts_with(b"\x1b_Gi=99;EINVAL:"));
-        }
+        assert!(whole.output_buffer.is_empty());
         for cut in [1, 2, 3, bytes.len() - 4, bytes.len() - 2] {
             assert_partition(
                 "control-cap",
@@ -634,9 +616,9 @@ fn oversized_kitty_discard_is_bounded_and_does_not_amplify_replies() {
             t.process_input(format!("\x1b_Gi=99,q={quiet};").as_bytes());
             t.process_input(&vec![b'A'; MAX_PENDING_ESCAPE]);
             assert!(t.parser.snapshot().pending_apc.is_empty());
-            assert!(t.parser.snapshot().discarding_oversized_apc);
+            assert_eq!(t.parser.rejected_count(), 1);
             let reply = t.get_output();
-            assert_eq!(reply.is_empty(), quiet == 2);
+            assert!(reply.is_empty());
             assert!(reply.len() < 256);
             for _ in 0..8 {
                 t.process_input(&[b'A'; 1024]);
@@ -645,7 +627,10 @@ fn oversized_kitty_discard_is_bounded_and_does_not_amplify_replies() {
             }
             t.process_input(terminator);
             t.process_input(b"RECOVERED");
-            assert!(!t.parser.snapshot().discarding_oversized_apc);
+            assert_eq!(
+                t.parser.pending_kind(),
+                jterm_engine::parser::PendingKind::None
+            );
             assert_eq!(t.screen.grid[0][0].character, 'R');
             assert!(t.command_records.is_empty());
             assert!(t.pending_completed_command_outputs.is_empty());
@@ -676,7 +661,7 @@ fn migration_fingerprints(
 /// Independent pre-extraction snapshots. Capture is explicit and must run on
 /// the original scanner before the production adapter is replaced.
 #[test]
-fn parser_migration_recorded_oracle() {
+fn historical_legacy_parser_migration_recorded_oracle() {
     let mut cases: Vec<(String, Vec<u8>)> = CASES
         .iter()
         .map(|(n, b)| ((*n).to_owned(), b.to_vec()))
@@ -702,6 +687,15 @@ fn parser_migration_recorded_oracle() {
     for (name, bytes) in cases {
         for cut in 0..=bytes.len() {
             let mut terminal = TerminalState::new(24, 6);
+            // Frozen pre-extraction evidence includes legacy overflow/cancel
+            // behavior. Keep that scanner explicit, never regenerate the oracle.
+            // Production bounded behavior has separate security and ordinary
+            // stream differential tests; other host oracles stay production.
+            terminal.parser =
+                jterm_engine::parser::Parser::new(jterm_engine::parser::ParserLimits {
+                    pending_bytes: MAX_PENDING_ESCAPE,
+                    kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES + 1,
+                });
             terminal.process_input(&bytes[..cut]);
             let prefix = migration_fingerprints(snapshot(&terminal));
             terminal.process_input(&bytes[cut..]);
@@ -732,6 +726,15 @@ fn parser_migration_recorded_oracle() {
             bytes.len(),
         ] {
             let mut terminal = TerminalState::new(24, 6);
+            // Frozen pre-extraction evidence includes legacy overflow/cancel
+            // behavior. Keep that scanner explicit, never regenerate the oracle.
+            // Production bounded behavior has separate security and ordinary
+            // stream differential tests; other host oracles stay production.
+            terminal.parser =
+                jterm_engine::parser::Parser::new(jterm_engine::parser::ParserLimits {
+                    pending_bytes: MAX_PENDING_ESCAPE,
+                    kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES + 1,
+                });
             terminal.process_input(&bytes[..cut]);
             // Record semantic lanes, not multi-megabyte parser carry debug text.
             let mut prefix = migration_fingerprints(snapshot(&terminal));

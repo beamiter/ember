@@ -1595,18 +1595,21 @@ fn fragmented_kitty_apc_advances_its_scan_cursor_and_stays_bounded() {
     std::mem::take(&mut terminal.output_buffer);
 
     let mut oversized = b"\x1b_Ga=p,i=53,q=0;".to_vec();
-    oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+    oversized.resize(MAX_PENDING_ESCAPE + 3, b'A');
     terminal.process_input(&oversized);
     assert!(terminal.parser.snapshot().pending_apc.is_empty());
-    assert!(terminal.parser.snapshot().discarding_oversized_apc);
+    assert_eq!(terminal.parser.rejected_count(), 1);
     let response = std::mem::take(&mut terminal.output_buffer);
-    assert!(response.starts_with(b"\x1b_Gi=53;EINVAL:"));
-    assert!(response.len() < 256);
+    // Resource rejection is opaque: no reflected Kitty recovery reply.
+    assert!(response.is_empty());
 
     // Discard through ST without allocating the oversized packet, then resume
     // ordinary terminal parsing on the same input batch.
     terminal.process_input(b"\x1b\\Z");
-    assert!(!terminal.parser.snapshot().discarding_oversized_apc);
+    assert_eq!(
+        terminal.parser.pending_kind(),
+        jterm_engine::parser::PendingKind::None
+    );
     assert_eq!(terminal.screen.grid[0][0].character, 'Z');
 
     // The bytes after ST belong to the normal stream, not the APC. Even when
@@ -1616,7 +1619,10 @@ fn fragmented_kitty_apc_advances_its_scan_cursor_and_stays_bounded() {
     near_limit.resize(MAX_PENDING_ESCAPE - 2, b'A');
     terminal.process_input(&near_limit);
     terminal.process_input(b"\x1b\\Y");
-    assert!(!terminal.parser.snapshot().discarding_oversized_apc);
+    assert_eq!(
+        terminal.parser.pending_kind(),
+        jterm_engine::parser::PendingKind::None
+    );
     assert!(terminal.parser.snapshot().pending_apc.is_empty());
     assert_eq!(terminal.screen.grid[0][1].character, 'Y');
 }
@@ -1727,29 +1733,19 @@ fn osc_terminators_straddling_chunks_complete_the_sequence() {
 }
 
 #[test]
-fn oversized_osc_is_dropped_and_parsing_resumes_in_ground_state() {
+fn oversized_osc_discards_until_terminator_without_payload_side_effects() {
     let mut terminal = TerminalState::new(8, 2);
     let mut oversized = b"\x1b]0;".to_vec();
-    oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+    oversized.resize(MAX_PENDING_ESCAPE + 3, b'A');
     terminal.process_input(&oversized);
-    assert!(terminal.parser.snapshot().pending_osc.is_empty());
-    assert_eq!(terminal.parser.snapshot().pending_osc_scan_from, 0);
-
-    // Unlike kitty APCs there is no discard-until-ST mode: once the buffer is
-    // dropped the parser is back in ground state and the next batch is
-    // ordinary terminal input (the pre-existing pending_escape policy).
-    terminal.process_input(b"ok");
+    assert_eq!(terminal.parser.rejected_count(), 1);
+    assert_eq!(terminal.parser.retained_bytes(), 0);
+    terminal.process_input(b"SECRET\x1b]52;c;aGVsbG8=\x1b[2J");
+    assert!(terminal.pending_osc52_clipboard_set.is_none());
+    assert_eq!(terminal.screen.grid[0][0].character, ' ');
+    terminal.process_input(b"\x07ok\x1b]0;new\x07");
     assert_eq!(terminal.screen.grid[0][0].character, 'o');
     assert_eq!(terminal.screen.grid[0][1].character, 'k');
-
-    // Accumulation that crosses the cap over several batches is dropped the
-    // same way, and a later well-formed OSC still parses.
-    terminal.process_input(b"\x1b]0;title");
-    assert!(!terminal.parser.snapshot().pending_osc.is_empty());
-    let chunk = vec![b'B'; MAX_PENDING_ESCAPE];
-    terminal.process_input(&chunk);
-    assert!(terminal.parser.snapshot().pending_osc.is_empty());
-    terminal.process_input(b"\x1b]0;new\x07");
     assert_eq!(terminal.titles.window_title, "new");
 }
 
@@ -1808,16 +1804,14 @@ fn fragmented_dcs_advances_its_scan_cursor_and_stays_bounded() {
     assert!(terminal.parser.snapshot().pending_string.is_empty());
     assert_eq!(terminal.screen.grid[0][0].character, 'Z');
 
-    // Oversized DCS follows the pending_escape policy: drop the buffer and
-    // return to ground state.
+    // Oversized DCS remains opaque until its ST terminator.
     let mut oversized = b"\x1bP".to_vec();
-    oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+    oversized.resize(MAX_PENDING_ESCAPE + 3, b'A');
     terminal.process_input(&oversized);
     assert!(terminal.parser.snapshot().pending_string.is_empty());
     assert_eq!(terminal.parser.snapshot().pending_string_scan_from, 0);
     terminal.process_input(b"\x1b\\no");
-    // In ground state a stray ST is a complete ESC sequence and is consumed;
-    // it must not print its `\`.
+    // ST ends the discard; only the following ordinary suffix is displayed.
     assert_eq!(terminal.screen.grid[0][1].character, 'n');
     assert_eq!(terminal.screen.grid[0][2].character, 'o');
 }
@@ -7725,17 +7719,20 @@ fn a_real_reset_interrupts_control_strings_at_every_split() {
 }
 
 #[test]
-fn discarded_oversized_apc_still_obeys_cancellation_and_reset() {
-    for suffix in [b"\x18ok".as_slice(), b"\x1aok", b"\x1bcok"] {
+fn discarded_oversized_apc_obeys_cancel_but_does_not_execute_embedded_reset() {
+    for suffix in [b"\x18ok".as_slice(), b"\x1aok", b"\x1bcSECRET\x1b\\ok"] {
         let mut terminal = TerminalState::new(16, 2);
         let mut oversized = b"\x1b_Gi=1;".to_vec();
-        oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+        oversized.resize(MAX_PENDING_ESCAPE + 3, b'A');
         terminal.process_input(&oversized);
-        assert!(terminal.parser.snapshot().discarding_oversized_apc);
+        assert_eq!(terminal.parser.rejected_count(), 1);
         for byte in suffix {
             terminal.process_input(&[*byte]);
         }
-        assert!(!terminal.parser.snapshot().discarding_oversized_apc);
+        assert_eq!(
+            terminal.parser.pending_kind(),
+            jterm_engine::parser::PendingKind::None
+        );
         assert_eq!(terminal.screen.grid[0][0].character, 'o');
         assert_eq!(terminal.screen.grid[0][1].character, 'k');
     }
@@ -10246,5 +10243,80 @@ fn engine_row_edits_dirty_host_versions_before_later_commands() {
         terminal.get_dirty_rows(prior, &mut dirty);
         assert_eq!(dirty, vec![0]);
         assert!(!terminal.screen.pending_wrap);
+    }
+}
+
+#[test]
+fn bounded_parser_oversized_osc8_clears_active_link_without_reflecting_payload() {
+    let mut terminal = TerminalState::new(16, 2);
+    terminal.process_input(b"\x1b]8;;https://safe.test\x1b\\A");
+    assert!(!terminal.screen.grid[0][0].hyperlink_id.is_none());
+    let mut attack = b"\x1b]8;;https://oversized.test/".to_vec();
+    attack.resize(MAX_PENDING_ESCAPE + 3, b'x');
+    terminal.process_input(&attack);
+    assert_eq!(terminal.parser.rejected_count(), 1);
+    assert!(terminal.screen.current_hyperlink.is_none());
+    terminal.process_input(b"\x1b\\B");
+    assert_eq!(terminal.screen.grid[0][1].character, 'B');
+    assert!(terminal.screen.grid[0][1].hyperlink_id.is_none());
+    assert!(!terminal.screen.grid[0][0].hyperlink_id.is_none());
+    assert!(terminal.output_buffer.is_empty());
+}
+
+#[test]
+fn bounded_parser_all_strings_reject_complete_and_split_oversize_without_effects() {
+    for intro in *b"]P_X^" {
+        let mut bytes = vec![27, intro];
+        bytes.resize(MAX_PENDING_ESCAPE + 3, b'x');
+        bytes.extend(b"\x1b[2J\x1bc\x1b[6n\x1b]52;c;SECRET\x1b\\Z");
+        for cut in [
+            0,
+            2,
+            MAX_PENDING_ESCAPE - 1,
+            MAX_PENDING_ESCAPE + 2,
+            bytes.len() - 2,
+            bytes.len(),
+        ] {
+            let mut t = TerminalState::new(16, 2);
+            t.process_input(b"A\x1b[31m");
+            t.process_input(&bytes[..cut]);
+            t.process_input(&bytes[cut..]);
+            assert_eq!(t.parser.rejected_count(), 1, "intro={intro} cut={cut}");
+            assert_eq!(t.parser.retained_bytes(), 0);
+            assert_eq!(t.screen.grid[0][0].character, 'A');
+            assert_eq!(t.screen.grid[0][1].character, 'Z');
+            assert_eq!(t.screen.grid[0][1].foreground, Color::Red);
+            assert!(t.titles.window_title.is_empty());
+            assert!(t.output_buffer.is_empty());
+            assert!(t.pending_osc52_clipboard_set.is_none());
+            assert!(!t.screen.use_alt_buffer);
+        }
+    }
+}
+
+#[test]
+fn bounded_parser_normal_stream_matches_legacy_dispatch_at_every_split() {
+    // Independent old scanner mode feeds the same production host dispatch;
+    // normal behavior must stay unchanged, not merely match a new golden.
+    let bytes = b"hello\x1b[31mX\x1b[0m\x1b]0;title\x07\x1b]8;;https://safe.test\x1b\\L\x1b]8;;\x1b\\\r\n\xe4\xb8\xad\x1b[?1049hALT\x1b[?1049l\x1b[6n";
+    for cut in 0..=bytes.len() {
+        let mut strict = TerminalState::new(24, 6);
+        let mut legacy = TerminalState::new(24, 6);
+        legacy.parser = jterm_engine::parser::Parser::new(jterm_engine::parser::ParserLimits {
+            pending_bytes: MAX_PENDING_ESCAPE,
+            kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES + 1,
+        });
+        for part in [&bytes[..cut], &bytes[cut..]] {
+            strict.process_input(part);
+            legacy.process_input(part);
+        }
+        for row in 0..6 {
+            assert_eq!(strict.screen.grid[row], legacy.screen.grid[row]);
+        }
+        assert_eq!(strict.screen.cursor_row, legacy.screen.cursor_row);
+        assert_eq!(strict.screen.cursor_col, legacy.screen.cursor_col);
+        assert_eq!(strict.titles.window_title, legacy.titles.window_title);
+        assert_eq!(strict.output_buffer, legacy.output_buffer);
+        assert_eq!(strict.parser.rejected_count(), 0);
     }
 }

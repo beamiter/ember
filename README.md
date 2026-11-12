@@ -1616,6 +1616,8 @@ effects.
 
 ## Security notes
 
+The shared scanner enforces the [bounded control-string policy](docs/BOUNDED_PARSER.md) for complete and fragmented input, including intentional oversized/cancelled Kitty response changes and validation limits.
+
 - OSC 52 clipboard writes and reads are disabled by default; each direction
   requires its corresponding option to be set to `true` explicitly.
 - MIME-aware OSC 5522 data reads are authorized only by a short-lived,

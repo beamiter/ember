@@ -249,10 +249,14 @@ impl super::TerminalState {
             current_working_dir: None,
             organism_working_dir: None,
             global_bg: Color::Default,
-            parser: jterm_engine::parser::Parser::new(jterm_engine::parser::ParserLimits {
-                pending_bytes: MAX_PENDING_ESCAPE,
-                kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES + 1,
-            }),
+            parser: jterm_engine::parser::Parser::with_bounded_profile(
+                jterm_engine::parser::ParserLimits {
+                    pending_bytes: MAX_PENDING_ESCAPE,
+                    kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES + 1,
+                },
+                jterm_engine::parser::ParserProfile::EmberV1,
+            )
+            .expect("fixed Ember parser limits are valid"),
             ime_enabled: false,
             preedit_text: String::new(),
             preedit_cursor: 0,

@@ -284,9 +284,16 @@ impl super::TerminalState {
         if !input.is_empty() {
             self.invalidate_search_source();
         }
+        self.parser.begin_feed();
         let mut at = 0;
         loop {
+            let rejected_before = self.parser.rejected_count();
             let step = self.parser.next(&input[at..]);
+            if self.parser.rejected_count() != rejected_before {
+                // A rejected opaque string may have been an OSC 8 close/open.
+                // Fail closed without inspecting or reflecting its payload.
+                self.screen.current_hyperlink = HyperlinkId::NONE;
+            }
             at += step.consumed;
             let Some(event) = step.event else {
                 break;

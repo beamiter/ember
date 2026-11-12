@@ -73,10 +73,11 @@ const SECONDARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[>1;7802;0c";
 const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
 pub use jterm_engine::MAX_TERMINAL_COLS;
 pub const MAX_TERMINAL_ROWS: usize = 512;
-/// Hard cap on bytes carried across PTY read batches inside an unfinished
-/// OSC/DCS/CSI escape. Any well-formed sequence is far below this; a
-/// runaway/binary stream that never sends a terminator (BEL/ST/final byte)
-/// would otherwise grow the pending escape buffers without bound.
+/// Hard payload cap for complete and fragmented OSC/DCS/APC/SOS/PM strings.
+/// The scanner may retain one extra ESC for split ST, plus two framing bytes
+/// in diagnostic snapshots. CSI keeps its fixed cap; ESC intermediates cap at 8.
+/// Over-limit strings stay opaque until ST, OSC BEL, CAN or SUB. No embedded
+/// escape commands execute and no Kitty rejection payload is reflected.
 pub const MAX_PENDING_ESCAPE: usize = 4 * 1024 * 1024;
 
 /// Clipboard reads triggered by Kitty paste events are capabilities, not a

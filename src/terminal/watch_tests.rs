@@ -184,3 +184,37 @@ fn command_generation_exhaustion_disables_only_watch() {
     assert!(terminal.watch_command().is_none());
     assert!(terminal.command_records().back().unwrap().start_mark_seen);
 }
+
+#[test]
+fn bounded_discard_cross_batch_cannot_create_a_trusted_watch_start() {
+    let (mut terminal, mut source) = fixture();
+    let mut oversized = b"\x1bP".to_vec();
+    oversized.resize(crate::terminal::MAX_PENDING_ESCAPE + 3, b'x');
+    let updates = feed(&mut terminal, &mut source, &oversized);
+    assert!(updates
+        .iter()
+        .all(|u| !u.trusted_start && u.command.is_none()));
+    assert_eq!(terminal.parser.rejected_count(), 1);
+    // Separate source batches inside rejected DCS remain opaque. BEL ends
+    // OSC markers, but cannot end this enclosing DCS discard.
+    for payload in [b"\x1b]133;A\x07".as_slice(), b"\x1b]133;C\x07forged"] {
+        let updates = feed(&mut terminal, &mut source, payload);
+        assert!(updates
+            .iter()
+            .all(|u| !u.trusted_start && u.command.is_none()));
+        assert!(terminal.watch_command().is_none());
+        assert!(terminal.command_records.is_empty());
+    }
+    // Once ST actually terminates the rejected DCS, a complete real marker
+    // in a fresh, known reader batch is allowed to start a trusted command.
+    feed(&mut terminal, &mut source, b"\x1b\\");
+    let updates = feed(
+        &mut terminal,
+        &mut source,
+        b"\x1b]133;A\x07\x1b]133;C\x07real",
+    );
+    assert!(updates
+        .iter()
+        .any(|u| u.trusted_start && u.command.is_some()));
+    assert!(terminal.watch_command().is_some());
+}
