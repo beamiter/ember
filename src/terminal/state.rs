@@ -5822,8 +5822,10 @@ impl super::TerminalState {
                     // content actually reaches this chunk.
                     let mut owner = source;
                     let mut owner_found = false;
-                    for raw_index in source..next {
-                        let raw_len = self.scrollback[raw_index].reflow_content_len();
+                    for (raw_index, raw_row) in
+                        self.scrollback.iter().enumerate().take(next).skip(source)
+                    {
+                        let raw_len = raw_row.reflow_content_len();
                         let raw_end = logical_start.saturating_add(raw_len);
                         if !owner_found && raw_end > chunk_start {
                             owner = raw_index;
@@ -5836,7 +5838,7 @@ impl super::TerminalState {
                                 &mut origins,
                                 DisplayPoint::new(display_row, intersection_start - chunk_start),
                                 RawCellAnchor {
-                                    row_id: self.scrollback[raw_index].raw_row_id(),
+                                    row_id: raw_row.raw_row_id(),
                                     column: intersection_start - logical_start,
                                 },
                                 intersection_end - intersection_start,

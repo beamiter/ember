@@ -3599,10 +3599,10 @@ fn selective_erase_keeps_protected_wide_pairs_at_both_boundaries() {
         assert!(terminal.screen.grid[0][0].flags.wide());
         assert!(terminal.screen.grid[0][1].flags.wide_continuation());
         if sequence != "\x1b[1;1H\x1b[?1K" {
-            for col in 2..=4 {
-                assert_eq!(terminal.screen.grid[0][col].character, ' ');
-                assert!(!terminal.screen.grid[0][col].flags.wide());
-                assert!(!terminal.screen.grid[0][col].flags.wide_continuation());
+            for cell in &terminal.screen.grid[0][2..=4] {
+                assert_eq!(cell.character, ' ');
+                assert!(!cell.flags.wide());
+                assert!(!cell.flags.wide_continuation());
             }
         }
         terminal.process_input(b"\x1b[1;2H\x1b[X");

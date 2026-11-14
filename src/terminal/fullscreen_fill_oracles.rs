@@ -205,8 +205,7 @@ fn seeded(seed: usize) -> TerminalState {
     t.screen.last_printed_char = Some('R');
     for r in 0..rows {
         t.screen.grid.row_wrapped[r] = r % 2 == 0;
-        for c in 0..cols {
-            let cell = &mut t.screen.grid[r][c];
+        for cell in &mut t.screen.grid[r][..cols] {
             cell.flags.set_protected(true);
             cell.hyperlink_id = HyperlinkId::from_raw(17);
         }

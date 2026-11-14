@@ -209,8 +209,8 @@ fn seeded(context: usize, geometry: usize, row: usize) -> TerminalState {
         active: (1, 1),
         mode: SelectionMode::Normal,
     });
-    for r in 0..rows {
-        t.screen.grid.row_wrapped[r] = r % 2 == 0;
+    for (r, wrapped) in t.screen.grid.row_wrapped[..rows].iter_mut().enumerate() {
+        *wrapped = r % 2 == 0;
     }
     if let Some(a) = t.active_output_provenance.as_mut() {
         a.invalid = false;
