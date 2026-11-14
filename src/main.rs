@@ -1710,6 +1710,45 @@ fn mouse_press_reports_to_app(
     mouse_enabled && !shift_bypass && app_surface && !host_link_override
 }
 
+/// Xterm Cb modifier bits. Super/Command has no mouse-protocol bit.
+fn app_mouse_button(button: u8, modifiers: egui::Modifiers) -> u8 {
+    button
+        | (u8::from(modifiers.shift) << 2)
+        | (u8::from(modifiers.alt) << 3)
+        | (u8::from(modifiers.ctrl) << 4)
+}
+
+/// Button edges carry their own snapshot: frame-final modifiers may already
+/// differ after another key event. Synthetic cancellation uses the last snapshot.
+fn app_mouse_edge_modifiers(
+    events: &[egui::Event],
+    button: u8,
+    pressed: bool,
+    fallback: egui::Modifiers,
+) -> egui::Modifiers {
+    events
+        .iter()
+        .find_map(|event| match event {
+            egui::Event::PointerButton {
+                button: edge,
+                pressed: down,
+                modifiers,
+                ..
+            } if *down == pressed
+                && match edge {
+                    egui::PointerButton::Primary => button == 0,
+                    egui::PointerButton::Middle => button == 1,
+                    egui::PointerButton::Secondary => button == 2,
+                    _ => false,
+                } =>
+            {
+                Some(*modifiers)
+            }
+            _ => None,
+        })
+        .unwrap_or(fallback)
+}
+
 fn mouse_capture_accepts_new_press(capture_active: bool) -> bool {
     !capture_active
 }
@@ -7720,8 +7759,17 @@ impl eframe::App for TerminalApp {
             }
             buttons
         });
+        let mouse_cancelled = ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerGone | egui::Event::WindowFocused(false)
+                )
+            })
+        });
         if let Some(button) = terminal_button_pressed.filter(|button| {
-            mouse_capture_accepts_new_press(self.terminal_mouse_capture.is_some())
+            !mouse_cancelled
+                && mouse_capture_accepts_new_press(self.terminal_mouse_capture.is_some())
                 && (mouse_enabled || *button == 0)
                 && !terminal_pointer_input_blocked
                 && pointer_over_active_terminal
@@ -7759,7 +7807,9 @@ impl eframe::App for TerminalApp {
             let reported_to_app = app_mouse_press_reports_from_snapshot(
                 mouse_press_reports_to_app(
                     mouse_enabled,
-                    shift_mouse_bypass,
+                    ctx.input(|input| {
+                        app_mouse_edge_modifiers(&input.events, button, true, input.modifiers).shift
+                    }),
                     pointer_app_mouse_eligible,
                     link_press_override,
                 ),
@@ -7774,6 +7824,9 @@ impl eframe::App for TerminalApp {
                 session_id: active_session_id.clone(),
                 reported_to_app,
                 button,
+                last_modifiers: ctx.input(|input| {
+                    app_mouse_edge_modifiers(&input.events, button, true, input.modifiers)
+                }),
                 terminal: Arc::clone(&session.terminal),
                 write_tx: session.shell.write_sender(),
                 protocol_responses: active_protocol_responses.clone(),
@@ -7804,7 +7857,24 @@ impl eframe::App for TerminalApp {
             self.last_terminal_mouse_motion = None;
         }
 
-        let pointer_any_down = ctx.input(|input| input.pointer.any_down());
+        let pointer_any_down = !mouse_cancelled && ctx.input(|input| input.pointer.any_down());
+        if let Some(capture) = self.terminal_mouse_capture.as_mut() {
+            capture.last_modifiers = ctx.input(|input| {
+                app_mouse_edge_modifiers(
+                    &input.events,
+                    capture.button,
+                    false,
+                    if mouse_cancelled {
+                        capture.last_modifiers
+                    } else {
+                        input.modifiers
+                    },
+                )
+            });
+            if mouse_cancelled {
+                capture.local_selection_cancelled = true;
+            }
+        }
         let capture_button_explicitly_released = self
             .terminal_mouse_capture
             .as_ref()
@@ -7848,7 +7918,7 @@ impl eframe::App for TerminalApp {
             &terminal_buttons_released,
             pointer_any_down,
         );
-        let only_release = terminal_pointer_input_blocked;
+        let only_release = terminal_pointer_input_blocked || mouse_cancelled;
 
         let (
             mouse_terminal,
@@ -8021,9 +8091,21 @@ impl eframe::App for TerminalApp {
                         if capture.reported_to_app
                             && terminal_button_pressed == Some(capture.button)
                         {
-                            if let Some(report) =
-                                terminal.get_mouse_report(capture.button, col, row)
-                            {
+                            if let Some(report) = terminal.get_mouse_report(
+                                app_mouse_button(
+                                    capture.button,
+                                    ctx.input(|input| {
+                                        app_mouse_edge_modifiers(
+                                            &input.events,
+                                            capture.button,
+                                            true,
+                                            input.modifiers,
+                                        )
+                                    }),
+                                ),
+                                col,
+                                row,
+                            ) {
                                 if let Some(capture) = self.terminal_mouse_capture.as_mut() {
                                     queue_mouse_control(
                                         &mut capture.pending_controls,
@@ -8049,9 +8131,11 @@ impl eframe::App for TerminalApp {
                         )
                     {
                         let base_button = motion_button.unwrap_or(3);
-                        if let Some(report) =
-                            terminal.get_mouse_report(base_button.saturating_add(32), col, row)
-                        {
+                        if let Some(report) = terminal.get_mouse_report(
+                            app_mouse_button(base_button | 32, ctx.input(|input| input.modifiers)),
+                            col,
+                            row,
+                        ) {
                             reports.push(report);
                             self.last_terminal_mouse_motion =
                                 Some((mouse_session_id.clone(), col, row));
@@ -8074,7 +8158,16 @@ impl eframe::App for TerminalApp {
                 if let (Some(button), Some((row, col))) =
                     (reported_capture_release, frame_route.release_cell)
                 {
-                    if let Some(report) = terminal.get_mouse_release_report(button, col, row) {
+                    let modifiers = self
+                        .terminal_mouse_capture
+                        .as_ref()
+                        .map(|capture| capture.last_modifiers)
+                        .unwrap_or_default();
+                    if let Some(report) = terminal.get_mouse_release_report(
+                        app_mouse_button(button, modifiers),
+                        col,
+                        row,
+                    ) {
                         if let Some(capture) = self.terminal_mouse_capture.as_mut() {
                             queue_mouse_control(
                                 &mut capture.pending_controls,
@@ -10161,6 +10254,67 @@ mod tests {
         assert!(!rate_limit.allows(base));
         assert!(rate_limit.allows(base + OSC52_READ_RATE_WINDOW));
         assert_eq!(rate_limit.reads_in_window, 1);
+    }
+
+    #[test]
+    fn mouse_modifier_edges_preserve_event_snapshots_and_shift_ownership() {
+        use super::{app_mouse_button, app_mouse_edge_modifiers};
+        let press = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        let release = egui::Modifiers {
+            shift: true,
+            ..press
+        };
+        let events = [
+            egui::Event::PointerButton {
+                pos: egui::Pos2::ZERO,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: press,
+            },
+            egui::Event::PointerButton {
+                pos: egui::Pos2::ZERO,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: release,
+            },
+        ];
+        let down = app_mouse_edge_modifiers(&events, 2, true, egui::Modifiers::NONE);
+        let up = app_mouse_edge_modifiers(&events, 2, false, egui::Modifiers::NONE);
+        assert_eq!(app_mouse_button(2, down), 26);
+        assert_eq!(app_mouse_button(2 | 32, up), 62);
+        assert_eq!(app_mouse_button(2, up), 30);
+        assert!(mouse_press_reports_to_app(true, down.shift, true, false));
+        assert!(!mouse_press_reports_to_app(true, up.shift, true, false));
+        // A Shift-started selection stays local even when Shift is later lifted.
+        assert_eq!(captured_release_button(Some((false, 2)), &[2], false), None);
+        // Conversely a captured app gesture still releases after Shift is added.
+        assert_eq!(
+            captured_release_button(Some((true, 2)), &[2], false),
+            Some(2)
+        );
+        for cancel in [egui::Event::PointerGone, egui::Event::WindowFocused(false)] {
+            let snapshot = app_mouse_edge_modifiers(&[cancel], 2, false, release);
+            assert_eq!(app_mouse_button(2, snapshot), 30);
+            assert_eq!(
+                captured_release_button(Some((true, 2)), &[], false),
+                Some(2)
+            );
+        }
+        assert_eq!(
+            app_mouse_button(
+                0,
+                egui::Modifiers {
+                    mac_cmd: true,
+                    command: true,
+                    ..Default::default()
+                }
+            ),
+            0
+        );
     }
 
     #[test]

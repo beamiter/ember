@@ -10371,3 +10371,57 @@ fn bounded_non_apc_boundaries_preserve_pending_kitty_transfer() {
     terminal.process_input(b"\x1b_Gm=0,q=2;\x1b\\");
     assert!(terminal.kitty_graphics.get_image(903).is_some());
 }
+
+// Independent literal Cb oracle at Ember's production protocol facade.
+#[test]
+fn mouse_modifier_release_bytes_and_live_encoding_switches() {
+    for (bits, legacy_cb) in [
+        (0, 35),
+        (4, 39),
+        (8, 43),
+        (12, 47),
+        (16, 51),
+        (20, 55),
+        (24, 59),
+        (28, 63),
+    ] {
+        for button in 0..3 {
+            let mut terminal = TerminalState::new(80, 24);
+            terminal.process_input(b"\x1b[?1002h");
+            assert_eq!(
+                terminal.get_mouse_report(button | bits, 1, 2),
+                Some(vec![27, 91, 77, 32 + button + bits, 34, 35])
+            );
+            assert_eq!(
+                terminal.get_mouse_report(button | bits | 32, 1, 2),
+                Some(vec![27, 91, 77, 64 + button + bits, 34, 35])
+            );
+            assert_eq!(
+                terminal.get_mouse_release_report(button | bits, 1, 2),
+                Some(vec![27, 91, 77, legacy_cb, 34, 35])
+            );
+            terminal.process_input(b"\x1b[?1005h");
+            assert_eq!(
+                terminal.get_mouse_release_report(button | bits, 1, 2),
+                Some(vec![27, 91, 77, legacy_cb, 34, 35])
+            );
+            terminal.process_input(b"\x1b[?1015h");
+            assert_eq!(
+                terminal.get_mouse_release_report(button | bits, 1, 2),
+                Some(format!("\x1b[{};2;3M", legacy_cb).into_bytes())
+            );
+            terminal.process_input(b"\x1b[?1006h");
+            assert_eq!(
+                terminal.get_mouse_release_report(button | bits, 1, 2),
+                Some(format!("\x1b[<{};2;3m", button + bits).into_bytes())
+            );
+            terminal.process_input(b"\x1b[?1006l\x1b[?1015l\x1b[?1005l");
+            assert_eq!(
+                terminal.get_mouse_release_report(button | bits, 1, 2),
+                Some(vec![27, 91, 77, legacy_cb, 34, 35])
+            );
+            terminal.process_input(b"\x1b[?1002l");
+            assert_eq!(terminal.get_mouse_release_report(button | bits, 1, 2), None);
+        }
+    }
+}

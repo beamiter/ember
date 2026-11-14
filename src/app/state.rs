@@ -112,6 +112,9 @@ pub struct TerminalMouseCapture {
     /// change mid-drag.
     pub reported_to_app: bool,
     pub button: u8,
+    /// Latest real modifier snapshot, retained when focus/pointer cancellation
+    /// has no button-up event of its own.
+    pub last_modifiers: egui::Modifiers,
     /// Keep the original terminal and writer route alive across focus/tab
     /// changes so release can never land in a different PTY.
     pub terminal: Arc<ParkingMutex<crate::terminal::TerminalState>>,
