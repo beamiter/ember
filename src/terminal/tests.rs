@@ -10425,3 +10425,48 @@ fn mouse_modifier_release_bytes_and_live_encoding_switches() {
         }
     }
 }
+
+// Candidate: production host state regressions, not native GUI acceptance.
+#[test]
+fn unicode_023_halfwidth_marks_occupy_independent_cells() {
+    for input in ["\u{ff9e}\u{ff9f}", "ﾊﾟｸﾞ"] {
+        let bytes = input.as_bytes();
+        for split in 0..=bytes.len() {
+            let mut terminal = TerminalState::new(8, 3);
+            terminal.process_input(&bytes[..split]);
+            terminal.process_input(&bytes[split..]);
+            assert_eq!(
+                (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                (0, input.chars().count())
+            );
+            for (col, ch) in input.chars().enumerate() {
+                let cell = &terminal.screen.grid[0][col];
+                assert_eq!(cell.character, ch, "split {split} col {col}");
+                assert!(!cell.flags.wide() && !cell.flags.wide_continuation());
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_023_halfwidth_marks_wrap_and_backspace_by_cell() {
+    let input = "ab\u{ff9e}\u{ff9f}Z";
+    for split in 0..=input.len() {
+        let mut terminal = TerminalState::new(4, 3);
+        terminal.process_input(&input.as_bytes()[..split]);
+        terminal.process_input(&input.as_bytes()[split..]);
+        assert_eq!(terminal.screen.grid[0][2].character, '\u{ff9e}');
+        assert_eq!(terminal.screen.grid[0][3].character, '\u{ff9f}');
+        assert_eq!(terminal.screen.grid[1][0].character, 'Z');
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (1, 1)
+        );
+        terminal.process_input(b"\x08Q");
+        assert_eq!(terminal.screen.grid[1][0].character, 'Q');
+        assert_eq!(
+            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (1, 1)
+        );
+    }
+}
