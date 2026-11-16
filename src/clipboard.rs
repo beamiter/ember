@@ -488,7 +488,12 @@ mod unix_clipboard {
                 return Ok(read_text_from_bytes(bytes));
             }
 
-            Ok(ClipboardContent::Text(String::new()))
+            // A successful read of zero bytes returns above. Reaching this
+            // point means every backend failed or the shared deadline expired;
+            // do not misreport that as a genuinely empty clipboard.
+            Err(anyhow::anyhow!(
+                "读取剪贴板失败:工具不可用、读取失败或超时 (wl-paste/xclip/xsel)"
+            ))
         }
 
         pub fn paste_primary(&self) -> Result<String> {
@@ -587,6 +592,29 @@ mod unix_clipboard {
                 first_offered_mime(&offered, IMAGE_MIME_TYPES),
                 Some("image/png")
             );
+        }
+
+        #[test]
+        fn expired_paste_deadline_is_a_failure_not_empty_text() {
+            // An expired shared deadline prevents every helper from spawning,
+            // independent of the machine's installed clipboard tools/display.
+            let clipboard = ClipboardManager::new().unwrap();
+            assert!(clipboard.paste_contents_until(Instant::now()).is_err());
+        }
+
+        #[test]
+        fn successful_empty_read_remains_empty_text() {
+            let output = command_output_with_timeout(
+                "sh",
+                &["-c", "exit 0"],
+                Duration::from_secs(1),
+                MAX_CLIPBOARD_READ_BYTES,
+            )
+            .expect("a successful helper may legitimately return no bytes");
+            let ClipboardContent::Text(text) = read_text_from_bytes(output) else {
+                panic!("an empty text read must not become binary content");
+            };
+            assert!(text.is_empty());
         }
 
         #[test]
