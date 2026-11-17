@@ -89,6 +89,21 @@ def _block_end(code, opening):
     return end - 1
 
 
+def verify_overlay_font_zoom_order(main):
+    """Every final modal establishes input ownership before draining zoom."""
+    render = _function(main, 'render_ui')
+    methods = ('render_floating_panels', 'render_vim9_dialog',
+               'render_window_close_confirmation', 'handle_font_zoom')
+    calls = [_code(f'self.{method}(ctx);') for method in methods]
+    for method, call in zip(methods, calls):
+        matches = list(re.finditer(re.escape(call), render))
+        assert len(matches) == 1 and _top_level(render, matches[0]), \
+            f'{method} must run exactly once at render_ui top level'
+    assert render.strip().endswith(' '.join(calls)), \
+        'render_ui must finish overlays and both dialogs before draining font zoom'
+    return methods
+
+
 def verify_workspace_font_group_wiring(main):
     """All three center modes share the measured, clipped main-font surface."""
     render = _function(main, 'render_ui')
@@ -178,3 +193,4 @@ def verify_files_font_group_wiring(main, workspace):
     assert '. show ( & ctx , | ui | {' in helper, 'Drawer must return its Area response, not the parent layer'
     return {'owner_response': response, 'rectangle': rect, 'renderer': renderer,
             'dock_and_drawer': True, 'font_group': 'Ui', 'layer': 'owner response'}
+

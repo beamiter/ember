@@ -2,7 +2,9 @@
 """Positive and adversarial integration-source cases for Files font ownership."""
 from pathlib import Path
 import unittest
-from production_wiring import verify_files_font_group_wiring, verify_workspace_font_group_wiring
+from production_wiring import (verify_files_font_group_wiring,
+                               verify_workspace_font_group_wiring,
+                               verify_overlay_font_zoom_order)
 
 ROOT = Path(__file__).resolve().parent.parent
 MAIN = (ROOT / 'src/main.rs').read_text()
@@ -114,5 +116,47 @@ class WorkspaceFontWiring(unittest.TestCase):
                                    '.register_workspace(workspace_rect, workspace_rect, root_ui.layer_id());'))
 
 
+class OverlayFontZoomOrder(unittest.TestCase):
+    def rejected(self, source):
+        self.assertNotEqual(source, MAIN, 'Mutation must change production source')
+        with self.assertRaises(AssertionError):
+            verify_overlay_font_zoom_order(source)
+
+    def test_actual_overlay_order_includes_both_dialogs(self):
+        self.assertEqual(verify_overlay_font_zoom_order(MAIN),
+                         ('render_floating_panels', 'render_vim9_dialog',
+                          'render_window_close_confirmation', 'handle_font_zoom'))
+
+    def test_comments_and_whitespace_are_not_layout_dependencies(self):
+        source = MAIN.replace('self.render_window_close_confirmation(ctx);',
+                              '/* dialog */ self . render_window_close_confirmation ( ctx ) ;')
+        self.assertEqual(verify_overlay_font_zoom_order(source)[-1], 'handle_font_zoom')
+
+    def test_missing_or_duplicate_overlay_or_zoom_rejected(self):
+        for method in verify_overlay_font_zoom_order(MAIN):
+            call = f'self.{method}(ctx);'
+            with self.subTest(method=method):
+                self.rejected(MAIN.replace(call, '', 1))
+                self.rejected(MAIN.replace(call, call + call, 1))
+
+    def test_zoom_before_window_confirmation_rejected(self):
+        self.rejected(MAIN.replace('self.render_window_close_confirmation(ctx);',
+                                   'self.handle_font_zoom(ctx);', 1).replace(
+                                       'self.handle_font_zoom(ctx);\n    }',
+                                       'self.render_window_close_confirmation(ctx);\n    }', 1))
+
+    def test_comment_string_and_dead_block_cannot_supply_confirmation(self):
+        call = 'self.render_window_close_confirmation(ctx);'
+        for replacement in ['/* ' + call + ' */', 'let example = r#"' + call + '"#;',
+                            'if false { ' + call + ' }']:
+            with self.subTest(replacement=replacement):
+                self.rejected(MAIN.replace(call, replacement, 1))
+
+    def test_no_later_overlay_after_zoom(self):
+        self.rejected(MAIN.replace('self.handle_font_zoom(ctx);',
+                                   'self.handle_font_zoom(ctx); self.other_modal(ctx);', 1))
+
+
 if __name__ == '__main__':
     unittest.main()
+

@@ -3,11 +3,12 @@
 from pathlib import Path
 import json
 import os
-import re
 import subprocess
 import sys
 
-from production_wiring import verify_files_font_group_wiring, verify_workspace_font_group_wiring
+from production_wiring import (verify_files_font_group_wiring,
+                               verify_workspace_font_group_wiring,
+                               verify_overlay_font_zoom_order)
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -36,16 +37,9 @@ verify_files_font_group_wiring(main, workspace)
 assert "theme::configure_workspace_text(ui.style_mut(), self.config.font_size);" in main
 assert "theme::configure_workspace_text(root_ui.style_mut(), self.config.effective_ui_font_size());" in main
 # Every overlay must establish its current-frame input owner before zoom is
-# drained. Keep the real render_ui tail pinned, including the Vim dialog that
-# already existed when this harness still expected only two adjacent calls.
-render_ui = main.split("    fn render_ui(", 1)[1].split("\n    }", 1)[0]
-zoom_tail = ("render_floating_panels", "render_vim9_dialog", "handle_font_zoom")
-for method in zoom_tail:
-    assert render_ui.count(f"self.{method}(ctx);") == 1, method
-assert re.search(
-    r"\s*".join(re.escape(f"self.{method}(ctx);") for method in zoom_tail) + r"\s*$",
-    render_ui,
-), "render_ui must finish overlays and the Vim dialog before draining font zoom"
+# drained. Pin the real executable tail, including both Vim and whole-window
+# close confirmation, without allowing comments or dead blocks to satisfy it.
+verify_overlay_font_zoom_order(main)
 assert "self.config.font_size" not in tabs
 assert "ctrl_wheel_zoom_delta" not in input_source
 assert "font_size_accumulator" not in state
@@ -65,3 +59,4 @@ base = [cargo, "test", "--locked", "--manifest-path", str(HERE / "Cargo.toml")]
 # compile-only stubs in config_harness.rs.
 for args in (["--lib"], ["--test", "config_harness", "font_"], ["--test", "config_harness", "config_panel::tests::"]):
     subprocess.run(base + args, check=True)
+
