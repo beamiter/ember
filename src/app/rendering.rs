@@ -2588,6 +2588,15 @@ impl TerminalApp {
         ctx: &egui::Context,
         frame_pointer_input_blocked: bool,
     ) {
+        // Visibility belongs to every pane of the active tab, not just its
+        // focused session. Hidden canvases retain reading intent, but must not
+        // animate output accumulated while another tab was on screen.
+        let visible_sessions = self.layout().session_indices();
+        for (index, session) in self.session_manager.sessions_mut().iter_mut().enumerate() {
+            if !visible_sessions.contains(&index) {
+                session.transcript_canvas.suspend();
+            }
+        }
         // Capture keyboard invocation before the modal disables its workspace.
         self.remember_block_review_invoker(ctx);
         let interaction_enabled = terminal_frame_interaction_enabled(

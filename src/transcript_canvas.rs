@@ -9,6 +9,8 @@ use jterm_core::transcript_canvas::CanvasMotion;
 pub struct TranscriptCanvas {
     motion: CanvasMotion,
     initialized: bool,
+    resume_pending: bool,
+    resume_input: Vec<ResumeInput>,
     expected_offset: usize,
     document_rows: usize,
     projection_revision: u64,
@@ -18,6 +20,14 @@ pub struct TranscriptCanvas {
     follows_live: bool,
     expected_follow: bool,
     last_time: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResumeInput {
+    Scroll(f64, bool),
+    Seek(f64),
+    PauseFollow,
+    Stop,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -35,11 +45,31 @@ impl TranscriptCanvas {
         *self = Self::default();
     }
 
+    /// Hidden tabs keep their terminal and reading anchor, but have no visible
+    /// frames to animate. Never replay an old wheel target or background output
+    /// when their viewport becomes visible again.
+    pub fn suspend(&mut self) {
+        self.resume_pending = true;
+        // Inputs from a visible frame that never presented must not survive a
+        // second hide and replay on a later activation.
+        self.resume_input.clear();
+        self.motion.cancel();
+        self.last_time = None;
+    }
+
     pub fn stop(&mut self) {
+        if self.resume_pending {
+            self.resume_input.push(ResumeInput::Stop);
+            return;
+        }
         self.motion.cancel();
     }
 
     pub fn pause_follow(&mut self) {
+        if self.resume_pending {
+            self.resume_input.push(ResumeInput::PauseFollow);
+            return;
+        }
         self.motion.cancel();
         self.follows_live = false;
         self.expected_follow = false;
@@ -49,6 +79,11 @@ impl TranscriptCanvas {
     /// deltas are expressed in pixels by the host and use the shared spring.
     pub fn scroll(&mut self, pixels: f64, precision: bool) {
         if !self.initialized || !pixels.is_finite() || pixels == 0.0 {
+            return;
+        }
+        if self.resume_pending {
+            self.resume_input
+                .push(ResumeInput::Scroll(pixels, precision));
             return;
         }
         if precision {
@@ -64,6 +99,10 @@ impl TranscriptCanvas {
     pub fn seek_pixels(&mut self, pixels: f64) -> bool {
         if !self.initialized || !pixels.is_finite() {
             return false;
+        }
+        if self.resume_pending {
+            self.resume_input.push(ResumeInput::Seek(pixels));
+            return true;
         }
         self.motion.jump_to(pixels);
         self.follows_live = self.motion.position() <= 0.0;
@@ -108,12 +147,14 @@ impl TranscriptCanvas {
                 0.0
             };
         self.motion.set_reduced_motion(reduced_motion);
-        if !self.initialized || geometry_changed {
+        if !self.initialized || geometry_changed || self.resume_pending {
             // The projection supplies a reflowed whole-row anchor. Preserve
             // the reader's position within that row across resize/font zoom,
             // but never carry an obsolete wheel destination into new geometry.
             // Ember projects ceil(position), so this remainder is non-positive.
-            let position = if self.initialized && self.follows_live && follows_live {
+            let position = if follows_live
+                && (self.resume_pending || (self.initialized && self.follows_live))
+            {
                 0.0
             } else {
                 offset_rows as f64 + remainder
@@ -122,6 +163,7 @@ impl TranscriptCanvas {
             self.motion.jump_to(position * height);
             self.follows_live = follows_live;
             self.initialized = true;
+            self.resume_pending = false;
         } else if follows_live != self.expected_follow {
             // A keyboard action or explicit Return to live can change follow
             // ownership even when it names the same whole-row offset.
@@ -165,6 +207,19 @@ impl TranscriptCanvas {
             self.follows_live = follows_live;
         }
         self.motion.set_bounds(0.0, max);
+        // Input admitted on the first visible frame belongs to the restored
+        // viewport, not to the old hidden animation. Apply it after rebasing,
+        // in order, so a fresh thumb seek, wheel, page or selection wins.
+        for input in std::mem::take(&mut self.resume_input) {
+            match input {
+                ResumeInput::Scroll(pixels, precision) => self.scroll(pixels, precision),
+                ResumeInput::Seek(pixels) => {
+                    self.seek_pixels(pixels);
+                }
+                ResumeInput::PauseFollow => self.pause_follow(),
+                ResumeInput::Stop => self.stop(),
+            }
+        }
         let dt = self
             .last_time
             .filter(|previous| time.is_finite() && time >= *previous)
@@ -243,6 +298,106 @@ mod tests {
         t: f64,
     ) -> CanvasPresentation {
         canvas.present(offset, rows, rows as u64, 20, 80, follow, 20.0, t, false)
+    }
+
+    #[test]
+    fn hidden_live_tab_resumes_at_tail_without_replaying_background_growth() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 0, 200, true, 0.0);
+        let moving = present(&mut canvas, 0, 210, true, 0.016);
+        assert!(moving.animating);
+        canvas.suspend();
+        canvas.suspend(); // Multiple hidden frames must be idempotent.
+        let resumed = present(&mut canvas, moving.offset_rows, 10_000, true, 0.032);
+        assert_eq!(resumed.offset_rows, 0);
+        assert_eq!(resumed.translation, 0.0);
+        assert!(resumed.follows_live);
+        assert!(!resumed.animating);
+        // Once visible, ordinary new output keeps its existing animation.
+        let next = present(&mut canvas, 0, 10_001, true, 0.048);
+        assert!(next.animating);
+    }
+
+    #[test]
+    fn hidden_reader_keeps_rebased_fractional_anchor_without_old_wheel_target() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 10, 200, false, 0.0);
+        canvas.scroll(3.25, true);
+        let before = present(&mut canvas, 10, 200, false, 0.016);
+        canvas.page(18, 20.0); // This destination must not resume after hiding.
+        canvas.suspend();
+        // Projection rebases the same reading anchor by 100 appended rows.
+        let resumed = present(&mut canvas, before.offset_rows + 100, 300, false, 30.0);
+        assert_eq!(resumed.offset_rows, before.offset_rows + 100);
+        assert_eq!(resumed.translation, before.translation);
+        assert!(!resumed.follows_live);
+        assert!(!resumed.animating);
+    }
+
+    #[test]
+    fn hidden_reader_resize_and_explicit_return_to_live_keep_ownership() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 10, 200, false, 0.0);
+        canvas.suspend();
+        let resumed = canvas.present(22, 400, 4, 30, 100, false, 24.0, 10.0, false);
+        assert_eq!(resumed.offset_rows, 22);
+        assert!(!resumed.follows_live);
+        assert!(!resumed.animating);
+        canvas.suspend();
+        let live = canvas.present(0, 400, 4, 30, 100, true, 24.0, 11.0, false);
+        assert_eq!(live.offset_rows, 0);
+        assert!(live.follows_live);
+        assert!(!live.animating);
+    }
+
+    #[test]
+    fn resumed_first_frame_thumb_seek_wins_over_live_tail() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 0, 200, true, 0.0);
+        canvas.suspend();
+        assert!(canvas.seek_pixels(123.25));
+        let resumed = present(&mut canvas, 0, 10_000, true, 0.032);
+        assert_eq!(resumed.offset_rows, 7);
+        assert_eq!(resumed.translation, 16.75);
+        assert!(!resumed.follows_live);
+        assert!(!resumed.animating);
+    }
+
+    #[test]
+    fn resumed_first_frame_wheel_and_page_keep_new_input_in_order() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 0, 200, true, 0.0);
+        canvas.suspend();
+        canvas.scroll(3.25, true);
+        assert!(canvas.page(18, 20.0));
+        let resumed = present(&mut canvas, 0, 10_000, true, 0.032);
+        assert_eq!(resumed.offset_rows, 1);
+        assert_eq!(resumed.translation, 16.75);
+        assert!(!resumed.follows_live);
+        assert!(resumed.animating);
+        let settled = present(&mut canvas, 1, 10_000, false, 1.0);
+        assert_eq!(settled.offset_rows, 19);
+        assert_eq!(settled.translation, 16.75);
+    }
+
+    #[test]
+    fn resumed_first_frame_selection_cancels_new_page_not_new_thumb() {
+        let mut canvas = TranscriptCanvas::default();
+        present(&mut canvas, 0, 200, true, 0.0);
+        canvas.suspend();
+        canvas.page(18, 20.0);
+        canvas.pause_follow();
+        let paused = present(&mut canvas, 0, 10_000, true, 0.032);
+        assert!(!paused.follows_live);
+        assert!(!paused.animating);
+        assert_eq!(paused.offset_rows, 0);
+        canvas.suspend();
+        canvas.page(18, 20.0);
+        canvas.stop();
+        canvas.seek_pixels(123.25);
+        let thumb = present(&mut canvas, 0, 10_000, false, 0.064);
+        assert_eq!(thumb.offset_rows, 7);
+        assert!(!thumb.animating);
     }
 
     #[test]
@@ -518,5 +673,18 @@ mod tests {
         assert!(!resumed.animating);
         assert_eq!(resumed.offset_rows, 5);
         assert_eq!(resumed.translation, 10.0);
+    }
+    #[test]
+    fn hiding_again_discards_unpresented_resume_input() {
+        let mut canvas = TranscriptCanvas::default();
+        canvas.present(0, 200, 1, 20, 80, true, 20.0, 0.0, false);
+        canvas.suspend();
+        canvas.page(18, 20.0);
+        assert!(canvas.seek_pixels(123.25));
+        canvas.suspend();
+        let restored = canvas.present(0, 400, 2, 20, 80, true, 20.0, 0.032, false);
+        assert_eq!(restored.offset_rows, 0);
+        assert!(restored.follows_live);
+        assert!(!restored.animating);
     }
 }
