@@ -3,6 +3,7 @@
 import argparse
 import csv
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -27,11 +28,52 @@ def wait(check, label, seconds=25):
     raise AssertionError('Timed out: ' + label)
 
 
-def live(pid):
+# Keep fixture work alive longer than the required CI step's four-minute budget.
+# An expired sleep must never masquerade as work terminated by GUI close.
+JOB_SECONDS = 600
+SCENARIO_SECONDS = 240
+
+
+def process_state(pid):
     try:
-        return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0] not in ('Z', 'X')
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        return dict(pid=int(pid), state=fields[0], parent=int(fields[1]),
+                    group=int(fields[2]), foreground=int(fields[5]),
+                    start_time=int(fields[19]))
     except FileNotFoundError:
-        return False
+        return None
+
+
+def same_live_process(identity, current):
+    return (current is not None and current['pid'] == identity['pid']
+            and current['start_time'] == identity['start_time']
+            and current['state'] not in ('Z', 'X'))
+
+
+def assert_jobs_live(jobs):
+    assert len(jobs) == 2, 'Expected hidden and active tab jobs'
+    assert len({job['pid'] for job in jobs}) == 2, 'Jobs must be distinct'
+    for job in jobs:
+        assert same_live_process(job, process_state(job['pid'])), \
+            'Original foreground job exited or its PID was reused'
+
+
+def assert_dialog_absent(words):
+    assert words and any(row.get('text', '').strip() for row in words), 'No OCR text to establish dialog dismissal'
+    for phrase in ('Close window', 'Keep window open', 'Close anyway', 'Cancel'):
+        assert button(words, phrase) is None, 'Close confirmation remained visible: ' + phrase
+
+
+def button(words, phrase):
+    target = phrase.lower().split()
+    for index in range(len(words) - len(target) + 1):
+        chunk = words[index:index+len(target)]
+        if [r['text'].lower() for r in chunk] == target and len({(r['block_num'], r['par_num'], r['line_num']) for r in chunk}) == 1:
+            left = min(int(r['left']) for r in chunk)
+            right = max(int(r['left']) + int(r['width']) for r in chunk)
+            top = min(int(r['top']) for r in chunk)
+            bottom = max(int(r['top']) + int(r['height']) for r in chunk)
+            return ((left+right)//4, (top+bottom)//4)
 
 
 def main():
@@ -56,8 +98,15 @@ def main():
                             'initial_width = 1100\ninitial_height = 800\nrestore_session = false\n'
                             f'eva_companion_enabled = {str(args.eva == "on").lower()}\n'
                             + ('app_renderer = "glow"\n' if app_name == 'ember' else ''))
-    result = dict(app=app_name, eva=args.eva)
+    binary_hash = hashlib.sha256()
+    with args.binary.resolve().open('rb') as executable:
+        for chunk in iter(lambda: executable.read(1024 * 1024), b''):
+            binary_hash.update(chunk)
+    result = dict(app=app_name, eva=args.eva, backend='x11', display='Xvfb',
+                  input='xdotool synthetic X11 events', physical_input=False,
+                  binary_sha256=binary_hash.hexdigest())
     observation = 0
+    scenario_started = time.monotonic()
 
     def rows(label):
         nonlocal observation
@@ -74,17 +123,6 @@ def main():
                                        env=env, text=True, stderr=subprocess.DEVNULL, timeout=30)
         (out / (name + '.tsv')).write_text(text)
         return [r for r in csv.DictReader(io.StringIO(text), delimiter='\t') if r['text'].strip()]
-
-    def button(words, phrase):
-        target = phrase.lower().split()
-        for index in range(len(words) - len(target) + 1):
-            chunk = words[index:index+len(target)]
-            if [r['text'].lower() for r in chunk] == target and len({(r['block_num'], r['par_num'], r['line_num']) for r in chunk}) == 1:
-                left = min(int(r['left']) for r in chunk)
-                right = max(int(r['left']) + int(r['width']) for r in chunk)
-                top = min(int(r['top']) for r in chunk)
-                bottom = max(int(r['top']) + int(r['height']) for r in chunk)
-                return ((left+right)//4, (top+bottom)//4)
 
     def observe_button(label, phrase):
         return wait(lambda: button(rows(label), phrase), label)
@@ -111,44 +149,89 @@ def main():
         app = smoke.app = smoke.spawn([str(args.binary.resolve())], app_name)
         wait(smoke.app_window, 'native app window')
         time.sleep(1)
-        marker = out / 'shell.pid'
-        smoke.text(f'printf "%s\\n" "$$" > {marker}; sleep 120')
-        smoke.key('Return')
-        shell = int(wait(lambda: marker.read_text().strip() if marker.exists() else None, 'shell identity'))
-        children_path = Path(f'/proc/{shell}/task/{shell}/children')
-        job = int(wait(lambda: next((p for p in children_path.read_text().split()
-                                    if Path(f'/proc/{p}/comm').read_text().strip() == 'sleep'), None), 'real sleep child'))
-        result.update(shell_pid=shell, job_pid=job)
-        assert os.getpgid(job) != os.getpgid(shell), 'job must own a separate foreground group'
+        jobs, shells = [], []
+
+        def start_job(label):
+            marker = out / (label + '-shell.pid')
+            # The second marker is produced only by a command accepted in the
+            # newly active tab; a missed tab shortcut cannot satisfy this proof.
+            import shlex
+            smoke.text(f'printf "%s\\n" "$$" > {shlex.quote(str(marker))}; sleep {JOB_SECONDS}')
+            smoke.key('Return')
+            shell = int(wait(lambda: marker.read_text().strip() if marker.exists() else None,
+                             label + ' shell identity'))
+            assert shell not in shells, 'New tab must own a different shell'
+            children_path = Path(f'/proc/{shell}/task/{shell}/children')
+
+            def find_job():
+                for pid in children_path.read_text().split():
+                    try:
+                        if Path(f'/proc/{pid}/comm').read_text().strip() != 'sleep':
+                            continue
+                    except FileNotFoundError:
+                        continue
+                    state = process_state(int(pid))
+                    owner = process_state(shell)
+                    if (state and owner and state['parent'] == shell
+                            and state['state'] not in ('Z', 'X')
+                            and state['group'] != owner['group']
+                            and owner['foreground'] == state['group']):
+                        return state
+                return None
+
+            job = wait(find_job, label + ' real foreground sleep')
+            shells.append(shell)
+            jobs.append(job)
+            result[label] = dict(shell_pid=shell, job_pid=job['pid'],
+                                 job_start_time=job['start_time'], group=job['group'])
+
+        start_job('hidden')
         smoke.key('t', ('ctrl', 'shift'))
         time.sleep(.5)
+        start_job('active')
+        assert_jobs_live(jobs)
         point = request_close()
-        assert app.poll() is None and live(job)
+        assert app.poll() is None
+        assert_jobs_live(jobs)
         smoke.key('c', ('ctrl',))
         time.sleep(.3)
-        assert live(job), 'modal leaked Ctrl+C into the foreground job'
+        assert_jobs_live(jobs)  # Includes the actually active foreground job.
         click(observe_button('cancel-button', 'Cancel'))
         time.sleep(.3)
-        assert app.poll() is None and live(job), 'Cancel terminated work'
+        assert app.poll() is None
+        assert_jobs_live(jobs)
+        assert_dialog_absent(rows('after-cancel'))
         result['cancel_preserves_job'] = True
         request_close()
         smoke.key('Escape')
         time.sleep(.3)
-        assert app.poll() is None and live(job), 'Escape terminated work'
+        assert app.poll() is None
+        assert_jobs_live(jobs)
+        assert_dialog_absent(rows('after-escape'))
         result['escape_preserves_job'] = True
         point = request_close()
+        assert_jobs_live(jobs)
+        assert time.monotonic() - scenario_started < SCENARIO_SECONDS, 'Scenario exceeded step budget'
         click(point)
         if args.eva == 'on':
             click(observe_button('eva-keep-open', 'Keep window open'))
             time.sleep(.3)
-            assert app.poll() is None and live(job), 'Keep window open terminated work'
+            assert app.poll() is None
+            assert_jobs_live(jobs)
+            assert_dialog_absent(rows('after-eva-cancel'))
             # Cancelling Eva withdrawal revokes the earlier terminal approval.
-            click(request_close())
+            point = request_close()
+            assert_jobs_live(jobs)
+            click(point)
             result['eva_cancel_revokes_terminal_approval'] = True
-            click(observe_button('eva-force-close', 'Close anyway'))
+            point = observe_button('eva-force-close', 'Close anyway')
+            assert_jobs_live(jobs)
+            assert time.monotonic() - scenario_started < SCENARIO_SECONDS, 'Scenario exceeded step budget'
+            click(point)
         wait(lambda: app.poll() is not None, 'confirmed app exit', 15)
         assert app.returncode == 0, f'app exited with {app.returncode}'
-        wait(lambda: not live(job), 'confirmed close terminates real foreground job', 10)
+        wait(lambda: all(not same_live_process(job, process_state(job['pid'])) for job in jobs),
+             'confirmed close terminates both original foreground jobs', 10)
         result.update(confirmed_exit=True, job_terminated=True, hidden_tab_checked=True, modal_blocks_sigint=True, status='pass')
     except BaseException as error:
         result.update(status='fail', error=str(error))
@@ -165,3 +248,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

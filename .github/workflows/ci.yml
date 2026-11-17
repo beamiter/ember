@@ -407,6 +407,33 @@ jobs:
           python3 scripts/test-native-render-environment.py
           python3 scripts/native-render-environment.py --output native-smoke-artifacts/font-ocr-identities.json
 
+      - name: Gate X11 whole-window close with Eva off
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        timeout-minutes: 4
+        run: |
+          /usr/bin/python3 scripts/test-native-window-close.py
+          /usr/bin/python3 scripts/native-window-close.py \
+            --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
+            --eva off --output native-smoke-artifacts/window-close-eva-off
+
+      - name: Gate X11 whole-window close with Eva on
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        timeout-minutes: 4
+        run: |
+          /usr/bin/python3 scripts/test-native-window-close.py
+          /usr/bin/python3 scripts/native-window-close.py \
+            --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
+            --eva on --output native-smoke-artifacts/window-close-eva-on
+
+      - name: Preserve whole-window close evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ember-native-window-close-${{ github.sha }}
+          path: native-smoke-artifacts/window-close-*
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Gate X11 installed release interactions
         if: steps.desktop-install.outcome == 'success'
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend x11 --output native-smoke-artifacts/x11
