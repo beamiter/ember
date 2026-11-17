@@ -2872,6 +2872,7 @@ impl TerminalApp {
             session_manager,
             vim9_editors,
             vim9_window_close_pending: false,
+            window_close_confirmation: None,
             vim9_pending_tab_closes: Vec::new(),
             vim9_shell_entry_session,
             vim9_shell_tabs: Default::default(),
@@ -5884,6 +5885,7 @@ impl TerminalApp {
             .register_workspace(workspace_rect, main_panel.inner, root_ui.layer_id());
         self.render_floating_panels(ctx);
         self.render_vim9_dialog(ctx);
+        self.render_window_close_confirmation(ctx);
         self.handle_font_zoom(ctx);
     }
 

@@ -66,9 +66,7 @@ fn session_window_close_blocker(session: &crate::session::Session) -> Option<&'s
         .foreground_pgid()
         .or_else(|| jterm_core::process::foreground_pgid_via_stat(child));
     match foreground {
-        Some(group) if group != child => return Some(
-            "A foreground process is still running. Stop it or close its tab before closing this window.",
-        ),
+        Some(group) if group != child => return Some("A foreground process is still running."),
         _ => {}
     }
     // Explicit argv is a live command even when it is its own PTY session
@@ -82,15 +80,15 @@ fn session_window_close_blocker(session: &crate::session::Session) -> Option<&'s
     }
     if foreground == Some(child) && session.purpose == SessionPurpose::Interactive {
         if !session.shell.matches_interactive_shell_program() {
-            return Some("The shell was replaced by a command. Stop it or close its tab before closing this window.");
+            return Some("The shell was replaced by a command.");
         }
         match session.shell.session_activity() {
-            companion_host::pty_session::Activity::Busy => return Some(
-                "A background process is still attached. Stop it or close its tab before closing this window.",
-            ),
-            companion_host::pty_session::Activity::Unknown => return Some(
-                "Cannot verify attached terminal work. Check the session or close its tab explicitly.",
-            ),
+            companion_host::pty_session::Activity::Busy => {
+                return Some("A background process is still attached.")
+            }
+            companion_host::pty_session::Activity::Unknown => {
+                return Some("Cannot verify attached terminal work.")
+            }
             companion_host::pty_session::Activity::Idle => {}
         }
         let terminal = session.terminal.lock();
@@ -98,13 +96,13 @@ fn session_window_close_blocker(session: &crate::session::Session) -> Option<&'s
             return None;
         }
         return Some(if terminal.has_prompt_marks() {
-            "Terminal work or unfinished input is still present. Return to an empty prompt or close its tab explicitly."
+            "Terminal work or unfinished input is still present."
         } else {
-            "Shell activity is unavailable. Exit this shell or close its tab explicitly before closing this window."
+            "Shell activity is unavailable."
         });
     }
     Some(if session.purpose == SessionPurpose::EphemeralCommand {
-        "A terminal command is still running. Stop it or close its tab before closing this window."
+        "A terminal command is still running."
     } else {
         "Cannot verify that a terminal is idle. Try closing again after checking its work."
     })
@@ -234,16 +232,21 @@ fn sessions_snapshot_for_persistence(
 }
 
 impl TerminalApp {
-    /// Normal window close must preflight every pane before shared withdrawal.
-    /// Keep a refused request unarmed: ending a job does not mean "close now".
+    /// Confirm terminal work in every pane before shared withdrawal.
+    /// A pending confirmation never closes automatically when a job ends.
     pub(crate) fn guard_window_close(&mut self, ctx: &eframe::egui::Context) {
         if self.organism.eva.take_close_cancellation() {
             self.vim9_window_close_pending = false;
+            self.window_close_confirmation = None;
             ctx.send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
             return;
         }
         self.guard_vim9_window_close(ctx);
         if !self.vim9_editors.is_empty() {
+            return;
+        }
+        if self.window_close_confirmation.is_some() {
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
             return;
         }
         let requested =
@@ -252,13 +255,14 @@ impl TerminalApp {
         // Explicit process termination retains its existing shutdown behavior.
         // This guard handles ordinary WM/title-bar/keyboard close requests.
         if (requested || retiring)
+            && self.organism.eva.terminal_close_check_required()
             && !crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
         {
             if let Some(reason) = self.window_close_blocker() {
                 ctx.send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
                 self.vim9_window_close_pending = false;
                 self.organism.eva.pause_close_for_work();
-                self.set_status_for(reason, std::time::Duration::from_secs(5));
+                self.window_close_confirmation = Some(reason);
                 ctx.request_repaint();
                 return;
             }
@@ -266,6 +270,40 @@ impl TerminalApp {
         // An editor's deferred close is an explicit intent even after the
         // original native CloseRequested event has left the current frame.
         self.organism.eva.guard_close(ctx, requested);
+    }
+
+    pub(crate) fn render_window_close_confirmation(&mut self, ctx: &eframe::egui::Context) {
+        let Some(reason) = self.window_close_confirmation else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("window-close-confirmation"))
+            .frame(crate::theme::workspace_frame(14))
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.heading("Close Ember window?");
+                ui.label(reason);
+                ui.label("Closing this window will terminate work in all tabs and panes.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    cancel = ui.button("Cancel").clicked();
+                    confirm = ui.button("Close window").clicked();
+                });
+            });
+        // Closing the modal (including Escape) cancels; a repeated close
+        // shortcut cannot approve termination of terminal work.
+        if cancel || modal.should_close() {
+            self.window_close_confirmation = None;
+            self.vim9_window_close_pending = false;
+            self.organism.eva.keep_window_open(ctx);
+        } else if confirm {
+            self.window_close_confirmation = None;
+            self.organism.eva.confirm_terminal_close();
+            self.vim9_window_close_pending = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+        }
     }
 
     fn window_close_blocker(&self) -> Option<&'static str> {

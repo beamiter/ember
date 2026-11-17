@@ -19,6 +19,7 @@ pub(crate) struct EvaHost {
     close_cancelled: bool,
     cancel_key: host::CancelKeyLease,
     force_close: bool,
+    terminal_work_confirmed: bool,
     born: Instant,
     reduced_motion: bool,
     high_contrast: bool,
@@ -89,6 +90,7 @@ impl Default for EvaHost {
             close_cancelled: false,
             cancel_key: Default::default(),
             force_close: false,
+            terminal_work_confirmed: false,
             born: Instant::now(),
             reduced_motion: false,
             high_contrast: false,
@@ -277,6 +279,12 @@ impl EvaHost {
     pub fn close_in_progress(&self) -> bool {
         self.close_requested
     }
+    pub fn terminal_close_check_required(&self) -> bool {
+        !self.terminal_work_confirmed && !self.force_close
+    }
+    pub fn confirm_terminal_close(&mut self) {
+        self.terminal_work_confirmed = true;
+    }
     pub fn pause_close_for_work(&mut self) {
         if self.close_requested {
             // Withdrawal may already have cleared/retired the old body. Keep
@@ -368,6 +376,7 @@ impl EvaHost {
         self.close_requested = false;
         self.close_paused_for_work = false;
         self.force_close = false;
+        self.terminal_work_confirmed = false;
         self.close_cancelled = true;
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.cancel_withdrawal();

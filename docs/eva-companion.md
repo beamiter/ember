@@ -83,14 +83,21 @@ adapter without unrelated terminal test modules.
 
 ## Healthy close and execution identity
 
-Ordinary window close first checks every live pane. On Linux an interactive
+Ordinary window close first checks every live pane. If terminal work or
+unfinished input is present, a confirmation offers **Cancel** and **Close window**.
+The latter explicitly permits terminating work in every tab and pane, including
+hidden tabs, and continues through the normal Eva withdrawal flow. Cancelling
+either confirmation or withdrawal revokes that close intent; ending a job alone
+does not close the window. Explicit **Close anyway** is not blocked again by the
+terminal work check. On Linux an interactive
 root must still match its pinned shell executable and process start time, and
 the terminal must report a fresh empty prompt. An `exec` command can retain the
 shell's PID/PGID/SID; a builtin can also retain its executable. Neither is idle
 merely because the root owns the foreground. Submitted or unfinished input also
-keeps the window open. A shell without command-boundary reporting requires an
-explicit shell exit or tab close; process names and prompt-like output alone do
-not establish idle. These observations are not authenticated shell attestation.
+requires close confirmation. A shell without command-boundary reporting also
+requires explicit confirmation, shell exit or tab close; process names and
+prompt-like output alone do not establish idle. These observations are not
+authenticated shell attestation.
 
 An admitted close withdraws this host (not global Hide), presents a cleared
 frame when it owned a body, and waits for exact durable retirement/withdrawal
@@ -240,3 +247,15 @@ normal WM_DELETE_WINDOW close and fail-closed owner SIGKILL. Crash blocking is n
 automatic recovery: trusted surface-destruction certification remains missing.
 These are scoped native acceptance cases, not physical scanout, IME or performance
 measurements; machine reports preserve individual outcomes and binary hashes.
+
+
+## Native window-close regression
+
+Run `python3 scripts/native-window-close.py --binary target/release/ember
+--output /tmp/ember-close-check --eva on` (and again with a fresh output directory
+and `--eva off`). The fixture owns its Xvfb display and private home/configuration.
+It runs a real foreground `sleep` in a hidden tab, checks Cancel/Escape and modal
+input ownership, then verifies confirmed GUI exit and termination of that job.
+With Eva enabled, it also cancels withdrawal and verifies that the next close
+requires fresh terminal-work approval before using **Close anyway** against an
+unavailable private coordinator. This does not certify compositor retirement.

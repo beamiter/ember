@@ -1233,7 +1233,8 @@ impl TerminalApp {
     }
 
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
-        self.organism.eva.close_dialog_owns_input()
+        self.window_close_confirmation.is_some()
+            || self.organism.eva.close_dialog_owns_input()
             || self.reference_navigation_drawer_rect(ctx).is_some()
             || self.organism.eva.card_owns_input()
             || self.block_review.is_some()
@@ -2711,6 +2712,10 @@ impl TerminalApp {
         ui_input_blocked: bool,
         terminal_input_blocked: bool,
     ) -> (bool, bool, bool) {
+        if self.window_close_confirmation.is_some() {
+            self.claim_enter_for_prompt_recall();
+            return (false, false, false);
+        }
         let closing_owned = self.organism.eva.close_dialog_owns_input();
         if closing_owned {
             // A held dialog Enter stays owned when Escape or a pointer keeps

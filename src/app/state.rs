@@ -196,6 +196,7 @@ pub struct TerminalApp {
     pub session_manager: SessionManager,
     pub(crate) vim9_editors: std::collections::HashMap<String, crate::vim9_ide::Workbench>,
     pub(crate) vim9_window_close_pending: bool,
+    pub(crate) window_close_confirmation: Option<&'static str>,
     pub(crate) vim9_pending_tab_closes: Vec<Vec<String>>,
     pub(crate) vim9_shell_tabs:
         std::collections::HashMap<String, (String, jterm_core::vim9::Vim9ShellCompletion)>,
