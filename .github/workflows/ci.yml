@@ -530,7 +530,9 @@ jobs:
 
       - name: Gate Wayland installed release interactions
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
-        run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend wayland --output native-smoke-artifacts/wayland
+        run: |
+          python3 scripts/test-native-clipboard-readback.py
+          python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend wayland --output native-smoke-artifacts/wayland
 
       - name: Gate installed session recovery on both desktops
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' && steps.desktop-pointer.outcome == 'success' }}
@@ -639,3 +641,4 @@ jobs:
           path: native-smoke-artifacts
           if-no-files-found: error
           retention-days: 14
+

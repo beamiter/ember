@@ -746,7 +746,33 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         owner.stdin.write(payload.encode())
         owner.stdin.close()
         time.sleep(0.5)
-        assert self.read_clipboard() == payload.encode(), 'Clipboard owner readback mismatch'
+        try:
+            observed = self.read_clipboard()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            self.record_clipboard_readback_failure(owner, error=error)
+            raise
+        if observed != payload.encode():
+            self.record_clipboard_readback_failure(owner, observed=observed)
+        assert observed == payload.encode(), 'Clipboard owner readback mismatch'
+
+    def record_clipboard_readback_failure(self, owner, error=None, observed=None):
+        # Passive, bounded metadata only: never persist clipboard bytes, command
+        # arguments, stderr, environment or a new retry. Preserve the original
+        # 0.5-second wait and exact-payload gate even if evidence cannot be saved.
+        evidence = {
+            'phase': 'fixture-clipboard-owner-readback',
+            'backend': self.backend,
+            'owner_returncode': owner.poll(),
+            'reader_returncode': getattr(error, 'returncode', None),
+            'reader_timeout': isinstance(error, subprocess.TimeoutExpired),
+            'reader_stdout_bytes': len(observed if observed is not None else (getattr(error, 'stdout', None) or b'')),
+            'reader_stderr_bytes': len(getattr(error, 'stderr', None) or b''),
+            'payload_matched': False,
+        }
+        try:
+            (self.out / 'clipboard-readback-failure.json').write_text(json.dumps(evidence, indent=2) + '\n')
+        except OSError:
+            pass
 
     def read_clipboard(self):
         reader = ['xclip', '-selection', 'clipboard', '-o'] if self.backend == 'x11' else ['wl-paste', '--no-newline']
@@ -931,3 +957,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
