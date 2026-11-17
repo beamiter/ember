@@ -495,12 +495,26 @@ impl TerminalApp {
         self.session_manager.refresh_unseen_flags(&visible_sessions);
     }
 
+    /// Retire outgoing canvas motion at the visibility transition itself.
+    /// A -> B -> A can happen before any render pass observes B. Waiting for
+    /// render_terminal_content to find hidden sessions would replay A's target.
+    pub(super) fn select_tab_and_suspend_canvas(&mut self, tab_idx: usize) {
+        if tab_idx < self.tabs.len() && tab_idx != self.tabs.active_index() {
+            for session_idx in self.tabs.sessions_in(self.tabs.active_index()) {
+                if let Some(session) = self.session_manager.sessions_mut().get_mut(session_idx) {
+                    session.transcript_canvas.suspend();
+                }
+            }
+        }
+        self.tabs.set_active(tab_idx);
+    }
+
     /// 切换到某个 tab,并把键盘/剪贴板路由交给它当前选中的窗格。
     pub fn activate_tab(&mut self, tab_idx: usize) -> bool {
         if tab_idx >= self.tabs.len() {
             return false;
         }
-        self.tabs.set_active(tab_idx);
+        self.select_tab_and_suspend_canvas(tab_idx);
         let target = self.tabs.focused_session_of(tab_idx);
         if let Some(session_idx) = target {
             self.activate_session(session_idx);
@@ -2671,6 +2685,29 @@ mod tests {
 
     /// Auxiliary controller wiring guard; the headless close fixture also
     /// exercises successful/refused closes with the actual method body.
+    #[test]
+    fn canvas_visibility_transition_is_applied_by_both_activation_routes() {
+        let tabs = include_str!("tabs.rs");
+        let input = include_str!("input.rs");
+        let activation = tabs
+            .split_once("    pub fn activate_tab(")
+            .unwrap()
+            .1
+            .split_once("    pub fn close_tab_synced(")
+            .unwrap()
+            .0;
+        assert!(activation.contains("self.select_tab_and_suspend_canvas(tab_idx)"));
+        let direct = input
+            .split_once("    pub fn activate_session(")
+            .unwrap()
+            .1
+            .split_once("self.force_resize_session = true;")
+            .unwrap()
+            .0;
+        assert!(direct.contains("self.select_tab_and_suspend_canvas(tab_idx)"));
+        assert!(!direct.contains("self.tabs.set_active(tab_idx)"));
+    }
+
     #[test]
     fn session_close_revalidates_stable_rename_only_after_success() {
         let source = include_str!("tabs.rs");

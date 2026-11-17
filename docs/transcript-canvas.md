@@ -77,3 +77,28 @@ part of the renderer regression checks.
 Native window screenshots and software-rendered wheel traces validate visible
 intermediate positions separately. These checks do not establish physical-GPU
 frame latency or high-refresh touchpad behavior on a user's Wayland desktop.
+
+### Activation boundary
+
+Ordinary tab activation retires the outgoing tab's canvas motion immediately, for every
+pane, through both tab-selection and direct session-selection entry points.
+This matters for A → B → A input before an intermediate render: the render-time
+hidden-session sweep alone never sees A hidden in that sequence. Selecting the
+same tab does not cancel its animation. Fresh input after reactivation remains
+ordered after the restored anchor.
+
+The focused slice test is:
+
+```sh
+python3 scripts/test-canvas-tab-activation.py --core-canvas /path/to/pinned/core/src/transcript_canvas.rs
+```
+
+Use the exact core revision in Cargo.toml. This compiles the real activation
+method and both canvas modules with explicit session/tab test doubles. It
+checks two outgoing panes, a fast round trip with no hidden render, no-op/invalid
+activation, a non-live fractional reading anchor, and a fresh seek after return.
+Structural changes such as new-tab insertion, detach and removal still rely
+on their existing layout/render visibility handling and are not covered by
+this activation-only regression. It does not start Codex, exercise a
+native tab bar, prove the original reported full-history replay is eliminated,
+or replace full application compilation and native acceptance.

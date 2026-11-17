@@ -1928,7 +1928,7 @@ impl TerminalApp {
             self.bump_active_session_epoch();
         }
         if let Some(tab_idx) = self.tabs.tab_of_session(index) {
-            self.tabs.set_active(tab_idx);
+            self.select_tab_and_suspend_canvas(tab_idx);
             self.layout_mut().focus_session(index);
         }
         self.force_resize_session = true;
