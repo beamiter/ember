@@ -5263,11 +5263,21 @@ impl TerminalRenderer {
                     scrollbar_hovered || self.dragging_scrollbar
                 }
             };
-        let mouse_enabled = terminal.is_mouse_enabled();
+        let mouse_enabled = terminal.application_owns_pointer();
         let rendered_terminal = terminal as *const TerminalState as usize;
-        let primary_pressed =
-            ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
-        let pressed_summary = response.interact_pointer_pos().and_then(|pos| {
+        let primary_press = ui.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    pos,
+                    ..
+                } => Some(*pos),
+                _ => None,
+            })
+        });
+        let primary_pressed = primary_press.is_some();
+        let pressed_summary = primary_press.and_then(|pos| {
             Self::summary_at_position(
                 &summaries,
                 self.canvas_pointer_position(pos),
@@ -5276,19 +5286,15 @@ impl TerminalRenderer {
                 rows,
             )
         });
-        let press_app_mouse_eligible = primary_pressed
-            && response.interact_pointer_pos().is_some_and(|pos| {
-                self.pointer_app_mouse_eligible_projected(terminal, &viewport, pos)
-            });
+        let press_app_mouse_eligible = primary_press
+            .is_some_and(|pos| self.pointer_app_mouse_eligible_projected(terminal, &viewport, pos));
         self.local_selection_terminal = local_selection_capture_after_press(
             self.local_selection_terminal,
             rendered_terminal,
             mouse_enabled && press_app_mouse_eligible,
             interaction_enabled,
-            response.hovered()
-                && ui
-                    .input(|input| input.pointer.latest_pos())
-                    .is_some_and(|pos| content_rect.contains(pos)),
+            (response.hovered() || response.is_pointer_button_down_on())
+                && primary_press.is_some_and(|pos| content_rect.contains(pos)),
             primary_pressed,
             ui.input(|input| input.modifiers.shift),
         );
@@ -5325,7 +5331,7 @@ impl TerminalRenderer {
         // path. This ordering is also mirrored by main.rs before PTY mouse
         // encoding, so a historical card and a live mouse-reporting app never
         // both consume the same edge.
-        let click_pos = response.interact_pointer_pos();
+        let click_pos = primary_press.or_else(|| response.interact_pointer_pos());
         let pointer_in_content = click_pos.is_some_and(|pos| content_rect.contains(pos));
         let block_hit = click_pos.and_then(|pos| {
             self.finished_block_at_position(
@@ -5605,7 +5611,7 @@ impl TerminalRenderer {
             && should_clear_selection_on_click(
                 local_selection_enabled,
                 modifiers.ctrl,
-                tracker_click.is_some(),
+                tracker_click.is_some() || response.clicked(),
                 response.double_clicked(),
                 response.triple_clicked(),
                 self.dragging_scrollbar,
@@ -5683,79 +5689,70 @@ impl TerminalRenderer {
                     } else {
                         0
                     };
-                    terminal.select_word_at_projected(&viewport, row, col);
+                    if let Some(link) = links.iter().find(|link| {
+                        link.line == row && (link.col_start..link.col_end).contains(&col)
+                    }) {
+                        terminal.select_link_in_projection(&viewport, link, links);
+                    } else {
+                        terminal.select_word_at_projected(&viewport, row, col);
+                    }
                     // 同上:双击换选中也一并清掉 block 选中。
                     self.block_click = Some(crate::block_mode::BlockClick::Clear);
                 }
             }
         }
 
-        // Text selection: only when not interacting with scrollbar
+        // Record the anchor on press. Once egui crosses its drag threshold,
+        // the pointer (and a streaming transcript) may already have moved.
         let modifier_block_gesture_owns_drag = block_press_claimed;
         if interaction_enabled
             && local_selection_enabled
-            && response.drag_started()
+            && primary_pressed
             && !self.dragging_scrollbar
             && !modifier_block_gesture_owns_drag
         {
-            if let Some(pos) = response.interact_pointer_pos() {
-                // Only select text if NOT in scrollbar area
-                if pos.x < scrollbar_x {
-                    // Clamp position to rect bounds to prevent underflow
-                    let clamped_x =
-                        (pos.x - content_rect.left()).clamp(0.0, content_rect.width().max(0.0));
-                    let clamped_y = (self.canvas_pointer_position(pos).y - content_rect.top())
-                        .clamp(0.0, rows as f32 * line_height);
-
-                    let col = if char_width > 0.0 {
-                        ((clamped_x / char_width) as usize).min(cols - 1)
-                    } else {
-                        0
-                    };
-                    let row = if line_height > 0.0 {
-                        ((clamped_y / line_height) as usize).min(rows - 1)
-                    } else {
-                        0
-                    };
-                    let alt_held = ui.input(|i| i.modifiers.alt);
-                    if alt_held {
-                        terminal.start_block_selection_projected(&viewport, (row, col));
-                    } else {
-                        terminal.start_selection_projected(&viewport, (row, col));
-                    }
-                    self.block_click = Some(crate::block_mode::BlockClick::Clear);
-                    ui.ctx().request_repaint();
+            if let Some(pos) = click_pos.filter(|pos| pos.x < scrollbar_x) {
+                let (row, col) = grid_position_from_content(
+                    self.canvas_pointer_position(pos),
+                    self.canvas_mapping_rect(content_rect),
+                    char_width,
+                    line_height,
+                    cols,
+                    rows,
+                );
+                if modifiers.alt {
+                    terminal.start_block_selection_projected(&viewport, (row, col));
+                } else {
+                    terminal.start_selection_projected(&viewport, (row, col));
                 }
+                self.block_click = Some(crate::block_mode::BlockClick::Clear);
+                ctx.request_repaint();
             }
         }
 
-        // Update selection end during drag
+        // A move and release can arrive together before egui publishes a drag.
+        let drag_release = primary_released && !response.clicked();
         if interaction_enabled
             && local_selection_enabled
-            && response.dragged()
+            && (response.dragged() || response.drag_stopped() || drag_release)
             && !self.dragging_scrollbar
             && !modifier_block_gesture_owns_drag
         {
-            if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(pos) = response.interact_pointer_pos().or(pointer_latest) {
                 if pos.x < scrollbar_x {
-                    // Clamp position to rect bounds to prevent underflow
-                    let clamped_x =
-                        (pos.x - content_rect.left()).clamp(0.0, content_rect.width().max(0.0));
-                    let clamped_y = (self.canvas_pointer_position(pos).y - content_rect.top())
-                        .clamp(0.0, rows as f32 * line_height);
-
-                    let col = if char_width > 0.0 {
-                        ((clamped_x / char_width) as usize).min(cols - 1)
-                    } else {
-                        0
-                    };
-                    let row = if line_height > 0.0 {
-                        ((clamped_y / line_height) as usize).min(rows - 1)
-                    } else {
-                        0
-                    };
+                    let (row, col) = grid_position_from_content(
+                        self.canvas_pointer_position(pos),
+                        self.canvas_mapping_rect(content_rect),
+                        char_width,
+                        line_height,
+                        cols,
+                        rows,
+                    );
                     terminal.update_selection_projected(&viewport, (row, col));
-                    ui.ctx().request_repaint(); // Force repaint to show selection update
+                    if primary_released {
+                        terminal.normalize_link_selection(&viewport, links);
+                    }
+                    ctx.request_repaint();
                 }
             }
         }
@@ -6156,7 +6153,7 @@ impl TerminalRenderer {
             interactive: interaction_enabled,
             focused: focus_enabled,
             alternate: terminal.is_alt_buffer_active(),
-            app_mouse: terminal.is_mouse_enabled(),
+            app_mouse: terminal.application_owns_pointer(),
             selection: terminal.has_text_selection(),
             preedit: !terminal.preedit_text.is_empty(),
             images: !terminal.kitty_graphics.get_placements().is_empty(),
@@ -6432,15 +6429,17 @@ impl TerminalRenderer {
                 }
             }
 
-            // Link hover changes
             if self.last_rendered_hovered_link != *hovered_link {
-                if let Some(ref link) = self.last_rendered_hovered_link {
-                    if link.line < rows {
-                        dirty_rows[link.line] = true;
-                    }
-                }
-                if let Some(ref link) = hovered_link {
-                    if link.line < rows {
+                for link in links {
+                    if link.line < rows
+                        && [
+                            self.last_rendered_hovered_link.as_ref(),
+                            hovered_link.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .any(|hover| hover.same_reference(link))
+                    {
                         dirty_rows[link.line] = true;
                     }
                 }
@@ -6945,8 +6944,10 @@ impl TerminalRenderer {
                 let mut found = false;
                 for link in row_links {
                     if col_idx >= link.col_start && col_idx < link.col_end {
-                        let is_hovered_link =
-                            hovered_link.as_ref().map(|l| l == *link).unwrap_or(false);
+                        let is_hovered_link = hovered_link
+                            .as_ref()
+                            .map(|l| l.same_reference(link))
+                            .unwrap_or(false);
                         if is_hovered_link {
                             fg_color = hovered_link_color();
                         }
@@ -7270,8 +7271,10 @@ impl TerminalRenderer {
                     let mut found = false;
                     for link in row_links {
                         if col_idx >= link.col_start && col_idx < link.col_end {
-                            let is_hovered_link =
-                                hovered_link.as_ref().map(|l| l == *link).unwrap_or(false);
+                            let is_hovered_link = hovered_link
+                                .as_ref()
+                                .map(|l| l.same_reference(link))
+                                .unwrap_or(false);
                             if is_hovered_link {
                                 fg_color = hovered_link_color();
                             }
@@ -13348,6 +13351,89 @@ mod transcript_canvas_tests {
         );
         assert_eq!(renderer.canvas_geometry.translation, translation);
         assert!(!state.follows_bottom());
+    }
+
+    #[test]
+    fn inline_cli_drag_keeps_the_press_cell_during_output() {
+        let (mut renderer, _, policy) = fixture(false);
+        renderer.continuous_block = true;
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.set_inline_cli_launch(true);
+        terminal.process_input(b"\x1b[?1002hfirst selected\r\nsecond selected\r\n");
+        assert!(terminal.is_mouse_enabled());
+        assert!(!terminal.application_owns_pointer());
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 200.0));
+        let frame = |renderer: &mut TerminalRenderer,
+                     terminal: &mut TerminalState,
+                     state: &mut ProjectionViewState,
+                     canvas: &mut TranscriptCanvas,
+                     events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let viewport = renderer.canvas_viewport(terminal, &policy, state, canvas, &ctx);
+                    renderer.set_projection_frame(terminal, viewport, &policy);
+                    renderer.render_in_rect(
+                        ui,
+                        terminal,
+                        true,
+                        true,
+                        false,
+                        &Default::default(),
+                        &[],
+                        &None,
+                        rect,
+                    );
+                },
+            ).textures_delta.clear();
+        };
+        frame(
+            &mut renderer,
+            &mut terminal,
+            &mut state,
+            &mut canvas,
+            vec![],
+        );
+        let content = renderer.last_content_rect.unwrap();
+        let point =
+            |row: f32, col: f32| content.min + egui::vec2(9.0 * (col + 0.5), 20.0 * (row + 0.5));
+        let start = point(0.0, 0.0);
+        let end = point(1.0, 14.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        canvas.pause_follow();
+        state.pause_canvas_follow();
+        frame(
+            &mut renderer,
+            &mut terminal,
+            &mut state,
+            &mut canvas,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        terminal.process_input(b"\x1b[?2026hworking...\r\n\x1b[?2026l");
+        frame(
+            &mut renderer,
+            &mut terminal,
+            &mut state,
+            &mut canvas,
+            vec![egui::Event::PointerMoved(end), button(end, false)],
+        );
+        let selected = terminal.copy_selection().unwrap();
+        assert_eq!(
+            selected.lines().map(str::trim_end).collect::<Vec<_>>(),
+            ["first selected", "second selected"]
+        );
     }
 
     #[test]

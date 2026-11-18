@@ -38,6 +38,7 @@ pub enum LinkType {
 /// 单个链接的信息
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Link {
+    pub(crate) group: Option<(usize, usize)>,
     /// 链接所在行
     pub line: usize,
     /// 列起始位置
@@ -48,6 +49,48 @@ pub struct Link {
     pub link_type: LinkType,
     /// 链接文本/URL
     pub text: String,
+}
+
+impl Link {
+    pub(crate) fn same_reference(&self, other: &Self) -> bool {
+        if let Some(group) = self.group {
+            other.group == Some(group)
+                && self.link_type == other.link_type
+                && self.text == other.text
+        } else {
+            self == other
+        }
+    }
+
+    pub(crate) fn selection_bounds(&self, links: &[Self]) -> ((usize, usize), (usize, usize)) {
+        let mut start = (self.line, self.col_start);
+        let mut end = (self.line, self.col_end - 1);
+        for link in links.iter().filter(|link| self.same_reference(link)) {
+            start = start.min((link.line, link.col_start));
+            end = end.max((link.line, link.col_end - 1));
+        }
+        (start, end)
+    }
+}
+
+/// Spans share a reference even when only one of its fragments was covered.
+pub(crate) fn keep_uncovered(candidates: &mut Vec<Link>, authoritative: &[Link]) {
+    if authoritative.is_empty() {
+        return;
+    }
+    let mut covered = std::collections::HashSet::new();
+    candidates.retain(|link| {
+        let overlaps = authoritative.iter().any(|other| {
+            other.line == link.line
+                && other.col_start < link.col_end
+                && link.col_start < other.col_end
+        });
+        if overlaps {
+            covered.extend(link.group);
+        }
+        !overlaps
+    });
+    candidates.retain(|link| link.group.is_none_or(|group| !covered.contains(&group)));
 }
 
 /// 链接检测配置
@@ -128,6 +171,7 @@ impl LinkDetector {
             url_spans.push((col_start, col_end));
             if self.config.detect_urls && crate::terminal::is_supported_hyperlink_uri(url) {
                 links.push(Link {
+                    group: None,
                     line: line_idx,
                     col_start,
                     col_end,
@@ -163,6 +207,7 @@ impl LinkDetector {
                         .any(|l| l.col_start <= col_start && col_end <= l.col_end)
                 {
                     links.push(Link {
+                        group: None,
                         line: line_idx,
                         col_start,
                         col_end,
@@ -209,6 +254,7 @@ impl LinkDetector {
                     && Self::is_valid_file_path(matched_text)
                 {
                     links.push(Link {
+                        group: None,
                         line: line_idx,
                         col_start,
                         col_end,
@@ -294,6 +340,8 @@ impl LinkDetector {
                 // Start at the first overlapping row instead of rescanning the
                 // entire wrapped paragraph for every detected link.
                 let first = rows.partition_point(|&(_, _, end)| end <= link.col_start);
+                let (line, _, end) = rows[first];
+                let group = (link.col_end > end).then(|| (line, columns[link.col_start].0));
                 for &(line, start, end) in &rows[first..] {
                     if start >= link.col_end {
                         break;
@@ -302,6 +350,7 @@ impl LinkDetector {
                     let to = end.min(link.col_end);
                     if from < to {
                         all_links.push(Link {
+                            group,
                             line,
                             col_start: columns[from].0,
                             col_end: columns[to - 1].1,
@@ -315,7 +364,86 @@ impl LinkDetector {
             columns.clear();
             rows.clear();
         }
+        let delimited = Self::detect_delimited_links(visible_cells.iter().map(|row| row.as_ref()));
+        keep_uncovered(&mut all_links, &delimited);
+        all_links.extend(delimited.into_iter().filter(|link| match link.link_type {
+            LinkType::Url => {
+                self.config.detect_urls && jterm_core::link::is_openable_url(&link.text)
+            }
+            LinkType::FilePath => {
+                self.config.detect_file_paths
+                    && !jterm_core::review_input::contains_visual_spoofing(&link.text)
+            }
+            LinkType::IpAddress => false,
+        }));
         all_links
+    }
+
+    fn detect_delimited_links<'a>(
+        rows: impl Iterator<Item = &'a [crate::terminal::TerminalCell]>,
+    ) -> Vec<Link> {
+        let rows: Vec<_> = rows.collect();
+        if !rows
+            .iter()
+            .any(|row| row.iter().any(|cell| cell.character == '('))
+        {
+            return Vec::new();
+        }
+        let mut text_rows = Vec::with_capacity(rows.len());
+        let mut columns = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut text = String::new();
+            let mut cells: Vec<(usize, usize, usize)> = Vec::new();
+            for (col, cell) in row.iter().enumerate() {
+                if cell.flags.wide_continuation() {
+                    if let Some(last) = cells.last_mut() {
+                        last.2 = col + 1;
+                    }
+                } else {
+                    cells.push((text.len(), col, col + 1));
+                    text.push(cell.character);
+                }
+            }
+            let fills_width = row
+                .iter()
+                .rposition(|cell| !cell.flags.wide_continuation() && cell.character != ' ')
+                .is_some_and(|column| {
+                    column + 1 + usize::from(row[column].flags.wide())
+                        >= row.len().saturating_sub(1)
+                });
+            text_rows.push((text, fills_width));
+            columns.push(cells);
+        }
+        let rows: Vec<_> = text_rows
+            .iter()
+            .map(|(text, fills)| (text.as_str(), *fills))
+            .collect();
+        let mut links = Vec::new();
+        for reference in crate::delimited_reference::detect(&rows) {
+            let link_type = if reference.web {
+                LinkType::Url
+            } else {
+                LinkType::FilePath
+            };
+            let (first, start) = &reference.spans[0];
+            let first_cell = columns[*first].partition_point(|&(byte, _, _)| byte < start.start);
+            let group =
+                (reference.spans.len() > 1).then_some((*first, columns[*first][first_cell].1));
+            for (line, span) in reference.spans {
+                let cells = &columns[line];
+                let start = cells.partition_point(|&(byte, _, _)| byte < span.start);
+                let end = cells.partition_point(|&(byte, _, _)| byte < span.end);
+                links.push(Link {
+                    group,
+                    line,
+                    col_start: cells[start].1,
+                    col_end: cells[end - 1].2,
+                    link_type,
+                    text: reference.target.clone(),
+                });
+            }
+        }
+        links
     }
 
     /// Detect both textual links and explicit OSC 8 hyperlinks. Explicit
@@ -349,6 +477,7 @@ impl LinkDetector {
 
                 if let Some(target) = resolve_hyperlink(id) {
                     explicit_links.push(Link {
+                        group: None,
                         line: line_idx,
                         col_start,
                         col_end: col,
@@ -361,13 +490,7 @@ impl LinkDetector {
 
         let mut detected =
             self.detect_links_in_visible_cells_with_wrapping(visible_cells, row_wrapped);
-        detected.retain(|candidate| {
-            !explicit_links.iter().any(|explicit| {
-                explicit.line == candidate.line
-                    && explicit.col_start < candidate.col_end
-                    && candidate.col_start < explicit.col_end
-            })
-        });
+        keep_uncovered(&mut detected, &explicit_links);
         explicit_links.extend(detected);
         explicit_links
     }
@@ -553,6 +676,7 @@ mod tests {
             let (cells, wraps) = parsed_link_cells(text, 80);
             assert!(cells[0].iter().any(|cell| cell.flags.wide_continuation()));
             let expected = vec![Link {
+                group: None,
                 line: 0,
                 col_start: start,
                 col_end: end,
@@ -601,6 +725,65 @@ mod tests {
     }
 
     #[test]
+    fn hard_wrap_at_a_full_width_cjk_cell_keeps_both_fragments() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let (cells, wraps) = parsed_link_cells("(/tmp/中文\r\n报告.md)", 10);
+        let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
+        assert_eq!(links.len(), 2);
+        assert!(links[0].same_reference(&links[1]));
+        assert_eq!(links[0].text, "/tmp/中文报告.md");
+        assert_eq!(links[0].col_end, 10);
+    }
+
+    #[test]
+    fn rejected_wrapped_authority_does_not_open_its_first_fragment() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let (cells, wraps) =
+            parsed_link_cells("(https://safe.example-\r\n@other.example/path)", 80);
+        assert!(detector
+            .detect_links_in_visible_cells_with_wrapping(&cells, &wraps)
+            .is_empty());
+    }
+
+    #[test]
+    fn codex_hard_wrapped_file_targets_share_one_hit_and_selection() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let input =
+            "路线图 (/tmp/中 文/PMG-SOTA-\r\n    roadmap.canvas.tsx) · (reports/接触 优化.md)";
+        let (cells, wraps) = parsed_link_cells(input, 80);
+        assert!(wraps.iter().all(|wrapped| !wrapped));
+        let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
+        assert_eq!(links.len(), 3);
+        let first = links.iter().find(|link| link.line == 0).unwrap();
+        let second = links
+            .iter()
+            .find(|link| link.col_start == 4 && link.line == 1)
+            .unwrap();
+        assert!(first.same_reference(second));
+        assert_eq!(first.text, "/tmp/中 文/PMG-SOTA-roadmap.canvas.tsx");
+        assert_eq!(first.selection_bounds(&links), ((0, 8), (1, 21)));
+        assert_eq!(links[2].text, "reports/接触 优化.md");
+
+        let mut terminal = crate::terminal::TerminalState::new(80, 3);
+        terminal.process_input(input.as_bytes());
+        let viewport =
+            terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), false);
+        terminal.select_link_in_projection(&viewport, second, &links);
+        assert_eq!(
+            terminal.copy_selection().as_deref(),
+            Some(first.text.as_str())
+        );
+        let (start, end) = first.selection_bounds(&links);
+        terminal.start_selection_projected(&viewport, end);
+        terminal.update_selection_projected(&viewport, start);
+        terminal.normalize_link_selection(&viewport, &links);
+        assert_eq!(
+            terminal.copy_selection().as_deref(),
+            Some(first.text.as_str())
+        );
+    }
+
+    #[test]
     fn parsed_wide_links_split_wrapped_cells_without_joining_real_spaces() {
         let detector = LinkDetector::new(LinkDetectionConfig::default());
         let target = "https://example.com/界x";
@@ -614,6 +797,7 @@ mod tests {
             links,
             vec![
                 Link {
+                    group: Some((0, 0)),
                     line: 0,
                     col_start: 0,
                     col_end: 22,
@@ -621,6 +805,7 @@ mod tests {
                     text: target.into()
                 },
                 Link {
+                    group: Some((0, 0)),
                     line: 1,
                     col_start: 0,
                     col_end: 1,
@@ -683,6 +868,7 @@ mod tests {
         assert_eq!(
             links,
             vec![Link {
+                group: None,
                 line: 7,
                 col_start: 2,
                 col_end: 2 + target.chars().count(),
@@ -714,6 +900,7 @@ mod tests {
             links,
             vec![
                 Link {
+                    group: Some((0, 2)),
                     line: 0,
                     col_start: 2,
                     col_end: 10,
@@ -721,6 +908,7 @@ mod tests {
                     text: target.into()
                 },
                 Link {
+                    group: Some((0, 2)),
                     line: 1,
                     col_start: 0,
                     col_end: 12,
@@ -728,6 +916,7 @@ mod tests {
                     text: target.into()
                 },
                 Link {
+                    group: Some((0, 2)),
                     line: 2,
                     col_start: 0,
                     col_end: 7,
@@ -735,6 +924,7 @@ mod tests {
                     text: target.into()
                 },
                 Link {
+                    group: None,
                     line: 3,
                     col_start: 0,
                     col_end: 9,
@@ -830,6 +1020,7 @@ mod tests {
             "shell:touch-dangerous",
         ] {
             let link = Link {
+                group: None,
                 line: 0,
                 col_start: 0,
                 col_end: 1,

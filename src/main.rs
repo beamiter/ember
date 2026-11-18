@@ -17,6 +17,7 @@ mod config;
 mod config_panel;
 mod debug;
 mod debug_panel;
+mod delimited_reference;
 mod eva_companion;
 mod eva_glyphs;
 mod execution_journal;
@@ -7368,7 +7369,7 @@ impl eframe::App for TerminalApp {
         let mouse_enabled = {
             let terminal = session.terminal.lock();
             session.purpose != crate::session::SessionPurpose::RetainedCommand
-                && terminal.is_mouse_enabled()
+                && terminal.application_owns_pointer()
         };
         let shift_mouse_bypass = ctx.input(|input| input.modifiers.shift);
         let pointer_pos =
@@ -7612,7 +7613,10 @@ impl eframe::App for TerminalApp {
                         &mouse_projection_viewport,
                     )
                     .filter(|link| {
-                        link::host_activation_allowed(link.link_type, terminal.is_mouse_enabled())
+                        link::host_activation_allowed(
+                            link.link_type,
+                            terminal.application_owns_pointer(),
+                        )
                     }) {
                         self.pending_link_activation =
                             Some(crate::app::state::PendingLinkActivation {
@@ -8348,7 +8352,7 @@ impl eframe::App for TerminalApp {
                     })
             };
             self.hovered_link = self.hovered_link.take().filter(|link| {
-                link::host_activation_allowed(link.link_type, terminal.is_mouse_enabled())
+                link::host_activation_allowed(link.link_type, terminal.application_owns_pointer())
             });
             let hovered_link_eligible = pointer.is_some_and(|pos| {
                 let renderer = active_pane_renderer_idx
@@ -8392,13 +8396,28 @@ impl eframe::App for TerminalApp {
             // only a drag/session change/multiclick cancels it here.
             if let Some(pending) = self.pending_link_activation.as_mut() {
                 if pending.session_id != active_session_id
-                    || ctx.input(|input| {
-                        input.pointer.any_down()
-                            && input
-                                .pointer
-                                .hover_pos()
-                                .is_some_and(|pos| link_activation_dragged(pending.origin, pos))
-                    })
+                    || (pending.released_at.is_none()
+                        && ctx.input(|input| {
+                            let start = input.events.iter().rposition(|event| {
+                                matches!(event, egui::Event::PointerButton {
+                                    button: egui::PointerButton::Primary,
+                                    pressed: true,
+                                    pos,
+                                    ..
+                                } if *pos == pending.origin)
+                            }).map_or(0, |index| index + 1);
+                            input.events[start..].iter().any(|event| match event {
+                                egui::Event::PointerMoved(pos)
+                                | egui::Event::PointerButton {
+                                    button: egui::PointerButton::Primary,
+                                    pressed: false,
+                                    pos,
+                                    ..
+                                } => link_activation_dragged(pending.origin, *pos),
+                                egui::Event::PointerGone | egui::Event::WindowFocused(false) => true,
+                                _ => false,
+                            })
+                        }))
                 {
                     pending.cancelled = true;
                 }
@@ -8595,7 +8614,7 @@ impl eframe::App for TerminalApp {
                 PrimaryCopyRoute::Generic => {
                     let session = self.session_manager.get_active_session_mut();
                     let terminal = session.terminal.lock();
-                    if terminal.is_mouse_enabled() {
+                    if terminal.application_owns_pointer() {
                         None
                     } else {
                         terminal.copy_selection()
@@ -9618,6 +9637,7 @@ mod tests {
         );
 
         let link = crate::link::Link {
+            group: None,
             line: summary_row,
             col_start: 0,
             col_end: 1,
@@ -9637,6 +9657,7 @@ mod tests {
         );
 
         let live_link = crate::link::Link {
+            group: None,
             line: live_row,
             col_start: 0,
             col_end: 1,

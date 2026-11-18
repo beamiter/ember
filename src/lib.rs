@@ -10,6 +10,7 @@ pub mod color;
 pub mod command_palette;
 pub mod config;
 pub mod debug;
+mod delimited_reference;
 mod fold_preview;
 #[cfg(test)]
 mod font_zoom;

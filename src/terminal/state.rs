@@ -237,6 +237,7 @@ impl super::TerminalState {
             scrollback: VecDeque::new(),
             selection: None,
             projected_selection: None,
+            selection_link_text: None,
             selection_revision: 1,
             #[cfg(test)]
             search_source_epoch: search_chunk::next_source_epoch(),
@@ -4198,6 +4199,12 @@ impl super::TerminalState {
             .get_mouse_release_report(button, col, row)
     }
 
+    /// Inline agent transcripts are a native reading surface even if the
+    /// agent enables mouse reporting for its own TUI.
+    pub fn application_owns_pointer(&self) -> bool {
+        self.is_mouse_enabled() && self.inline_cli_scope_floor().is_none()
+    }
+
     pub fn is_mouse_enabled(&self) -> bool {
         self.protocol.modes().is_mouse_enabled()
     }
@@ -6193,7 +6200,10 @@ impl super::TerminalState {
     }
 
     pub fn clear_text_selection(&mut self) {
-        if self.selection.take().is_some() || self.projected_selection.take().is_some() {
+        self.selection_link_text = None;
+        let raw = self.selection.take();
+        let projected = self.projected_selection.take();
+        if raw.is_some() || projected.is_some() {
             self.bump_selection_revision();
         }
     }
@@ -6204,12 +6214,14 @@ impl super::TerminalState {
     }
 
     fn set_raw_selection(&mut self, selection: Selection) {
+        self.selection_link_text = None;
         self.projected_selection = None;
         self.selection = Some(selection);
         self.bump_selection_revision();
     }
 
     fn set_projected_selection(&mut self, selection: ProjectedSelection) {
+        self.selection_link_text = None;
         self.selection = None;
         self.projected_selection = Some(selection);
         self.bump_selection_revision();
@@ -6456,6 +6468,7 @@ impl super::TerminalState {
         viewport: &ProjectedViewport,
         display_pos: (usize, usize),
     ) {
+        self.selection_link_text = None;
         if self.projection_unavailable().is_some() || !viewport.is_available() {
             return;
         }
@@ -6982,7 +6995,85 @@ impl super::TerminalState {
         Some(result)
     }
 
+    pub(crate) fn select_link_in_projection(
+        &mut self,
+        viewport: &ProjectedViewport,
+        link: &crate::link::Link,
+        links: &[crate::link::Link],
+    ) {
+        let (start, end) = link.selection_bounds(links);
+        self.start_selection_projected(viewport, start);
+        if start != end {
+            self.update_selection_projected(viewport, end);
+        }
+        self.remember_link_selection(link);
+    }
+
+    /// If a normal drag covered the exact link, copy its logical destination.
+    /// Any larger range or rectangular selection keeps the original layout.
+    pub(crate) fn normalize_link_selection(
+        &mut self,
+        viewport: &ProjectedViewport,
+        links: &[crate::link::Link],
+    ) {
+        for link in links.iter().filter(|link| link.group == Some((link.line, link.col_start))) {
+            let (start, end) = link.selection_bounds(links);
+            if self.selection_matches_link(viewport, start, end) {
+                self.remember_link_selection(link);
+                break;
+            }
+        }
+    }
+
+    fn selection_matches_link(
+        &self,
+        viewport: &ProjectedViewport,
+        start: (usize, usize),
+        end: (usize, usize),
+    ) -> bool {
+        let matches = |anchor: (usize, usize), active: (usize, usize), start, end| {
+            (anchor.min(active), anchor.max(active)) == (start, end)
+        };
+        if let Some(selection) = &self.projected_selection {
+            let (Some(start), Some(end)) = (
+                Self::projected_selection_point(viewport, start),
+                Self::projected_selection_point(viewport, end),
+            ) else { return false };
+            return selection.mode == SelectionMode::Normal
+                && matches(selection.anchor.point, selection.active.point, start.point, end.point);
+        }
+        self.selection.is_some_and(|selection| {
+            selection.mode == SelectionMode::Normal
+                && matches(
+                    selection.anchor,
+                    selection.active,
+                    (viewport.legacy_absolute_row(start.0), start.1),
+                    (viewport.legacy_absolute_row(end.0), end.1),
+                )
+        })
+    }
+
+    fn remember_link_selection(&mut self, link: &crate::link::Link) {
+        if let Some(displayed) = self.copy_displayed_selection() {
+            if displayed != link.text
+                && displayed.lines().map(str::trim).collect::<String>() == link.text
+            {
+                self.selection_link_text = Some((displayed, link.text.clone()));
+            }
+        }
+    }
+
     pub fn copy_selection(&self) -> Option<String> {
+        let displayed = self.copy_displayed_selection()?;
+        if let Some((original, target)) = &self.selection_link_text {
+            if displayed == *original {
+                return Some(target.clone());
+            }
+        }
+        Some(displayed)
+    }
+
+    fn copy_displayed_selection(&self) -> Option<String> {
         if self.projection_unavailable().is_some() {
             return None;
         }
