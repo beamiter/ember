@@ -364,7 +364,9 @@ impl LinkDetector {
             columns.clear();
             rows.clear();
         }
-        let delimited = Self::detect_delimited_links(visible_cells.iter().map(|row| row.as_ref()));
+        let (delimited, blocked) =
+            Self::detect_delimited_links(visible_cells.iter().map(|row| row.as_ref()), row_wrapped);
+        keep_uncovered(&mut all_links, &blocked);
         keep_uncovered(&mut all_links, &delimited);
         all_links.extend(delimited.into_iter().filter(|link| match link.link_type {
             LinkType::Url => {
@@ -381,13 +383,29 @@ impl LinkDetector {
 
     fn detect_delimited_links<'a>(
         rows: impl Iterator<Item = &'a [crate::terminal::TerminalCell]>,
-    ) -> Vec<Link> {
+        soft_wraps: &[bool],
+    ) -> (Vec<Link>, Vec<Link>) {
         let rows: Vec<_> = rows.collect();
+        let mut safe_wraps = soft_wraps.to_vec();
+        if safe_wraps.len() == rows.len() {
+            for index in 0..rows.len().saturating_sub(1) {
+                // A wide glyph that cannot fit can leave an unmarked blank in
+                // the previous last cell. The grid cannot prove whether that
+                // blank was typed; fail closed instead of inventing a filename.
+                if rows[index].last().is_some_and(|cell| cell.character == ' ')
+                    && rows[index + 1]
+                        .first()
+                        .is_some_and(|cell| cell.flags.wide())
+                {
+                    safe_wraps[index] = false;
+                }
+            }
+        }
         if !rows
             .iter()
             .any(|row| row.iter().any(|cell| cell.character == '('))
         {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let mut text_rows = Vec::with_capacity(rows.len());
         let mut columns = Vec::with_capacity(rows.len());
@@ -419,7 +437,8 @@ impl LinkDetector {
             .map(|(text, fills)| (text.as_str(), *fills))
             .collect();
         let mut links = Vec::new();
-        for reference in crate::delimited_reference::detect(&rows) {
+        let mut blocked = Vec::new();
+        for reference in crate::delimited_reference::detect(&rows, &safe_wraps) {
             let link_type = if reference.web {
                 LinkType::Url
             } else {
@@ -433,7 +452,12 @@ impl LinkDetector {
                 let cells = &columns[line];
                 let start = cells.partition_point(|&(byte, _, _)| byte < span.start);
                 let end = cells.partition_point(|&(byte, _, _)| byte < span.end);
-                links.push(Link {
+                let destination = if reference.ambiguous {
+                    &mut blocked
+                } else {
+                    &mut links
+                };
+                destination.push(Link {
                     group,
                     line,
                     col_start: cells[start].1,
@@ -443,7 +467,7 @@ impl LinkDetector {
                 });
             }
         }
-        links
+        (links, blocked)
     }
 
     /// Detect both textual links and explicit OSC 8 hyperlinks. Explicit
@@ -729,10 +753,7 @@ mod tests {
         let detector = LinkDetector::new(LinkDetectionConfig::default());
         let (cells, wraps) = parsed_link_cells("(/tmp/中文\r\n报告.md)", 10);
         let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
-        assert_eq!(links.len(), 2);
-        assert!(links[0].same_reference(&links[1]));
-        assert_eq!(links[0].text, "/tmp/中文报告.md");
-        assert_eq!(links[0].col_end, 10);
+        assert!(links.is_empty());
     }
 
     #[test]
@@ -746,41 +767,99 @@ mod tests {
     }
 
     #[test]
-    fn codex_hard_wrapped_file_targets_share_one_hit_and_selection() {
+    fn ambiguous_physical_destinations_never_open_fragments() {
         let detector = LinkDetector::new(LinkDetectionConfig::default());
-        let input =
-            "路线图 (/tmp/中 文/PMG-SOTA-\r\n    roadmap.canvas.tsx) · (reports/接触 优化.md)";
-        let (cells, wraps) = parsed_link_cells(input, 80);
-        assert!(wraps.iter().all(|wrapped| !wrapped));
-        let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
-        assert_eq!(links.len(), 3);
-        let first = links.iter().find(|link| link.line == 0).unwrap();
-        let second = links
-            .iter()
-            .find(|link| link.col_start == 4 && link.line == 1)
-            .unwrap();
-        assert!(first.same_reference(second));
-        assert_eq!(first.text, "/tmp/中 文/PMG-SOTA-roadmap.canvas.tsx");
-        assert_eq!(first.selection_bounds(&links), ((0, 8), (1, 21)));
-        assert_eq!(links[2].text, "reports/接触 优化.md");
+        for input in [
+            "(reports/a-\r\n  sub/file.bin)",
+            "(reports/a-\r\n  sub/file.md )",
+            "(https://trusted.example-\r\n attacker.test/path)",
+            "(https://trusted.example\r\n attacker.test/path)",
+        ] {
+            let (cells, wraps) = parsed_link_cells(input, 80);
+            assert!(
+                detector
+                    .detect_links_in_visible_cells_with_wrapping(&cells, &wraps)
+                    .is_empty(),
+                "{input}"
+            );
+        }
+    }
 
-        let mut terminal = crate::terminal::TerminalState::new(80, 3);
-        terminal.process_input(input.as_bytes());
+    #[test]
+    fn rejected_soft_wrapped_file_blocks_ordinary_fragments() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        for input in ["(reports/a-  sub/file.md )", "(reports/a-  sub/file.bin)"] {
+            let (cells, wraps) = parsed_link_cells(input, 12);
+            assert!(wraps.iter().any(|wrapped| *wrapped));
+            assert!(
+                detector
+                    .detect_links_in_visible_cells_with_wrapping(&cells, &wraps)
+                    .is_empty(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_wrap_padding_cannot_become_a_different_filename() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        // The opening parenthesis plus reports/a consumes ten columns. A
+        // two-cell glyph cannot fit in the eleventh remaining cell.
+        let (cells, wraps) = parsed_link_cells("(reports/a界.md)", 11);
+        assert!(wraps[0]);
+        assert_eq!(cells[0].last().unwrap().character, ' ');
+        assert!(cells[1][0].flags.wide());
+        assert!(detector
+            .detect_links_in_visible_cells_with_wrapping(&cells, &wraps)
+            .is_empty());
+    }
+
+    #[test]
+    fn raw_copy_keeps_wide_wrap_geometry() {
+        let mut terminal = crate::terminal::TerminalState::new(5, 3);
+        terminal.process_input("abcd界x".as_bytes());
+        terminal.start_selection((0, 0));
+        terminal.update_selection((1, 2));
+        assert_eq!(terminal.copy_selection().as_deref(), Some("abcd界x"));
+    }
+
+    #[test]
+    fn soft_wrapped_file_preserves_literal_spaces() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let (cells, wraps) = parsed_link_cells("(reports/a-  b.md)", 12);
+        let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
+        assert!(!links.is_empty());
+        assert!(links.iter().all(|link| link.text == "reports/a-  b.md"));
+        let mut terminal = crate::terminal::TerminalState::new(12, 3);
+        terminal.process_input(b"(reports/a-  b.md)");
         let viewport =
             terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), false);
-        terminal.select_link_in_projection(&viewport, second, &links);
+        terminal.select_link_in_projection(&viewport, &links[0], &links);
         assert_eq!(
             terminal.copy_selection().as_deref(),
-            Some(first.text.as_str())
+            Some("reports/a-  b.md")
         );
-        let (start, end) = first.selection_bounds(&links);
+        let (start, end) = links[0].selection_bounds(&links);
         terminal.start_selection_projected(&viewport, end);
         terminal.update_selection_projected(&viewport, start);
         terminal.normalize_link_selection(&viewport, &links);
         assert_eq!(
             terminal.copy_selection().as_deref(),
-            Some(first.text.as_str())
+            Some("reports/a-  b.md")
         );
+        // Identical non-space bytes are not sufficient identity evidence.
+        let mut mismatched = links.clone();
+        for link in &mut mismatched {
+            link.text = "reports/a-b .md".into();
+        }
+        terminal.select_link_in_projection(&viewport, &mismatched[0], &mismatched);
+        assert_ne!(
+            terminal.copy_selection().as_deref(),
+            Some("reports/a-b .md")
+        );
+        assert!(detector
+            .detect_links_in_visible_cells_with_wrapping(&cells, &[])
+            .is_empty());
     }
 
     #[test]

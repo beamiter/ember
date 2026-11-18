@@ -478,7 +478,7 @@ pub struct TerminalState {
     pub scrollback: VecDeque<ScrollbackLine>,
     pub selection: Option<Selection>,
     projected_selection: Option<ProjectedSelection>,
-    selection_link_text: Option<(String, String)>,
+    selection_link_text: Option<(String, String, bool)>,
     selection_revision: u64,
     pub scroll_offset: usize,
     max_scrollback: usize,

@@ -7016,7 +7016,10 @@ impl super::TerminalState {
         viewport: &ProjectedViewport,
         links: &[crate::link::Link],
     ) {
-        for link in links.iter().filter(|link| link.group == Some((link.line, link.col_start))) {
+        for link in links
+            .iter()
+            .filter(|link| link.group == Some((link.line, link.col_start)))
+        {
             let (start, end) = link.selection_bounds(links);
             if self.selection_matches_link(viewport, start, end) {
                 self.remember_link_selection(link);
@@ -7038,9 +7041,16 @@ impl super::TerminalState {
             let (Some(start), Some(end)) = (
                 Self::projected_selection_point(viewport, start),
                 Self::projected_selection_point(viewport, end),
-            ) else { return false };
+            ) else {
+                return false;
+            };
             return selection.mode == SelectionMode::Normal
-                && matches(selection.anchor.point, selection.active.point, start.point, end.point);
+                && matches(
+                    selection.anchor.point,
+                    selection.active.point,
+                    start.point,
+                    end.point,
+                );
         }
         self.selection.is_some_and(|selection| {
             selection.mode == SelectionMode::Normal
@@ -7055,18 +7065,32 @@ impl super::TerminalState {
 
     fn remember_link_selection(&mut self, link: &crate::link::Link) {
         if let Some(displayed) = self.copy_displayed_selection() {
+            let exact_file = link.link_type == crate::link::LinkType::FilePath
+                && link.group.is_some()
+                && self
+                    .copy_displayed_selection_with_soft_spaces(true)
+                    .as_deref()
+                    == Some(link.text.as_str());
             if displayed != link.text
-                && displayed.lines().map(str::trim).collect::<String>() == link.text
+                && (exact_file
+                    || (link.link_type != crate::link::LinkType::FilePath
+                        && displayed.lines().map(str::trim).collect::<String>() == link.text))
             {
-                self.selection_link_text = Some((displayed, link.text.clone()));
+                self.selection_link_text = Some((displayed, link.text.clone(), exact_file));
             }
         }
     }
 
     pub fn copy_selection(&self) -> Option<String> {
         let displayed = self.copy_displayed_selection()?;
-        if let Some((original, target)) = &self.selection_link_text {
-            if displayed == *original {
+        if let Some((original, target, exact_file)) = &self.selection_link_text {
+            if displayed == *original
+                && (!exact_file
+                    || self
+                        .copy_displayed_selection_with_soft_spaces(true)
+                        .as_deref()
+                        == Some(target.as_str()))
+            {
                 return Some(target.clone());
             }
         }
@@ -7074,6 +7098,16 @@ impl super::TerminalState {
     }
 
     fn copy_displayed_selection(&self) -> Option<String> {
+        self.copy_displayed_selection_with_soft_spaces(false)
+    }
+
+    // For exact file-link selection validation only: compare the selected
+    // source bytes before legacy soft-wrap padding removal. Never infer where
+    // missing spaces belonged from a whitespace-normalized string.
+    fn copy_displayed_selection_with_soft_spaces(
+        &self,
+        preserve_soft_spaces: bool,
+    ) -> Option<String> {
         if self.projection_unavailable().is_some() {
             return None;
         }
@@ -7151,7 +7185,7 @@ impl super::TerminalState {
 
                 // 软换行(URL 等被终端宽度截断)拼接时去掉尾部填充空白,
                 // 避免还原后的字符串里夹杂大段空格。
-                if !block && row_wrapped && abs_row < last_row {
+                if !preserve_soft_spaces && !block && row_wrapped && abs_row < last_row {
                     let trimmed_len = line_buf.trim_end_matches(' ').len();
                     line_buf.truncate(trimmed_len);
                 }
