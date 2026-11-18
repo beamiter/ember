@@ -88,11 +88,26 @@ impl LocalPreviewPanel {
         self.error = None;
         Ok(())
     }
+    fn close(&mut self) {
+        self.visible = false;
+        self.candidate = None;
+        self.text = None;
+        self.texture = None;
+        self.error = None;
+        self.location = None;
+        self.seek_pending = false;
+        // Keep the receiver until completion: a blocked filesystem worker must
+        // still occupy the one-worker slot even after its UI is dismissed.
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, active_session_id: &str) {
         if let Some(rx) = &self.pending {
             match rx.try_recv() {
                 Ok(result) => {
                     self.pending = None;
+                    if !self.visible {
+                        return;
+                    }
                     match result {
                         Ok(loaded) => {
                             self.path = loaded.path;
@@ -116,7 +131,9 @@ impl LocalPreviewPanel {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending = None;
-                    self.error = Some("Preview worker stopped".into());
+                    if self.visible {
+                        self.error = Some("Preview worker stopped".into());
+                    }
                 }
                 Err(mpsc::TryRecvError::Empty) => ui
                     .ctx()
@@ -134,7 +151,7 @@ impl LocalPreviewPanel {
                 ui.horizontal(|ui| {
                     ui.strong("File preview · read only");
                     if ui.button("Close").clicked() {
-                        self.visible = false;
+                        self.close();
                     }
                 });
                 ui.label(crate::sidebar::bound_sidebar_path_label(&self.path));
@@ -444,7 +461,64 @@ mod tests {
         let _ = frame(&mut panel, &ctx, "owner", events);
         assert!(!panel.visible);
         assert!(panel.pending.is_none());
+        assert!(panel.candidate.is_none());
     }
+    #[test]
+    fn closed_preview_discards_late_result_without_freeing_worker_slot_early() {
+        let mut panel = LocalPreviewPanel::default();
+        panel
+            .open("owner".into(), "view.md".into(), PathBuf::from("/tmp"))
+            .unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        panel.pending = Some(rx);
+        panel.text = Some(PreviewText::new("old content".into()));
+        panel.error = Some("old error".into());
+        panel.close();
+        assert!(panel.text.is_none() && panel.error.is_none() && panel.candidate.is_none());
+        assert!(panel
+            .open("owner".into(), "other.md".into(), PathBuf::from("/tmp"))
+            .is_err());
+        tx.send(Ok(LoadedPreview {
+            path: PathBuf::from("/tmp/view.md"),
+            location: None,
+            content: crate::local_preview::PreviewContent::Image(egui::ColorImage::filled(
+                [2, 2],
+                egui::Color32::RED,
+            )),
+        }))
+        .unwrap();
+        let ctx = egui::Context::default();
+        assert!(labels(&frame(&mut panel, &ctx, "owner", vec![])).is_empty());
+        assert!(panel.pending.is_none());
+        assert!(panel.texture.is_none() && panel.text.is_none() && panel.error.is_none());
+        assert!(!panel.visible);
+        panel
+            .open("owner".into(), "other.md".into(), PathBuf::from("/tmp"))
+            .unwrap();
+        assert!(panel.candidate.is_some());
+    }
+
+    #[test]
+    fn closed_preview_worker_failure_stays_dismissed() {
+        for disconnect in [false, true] {
+            let mut panel = LocalPreviewPanel::default();
+            panel
+                .open("owner".into(), "view.md".into(), PathBuf::from("/tmp"))
+                .unwrap();
+            let (tx, rx) = mpsc::sync_channel(1);
+            panel.pending = Some(rx);
+            panel.close();
+            if !disconnect {
+                tx.send(Err("late failure".into())).unwrap();
+            }
+            drop(tx);
+            let ctx = egui::Context::default();
+            assert!(labels(&frame(&mut panel, &ctx, "owner", vec![])).is_empty());
+            assert!(panel.pending.is_none() && panel.error.is_none());
+            assert!(!panel.visible);
+        }
+    }
+
     #[test]
     fn egui_confirmation_click_loads_inert_source_and_locates_line() {
         let dir = std::env::temp_dir().join(format!("ember-preview-egui-{}", std::process::id()));
