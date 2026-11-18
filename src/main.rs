@@ -8398,14 +8398,18 @@ impl eframe::App for TerminalApp {
                 if pending.session_id != active_session_id
                     || (pending.released_at.is_none()
                         && ctx.input(|input| {
-                            let start = input.events.iter().rposition(|event| {
-                                matches!(event, egui::Event::PointerButton {
+                            let start = input
+                                .events
+                                .iter()
+                                .rposition(|event| {
+                                    matches!(event, egui::Event::PointerButton {
                                     button: egui::PointerButton::Primary,
                                     pressed: true,
                                     pos,
                                     ..
                                 } if *pos == pending.origin)
-                            }).map_or(0, |index| index + 1);
+                                })
+                                .map_or(0, |index| index + 1);
                             input.events[start..].iter().any(|event| match event {
                                 egui::Event::PointerMoved(pos)
                                 | egui::Event::PointerButton {
@@ -8414,7 +8418,9 @@ impl eframe::App for TerminalApp {
                                     pos,
                                     ..
                                 } => link_activation_dragged(pending.origin, *pos),
-                                egui::Event::PointerGone | egui::Event::WindowFocused(false) => true,
+                                egui::Event::PointerGone | egui::Event::WindowFocused(false) => {
+                                    true
+                                }
                                 _ => false,
                             })
                         }))

@@ -5606,12 +5606,14 @@ impl TerminalRenderer {
         // A plain local body click dismisses the previous selection. Scrollbar
         // navigation preserves it; header/modifier gestures above own their
         // edge; double/triple clicks replace text selection below.
+        // Toolkit clicked() must not bypass the tracker: it may still be true
+        // after a projection change has invalidated the press-time target.
         let plain_content_click = !block_press_claimed
             && interaction_enabled
             && should_clear_selection_on_click(
                 local_selection_enabled,
                 modifiers.ctrl,
-                tracker_click.is_some() || response.clicked(),
+                tracker_click.is_some(),
                 response.double_clicked(),
                 response.triple_clicked(),
                 self.dragging_scrollbar,
@@ -8026,7 +8028,7 @@ mod tests {
             .unwrap();
         for required in [
             "terminal.is_alt_buffer_active()",
-            "terminal.is_mouse_enabled()",
+            "terminal.application_owns_pointer()",
             "terminal.has_text_selection()",
             "terminal.preedit_text.is_empty()",
             "terminal.kitty_graphics.get_placements().is_empty()",
@@ -13392,7 +13394,9 @@ mod transcript_canvas_tests {
                         rect,
                     );
                 },
-            ).textures_delta.clear();
+            )
+            .textures_delta
+            .clear();
         };
         frame(
             &mut renderer,
