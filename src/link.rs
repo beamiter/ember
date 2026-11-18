@@ -190,15 +190,11 @@ impl LinkDetector {
                 }) {
                     continue;
                 }
-                // 剥离尾部标点(句末句号、逗号、右括号等不属于路径的一部分)
-                let trimmed = m.as_str().trim_end_matches(|c: char| {
-                    matches!(
-                        c,
-                        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"'
-                    )
-                });
-                let end_b = start_b + trimmed.len();
-                let matched_text = &line[start_b..end_b];
+                // Explicit path tokens may name files whose final character is
+                // punctuation. Never guess a different target by stripping it.
+                // Bare extension candidates remain subject to delimiter policy.
+                let end_b = m.end();
+                let matched_text = m.as_str();
 
                 let col_start = Self::byte_offset_to_char_offset(line, start_b);
                 let col_end = Self::byte_offset_to_char_offset(line, end_b);
@@ -593,6 +589,18 @@ mod tests {
     }
 
     #[test]
+    fn parsed_wide_file_path_keeps_trailing_period_cell() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let target = "./界.md。";
+        let (cells, wraps) = parsed_link_cells(target, 80);
+        let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].text, target);
+        assert_eq!((links[0].col_start, links[0].col_end), (0, 9));
+        assert!(cells[0][8].flags.wide_continuation());
+    }
+
+    #[test]
     fn parsed_wide_links_split_wrapped_cells_without_joining_real_spaces() {
         let detector = LinkDetector::new(LinkDetectionConfig::default());
         let target = "https://example.com/界x";
@@ -964,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_path_trailing_punctuation_stripped() {
+    fn test_file_path_trailing_punctuation_preserved() {
         let detector = LinkDetector::new(LinkDetectionConfig::default());
         let line = "edit /etc/hosts.";
         let links = detector.detect_links_in_line(line, 0);
@@ -972,7 +980,7 @@ mod tests {
             .iter()
             .find(|l| l.link_type == LinkType::FilePath)
             .unwrap();
-        assert_eq!(p.text, "/etc/hosts");
+        assert_eq!(p.text, "/etc/hosts.");
     }
 
     #[test]
@@ -1113,6 +1121,8 @@ mod preview_boundary_tests {
                 "https://example.com/src/报告.TSX:4:2",
                 "file:///目录/文件.PNG",
                 "evil://host/PHOTO.PNG",
+                "https://host/README.md.",
+                "file:///README.md?",
             ] {
                 assert!(
                     !detector
@@ -1122,6 +1132,41 @@ mod preview_boundary_tests {
                     "{text}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn explicit_paths_keep_literal_punctuation_and_bare_periods_are_ambiguous() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        for target in [
+            "./README.md.",
+            "./README.md。",
+            "../report.md?",
+            "/tmp/report.md!",
+            "./report.md,",
+            "./report.md;",
+            "./view.tsx:4:2.",
+            "./view.tsx:",
+        ] {
+            let links = detector.detect_links_in_line(target, 0);
+            assert_eq!(links.len(), 1, "{target}: {links:?}");
+            assert_eq!(links[0].text, target);
+            assert_eq!(links[0].col_end, target.chars().count());
+        }
+        for target in [
+            "README.md.",
+            "README.md。",
+            "README.md.bak",
+            "README.md?",
+            "README.md:4:2.",
+        ] {
+            assert!(
+                !detector
+                    .detect_links_in_line(target, 0)
+                    .iter()
+                    .any(|l| l.link_type == LinkType::FilePath),
+                "{target}"
+            );
         }
     }
 

@@ -294,6 +294,32 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn punctuation_candidates_never_fall_back_to_other_real_files() {
+        let dir =
+            std::env::temp_dir().join(format!("ember-preview-punctuation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let detector = crate::link::LinkDetector::new(Default::default());
+        std::fs::write(dir.join("report.md"), "plain").unwrap();
+        for suffix in [".", "。", "?", "!", ",", ";", ":", ":4:2."] {
+            let name = format!("report.md{suffix}");
+            std::fs::write(dir.join(&name), "literal").unwrap();
+            let target = format!("./{name}");
+            let links = detector.detect_links_in_line(&target, 0);
+            assert_eq!(links.len(), 1);
+            assert_eq!(links[0].text, target);
+            let (path, location) = resolve(&links[0].text, &dir).unwrap();
+            assert!(location.is_none());
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "literal");
+            std::fs::remove_file(dir.join(&name)).unwrap();
+            assert!(
+                resolve(&links[0].text, &dir).is_err(),
+                "must not fall back: {target}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn indexed_lines_preserve_unicode_crlf_and_empty_tail() {
         let text = PreviewText::new("α\r\n界\n".into());
         assert_eq!(text.starts.len(), 3);
