@@ -95,7 +95,7 @@ impl LinkDetector {
 
         // 文件路径正则：以 /、./、../、~/ 开头(前面是行首或空白)。
         // 用捕获组提取实际路径，避免把前导空白计入列偏移。
-        let file_path_regex = Regex::new(r"(?:^|\s)((?:\.{0,2}|~)/[^\s<>\[\]{}|\\^`()]*)").unwrap();
+        let file_path_regex = Regex::new(r#"(?:^|[\s`"'])((?:(?:\.{0,2}|~)/[^\s<>\[\]{}|\\^`()"']*|[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:tsx|jsx|md|txt|rs|py|json|toml|yaml|yml|css|html|svg|png|jpg|jpeg|webp|ts|js)(?::[0-9]+){0,2}))"#).unwrap();
 
         Self {
             config,
@@ -176,6 +176,12 @@ impl LinkDetector {
             for caps in self.file_path_regex.captures_iter(line) {
                 let Some(m) = caps.get(1) else { continue };
                 let start_b = m.start();
+                // Do not activate a supported-extension prefix of a longer token.
+                if line[m.end()..].chars().next().is_some_and(|c| {
+                    c.is_alphanumeric() || matches!(c, '_' | '/' | '-' | ':' | '.')
+                }) {
+                    continue;
+                }
                 // 剥离尾部标点(句末句号、逗号、右括号等不属于路径的一部分)
                 let trimmed = m.as_str().trim_end_matches(|c: char| {
                     matches!(
@@ -224,7 +230,12 @@ impl LinkDetector {
         if !(trimmed.starts_with('/')
             || trimmed.starts_with("./")
             || trimmed.starts_with("../")
-            || trimmed.starts_with("~/"))
+            || trimmed.starts_with("~/")
+            || (trimmed.split(':').next().is_some_and(|path| {
+                path.rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.contains('.') && !name.starts_with('.'))
+            }) && !trimmed.contains("://")))
         {
             return false;
         }
@@ -1002,5 +1013,60 @@ mod tests {
             detector.detect_links_in_line("see https://en.wikipedia.org/wiki/Foo_(bar) now", 0);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].text, "https://en.wikipedia.org/wiki/Foo_(bar)");
+    }
+}
+
+#[cfg(test)]
+mod local_preview_detection_tests {
+    use super::*;
+    #[test]
+    fn detects_codex_source_references_without_a_dot_slash_prefix() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        for text in [
+            "src/App.tsx:12:3",
+            "README.md",
+            "./images/chart.png",
+            "../notes.md",
+        ] {
+            let links = detector.detect_links_in_line(text, 0);
+            assert!(
+                links
+                    .iter()
+                    .any(|link| link.link_type == LinkType::FilePath && link.text == text),
+                "{text}: {links:?}"
+            );
+        }
+    }
+}
+
+/// Keep application mouse reporting ownership for local previews, without
+/// changing the existing explicit Ctrl-click URL opener contract.
+pub fn host_activation_allowed(kind: LinkType, app_mouse: bool) -> bool {
+    kind != LinkType::FilePath || !app_mouse
+}
+
+#[cfg(test)]
+mod preview_boundary_tests {
+    use super::*;
+    #[test]
+    fn longer_extension_is_never_a_different_file() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        for text in [
+            "README.md.bak",
+            "src/view.tsx.map",
+            "file.tsxx",
+            "src/view.tsx-other",
+        ] {
+            assert!(!detector
+                .detect_links_in_line(text, 0)
+                .iter()
+                .any(|link| link.link_type == LinkType::FilePath));
+        }
+    }
+    #[test]
+    fn preview_keeps_app_mouse_but_preserves_url_contract() {
+        assert!(!host_activation_allowed(LinkType::FilePath, true));
+        assert!(host_activation_allowed(LinkType::FilePath, false));
+        assert!(host_activation_allowed(LinkType::Url, true));
     }
 }

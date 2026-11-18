@@ -36,6 +36,9 @@ mod keybindings;
 mod kitty_graphics;
 mod layout;
 mod link;
+mod local_preview;
+mod local_preview_panel;
+mod local_reference;
 mod native_enter;
 mod navigation_drawer;
 mod organism;
@@ -2943,6 +2946,7 @@ impl TerminalApp {
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             hovered_link: None,
             pending_link_activation: None,
+            local_preview_panel: Default::default(),
             cached_links: Vec::new(),
             cached_links_projection_key: None,
             cached_links_terminal_ptr: usize::MAX,
@@ -5832,6 +5836,13 @@ impl TerminalApp {
         self.render_reference_inspector(root_ui);
         self.render_reference_files_navigation(root_ui);
         self.render_sidebar(root_ui);
+        let preview_session_id = self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            .clone();
+        self.local_preview_panel.show(root_ui, &preview_session_id);
         self.render_organism(root_ui);
         self.render_vim9_workbench(root_ui);
         let layout = self.reference_layout(ctx);
@@ -7563,6 +7574,19 @@ impl eframe::App for TerminalApp {
                 let renderer = active_pane_renderer_idx
                     .and_then(|index| self.pane_renderers.get(index))
                     .unwrap_or(&self.renderer);
+                let local_cwd = (session.purpose == crate::session::SessionPurpose::Interactive
+                    && matches!(
+                        ssh_files_follow::observe_session(session),
+                        ssh_files_follow::Observation::None
+                    ))
+                .then(|| {
+                    session
+                        .shell
+                        .foreground_pgid()
+                        .and_then(jterm_core::process::process_cwd)
+                        .map(std::path::PathBuf::from)
+                })
+                .flatten();
                 let terminal = session.terminal.lock();
                 if renderer.pointer_link_eligible_projected(
                     &terminal,
@@ -7586,10 +7610,14 @@ impl eframe::App for TerminalApp {
                         renderer.char_width,
                         renderer.line_height,
                         &mouse_projection_viewport,
-                    ) {
+                    )
+                    .filter(|link| {
+                        link::host_activation_allowed(link.link_type, terminal.is_mouse_enabled())
+                    }) {
                         self.pending_link_activation =
                             Some(crate::app::state::PendingLinkActivation {
                                 session_id: active_session_id.clone(),
+                                local_cwd,
                                 link,
                                 origin,
                                 cancelled: false,
@@ -8319,6 +8347,9 @@ impl eframe::App for TerminalApp {
                         )
                     })
             };
+            self.hovered_link = self.hovered_link.take().filter(|link| {
+                link::host_activation_allowed(link.link_type, terminal.is_mouse_enabled())
+            });
             let hovered_link_eligible = pointer.is_some_and(|pos| {
                 let renderer = active_pane_renderer_idx
                     .and_then(|index| self.pane_renderers.get(index))
@@ -8433,12 +8464,31 @@ impl eframe::App for TerminalApp {
                 })
                 .is_some()
                 .then(|| self.pending_link_activation.take())
-                .flatten()
-                .map(|pending| pending.link);
-            if let Some(link) = link {
-                let (msg, dur) = match link::open_link(&link) {
+                .flatten();
+            if let Some(pending) = link {
+                let link = pending.link;
+                let result: Result<(), Box<dyn std::error::Error>> = if link.link_type
+                    == link::LinkType::FilePath
+                {
+                    pending.local_cwd.as_deref()
+                        .ok_or_else(|| "Local session working directory is unavailable; remote preview is not supported".to_string())
+                        .and_then(|cwd| self.local_preview_panel.open(pending.session_id, link.text.clone(), cwd.to_path_buf()))
+                        .map_err(|error| std::io::Error::other(error).into())
+                } else if link.text.to_ascii_lowercase().starts_with("file:") {
+                    Err(std::io::Error::other(
+                        "file URI preview is not supported; use a local path",
+                    )
+                    .into())
+                } else {
+                    link::open_link(&link)
+                };
+                let (msg, dur) = match result {
                     Ok(_) => (
-                        format!("Opened: {}", link.text),
+                        if link.link_type == link::LinkType::FilePath {
+                            format!("Local preview candidate: {}", link.text)
+                        } else {
+                            format!("Opened: {}", link.text)
+                        },
                         Duration::from_millis(2500),
                     ),
                     Err(e) => (

@@ -77,6 +77,7 @@ pub struct PaneDrag {
 }
 
 pub struct PendingLinkActivation {
+    pub local_cwd: Option<std::path::PathBuf>,
     pub session_id: String,
     pub link: link::Link,
     pub origin: egui::Pos2,
@@ -274,6 +275,7 @@ pub struct TerminalApp {
 
     // File-tree sidebar
     pub sidebar: sidebar::Sidebar,
+    pub local_preview_panel: crate::local_preview_panel::LocalPreviewPanel,
     pub(crate) reference_inspector: ReferenceInspectorState,
     /// 文件树名称输入对话框（New File / New Folder / Rename）。
     pub sidebar_name_dialog: Option<crate::FsNameDialog>,
