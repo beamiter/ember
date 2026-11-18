@@ -93,9 +93,11 @@ impl LinkDetector {
             r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"
         ).unwrap();
 
-        // 文件路径正则：以 /、./、../、~/ 开头(前面是行首或空白)。
+        // Paths start at a token boundary. Bare paths accept Unicode letters/numbers
+        // and combining marks; only the known ASCII extension is case-insensitive.
+        // Preserve the exact spelling (no Unicode normalization or case folding).
         // 用捕获组提取实际路径，避免把前导空白计入列偏移。
-        let file_path_regex = Regex::new(r#"(?:^|[\s`"'])((?:(?:\.{0,2}|~)/[^\s<>\[\]{}|\\^`()"']*|[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:tsx|jsx|md|txt|rs|py|json|toml|yaml|yml|css|html|svg|png|jpg|jpeg|webp|ts|js)(?::[0-9]+){0,2}))"#).unwrap();
+        let file_path_regex = Regex::new(r#"(?:^|[\s`"'])((?:(?:\.{0,2}|~)/[^\s<>\[\]{}|\\^`()"']*|[\p{L}\p{N}_][\p{L}\p{N}\p{M}_./-]*\.(?i-u:tsx|jsx|md|txt|rs|py|json|toml|yaml|yml|css|html|svg|png|jpg|jpeg|webp|ts|js)(?::[0-9]+){0,2}))"#).unwrap();
 
         Self {
             config,
@@ -176,9 +178,15 @@ impl LinkDetector {
             for caps in self.file_path_regex.captures_iter(line) {
                 let Some(m) = caps.get(1) else { continue };
                 let start_b = m.start();
-                // Do not activate a supported-extension prefix of a longer token.
+                // Require an explicit delimiter: combining marks, emoji, zero-width
+                // characters and suffix operators must not turn a longer token
+                // into a different local filename.
                 if line[m.end()..].chars().next().is_some_and(|c| {
-                    c.is_alphanumeric() || matches!(c, '_' | '/' | '-' | ':' | '.')
+                    !c.is_whitespace()
+                        && !matches!(
+                            c,
+                            ',' | ';' | '!' | ')' | ']' | '}' | '\'' | '"' | '`' | '>'
+                        )
                 }) {
                     continue;
                 }
@@ -563,6 +571,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parsed_unicode_file_links_map_wide_cells_and_wraps() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let target = "目录/文件.MD:4:2";
+        let (cells, wraps) = parsed_link_cells(target, 7);
+        assert!(wraps[0]);
+        let links = detector.detect_links_in_visible_cells_with_wrapping(&cells, &wraps);
+        assert_eq!(links.len(), 3);
+        for (link, (row, start, end)) in links.iter().zip([(0, 0, 7), (1, 0, 7), (2, 0, 2)]) {
+            assert_eq!(link.text, target);
+            assert_eq!(link.link_type, LinkType::FilePath);
+            assert_eq!((link.line, link.col_start, link.col_end), (row, start, end));
+        }
+        // Both physical halves of each wide glyph are inside the activation span.
+        assert!(cells[0][1].flags.wide_continuation());
+        assert!(cells[0][3].flags.wide_continuation());
+        assert!(cells[0][6].flags.wide_continuation());
     }
 
     #[test]
@@ -1025,6 +1052,11 @@ mod local_preview_detection_tests {
         for text in [
             "src/App.tsx:12:3",
             "README.md",
+            "PHOTO.PNG",
+            "src/View.TSX:4:2",
+            "目录/文件.md",
+            "src/报告.tsx:4:2",
+            "cafe\u{301}/re\u{301}sume\u{301}.Md:3",
             "./images/chart.png",
             "../notes.md",
         ] {
@@ -1056,6 +1088,13 @@ mod preview_boundary_tests {
             "src/view.tsx.map",
             "file.tsxx",
             "src/view.tsx-other",
+            "PHOTO.PNGx",
+            "src/报告.TSX.map",
+            "cafe.md\u{301}",
+            "src/报告.md\u{200d}",
+            "src/报告.md💥",
+            "PHOTO.PNG:4:2:3",
+            "PHOTO.PNG?query",
         ] {
             assert!(!detector
                 .detect_links_in_line(text, 0)
@@ -1063,6 +1102,29 @@ mod preview_boundary_tests {
                 .any(|link| link.link_type == LinkType::FilePath));
         }
     }
+    #[test]
+    fn unicode_paths_do_not_escape_url_ownership() {
+        for enabled in [true, false] {
+            let detector = LinkDetector::new(LinkDetectionConfig {
+                detect_urls: enabled,
+                ..Default::default()
+            });
+            for text in [
+                "https://example.com/src/报告.TSX:4:2",
+                "file:///目录/文件.PNG",
+                "evil://host/PHOTO.PNG",
+            ] {
+                assert!(
+                    !detector
+                        .detect_links_in_line(text, 0)
+                        .iter()
+                        .any(|l| l.link_type == LinkType::FilePath),
+                    "{text}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn preview_keeps_app_mouse_but_preserves_url_contract() {
         assert!(!host_activation_allowed(LinkType::FilePath, true));
