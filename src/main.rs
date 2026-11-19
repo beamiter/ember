@@ -7097,6 +7097,9 @@ impl eframe::App for TerminalApp {
                     self.organism
                         .watch_parsed(&active_session_id, update, has_more_data);
                 });
+                session
+                    .terminal_presentation
+                    .note_output(std::time::Instant::now());
                 terminal.check_sync_output_timeout();
                 terminal_parse_time += active_parse_started.elapsed();
                 active_processed_bytes = accumulated_data.len();
@@ -7381,7 +7384,11 @@ impl eframe::App for TerminalApp {
             projected_viewport_for_session(session, renderer)
         };
 
-        if !mouse_projection_viewport.is_available() {
+        if !mouse_projection_viewport.is_available()
+            || session
+                .terminal_presentation
+                .holding_frame(&session.terminal.lock(), std::time::Instant::now())
+        {
             terminal_pointer_input_blocked = true;
             self.terminal_mouse_capture = None;
             self.last_terminal_mouse_motion = None;

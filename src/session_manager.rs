@@ -812,6 +812,9 @@ impl SessionManager {
             let mut terminal = session.terminal.lock();
             if !data.is_empty() {
                 terminal.process_output_buffer(&data, |_| {});
+                session
+                    .terminal_presentation
+                    .note_output(std::time::Instant::now());
             }
             terminal.check_sync_output_timeout();
             let response = terminal.get_output();

@@ -1495,7 +1495,7 @@ pub struct TerminalRenderer {
     /// Session-owned projection materialized by the app before link detection.
     /// The terminal pointer prevents a renderer reused by another tab/pane
     /// from consuming a stale snapshot; the value is drained by render.
-    frame_projection: Option<(usize, ProjectedViewport)>,
+    frame_projection: Option<(usize, ProjectedViewport, bool)>,
     requested_collapsed_zone_ids: std::collections::HashSet<u64>,
     /// Tighten card-only spacing/radius without changing the terminal grid or
     /// PTY geometry.
@@ -2030,10 +2030,23 @@ impl TerminalRenderer {
         viewport: ProjectedViewport,
         policy: &crate::terminal::ProjectionPolicy,
     ) {
-        self.frame_projection = Some((terminal as *const TerminalState as usize, viewport));
+        self.frame_projection = Some((terminal as *const TerminalState as usize, viewport, false));
         self.requested_collapsed_zone_ids.clear();
         self.requested_collapsed_zone_ids
             .extend(policy.collapsed_zone_ids());
+    }
+
+    #[allow(dead_code)] // Called by the binary workspace.
+    pub(crate) fn set_retained_projection_frame(
+        &mut self,
+        terminal: &TerminalState,
+        viewport: ProjectedViewport,
+        canvas: crate::transcript_canvas::CanvasGeometry,
+    ) {
+        self.frame_projection = Some((terminal as *const TerminalState as usize, viewport, true));
+        self.canvas_geometry = canvas;
+        self.scroll_pixel_offset = canvas.translation;
+        self.requested_collapsed_zone_ids.clear();
     }
 
     /// Admit an absolute drag before canvas presentation, exactly as wheel and
@@ -2482,6 +2495,9 @@ impl TerminalRenderer {
         line_height: f32,
         layer: KittyImageLayer,
     ) {
+        if !viewport.is_available() {
+            return;
+        }
         let viewport_rows = i64::try_from(viewport.rows()).unwrap_or(i64::MAX);
         let mut placements: Vec<_> = terminal
             .kitty_graphics
@@ -4847,13 +4863,13 @@ impl TerminalRenderer {
             (line_height * pixels_per_point).round().max(1.0) as u32,
         );
         let terminal_ptr = terminal as *const TerminalState as usize;
-        let viewport = self
+        let (viewport, retained) = self
             .frame_projection
             .take()
-            .filter(|(source, _)| *source == terminal_ptr)
-            .map(|(_, viewport)| viewport)
-            .unwrap_or_else(|| self.projected_viewport(terminal));
-        if terminal.projection_unavailable().is_some() || !viewport.is_available() {
+            .filter(|(source, _, _)| *source == terminal_ptr)
+            .map(|(_, viewport, retained)| (viewport, retained))
+            .unwrap_or_else(|| (self.projected_viewport(terminal), false));
+        if !retained && (terminal.projection_unavailable().is_some() || !viewport.is_available()) {
             // No raw/native fallback: it could reveal content outside the scope
             // that requested this projection. Drop all previously armed geometry.
             self.last_content_rect = None;
@@ -4908,6 +4924,25 @@ impl TerminalRenderer {
             );
             return response;
         }
+        // Frozen rows only supply paint. All pointer and row-based actions
+        // resume when the live projection is published again.
+        let interaction_enabled = interaction_enabled && !retained;
+        let cursor_visible = cursor_visible && !retained;
+        let retained_search = retained.then(crate::search::SearchState::default);
+        let search_state = retained_search.as_ref().unwrap_or(search_state);
+        let links = if retained { &[] } else { links };
+        let hovered_link = if retained { &None } else { hovered_link };
+        if retained {
+            self.dragging_scrollbar = false;
+            self.local_selection_terminal = None;
+            self.projected_scroll_request = None;
+            self.block_primary_press = None;
+            self.summary_primary_press = None;
+            self.click_tracker.cancel();
+            self.click_tracker_terminal = None;
+            self.cursor_move_input.clear();
+            self.cursor_move_terminal_ptr = None;
+        }
         self.projected_kitty_rows_remaining = viewport
             .is_transformed()
             .then(|| projected_kitty_row_budget(viewport.rows()));
@@ -4918,7 +4953,8 @@ impl TerminalRenderer {
             .native_vim9_frame
             .as_ref()
             .filter(|frame| {
-                crate::vim9_buffer::usable(frame, rows, cols)
+                !retained
+                    && crate::vim9_buffer::usable(frame, rows, cols)
                     && viewport.scroll_offset() == 0
                     && terminal.selection.is_none()
             })
@@ -4998,7 +5034,7 @@ impl TerminalRenderer {
                 .y
                 .min(self.shared_composer_rect(content_rect, composer).top());
         }
-        self.last_content_rect = Some(content_rect);
+        self.last_content_rect = (!retained).then_some(content_rect);
         // The extra materialized row is only a paint margin. It must never
         // leak into the tab/pane padding while translating the document.
         let painter = painter.with_clip_rect(egui::Rect::from_min_max(
@@ -5032,7 +5068,11 @@ impl TerminalRenderer {
         // Owned per-frame snapshot of visible command blocks, shared by the
         // gutter hit test below and the chrome painting after the grid.
         // `None` while chrome is gated off (config, alt screen, reflow).
-        let summaries = Self::projected_summary_rows(terminal, &viewport);
+        let summaries = if retained {
+            Vec::new()
+        } else {
+            Self::projected_summary_rows(terminal, &viewport)
+        };
         if self.chat_mode && terminal.colors.background_override().is_none() {
             let history_end = viewport
                 .chat_composer_rows()
@@ -5062,7 +5102,9 @@ impl TerminalRenderer {
                 }
             }
         }
-        let mut block_chrome = self.block_chrome_snapshot(terminal, &viewport, rows);
+        let mut block_chrome = (!retained)
+            .then(|| self.block_chrome_snapshot(terminal, &viewport, rows))
+            .flatten();
         if let Some(entries) = block_chrome.as_deref().filter(|_| !self.chat_mode) {
             let command_ranges: Vec<_> = entries
                 .iter()
@@ -5163,6 +5205,7 @@ impl TerminalRenderer {
                 })
             });
 
+        let ime_rect = ime_rect.filter(|_| !retained);
         let preedit = if focus_enabled && terminal.ime_enabled && !terminal.preedit_text.is_empty()
         {
             ime_rect.and_then(|caret| {
@@ -5799,6 +5842,7 @@ impl TerminalRenderer {
                 char_width,
                 line_height,
                 &block_row_backdrops,
+                retained,
             )
         } else {
             false
@@ -6279,8 +6323,11 @@ impl TerminalRenderer {
             }
         }
 
-        // Clear dirty region after rendering
-        terminal.dirty_region.clear();
+        // Clear dirty region after rendering a live frame. A retained frame
+        // has not presented any changes to the live grid.
+        if !retained {
+            terminal.dirty_region.clear();
+        }
 
         response
     }
@@ -6304,6 +6351,7 @@ impl TerminalRenderer {
         char_width: f32,
         line_height: f32,
         block_row_backdrops: &[Option<Color32>],
+        retained: bool,
     ) -> bool {
         let render_state = match &self.wgpu_render_state {
             Some(rs) => rs,
@@ -6348,8 +6396,12 @@ impl TerminalRenderer {
 
         // --- Dirty detection: determine which rows need rebuild ---
         let terminal_ptr = terminal as *const _ as usize;
-        let current_grid_version = terminal.get_grid_version();
         let current_projection_key = viewport.key();
+        let current_grid_version = if retained {
+            current_projection_key.grid_version
+        } else {
+            terminal.get_grid_version()
+        };
         let current_projection_layout_key = current_projection_key.layout_key();
         let current_selection = terminal.selection;
         let current_selection_revision = terminal.selection_revision();
@@ -6381,6 +6433,7 @@ impl TerminalRenderer {
             || self.last_rendered_terminal_ptr != terminal_ptr
             || self.last_rendered_rows != rows
             || self.last_rendered_cols != cols
+            || (retained && self.last_rendered_grid_version != current_grid_version)
             || self.last_rendered_projection_layout_key != Some(current_projection_layout_key);
 
         // 跨帧复用 dirty_rows 缓冲:make_mut 在上一帧 callback 已 drop(refcount==1)时
@@ -6393,12 +6446,14 @@ impl TerminalRenderer {
             dirty_rows.fill(true);
         } else {
             // Grid content changes - reuse changed_rows_buffer for collection
-            self.changed_rows_buffer.clear();
-            terminal.get_dirty_rows(
-                self.last_rendered_grid_version,
-                &mut self.changed_rows_buffer,
-            );
-            mark_changed_grid_rows(terminal, viewport, &self.changed_rows_buffer, dirty_rows);
+            if !retained {
+                self.changed_rows_buffer.clear();
+                terminal.get_dirty_rows(
+                    self.last_rendered_grid_version,
+                    &mut self.changed_rows_buffer,
+                );
+                mark_changed_grid_rows(terminal, viewport, &self.changed_rows_buffer, dirty_rows);
+            }
 
             // Selection overlay changes
             if self.last_rendered_selection != current_selection
@@ -12787,7 +12842,11 @@ mod transcript_canvas_tests {
         renderer.last_content_rect = Some(rect);
         renderer.dragging_scrollbar = true;
         renderer.scroll_pixel_offset = 3.0;
-        renderer.frame_projection = Some((&terminal as *const TerminalState as usize, unavailable));
+        renderer.frame_projection = Some((
+            &terminal as *const TerminalState as usize,
+            unavailable,
+            false,
+        ));
         let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(rect),

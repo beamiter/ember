@@ -1,9 +1,9 @@
 use crate::shell::ShellSession;
-use crate::terminal::{ProjectionPolicy, ProjectionViewState, TerminalState};
+use crate::terminal::{ProjectedViewport, ProjectionPolicy, ProjectionViewState, TerminalState};
 use parking_lot::Mutex as ParkingMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// UI-side retry storage is separate from the bounded PTY writer, but must be
 /// bounded as well: a stopped child plus key repeat must not grow memory
@@ -123,6 +123,108 @@ pub enum SessionPurpose {
     RetainedCommand,
 }
 
+const RESIZE_SETTLE: Duration = Duration::from_millis(100);
+const REPAINT_QUIET: Duration = Duration::from_millis(120);
+const REPAINT_LIMIT: Duration = Duration::from_secs(1);
+
+#[allow(dead_code)] // Paint state belongs to the binary workspace.
+pub(crate) struct PublishedTerminalFrame {
+    pub viewport: ProjectedViewport,
+    pub canvas: crate::transcript_canvas::CanvasGeometry,
+}
+
+#[derive(Default)]
+pub(crate) struct TerminalPresentation {
+    resize_target: Option<((usize, usize), Instant)>,
+    repaint: Option<ResizeRepaint>,
+    #[allow(dead_code)] // Read by the binary renderer.
+    pub last_frame: Option<PublishedTerminalFrame>,
+}
+
+struct ResizeRepaint {
+    publish_at: Instant,
+    limit: Instant,
+}
+
+impl ResizeRepaint {
+    #[allow(dead_code)] // Started by the binary workspace.
+    fn new(now: Instant) -> Self {
+        Self {
+            publish_at: now + REPAINT_QUIET,
+            limit: now + REPAINT_LIMIT,
+        }
+    }
+
+    fn note_output(&mut self, now: Instant) {
+        self.publish_at = (now + REPAINT_QUIET).min(self.limit);
+    }
+
+    #[allow(dead_code)] // Read by the binary workspace.
+    fn finished(&self, now: Instant, synchronized: bool) -> bool {
+        now >= self.limit || (!synchronized && now >= self.publish_at)
+    }
+}
+
+impl TerminalPresentation {
+    #[allow(dead_code)] // Called by the binary renderer.
+    fn defer_resize(
+        &mut self,
+        target: (usize, usize),
+        now: Instant,
+        ctx: &eframe::egui::Context,
+    ) -> bool {
+        let due = match self.resize_target {
+            Some((pending, due)) if pending == target => due,
+            _ => {
+                let due = now + RESIZE_SETTLE;
+                self.resize_target = Some((target, due));
+                due
+            }
+        };
+        if let Some(delay) = due
+            .checked_duration_since(now)
+            .filter(|delay| !delay.is_zero())
+        {
+            ctx.request_repaint_after(delay);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn note_output(&mut self, now: Instant) {
+        if let Some(repaint) = self.repaint.as_mut() {
+            repaint.note_output(now);
+        }
+    }
+
+    #[allow(dead_code)] // Called by the binary renderer.
+    pub(crate) fn holding_frame(&self, terminal: &TerminalState, now: Instant) -> bool {
+        terminal.sync_output_active
+            || self
+                .repaint
+                .as_ref()
+                .is_some_and(|repaint| !repaint.finished(now, false))
+    }
+
+    #[allow(dead_code)] // Called by the binary renderer.
+    pub(crate) fn settle(&mut self, terminal: &TerminalState, ctx: &eframe::egui::Context) -> bool {
+        let now = Instant::now();
+        if self
+            .repaint
+            .as_ref()
+            .is_some_and(|repaint| repaint.finished(now, terminal.sync_output_active))
+        {
+            self.repaint = None;
+        }
+        if !self.holding_frame(terminal, now) {
+            return false;
+        }
+        ctx.request_repaint_after(Duration::from_millis(25));
+        true
+    }
+}
+
 /// Session - 完整的会话，包含终端状态和 Shell 会话
 pub struct Session {
     pub metadata: SessionMetadata,
@@ -141,6 +243,7 @@ pub struct Session {
     /// stream into the newly active terminal corrupts both its screen and its
     /// terminal modes.
     pub pending_output: crate::output_batch::OutputBuffer,
+    pub(crate) terminal_presentation: TerminalPresentation,
     /// Session-owned view policy. Renderers are reused across tabs/panes and
     /// must never carry collapse state or projected scroll between sessions.
     pub projection_policy: ProjectionPolicy,
@@ -159,6 +262,37 @@ pub struct Session {
 }
 
 impl Session {
+    #[allow(dead_code)] // The library type is also built without the workspace.
+    pub(crate) fn resize_terminal(
+        &mut self,
+        terminal: &mut TerminalState,
+        target: (usize, usize),
+        force: bool,
+        ctx: &eframe::egui::Context,
+    ) {
+        let previous = (terminal.screen.grid.row_len(), terminal.screen.grid.rows());
+        let changed = target != previous;
+        if !changed && !force {
+            self.terminal_presentation.resize_target = None;
+            return;
+        }
+        let inline_agent = changed
+            && !terminal.is_alt_buffer_active()
+            && (terminal.inline_cli_scope_floor().is_some()
+                || crate::session_manager::get_foreground_command(self.get_shell_pid())
+                    .as_deref()
+                    .is_some_and(crate::immersive_command::reading_agent_command));
+        let now = Instant::now();
+        if inline_agent && !force && self.terminal_presentation.defer_resize(target, now, ctx) {
+            return;
+        }
+        self.terminal_presentation.resize_target = None;
+        terminal.on_resize(target.0, target.1);
+        if self.shell.resize(target.0, target.1).is_ok() && inline_agent {
+            self.terminal_presentation.repaint = Some(ResizeRepaint::new(Instant::now()));
+        }
+    }
+
     /// Append bytes to this session's strict input FIFO without crossing its
     /// memory cap. `false` guarantees that no byte was appended.
     pub fn queue_input(&mut self, input: &[u8]) -> bool {
@@ -271,6 +405,7 @@ impl Session {
             purpose: SessionPurpose::Interactive,
             pending_input: Vec::new(),
             pending_output: crate::output_batch::OutputBuffer::default(),
+            terminal_presentation: TerminalPresentation::default(),
             projection_policy: ProjectionPolicy::new(),
             projection_view_state: ProjectionViewState::new(),
             transcript_canvas: crate::transcript_canvas::TranscriptCanvas::default(),
@@ -308,6 +443,31 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_resize_waits_for_the_latest_grid_size() {
+        let ctx = eframe::egui::Context::default();
+        let now = Instant::now();
+        let mut presentation = TerminalPresentation::default();
+        assert!(presentation.defer_resize((80, 24), now, &ctx));
+
+        let final_change = now + RESIZE_SETTLE / 2;
+        assert!(presentation.defer_resize((90, 30), final_change, &ctx));
+        assert!(presentation.defer_resize((90, 30), now + RESIZE_SETTLE, &ctx));
+        assert!(!presentation.defer_resize((90, 30), final_change + RESIZE_SETTLE, &ctx));
+    }
+
+    #[test]
+    fn resize_repaint_outlasts_a_quiet_synchronized_chunk() {
+        let now = Instant::now();
+        let mut repaint = ResizeRepaint::new(now);
+        let next_chunk = now + REPAINT_QUIET * 2;
+        assert!(!repaint.finished(next_chunk, true));
+        repaint.note_output(next_chunk);
+        assert!(!repaint.finished(next_chunk, false));
+        assert!(repaint.finished(next_chunk + REPAINT_QUIET, false));
+        assert!(repaint.finished(now + REPAINT_LIMIT, true));
+    }
 
     #[test]
     fn concurrent_session_sequences_are_unique() {

@@ -1617,6 +1617,51 @@ fn draw_block_workspace(
     action
 }
 
+#[allow(clippy::too_many_arguments)]
+fn prepare_terminal_projection(
+    renderer: &mut crate::ui::TerminalRenderer,
+    session: &mut crate::session::Session,
+    terminal: &mut crate::terminal::TerminalState,
+    ctx: &egui::Context,
+    content_rect: egui::Rect,
+    interaction_enabled: bool,
+    focused: bool,
+) -> crate::terminal::ProjectedViewport {
+    let held = session.terminal_presentation.settle(terminal, ctx);
+    if held {
+        if let Some(frame) = &session.terminal_presentation.last_frame {
+            renderer.set_retained_projection_frame(terminal, frame.viewport.clone(), frame.canvas);
+            return frame.viewport.clone();
+        }
+    }
+    renderer.prepare_canvas_scrollbar(
+        terminal,
+        &session.projection_policy,
+        &mut session.projection_view_state,
+        &mut session.transcript_canvas,
+        ctx,
+        content_rect,
+        interaction_enabled,
+        focused,
+    );
+    let viewport = renderer.canvas_viewport(
+        terminal,
+        &session.projection_policy,
+        &mut session.projection_view_state,
+        &mut session.transcript_canvas,
+        ctx,
+    );
+    renderer.set_projection_frame(terminal, viewport.clone(), &session.projection_policy);
+    session.terminal_presentation.last_frame =
+        viewport
+            .is_available()
+            .then(|| crate::session::PublishedTerminalFrame {
+                viewport: viewport.clone(),
+                canvas: renderer.canvas_geometry,
+            });
+    viewport
+}
+
 fn prune_permanently_unavailable_collapses(
     policy: &mut crate::terminal::ProjectionPolicy,
     terminal: &crate::terminal::TerminalState,
@@ -2709,11 +2754,15 @@ impl TerminalApp {
         // 单窗格才按整窗口尺寸 resize 活跃会话;多窗格时各窗格在下方
         // 各自按自己的 rect 尺寸 resize(否则活跃会话会被错误地撑成整窗口大小)。
         let multi_pane = self.layout().panes().len() > 1;
-        if !multi_pane && (cols != self.cols || rows != self.rows || self.force_resize_session) {
+        if !multi_pane {
             let session = self.session_manager.get_active_session_mut();
-            let _ = session.shell.resize(cols, rows);
-            let mut terminal = session.terminal.lock();
-            terminal.on_resize(cols, rows);
+            let terminal = std::sync::Arc::clone(&session.terminal);
+            session.resize_terminal(
+                &mut terminal.lock(),
+                (cols, rows),
+                self.force_resize_session,
+                ctx,
+            );
             self.cols = cols;
             self.rows = rows;
             if self.force_resize_session {
@@ -2805,12 +2854,12 @@ impl TerminalApp {
                     let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                     let terminal_arc = std::sync::Arc::clone(&session.terminal);
                     let mut terminal_guard = terminal_arc.lock();
-                    if pane_cols != terminal_guard.screen.grid.row_len()
-                        || pane_rows != terminal_guard.screen.grid.rows()
-                    {
-                        terminal_guard.on_resize(pane_cols, pane_rows);
-                        let _ = session.shell.resize(pane_cols, pane_rows);
-                    }
+                    session.resize_terminal(
+                        &mut terminal_guard,
+                        (pane_cols, pane_rows),
+                        false,
+                        ctx,
+                    );
                     let content_rect = self.pane_renderers[pane_idx]
                         .resolve_glass_layout(&terminal_guard, pane_outer_rect);
                     prune_permanently_unavailable_collapses(
@@ -2838,8 +2887,6 @@ impl TerminalApp {
                     session.projection_policy.set_chat_command_bubbles(
                         self.pane_renderers[pane_idx].chat_command_bubbles,
                     );
-                    let projection_policy = &session.projection_policy;
-                    let projection_view_state = &mut session.projection_view_state;
                     // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
                     // 链接检测(含逐行 String 分配)。失效条件与单窗格路径一致。
                     let renderer = &mut self.pane_renderers[pane_idx];
@@ -2848,28 +2895,16 @@ impl TerminalApp {
                         .shell
                         .foreground_pgid()
                         .map(|foreground| (session.shell.get_child_pid(), foreground));
-                    renderer.prepare_canvas_scrollbar(
+                    let viewport = prepare_terminal_projection(
+                        renderer,
+                        session,
                         &mut terminal_guard,
-                        projection_policy,
-                        projection_view_state,
-                        &mut session.transcript_canvas,
                         ctx,
                         content_rect,
                         terminal_interaction_enabled,
                         terminal_interaction_enabled && pane.focused,
                     );
-                    let viewport = renderer.canvas_viewport(
-                        &mut terminal_guard,
-                        projection_policy,
-                        projection_view_state,
-                        &mut session.transcript_canvas,
-                        ctx,
-                    );
-                    renderer.set_projection_frame(
-                        &terminal_guard,
-                        viewport.clone(),
-                        projection_policy,
-                    );
+                    let projection_view_state = &mut session.projection_view_state;
                     let projection_key = viewport.key();
                     if renderer.cached_links_projection_key != Some(projection_key)
                         || terminal_ptr != renderer.cached_links_terminal_ptr
@@ -3144,32 +3179,17 @@ impl TerminalApp {
                 session
                     .projection_policy
                     .set_chat_command_bubbles(self.renderer.chat_command_bubbles);
-                let projection_policy = &session.projection_policy;
-                let projection_view_state = &mut session.projection_view_state;
-
                 // 获取链接列表用于渲染（使用缓存）
-                self.renderer.prepare_canvas_scrollbar(
+                let viewport = prepare_terminal_projection(
+                    &mut self.renderer,
+                    session,
                     &mut terminal_guard,
-                    projection_policy,
-                    projection_view_state,
-                    &mut session.transcript_canvas,
                     ctx,
                     single_presentation_rect,
                     terminal_interaction_enabled,
                     terminal_interaction_enabled,
                 );
-                let viewport = self.renderer.canvas_viewport(
-                    &mut terminal_guard,
-                    projection_policy,
-                    projection_view_state,
-                    &mut session.transcript_canvas,
-                    ctx,
-                );
-                self.renderer.set_projection_frame(
-                    &terminal_guard,
-                    viewport.clone(),
-                    projection_policy,
-                );
+                let projection_view_state = &mut session.projection_view_state;
                 let projection_key = viewport.key();
 
                 if self.cached_links_projection_key != Some(projection_key)
