@@ -97,7 +97,12 @@ pub fn load(path: &Path) -> Result<PreviewContent, String> {
         MAX_TEXT_BYTES
     };
     if metadata.len() > limit {
-        return Err("Preview exceeds its byte budget".into());
+        let message = if format.is_none() {
+            "Text preview exceeds the 1 MiB limit"
+        } else {
+            "Preview exceeds its byte budget"
+        };
+        return Err(message.into());
     }
     let mut bytes = prefix[..count].to_vec();
     file.take(limit + 1 - count as u64)
@@ -365,7 +370,10 @@ mod tests {
             .unwrap()
             .set_len(MAX_TEXT_BYTES + 1)
             .unwrap();
-        assert!(load(&f.0).is_err());
+        assert_eq!(
+            load(&f.0).err().as_deref(),
+            Some("Text preview exceeds the 1 MiB limit")
+        );
     }
     #[test]
     fn png_decode_and_pixel_limit() {
