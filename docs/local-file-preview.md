@@ -1,10 +1,17 @@
-# Local file preview (initial Ember slice)
+# Local file preview
 
-Ctrl + primary click on a detected local file reference opens a read-only right sidebar candidate. Because terminal output can come from a remote proxy even when its foreground process is local, this first slice **does not automatically read the file**. The user selects **Preview local file** after inspecting the candidate and local base directory. Known SSH and non-interactive sessions are rejected. A foreground application with mouse reporting enabled retains the click; the host does not take it for preview.
+In **Files**, right-click a single file in the local tree and choose **Preview file**. The inspector reads its exact filename. Ctrl + primary click on a detected reference in terminal output opens a candidate with the absolute local path and any source-location fallback. Choose **Preview local file** to start the read. Known SSH and non-interactive sessions are rejected. A foreground application with mouse reporting enabled retains the click.
 
 The base directory is captured from the originating PTY foreground process at pointer press, not from terminal-controlled OSC 7 or the assistant process cwd. A delayed click is cancelled on session changes as before. A preview is shown only for its originating session. File reads and image decoding happen on one worker, so slow filesystems cannot create an unbounded thread queue.
 
-Supported initial scope:
+The preview uses the existing Inspector, including its compact drawer.
+**Go to line** highlights a one-based source line. **Copy text** copies the
+loaded source without line-number decorations, and **Copy path** copies the
+displayed path. **Reload** reads the path shown after resolution. Images show
+their pixel dimensions, fit the available space by default, and offer
+**Actual size** for scrolling at a larger scale.
+
+Supported content and paths:
 
 - Existing absolute, `./`, `../`, `~/` references and bare source references such as `src/App.tsx:12:3`, `README.md`, `PHOTO.PNG`, and `目录/报告.TSX:4:2`. Bare candidates accept Unicode letters, numbers and combining marks with known ASCII extensions matched without case sensitivity; spelling is preserved without normalization. Unsupported suffixes are not truncated into another filename. Detection maps logical text spans back to wide terminal cells and wrapped rows. The existing grid stores one codepoint per cell: it NFC-composes supported combining sequences and can discard uncomposable marks. Therefore decomposed on-disk filenames are not guaranteed to survive terminal rendering byte-for-byte; this change does not claim to fix that grid limitation.
 - UTF-8 text including TSX, Markdown, HTML and SVG is displayed as inert selectable source. No JavaScript, shell, HTML/webview, Markdown commands, external opener or remote fetch is invoked.

@@ -86,19 +86,7 @@ pub(crate) fn show_inspector_drawer<R>(
         })
 }
 
-pub(crate) fn remember_inspector_control(ui: &egui::Ui, response: &egui::Response) {
-    crate::ui::remember_reference_chrome_scope(
-        ui.ctx(),
-        response.id,
-        response.rect,
-        response.clicked(),
-    );
-    if response.has_focus() {
-        ui.ctx().data_mut(|data| {
-            data.insert_temp(egui::Id::new("block-action-focus"), response.id);
-        });
-    }
-}
+pub(crate) use crate::ui::remember_inspector_control;
 
 fn inspector_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
     let response = ui.add_enabled(enabled, egui::Button::new(label));
@@ -365,6 +353,16 @@ impl TerminalApp {
         }
     }
 
+    pub(crate) fn active_file_preview_is_open(&self) -> bool {
+        self.session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .is_some_and(|session| {
+                self.local_preview_panel
+                    .is_visible_for(&session.metadata.session_id)
+            })
+    }
+
     pub(crate) fn reference_layout(&self, ctx: &egui::Context) -> shell::Layout {
         let size = ctx.viewport_rect().size();
         let mut layout =
@@ -372,7 +370,7 @@ impl TerminalApp {
         if !self.sidebar.visible {
             layout = layout.without_navigation();
         }
-        if !self.reference_inspector.open {
+        if !self.reference_inspector.open && !self.active_file_preview_is_open() {
             layout = layout.without_inspector();
         }
         layout.with_chrome_font_size(self.config.effective_ui_font_size())
@@ -518,10 +516,9 @@ impl TerminalApp {
         &self,
         ctx: &egui::Context,
     ) -> Option<egui::Rect> {
-        if self.reference_navigation_drawer_rect(ctx).is_some()
-            || !self.reference_inspector.open
-            || !self.reference_inspector.narrow_drawer
-        {
+        let drawer_requested = self.active_file_preview_is_open()
+            || (self.reference_inspector.open && self.reference_inspector.narrow_drawer);
+        if self.reference_navigation_drawer_rect(ctx).is_some() || !drawer_requested {
             return None;
         }
         let screen = ctx.viewport_rect();
@@ -687,6 +684,9 @@ impl TerminalApp {
         remember_inspector_control(ui, &response);
         if response.clicked() {
             if shown {
+                if self.active_file_preview_is_open() {
+                    self.local_preview_panel.close();
+                }
                 self.reference_inspector.open = false;
                 self.reference_inspector.narrow_drawer = false;
             } else {
@@ -1555,8 +1555,9 @@ impl TerminalApp {
 
     pub(crate) fn render_reference_inspector(&mut self, root: &mut egui::Ui) {
         self.render_workspace_remote(root.ctx());
+        let show_preview = self.active_file_preview_is_open();
         if !self.reference_inspector_visible(root.ctx())
-            || self.sidebar.view == sidebar::SidebarView::Files
+            || (self.sidebar.view == sidebar::SidebarView::Files && !show_preview)
         {
             return;
         }
@@ -1569,7 +1570,7 @@ impl TerminalApp {
         if let Some(rect) = self.reference_inspector_drawer_rect(root.ctx()) {
             let response =
                 show_inspector_drawer(root, rect, "reference-inspector-drawer", frame, |ui| {
-                    self.render_reference_inspector_contents(ui);
+                    self.render_reference_inspector_page(ui, show_preview);
                 });
             self.font_zoom.register(
                 response.response.rect,
@@ -1590,7 +1591,24 @@ impl TerminalApp {
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(frame)
-                .show_bounded(root, |ui| self.render_reference_inspector_contents(ui));
+                .show_bounded(root, |ui| {
+                    self.render_reference_inspector_page(ui, show_preview)
+                });
+        }
+    }
+
+    fn render_reference_inspector_page(&mut self, ui: &mut egui::Ui, show_preview: bool) {
+        if show_preview {
+            chrome_style(
+                ui,
+                self.config.effective_ui_font_size() / config::DEFAULT_FONT_SIZE,
+            );
+            if self.local_preview_panel.show(ui) {
+                self.return_focus_to_terminal(ui.ctx());
+                ui.ctx().request_repaint();
+            }
+        } else {
+            self.render_reference_inspector_contents(ui);
         }
     }
 

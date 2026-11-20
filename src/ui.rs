@@ -871,6 +871,15 @@ const BLOCK_GUTTER_WIDTH: f32 = crate::block_mode::GUTTER_CLICK_BAND_PX;
 
 type ReferenceChromeScopes = std::collections::HashMap<egui::Id, (u64, bool, egui::Rect)>;
 
+pub(crate) fn remember_inspector_control(ui: &egui::Ui, response: &egui::Response) {
+    remember_reference_chrome_scope(ui.ctx(), response.id, response.rect, response.clicked());
+    if response.has_focus() {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new("block-action-focus"), response.id);
+        });
+    }
+}
+
 /// Each visible native pane keeps its own scope. A later pane must never
 /// overwrite an earlier pane's open menu or its closing input batch.
 pub(crate) fn remember_reference_chrome_scope(

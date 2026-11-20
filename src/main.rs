@@ -2480,6 +2480,7 @@ enum FsMenuAction {
     CopyPath(Vec<std::path::PathBuf>),
     /// Open a local file with the trusted system opener.
     Open(std::path::PathBuf),
+    Preview(std::path::PathBuf),
     /// 重新扫描该目录（若已加载）。
     Refresh(std::path::PathBuf),
 }
@@ -3545,7 +3546,7 @@ impl TerminalApp {
     /// 渲染左侧文件树侧边栏。必须在 CentralPanel 之前调用，
     /// 否则中央区域不会正确收缩。
     #[allow(deprecated)]
-    fn render_sidebar(&mut self, root_ui: &mut egui::Ui) {
+    fn render_sidebar(&mut self, root_ui: &mut egui::Ui, preview_was_open: bool) {
         // Configuration can change while the sidebar is hidden (and a Files
         // dialog can still be open). Reconcile before the visibility early
         // return so stale remote paths never retain a live dispatch context.
@@ -3576,7 +3577,8 @@ impl TerminalApp {
             }
         }
         let files_selected = self.sidebar.view == sidebar::SidebarView::Files;
-        if (files_selected && !self.reference_inspector_visible(root_ui.ctx()))
+        if (files_selected
+            && (!self.reference_inspector_visible(root_ui.ctx()) || preview_was_open))
             || (!files_selected && !self.reference_navigation_visible(root_ui.ctx()))
         {
             // 展开按钮统一由顶部栏内的 ☰ 负责(Top 模式在 tab 栏，Sidebar 模式在精简顶部栏)，
@@ -4768,6 +4770,9 @@ impl TerminalApp {
             }
         }
         if let Some(action) = fs_menu_action {
+            if matches!(action, FsMenuAction::Preview(_)) {
+                root_ui.ctx().request_repaint();
+            }
             self.apply_fs_menu_action(action, fs_intent_context);
         }
         if cancel_transfer && self.sidebar.cancel_transfers() > 0 {
@@ -5208,6 +5213,10 @@ impl TerminalApp {
         crate::theme::configure_popup_text(ui, font_size);
         let multi = targets.len() > 1;
         if let Some((path, false)) = entry {
+            if files_are_local && !multi && ui.button("Preview file").clicked() {
+                *menu = Some(FsMenuAction::Preview(path.to_path_buf()));
+                ui.close();
+            }
             let open = ui.add_enabled(files_are_local && !multi, egui::Button::new("Open  Enter"));
             if files_are_local {
                 if open.clicked() {
@@ -5325,7 +5334,8 @@ impl TerminalApp {
             FsMenuAction::NewFile(path)
             | FsMenuAction::NewFolder(path)
             | FsMenuAction::Rename(path)
-            | FsMenuAction::Paste(path) => self.sidebar.path_uses_stale_snapshot(path),
+            | FsMenuAction::Paste(path)
+            | FsMenuAction::Preview(path) => self.sidebar.path_uses_stale_snapshot(path),
             FsMenuAction::Delete { paths }
             | FsMenuAction::Copy { paths }
             | FsMenuAction::Cut { paths } => paths
@@ -5401,6 +5411,17 @@ impl TerminalApp {
                     Duration::from_secs(5),
                 ),
             },
+            FsMenuAction::Preview(path) => {
+                if !self.sidebar.location().is_remote() {
+                    let session_id = self
+                        .session_manager
+                        .get_active_session_mut()
+                        .metadata
+                        .session_id
+                        .clone();
+                    self.local_preview_panel.open_tree_file(session_id, path);
+                }
+            }
             FsMenuAction::Refresh(dir) => {
                 if let Some(error) = self.sidebar.refresh_loaded_node(&dir) {
                     self.set_status_for(
@@ -5834,16 +5855,11 @@ impl TerminalApp {
         self.render_reference_optional_controls(root_ui);
         self.render_reference_rail(root_ui);
         self.render_reference_navigation_scrim(root_ui);
+        self.local_preview_panel.poll(root_ui.ctx());
+        let preview_was_open = self.active_file_preview_is_open();
         self.render_reference_inspector(root_ui);
         self.render_reference_files_navigation(root_ui);
-        self.render_sidebar(root_ui);
-        let preview_session_id = self
-            .session_manager
-            .get_active_session_mut()
-            .metadata
-            .session_id
-            .clone();
-        self.local_preview_panel.show(root_ui, &preview_session_id);
+        self.render_sidebar(root_ui, preview_was_open);
         self.render_organism(root_ui);
         self.render_vim9_workbench(root_ui);
         let layout = self.reference_layout(ctx);
@@ -8517,7 +8533,8 @@ impl eframe::App for TerminalApp {
                 let (msg, dur) = match result {
                     Ok(_) => (
                         if link.link_type == link::LinkType::FilePath {
-                            format!("Local preview candidate: {}", link.text)
+                            ctx.request_repaint();
+                            "Review the local file in the inspector".to_string()
                         } else {
                             format!("Opened: {}", link.text)
                         },

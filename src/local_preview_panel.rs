@@ -1,11 +1,65 @@
-//! Read-only preview. One bounded worker; no browser, subprocess or renderer execution.
-use crate::glass_shell::BoundedPanel;
-use std::path::PathBuf;
+//! Read-only local previews, with one worker and one current inspector page.
+use crate::local_reference::SourceLocationCandidate;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+
+#[derive(Clone)]
+struct ReadTarget {
+    path: PathBuf,
+    fallback: Option<(PathBuf, SourceLocationCandidate)>,
+}
+
+impl ReadTarget {
+    fn exact(path: PathBuf) -> Self {
+        Self {
+            path,
+            fallback: None,
+        }
+    }
+
+    fn reference(target: &str, cwd: &Path) -> Result<Self, String> {
+        let candidate = crate::local_reference::parse_candidate(target)
+            .ok_or_else(|| "Unsupported local file reference".to_string())?;
+        if !cwd.is_absolute() {
+            return Err("Local working directory must be absolute".into());
+        }
+        let join = |text: &str| -> Result<PathBuf, String> {
+            if let Some(rest) = text.strip_prefix("~/") {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_absolute())
+                    .ok_or_else(|| "Local home directory unavailable".to_string())?;
+                Ok(home.join(rest))
+            } else {
+                Ok(cwd.join(text))
+            }
+        };
+        let path = join(&candidate.exact_path)?;
+        let fallback = candidate
+            .source_location
+            .map(|location| join(&location.path).map(|path| (path, location)))
+            .transpose()?;
+        Ok(Self { path, fallback })
+    }
+
+    fn resolve(self) -> Result<(PathBuf, Option<SourceLocationCandidate>), String> {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(_) => Ok((self.path, None)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self
+                .fallback
+                .map(|(path, location)| (path, Some(location)))
+                .ok_or_else(|| "Local file not found".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                Err("Permission denied reading the local file".into())
+            }
+            Err(_) => Err("Cannot inspect local file".into()),
+        }
+    }
+}
 
 struct LoadedPreview {
     path: PathBuf,
-    location: Option<crate::local_reference::SourceLocationCandidate>,
+    location: Option<SourceLocationCandidate>,
     content: crate::local_preview::PreviewContent,
 }
 
@@ -13,12 +67,14 @@ struct PreviewText {
     source: String,
     starts: Vec<usize>,
 }
+
 impl PreviewText {
     fn new(source: String) -> Self {
         let mut starts = vec![0];
         starts.extend(source.match_indices('\n').map(|(offset, _)| offset + 1));
         Self { source, starts }
     }
+
     fn line(&self, index: usize) -> &str {
         let start = self.starts[index];
         let end = self
@@ -30,48 +86,71 @@ impl PreviewText {
     }
 }
 
+type PreviewResult = Result<LoadedPreview, String>;
+
 #[derive(Default)]
 pub struct LocalPreviewPanel {
     session_id: String,
     path: PathBuf,
     visible: bool,
-    pending: Option<Receiver<Result<LoadedPreview, String>>>,
+    pending: Option<(u64, Receiver<PreviewResult>)>,
     text: Option<PreviewText>,
     texture: Option<egui::TextureHandle>,
     error: Option<String>,
-    candidate: Option<(String, PathBuf)>,
-    location: Option<crate::local_reference::SourceLocationCandidate>,
+    candidate: Option<ReadTarget>,
+    last_request: Option<ReadTarget>,
+    location: Option<SourceLocationCandidate>,
     seek_pending: bool,
+    line_input: String,
+    selected_line: Option<usize>,
+    line_error: Option<String>,
+    actual_size: bool,
     content_revision: u64,
 }
+
 impl LocalPreviewPanel {
     pub fn open(&mut self, session_id: String, target: String, cwd: PathBuf) -> Result<(), String> {
-        if self.pending.is_some() {
-            return Err("A file preview is still loading".into());
-        }
-        self.session_id = session_id;
-        self.path = PathBuf::from(&target);
-        self.visible = true;
-        self.text = None;
-        self.texture = None;
-        self.error = None;
-        self.location = None;
-        self.seek_pending = false;
-        self.content_revision = self.content_revision.wrapping_add(1);
-        self.candidate = Some((target, cwd));
+        let target = ReadTarget::reference(&target, &cwd)?;
+        self.present(session_id, &target.path);
+        self.candidate = Some(target);
         Ok(())
     }
-    fn load_confirmed(&mut self, target: String, cwd: PathBuf) -> Result<(), String> {
-        // A blocked filesystem cannot cause unbounded worker creation on repeated clicks.
-        if self.pending.is_some() {
-            return Err("A file preview is still loading".into());
+
+    pub fn open_tree_file(&mut self, session_id: String, path: PathBuf) {
+        if !path.is_absolute() {
+            return;
         }
+        self.present(session_id, &path);
+        self.last_request = Some(ReadTarget::exact(path));
+        self.start_read();
+    }
+
+    fn present(&mut self, session_id: String, path: &Path) {
+        self.close();
+        self.session_id = session_id;
+        self.path = path.to_path_buf();
+        self.visible = true;
+    }
+
+    fn start_read(&mut self) {
+        if self.pending.is_some() {
+            self.error = Some("Another preview is still reading. Try again shortly.".into());
+            return;
+        }
+        let Some(target) = self
+            .candidate
+            .as_ref()
+            .or(self.last_request.as_ref())
+            .cloned()
+        else {
+            return;
+        };
         let (tx, rx) = mpsc::sync_channel(1);
-        let path = PathBuf::from(&target);
-        std::thread::Builder::new()
+        let worker_target = target.clone();
+        if std::thread::Builder::new()
             .name("local-file-preview".into())
             .spawn(move || {
-                let _ = tx.send(resolve(&target, &cwd).and_then(|(path, location)| {
+                let _ = tx.send(worker_target.resolve().and_then(|(path, location)| {
                     crate::local_preview::load(&path).map(|content| LoadedPreview {
                         path,
                         location,
@@ -79,199 +158,315 @@ impl LocalPreviewPanel {
                     })
                 }));
             })
-            .map_err(|e| e.to_string())?;
-        self.path = path;
-        self.visible = true;
-        self.pending = Some(rx);
+            .is_err()
+        {
+            self.error = Some("Could not start the preview reader".into());
+            return;
+        }
+        self.content_revision = self.content_revision.wrapping_add(1);
+        self.candidate = None;
+        self.last_request = Some(target);
+        self.pending = Some((self.content_revision, rx));
         self.text = None;
         self.texture = None;
         self.error = None;
-        Ok(())
+        self.line_error = None;
     }
-    fn close(&mut self) {
+
+    pub fn is_visible_for(&self, session_id: &str) -> bool {
+        self.visible && self.session_id == session_id
+    }
+
+    pub fn close(&mut self) {
+        // Keep the receiver until completion so a blocked read still holds the worker slot.
+        self.content_revision = self.content_revision.wrapping_add(1);
         self.visible = false;
+        self.path.clear();
         self.candidate = None;
+        self.last_request = None;
         self.text = None;
         self.texture = None;
         self.error = None;
         self.location = None;
         self.seek_pending = false;
-        // Keep the receiver until completion: a blocked filesystem worker must
-        // still occupy the one-worker slot even after its UI is dismissed.
+        self.line_input.clear();
+        self.selected_line = None;
+        self.line_error = None;
+        self.actual_size = false;
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, active_session_id: &str) {
-        if let Some(rx) = &self.pending {
-            match rx.try_recv() {
-                Ok(result) => {
-                    self.pending = None;
-                    if !self.visible {
-                        return;
-                    }
-                    match result {
-                        Ok(loaded) => {
-                            self.path = loaded.path;
-                            self.location = loaded.location;
-                            self.seek_pending = true;
-                            match loaded.content {
-                                crate::local_preview::PreviewContent::Text(text) => {
-                                    self.text = Some(PreviewText::new(text))
-                                }
-                                crate::local_preview::PreviewContent::Image(image) => {
-                                    self.texture = Some(ui.ctx().load_texture(
-                                        "local-file-preview",
-                                        image,
-                                        egui::TextureOptions::LINEAR,
-                                    ))
-                                }
-                            }
-                        }
-                        Err(error) => self.error = Some(error),
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.pending = None;
-                    if self.visible {
-                        self.error = Some("Preview worker stopped".into());
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => ui
-                    .ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(50)),
+    pub fn poll(&mut self, ctx: &egui::Context) {
+        let Some((revision, receiver)) = &self.pending else {
+            return;
+        };
+        let revision = *revision;
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Disconnected) => Err("Preview reader stopped".into()),
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                return;
             }
-        }
-        // A result belongs only to the originating session, never to another tab.
-        if !self.visible || self.session_id != active_session_id {
+        };
+        self.pending = None;
+        if !self.visible || revision != self.content_revision {
             return;
         }
-        egui::Panel::right("local_read_only_preview")
-            .default_size(340.0)
-            .resizable(true)
-            .show_bounded(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.strong("File preview · read only");
-                    if ui.button("Close").clicked() {
-                        self.close();
+        match result {
+            Ok(loaded) => {
+                self.path = loaded.path;
+                self.last_request = Some(ReadTarget::exact(self.path.clone()));
+                if let Some(location) = loaded.location {
+                    self.selected_line = Some(location.line.get() as usize);
+                    self.location = Some(location);
+                }
+                match loaded.content {
+                    crate::local_preview::PreviewContent::Text(text) => {
+                        self.text = Some(PreviewText::new(text));
+                        if let Some(line) = self.selected_line {
+                            self.line_input = line.to_string();
+                            self.seek_pending = true;
+                        }
                     }
-                });
-                ui.label(crate::sidebar::bound_sidebar_path_label(&self.path));
-                ui.separator();
-                if let Some((target, cwd)) = self.candidate.clone() {
-                    ui.label("Terminal output does not prove a path belongs to this computer.");
-                    ui.label(format!(
-                        "Local base: {}",
-                        crate::sidebar::bound_sidebar_path_label(&cwd)
-                    ));
-                    if ui.button("Preview local file").clicked() {
-                        self.candidate = None;
-                        if let Err(error) = self.load_confirmed(target, cwd) {
-                            self.error = Some(error);
+                    crate::local_preview::PreviewContent::Image(image) => {
+                        self.texture = Some(ctx.load_texture(
+                            "local-file-preview",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                }
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui) -> bool {
+        let close = ui
+            .horizontal(|ui| {
+                ui.strong("Local file preview");
+                let close = ui.button("Close");
+                crate::ui::remember_inspector_control(ui, &close);
+                close.clicked()
+            })
+            .inner;
+        if close {
+            self.close();
+            return true;
+        }
+        let path = display_path(&self.path);
+        if self.candidate.is_none() {
+            ui.add(egui::Label::new(&path).truncate())
+                .on_hover_text(&path);
+        }
+        ui.separator();
+
+        let reading = self
+            .pending
+            .as_ref()
+            .is_some_and(|(revision, _)| *revision == self.content_revision);
+        if let Some(target) = &self.candidate {
+            let confirmed = egui::ScrollArea::vertical()
+                .id_salt(("local_preview_confirmation", self.content_revision))
+                .show(ui, |ui| {
+                    ui.label("Confirm that the terminal reference belongs to this computer before reading.");
+                    ui.label(&path);
+                    if let Some((fallback, location)) = &target.fallback {
+                        ui.label(format!(
+                            "If this filename is missing, read {} ({})",
+                            display_path(fallback),
+                            location_label(location),
+                        ));
+                    }
+                    if let Some(error) = &self.error {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                    let confirm = ui.button("Preview local file");
+                    crate::ui::remember_inspector_control(ui, &confirm);
+                    confirm.clicked()
+                }).inner;
+            if confirmed {
+                self.start_read();
+                ui.ctx().request_repaint();
+            }
+            return false;
+        }
+        {
+            let ready = self.text.is_some() || self.texture.is_some();
+            ui.horizontal_wrapped(|ui| {
+                let reload = ui.add_enabled(!reading, egui::Button::new("Reload"));
+                crate::ui::remember_inspector_control(ui, &reload);
+                if reload.clicked() {
+                    self.start_read();
+                    ui.ctx().request_repaint();
+                }
+                if ready && !reload.clicked() {
+                    let copy_path = ui.button("Copy path");
+                    crate::ui::remember_inspector_control(ui, &copy_path);
+                    if copy_path.clicked() {
+                        ui.ctx().copy_text(path);
+                    }
+                    if let Some(text) = &self.text {
+                        let copy = ui.button("Copy text");
+                        crate::ui::remember_inspector_control(ui, &copy);
+                        if copy.clicked() {
+                            ui.ctx().copy_text(text.source.clone());
                         }
                     }
                 }
-                if self.pending.is_some() {
-                    ui.spinner();
+            });
+        }
+        if reading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading local file…");
+            });
+        }
+        if let Some(error) = &self.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        if self.text.is_some() {
+            self.show_source(ui);
+        }
+        if let Some(texture) = &self.texture {
+            let size = texture.size();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{} × {} pixels", size[0], size[1]));
+                let actual = ui.toggle_value(&mut self.actual_size, "Actual size");
+                crate::ui::remember_inspector_control(ui, &actual);
+            });
+            self.show_image(ui, texture);
+        }
+        false
+    }
+
+    fn show_source(&mut self, ui: &mut egui::Ui) {
+        let Some(text) = &self.text else {
+            return;
+        };
+        if text.source.is_empty() {
+            ui.label("Empty file");
+            return;
+        }
+        let count = text.starts.len();
+        let mut jump = false;
+        ui.horizontal_wrapped(|ui| {
+            let input = ui.add(
+                egui::TextEdit::singleline(&mut self.line_input)
+                    .hint_text("Line number")
+                    .char_limit(10)
+                    .desired_width(82.0),
+            );
+            crate::ui::remember_inspector_control(ui, &input);
+            let button = ui.button("Go to line");
+            crate::ui::remember_inspector_control(ui, &button);
+            jump = button.clicked()
+                || (input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+        });
+        if jump {
+            match self.line_input.trim().parse::<usize>() {
+                Ok(line) if (1..=count).contains(&line) => {
+                    self.selected_line = Some(line);
+                    self.location = None;
+                    self.seek_pending = true;
+                    self.line_error = None;
                 }
-                if let Some(error) = &self.error {
-                    ui.label(error);
+                _ => self.line_error = Some(format!("Choose a line from 1 to {count}.")),
+            }
+        }
+        let target = self.selected_line.filter(|line| *line <= count);
+        if let Some(error) = &self.line_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        } else if self.selected_line.is_some() && target.is_none() {
+            ui.label(format!(
+                "Requested line is outside this file · {count} lines"
+            ));
+        } else if let Some(location) = &self.location {
+            ui.label(format!("{} · {count} lines", location_label(location)));
+        } else {
+            ui.label(match target {
+                Some(line) => format!("Line {line} · {count} lines"),
+                None => format!("{count} lines"),
+            });
+        }
+        let font =
+            egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Monospace].size);
+        let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+        let mut scroll = egui::ScrollArea::both()
+            .id_salt(("local_preview_content", self.content_revision))
+            .auto_shrink([false, false]);
+        if self.seek_pending {
+            let index = target.unwrap_or(1) - 1;
+            scroll = scroll
+                .vertical_scroll_offset(index as f32 * (row_height + ui.spacing().item_spacing.y));
+            self.seek_pending = false;
+        }
+        scroll.show_rows(ui, row_height, count, |ui, range| {
+            for index in range {
+                let mut line =
+                    egui::RichText::new(format!("{:>6}  {}", index + 1, text.line(index)))
+                        .font(font.clone());
+                if target == Some(index + 1) {
+                    line = line.background_color(ui.visuals().selection.bg_fill);
                 }
-                if let Some(text) = &self.text {
-                    let target = self
-                        .location
-                        .as_ref()
-                        .map(|location| location.line.get() as usize - 1);
-                    if let Some(location) = &self.location {
-                        let column = location
-                            .column
-                            .map(|value| format!(", column {}", value))
-                            .unwrap_or_default();
-                        ui.label(format!("Line {}{}", location.line, column));
-                        if target.is_some_and(|index| index >= text.starts.len()) {
-                            ui.label("Requested line is outside this file; showing the beginning.");
-                        }
-                    }
-                    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-                    let mut scroll = egui::ScrollArea::both()
-                        .id_salt(("local_preview_content", self.content_revision));
-                    if self.seek_pending {
-                        let index = target
-                            .filter(|&index| index < text.starts.len())
-                            .unwrap_or(0);
-                        scroll = scroll.vertical_scroll_offset(
-                            index as f32 * (row_height + ui.spacing().item_spacing.y),
-                        );
-                        self.seek_pending = false;
-                    }
-                    scroll.show_rows(ui, row_height, text.starts.len(), |ui, range| {
-                        for index in range {
-                            let mut line = egui::RichText::new(format!(
-                                "{:>6}  {}",
-                                index + 1,
-                                text.line(index)
-                            ))
-                            .monospace();
-                            if target == Some(index) {
-                                line = line.background_color(ui.visuals().selection.bg_fill);
-                            }
-                            ui.add(
-                                egui::Label::new(line)
-                                    .selectable(true)
-                                    .wrap_mode(egui::TextWrapMode::Extend),
-                            );
-                        }
-                    });
-                }
-                if let Some(texture) = &self.texture {
-                    egui::ScrollArea::both()
-                        .id_salt(("local_preview_image", self.content_revision))
-                        .show(ui, |ui| {
-                            ui.image((texture.id(), texture.size_vec2()));
-                        });
-                }
+                ui.add(
+                    egui::Label::new(line)
+                        .selectable(true)
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            }
+        });
+    }
+
+    fn show_image(&self, ui: &mut egui::Ui, texture: &egui::TextureHandle) {
+        let size = texture.size_vec2();
+        let available = ui.available_size().max(egui::Vec2::splat(1.0));
+        let native = size / ui.ctx().pixels_per_point();
+        let display = if self.actual_size {
+            native
+        } else {
+            native
+                * (available.x / native.x)
+                    .min(available.y / native.y)
+                    .min(1.0)
+        };
+        egui::ScrollArea::both()
+            .id_salt((
+                "local_preview_image",
+                self.content_revision,
+                self.actual_size,
+            ))
+            .show(ui, |ui| {
+                ui.image((texture.id(), display));
             });
     }
 }
 
-fn resolve(
-    target: &str,
-    cwd: &std::path::Path,
-) -> Result<
-    (
-        PathBuf,
-        Option<crate::local_reference::SourceLocationCandidate>,
-    ),
-    String,
-> {
-    let candidate = crate::local_reference::parse_candidate(target)
-        .ok_or_else(|| "Unsupported local file reference".to_string())?;
-    if !cwd.is_absolute() {
-        return Err("Local working directory must be absolute".into());
-    }
-    let join = |text: &str| -> Result<PathBuf, String> {
-        if let Some(rest) = text.strip_prefix("~/") {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .ok_or_else(|| "Local home directory unavailable".to_string())?;
-            Ok(home.join(rest))
-        } else {
-            Ok(cwd.join(text))
-        }
-    };
-    let exact = join(&candidate.exact_path)?;
-    match std::fs::symlink_metadata(&exact) {
-        Ok(_) => Ok((exact, None)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => candidate
-            .source_location
-            .map(|location| join(&location.path).map(|path| (path, Some(location))))
-            .unwrap_or_else(|| Err("Local file not found".into())),
-        Err(_) => Err("Cannot inspect local file".into()),
+fn display_path(path: &Path) -> String {
+    let value = path
+        .to_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{:?}", path.as_os_str()));
+    jterm_core::review_input::safe_inline_display(&value, 32 * 1024)
+}
+
+fn location_label(location: &SourceLocationCandidate) -> String {
+    match location.column {
+        Some(column) => format!("Line {}, column {column} (reported)", location.line),
+        None => format!("Line {}", location.line),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolve(
+        target: &str,
+        cwd: &Path,
+    ) -> Result<(PathBuf, Option<SourceLocationCandidate>), String> {
+        ReadTarget::reference(target, cwd)?.resolve()
+    }
     #[test]
     fn candidate_requires_explicit_local_choice_before_io() {
         let mut panel = LocalPreviewPanel::default();
@@ -361,7 +556,10 @@ mod tests {
                 ..Default::default()
             },
             |root_ui| {
-                egui::CentralPanel::default().show(root_ui, |ui| panel.show(ui, session));
+                panel.poll(root_ui.ctx());
+                if panel.is_visible_for(session) {
+                    egui::CentralPanel::default().show(root_ui, |ui| panel.show(ui));
+                }
             },
         );
         output.textures_delta.clear();
@@ -399,7 +597,7 @@ mod tests {
             .unwrap();
         panel.candidate = None;
         let (tx, rx) = mpsc::sync_channel(1);
-        panel.pending = Some(rx);
+        panel.pending = Some((panel.content_revision, rx));
         tx.send(Ok(LoadedPreview {
             path: PathBuf::from("/tmp/view.tsx"),
             location: crate::local_reference::parse_candidate("view.tsx:1500:3")
@@ -470,14 +668,19 @@ mod tests {
             .open("owner".into(), "view.md".into(), PathBuf::from("/tmp"))
             .unwrap();
         let (tx, rx) = mpsc::sync_channel(1);
-        panel.pending = Some(rx);
+        panel.pending = Some((panel.content_revision, rx));
         panel.text = Some(PreviewText::new("old content".into()));
         panel.error = Some("old error".into());
         panel.close();
         assert!(panel.text.is_none() && panel.error.is_none() && panel.candidate.is_none());
-        assert!(panel
+        panel
             .open("owner".into(), "other.md".into(), PathBuf::from("/tmp"))
-            .is_err());
+            .unwrap();
+        panel.start_read();
+        assert!(
+            panel.candidate.is_some(),
+            "busy reader must keep the new confirmation"
+        );
         tx.send(Ok(LoadedPreview {
             path: PathBuf::from("/tmp/view.md"),
             location: None,
@@ -488,14 +691,11 @@ mod tests {
         }))
         .unwrap();
         let ctx = egui::Context::default();
-        assert!(labels(&frame(&mut panel, &ctx, "owner", vec![])).is_empty());
+        let _ = frame(&mut panel, &ctx, "owner", vec![]);
         assert!(panel.pending.is_none());
-        assert!(panel.texture.is_none() && panel.text.is_none() && panel.error.is_none());
-        assert!(!panel.visible);
-        panel
-            .open("owner".into(), "other.md".into(), PathBuf::from("/tmp"))
-            .unwrap();
-        assert!(panel.candidate.is_some());
+        assert!(panel.texture.is_none() && panel.text.is_none());
+        assert!(panel.visible && panel.candidate.is_some());
+        assert_eq!(panel.path, PathBuf::from("/tmp/other.md"));
     }
 
     #[test]
@@ -506,7 +706,7 @@ mod tests {
                 .open("owner".into(), "view.md".into(), PathBuf::from("/tmp"))
                 .unwrap();
             let (tx, rx) = mpsc::sync_channel(1);
-            panel.pending = Some(rx);
+            panel.pending = Some((panel.content_revision, rx));
             panel.close();
             if !disconnect {
                 tx.send(Err("late failure".into())).unwrap();
@@ -571,6 +771,48 @@ mod tests {
         assert_eq!(panel.location.as_ref().unwrap().line.get(), 2);
         assert!(panel.text.as_ref().unwrap().line(1).starts_with("<script>"));
         assert!(panel.error.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn reload_reads_the_resolved_path_even_when_a_literal_name_appears() {
+        let dir = std::env::temp_dir().join(format!("ember-preview-reload-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("view.tsx");
+        let literal = dir.join("view.tsx:2");
+        std::fs::write(&source, "first\nsecond").unwrap();
+        let mut panel = LocalPreviewPanel::default();
+        panel
+            .open("owner".into(), "view.tsx:2".into(), dir.clone())
+            .unwrap();
+        let ctx = egui::Context::default();
+        let read = |panel: &mut LocalPreviewPanel| {
+            for _ in 0..100 {
+                panel.poll(&ctx);
+                if panel.pending.is_none() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("preview did not load");
+        };
+        panel.start_read();
+        read(&mut panel);
+        assert_eq!(panel.path, source);
+        assert_eq!(panel.selected_line, Some(2));
+        std::fs::write(&literal, "literal colon filename").unwrap();
+        std::fs::write(&source, "first\nupdated").unwrap();
+        panel.start_read();
+        read(&mut panel);
+        assert_eq!(panel.path, source);
+        assert_eq!(panel.text.as_ref().unwrap().line(1), "updated");
+        panel.open_tree_file("owner".into(), literal.clone());
+        read(&mut panel);
+        assert_eq!(panel.path, literal);
+        assert_eq!(
+            panel.text.as_ref().unwrap().line(0),
+            "literal colon filename"
+        );
+        assert!(panel.selected_line.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
