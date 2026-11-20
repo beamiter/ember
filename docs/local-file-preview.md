@@ -7,7 +7,10 @@ The base directory is captured from the originating PTY foreground process at po
 The preview uses the existing Inspector, including its compact drawer.
 **Go to line** highlights a one-based source line. **Copy text** copies the
 loaded source without line-number decorations, and **Copy path** copies the
-displayed path. **Reload** reads the path shown after resolution. Images show
+displayed path. **Find** searches the source with case-sensitive text matching.
+**Prev** and **Next** move between matching lines and wrap around. **Reload**
+reads the path shown after resolution and keeps the last preview usable during
+the read and after a failure. Images show
 their pixel dimensions, fit the available space by default, and offer
 **Actual size** for scrolling at a larger scale.
 

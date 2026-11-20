@@ -86,6 +86,47 @@ impl PreviewText {
     }
 }
 
+#[derive(Default)]
+struct SourceMatches(Vec<usize>);
+
+impl SourceMatches {
+    fn update(&mut self, source: &str, query: &str) {
+        self.0.clear();
+        if !query.is_empty() {
+            self.0.extend(
+                source
+                    .split('\n')
+                    .enumerate()
+                    .filter_map(|(index, line)| line.contains(query).then_some(index + 1)),
+            );
+        }
+    }
+
+    fn step(&self, line: Option<usize>, previous: bool) -> Option<usize> {
+        let index = if previous {
+            line.map_or(self.0.len(), |line| {
+                self.0.partition_point(|hit| *hit < line)
+            })
+            .checked_sub(1)
+            .or_else(|| self.0.len().checked_sub(1))?
+        } else {
+            line.map_or(0, |line| self.0.partition_point(|hit| *hit <= line))
+        };
+        self.0.get(index).or_else(|| self.0.first()).copied()
+    }
+
+    fn status(&self, line: Option<usize>) -> String {
+        if self.0.is_empty() {
+            return "No matching lines".into();
+        }
+        match line.and_then(|line| self.0.binary_search(&line).ok()) {
+            Some(index) => format!("Match {} of {}", index + 1, self.0.len()),
+            None if self.0.len() == 1 => "1 matching line".into(),
+            None => format!("{} matching lines", self.0.len()),
+        }
+    }
+}
+
 type PreviewResult = Result<LoadedPreview, String>;
 
 #[derive(Default)]
@@ -104,6 +145,9 @@ pub struct LocalPreviewPanel {
     line_input: String,
     selected_line: Option<usize>,
     line_error: Option<String>,
+    find_open: bool,
+    find_query: String,
+    matches: SourceMatches,
     actual_size: bool,
     content_revision: u64,
 }
@@ -163,14 +207,10 @@ impl LocalPreviewPanel {
             self.error = Some("Could not start the preview reader".into());
             return;
         }
-        self.content_revision = self.content_revision.wrapping_add(1);
         self.candidate = None;
         self.last_request = Some(target);
         self.pending = Some((self.content_revision, rx));
-        self.text = None;
-        self.texture = None;
         self.error = None;
-        self.line_error = None;
     }
 
     pub fn is_visible_for(&self, session_id: &str) -> bool {
@@ -192,6 +232,9 @@ impl LocalPreviewPanel {
         self.line_input.clear();
         self.selected_line = None;
         self.line_error = None;
+        self.find_open = false;
+        self.find_query.clear();
+        self.matches.update("", "");
         self.actual_size = false;
     }
 
@@ -222,13 +265,25 @@ impl LocalPreviewPanel {
                 }
                 match loaded.content {
                     crate::local_preview::PreviewContent::Text(text) => {
-                        self.text = Some(PreviewText::new(text));
-                        if let Some(line) = self.selected_line {
-                            self.line_input = line.to_string();
-                            self.seek_pending = true;
+                        if self.text.is_none() {
+                            if let Some(line) = self.selected_line {
+                                self.line_input = line.to_string();
+                                self.seek_pending = true;
+                            }
+                        }
+                        self.texture = None;
+                        self.matches.update(&text, &self.find_query);
+                        if self
+                            .text
+                            .as_ref()
+                            .is_none_or(|previous| previous.source != text)
+                        {
+                            self.text = Some(PreviewText::new(text));
                         }
                     }
                     crate::local_preview::PreviewContent::Image(image) => {
+                        self.text = None;
+                        self.matches.update("", "");
                         self.texture = Some(ctx.load_texture(
                             "local-file-preview",
                             image,
@@ -237,7 +292,13 @@ impl LocalPreviewPanel {
                     }
                 }
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => {
+                self.error = Some(if self.text.is_some() || self.texture.is_some() {
+                    format!("Reload failed. Showing the last preview.\n{error}")
+                } else {
+                    error
+                });
+            }
         }
     }
 
@@ -294,13 +355,14 @@ impl LocalPreviewPanel {
         {
             let ready = self.text.is_some() || self.texture.is_some();
             ui.horizontal_wrapped(|ui| {
-                let reload = ui.add_enabled(!reading, egui::Button::new("Reload"));
+                let label = if ready || reading { "Reload" } else { "Retry" };
+                let reload = ui.add_enabled(!reading, egui::Button::new(label));
                 crate::ui::remember_inspector_control(ui, &reload);
                 if reload.clicked() {
                     self.start_read();
                     ui.ctx().request_repaint();
                 }
-                if ready && !reload.clicked() {
+                if ready {
                     let copy_path = ui.button("Copy path");
                     crate::ui::remember_inspector_control(ui, &copy_path);
                     if copy_path.clicked() {
@@ -319,7 +381,11 @@ impl LocalPreviewPanel {
         if reading {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Reading local file…");
+                ui.label(if self.text.is_some() || self.texture.is_some() {
+                    "Reloading local file…"
+                } else {
+                    "Reading local file…"
+                });
             });
         }
         if let Some(error) = &self.error {
@@ -350,18 +416,22 @@ impl LocalPreviewPanel {
         }
         let count = text.starts.len();
         let mut jump = false;
+        let mut focus_find = false;
         ui.horizontal_wrapped(|ui| {
             let input = ui.add(
                 egui::TextEdit::singleline(&mut self.line_input)
-                    .hint_text("Line number")
+                    .hint_text("Line")
                     .char_limit(10)
-                    .desired_width(82.0),
+                    .desired_width(57.0),
             );
             crate::ui::remember_inspector_control(ui, &input);
             let button = ui.button("Go to line");
             crate::ui::remember_inspector_control(ui, &button);
             jump = button.clicked()
                 || (input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+            let find = ui.toggle_value(&mut self.find_open, "Find");
+            crate::ui::remember_inspector_control(ui, &find);
+            focus_find = find.clicked() && self.find_open;
         });
         if jump {
             match self.line_input.trim().parse::<usize>() {
@@ -372,6 +442,59 @@ impl LocalPreviewPanel {
                     self.line_error = None;
                 }
                 _ => self.line_error = Some(format!("Choose a line from 1 to {count}.")),
+            }
+        }
+        if self.find_open {
+            let step = ui
+                .horizontal_wrapped(|ui| {
+                    let input = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.find_query)
+                                .hint_text("Find text")
+                                .char_limit(256)
+                                .desired_width(96.0),
+                        )
+                        .on_hover_text("Case-sensitive matching");
+                    crate::ui::remember_inspector_control(ui, &input);
+                    if focus_find {
+                        input.request_focus();
+                    }
+                    if input.changed() {
+                        self.matches.update(&text.source, &self.find_query);
+                    }
+                    let available = !self.matches.0.is_empty();
+                    let previous = ui
+                        .add_enabled(available, egui::Button::new("Prev"))
+                        .on_hover_text("Previous matching line");
+                    let next = ui
+                        .add_enabled(available, egui::Button::new("Next"))
+                        .on_hover_text("Next matching line");
+                    for control in [&previous, &next] {
+                        crate::ui::remember_inspector_control(ui, control);
+                    }
+                    if previous.clicked() {
+                        Some(true)
+                    } else if next.clicked()
+                        || (input.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                    {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                })
+                .inner;
+            if let Some(line) =
+                step.and_then(|previous| self.matches.step(self.selected_line, previous))
+            {
+                self.selected_line = Some(line);
+                self.line_input = line.to_string();
+                self.location = None;
+                self.seek_pending = true;
+                self.line_error = None;
+            }
+            if !self.find_query.is_empty() {
+                ui.small(self.matches.status(self.selected_line));
             }
         }
         let target = self.selected_line.filter(|line| *line <= count);
@@ -397,8 +520,9 @@ impl LocalPreviewPanel {
             .auto_shrink([false, false]);
         if self.seek_pending {
             let index = target.unwrap_or(1) - 1;
-            scroll = scroll
-                .vertical_scroll_offset(index as f32 * (row_height + ui.spacing().item_spacing.y));
+            let stride = row_height + ui.spacing().item_spacing.y;
+            let context = (ui.available_height() - stride).max(0.0) / 2.0;
+            scroll = scroll.vertical_scroll_offset((index as f32 * stride - context).max(0.0));
             self.seek_pending = false;
         }
         scroll.show_rows(ui, row_height, count, |ui, range| {
@@ -460,6 +584,21 @@ fn location_label(location: &SourceLocationCandidate) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_find_uses_literal_matching_lines_and_wraps() {
+        let mut matches = SourceMatches::default();
+        matches.update("first\n界界\nempty\n界", "界");
+        assert_eq!(matches.status(None), "2 matching lines");
+        assert_eq!(matches.step(None, false), Some(2));
+        assert_eq!(matches.step(Some(2), false), Some(4));
+        assert_eq!(matches.step(Some(4), false), Some(2));
+        assert_eq!(matches.step(Some(2), true), Some(4));
+        assert_eq!(matches.status(Some(4)), "Match 2 of 2");
+        matches.update("larger", "Large");
+        assert_eq!(matches.status(None), "No matching lines");
+        assert_eq!(matches.step(None, true), None);
+    }
 
     fn resolve(
         target: &str,
@@ -800,6 +939,16 @@ mod tests {
         assert_eq!(panel.path, source);
         assert_eq!(panel.selected_line, Some(2));
         std::fs::write(&literal, "literal colon filename").unwrap();
+        std::fs::remove_file(&source).unwrap();
+        panel.start_read();
+        assert_eq!(panel.text.as_ref().unwrap().line(1), "second");
+        read(&mut panel);
+        assert!(panel
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Showing the last preview"));
+        assert_eq!(panel.text.as_ref().unwrap().line(1), "second");
         std::fs::write(&source, "first\nupdated").unwrap();
         panel.start_read();
         read(&mut panel);
