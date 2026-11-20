@@ -6,13 +6,15 @@ The base directory is captured from the originating PTY foreground process at po
 
 The preview uses the existing Inspector, including its compact drawer.
 **Go to line** highlights a one-based source line. **Copy text** copies the
-loaded source without line-number decorations, and **Copy path** copies the
-displayed path. **Find** searches the source with case-sensitive text matching.
-**Prev** and **Next** move between matching lines and wrap around. **Reload**
-reads the path shown after resolution and keeps the last preview usable during
-the read and after a failure. Images show
-their pixel dimensions, fit the available space by default, and offer
-**Actual size** for scrolling at a larger scale.
+source without line numbers, **Copy line** copies the highlighted source line
+without its line break, and **Copy path** copies the displayed path. **Find**
+marks literal occurrences, including multiple matches on one line. **Prev** and
+**Next** wrap through matches and reveal the active occurrence horizontally.
+**Match case** is on by default. The preview indexes the first 4,096 matches
+and adds a plus sign to the count when more exist. **Reload** reads the resolved
+path and keeps the last preview usable during the read and after a failure.
+Images show pixel dimensions and offer **Fit image** and preset zoom levels
+from 25% to 400%. At 100%, a source pixel maps to a display pixel.
 
 Supported content and paths:
 

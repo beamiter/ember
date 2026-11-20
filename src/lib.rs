@@ -25,6 +25,7 @@ pub mod layout;
 pub mod link;
 pub mod local_preview;
 pub mod local_preview_panel;
+mod preview_navigation;
 pub mod local_reference;
 pub mod organism;
 pub mod output_batch;

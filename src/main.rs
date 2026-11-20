@@ -39,6 +39,7 @@ mod layout;
 mod link;
 mod local_preview;
 mod local_preview_panel;
+mod preview_navigation;
 mod local_reference;
 mod native_enter;
 mod navigation_drawer;

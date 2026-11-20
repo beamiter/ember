@@ -1,5 +1,6 @@
 //! Read-only local previews, with one worker and one current inspector page.
 use crate::local_reference::SourceLocationCandidate;
+use crate::preview_navigation::{match_background, ImageZoom, SourceMatches};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
@@ -86,47 +87,6 @@ impl PreviewText {
     }
 }
 
-#[derive(Default)]
-struct SourceMatches(Vec<usize>);
-
-impl SourceMatches {
-    fn update(&mut self, source: &str, query: &str) {
-        self.0.clear();
-        if !query.is_empty() {
-            self.0.extend(
-                source
-                    .split('\n')
-                    .enumerate()
-                    .filter_map(|(index, line)| line.contains(query).then_some(index + 1)),
-            );
-        }
-    }
-
-    fn step(&self, line: Option<usize>, previous: bool) -> Option<usize> {
-        let index = if previous {
-            line.map_or(self.0.len(), |line| {
-                self.0.partition_point(|hit| *hit < line)
-            })
-            .checked_sub(1)
-            .or_else(|| self.0.len().checked_sub(1))?
-        } else {
-            line.map_or(0, |line| self.0.partition_point(|hit| *hit <= line))
-        };
-        self.0.get(index).or_else(|| self.0.first()).copied()
-    }
-
-    fn status(&self, line: Option<usize>) -> String {
-        if self.0.is_empty() {
-            return "No matching lines".into();
-        }
-        match line.and_then(|line| self.0.binary_search(&line).ok()) {
-            Some(index) => format!("Match {} of {}", index + 1, self.0.len()),
-            None if self.0.len() == 1 => "1 matching line".into(),
-            None => format!("{} matching lines", self.0.len()),
-        }
-    }
-}
-
 type PreviewResult = Result<LoadedPreview, String>;
 
 #[derive(Default)]
@@ -147,8 +107,9 @@ pub struct LocalPreviewPanel {
     line_error: Option<String>,
     find_open: bool,
     find_query: String,
+    ignore_case: bool,
     matches: SourceMatches,
-    actual_size: bool,
+    zoom: ImageZoom,
     content_revision: u64,
 }
 
@@ -234,8 +195,9 @@ impl LocalPreviewPanel {
         self.line_error = None;
         self.find_open = false;
         self.find_query.clear();
-        self.matches.update("", "");
-        self.actual_size = false;
+        self.ignore_case = false;
+        self.matches = SourceMatches::default();
+        self.zoom = ImageZoom::Fit;
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -272,7 +234,8 @@ impl LocalPreviewPanel {
                             }
                         }
                         self.texture = None;
-                        self.matches.update(&text, &self.find_query);
+                        self.matches
+                            .update(&text, &self.find_query, !self.ignore_case);
                         if self
                             .text
                             .as_ref()
@@ -283,7 +246,7 @@ impl LocalPreviewPanel {
                     }
                     crate::local_preview::PreviewContent::Image(image) => {
                         self.text = None;
-                        self.matches.update("", "");
+                        self.matches = SourceMatches::default();
                         self.texture = Some(ctx.load_texture(
                             "local-file-preview",
                             image,
@@ -374,6 +337,16 @@ impl LocalPreviewPanel {
                         if copy.clicked() {
                             ui.ctx().copy_text(text.source.clone());
                         }
+                        let line = self.selected_line.filter(|&line| {
+                            !text.source.is_empty() && (1..=text.starts.len()).contains(&line)
+                        });
+                        let copy_line = ui
+                            .add_enabled(line.is_some(), egui::Button::new("Copy line"))
+                            .on_hover_text("Copy the highlighted line without its line number");
+                        crate::ui::remember_inspector_control(ui, &copy_line);
+                        if let Some(line) = line.filter(|_| copy_line.clicked()) {
+                            ui.ctx().copy_text(text.line(line - 1).to_owned());
+                        }
                     }
                 }
             });
@@ -398,8 +371,17 @@ impl LocalPreviewPanel {
             let size = texture.size();
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{} × {} pixels", size[0], size[1]));
-                let actual = ui.toggle_value(&mut self.actual_size, "Actual size");
-                crate::ui::remember_inspector_control(ui, &actual);
+                let zoom = egui::ComboBox::from_id_salt("local_preview_zoom")
+                    .selected_text(self.zoom.to_string())
+                    .show_ui(ui, |ui| {
+                        for option in ImageZoom::OPTIONS {
+                            ui.selectable_value(&mut self.zoom, option, option.to_string());
+                        }
+                    });
+                crate::ui::remember_inspector_control(
+                    ui,
+                    &zoom.response.on_hover_text("Image zoom"),
+                );
             });
             self.show_image(ui, texture);
         }
@@ -437,6 +419,7 @@ impl LocalPreviewPanel {
             match self.line_input.trim().parse::<usize>() {
                 Ok(line) if (1..=count).contains(&line) => {
                     self.selected_line = Some(line);
+                    self.matches.clear_active();
                     self.location = None;
                     self.seek_pending = true;
                     self.line_error = None;
@@ -454,21 +437,27 @@ impl LocalPreviewPanel {
                                 .char_limit(256)
                                 .desired_width(96.0),
                         )
-                        .on_hover_text("Case-sensitive matching");
+                        .on_hover_text("Search for literal text in this file");
                     crate::ui::remember_inspector_control(ui, &input);
                     if focus_find {
                         input.request_focus();
                     }
-                    if input.changed() {
-                        self.matches.update(&text.source, &self.find_query);
+                    let mut match_case = !self.ignore_case;
+                    let case = ui.checkbox(&mut match_case, "Match case");
+                    crate::ui::remember_inspector_control(ui, &case);
+                    if input.changed() || case.changed() {
+                        self.ignore_case = !match_case;
+                        self.matches.clear_active();
+                        self.matches
+                            .update(&text.source, &self.find_query, match_case);
                     }
-                    let available = !self.matches.0.is_empty();
+                    let available = !self.matches.is_empty();
                     let previous = ui
                         .add_enabled(available, egui::Button::new("Prev"))
-                        .on_hover_text("Previous matching line");
+                        .on_hover_text("Previous match");
                     let next = ui
                         .add_enabled(available, egui::Button::new("Next"))
-                        .on_hover_text("Next matching line");
+                        .on_hover_text("Next match");
                     for control in [&previous, &next] {
                         crate::ui::remember_inspector_control(ui, control);
                     }
@@ -484,17 +473,17 @@ impl LocalPreviewPanel {
                     }
                 })
                 .inner;
-            if let Some(line) =
+            if let Some(hit) =
                 step.and_then(|previous| self.matches.step(self.selected_line, previous))
             {
-                self.selected_line = Some(line);
-                self.line_input = line.to_string();
+                self.selected_line = Some(hit.line);
+                self.line_input = hit.line.to_string();
                 self.location = None;
                 self.seek_pending = true;
                 self.line_error = None;
             }
             if !self.find_query.is_empty() {
-                ui.small(self.matches.status(self.selected_line));
+                ui.small(self.matches.status());
             }
         }
         let target = self.selected_line.filter(|line| *line <= count);
@@ -518,8 +507,22 @@ impl LocalPreviewPanel {
         let mut scroll = egui::ScrollArea::both()
             .id_salt(("local_preview_content", self.content_revision))
             .auto_shrink([false, false]);
+        let active = self.find_open.then(|| self.matches.active()).flatten();
         if self.seek_pending {
             let index = target.unwrap_or(1) - 1;
+            let x = active
+                .filter(|hit| hit.line == index + 1)
+                .map_or(0.0, |hit| {
+                    let prefix = format!("{:>6}  {}", hit.line, &text.line(index)[..hit.start]);
+                    let width = ui.fonts_mut(|fonts| {
+                        fonts
+                            .layout_no_wrap(prefix, font.clone(), egui::Color32::WHITE)
+                            .size()
+                            .x
+                    });
+                    (width - ui.available_width() * 0.2).max(0.0)
+                });
+            scroll = scroll.horizontal_scroll_offset(x);
             let stride = row_height + ui.spacing().item_spacing.y;
             let context = (ui.available_height() - stride).max(0.0) / 2.0;
             scroll = scroll.vertical_scroll_offset((index as f32 * stride - context).max(0.0));
@@ -527,14 +530,40 @@ impl LocalPreviewPanel {
         }
         scroll.show_rows(ui, row_height, count, |ui, range| {
             for index in range {
-                let mut line =
-                    egui::RichText::new(format!("{:>6}  {}", index + 1, text.line(index)))
-                        .font(font.clone());
-                if target == Some(index + 1) {
-                    line = line.background_color(ui.visuals().selection.bg_fill);
+                let line = text.line(index);
+                let row = index + 1;
+                let hits = if self.find_open {
+                    self.matches.hits(Some(row))
+                } else {
+                    &[]
+                };
+                let format = egui::TextFormat {
+                    font_id: font.clone(),
+                    color: ui.visuals().text_color(),
+                    background: if target == Some(row) {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    },
+                    ..Default::default()
+                };
+                let mut job = egui::text::LayoutJob::default();
+                job.append(&format!("{row:>6}  "), 0.0, format.clone());
+                let mut start = 0;
+                for hit in hits {
+                    job.append(&line[start..hit.start], 0.0, format.clone());
+                    let [red, green, blue] = match_background(active == Some(*hit));
+                    let marked = egui::TextFormat {
+                        background: egui::Color32::from_rgb(red, green, blue),
+                        color: egui::Color32::from_rgb(35, 23, 8),
+                        ..format.clone()
+                    };
+                    job.append(&line[hit.start..hit.end], 0.0, marked);
+                    start = hit.end;
                 }
+                job.append(&line[start..], 0.0, format);
                 ui.add(
-                    egui::Label::new(line)
+                    egui::Label::new(job)
                         .selectable(true)
                         .wrap_mode(egui::TextWrapMode::Extend),
                 );
@@ -546,20 +575,14 @@ impl LocalPreviewPanel {
         let size = texture.size_vec2();
         let available = ui.available_size().max(egui::Vec2::splat(1.0));
         let native = size / ui.ctx().pixels_per_point();
-        let display = if self.actual_size {
-            native
-        } else {
-            native
-                * (available.x / native.x)
-                    .min(available.y / native.y)
-                    .min(1.0)
-        };
+        let scale = self.zoom.scale().unwrap_or_else(|| {
+            (available.x / native.x)
+                .min(available.y / native.y)
+                .min(1.0)
+        });
+        let display = native * scale;
         egui::ScrollArea::both()
-            .id_salt((
-                "local_preview_image",
-                self.content_revision,
-                self.actual_size,
-            ))
+            .id_salt(("local_preview_image", self.content_revision, self.zoom))
             .show(ui, |ui| {
                 ui.image((texture.id(), display));
             });
@@ -584,21 +607,6 @@ fn location_label(location: &SourceLocationCandidate) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn source_find_uses_literal_matching_lines_and_wraps() {
-        let mut matches = SourceMatches::default();
-        matches.update("first\n界界\nempty\n界", "界");
-        assert_eq!(matches.status(None), "2 matching lines");
-        assert_eq!(matches.step(None, false), Some(2));
-        assert_eq!(matches.step(Some(2), false), Some(4));
-        assert_eq!(matches.step(Some(4), false), Some(2));
-        assert_eq!(matches.step(Some(2), true), Some(4));
-        assert_eq!(matches.status(Some(4)), "Match 2 of 2");
-        matches.update("larger", "Large");
-        assert_eq!(matches.status(None), "No matching lines");
-        assert_eq!(matches.step(None, true), None);
-    }
 
     fn resolve(
         target: &str,
@@ -724,6 +732,61 @@ mod tests {
         }
         result
     }
+    #[test]
+    fn egui_find_reveals_the_second_occurrence_and_copies_the_source_line() {
+        let line = format!("界needle {} NEEDLE", "x".repeat(240));
+        let mut panel = LocalPreviewPanel {
+            session_id: "owner".into(),
+            visible: true,
+            path: PathBuf::from("/tmp/preview.txt"),
+            find_open: true,
+            find_query: "needle".into(),
+            text: Some(PreviewText::new(format!("{line}\r\nnext row\n"))),
+            ..Default::default()
+        };
+        panel.matches.update(&line, "needle", true);
+        let ctx = egui::Context::default();
+        let click = |panel: &mut LocalPreviewPanel, label: &str| {
+            let output = frame(panel, &ctx, "owner", vec![]);
+            let pos = labels(&output)
+                .into_iter()
+                .find(|(value, _)| value == label)
+                .unwrap()
+                .1
+                + egui::vec2(3.0, 3.0);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(
+                panel,
+                &ctx,
+                "owner",
+                vec![egui::Event::PointerMoved(pos), button(true), button(false)],
+            )
+        };
+        let _ = frame(&mut panel, &ctx, "owner", vec![]);
+        click(&mut panel, "Match case");
+        assert_eq!(panel.matches.status(), "2 matches");
+        click(&mut panel, "Next");
+        assert_eq!(panel.matches.active().unwrap().start, "界".len());
+        click(&mut panel, "Next");
+        assert_eq!(
+            panel.matches.active().unwrap().start,
+            line.len() - "NEEDLE".len()
+        );
+        let output = frame(&mut panel, &ctx, "owner", vec![]);
+        assert!(labels(&output)
+            .iter()
+            .any(|(value, pos)| value.ends_with("NEEDLE") && pos.x < -100.0));
+        let copied = click(&mut panel, "Copy line");
+        assert!(copied.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == &line)
+        }));
+    }
+
     #[test]
     fn egui_frames_seek_and_virtualize_without_stealing_other_session() {
         let mut panel = LocalPreviewPanel::default();
