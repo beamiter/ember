@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Positive and adversarial integration-source cases for Files font ownership."""
 from pathlib import Path
+import re
 import unittest
 from production_wiring import (verify_files_font_group_wiring,
                                verify_workspace_font_group_wiring,
@@ -111,6 +112,21 @@ class WorkspaceFontWiring(unittest.TestCase):
         self.rejected(MAIN.replace('self.render_reference_rich_canvas(ui);',
                                    '/* self.render_reference_rich_canvas(ui); */'))
 
+    def test_trailing_comma_does_not_change_the_two_required_inputs(self):
+        pattern = r'(frame_pointer_input_blocked,\s*frame_selection_input_blocked),(\s*\);)'
+        source, count = re.subn(pattern, r'\1\2', MAIN)
+        self.assertEqual(count, 1)
+        self.assertTrue(verify_workspace_font_group_wiring(source)['exclusive'])
+
+    def test_terminal_input_gates_cannot_be_disabled_or_swapped(self):
+        pattern = r'self\.render_terminal_content\(\s*ui,\s*ctx,\s*frame_pointer_input_blocked,\s*frame_selection_input_blocked,?\s*\);'
+        for pointer, selection in [('false', 'frame_selection_input_blocked'),
+                                   ('frame_pointer_input_blocked', 'false'),
+                                   ('frame_selection_input_blocked', 'frame_pointer_input_blocked')]:
+            with self.subTest(pointer=pointer, selection=selection):
+                self.rejected(re.sub(pattern,
+                    f'self.render_terminal_content(ui, ctx, {pointer}, {selection},);', MAIN))
+
     def test_content_must_be_registered_after_render(self):
         self.rejected(MAIN.replace('.register_workspace(workspace_rect, main_panel.inner, root_ui.layer_id());',
                                    '.register_workspace(workspace_rect, workspace_rect, root_ui.layer_id());'))
@@ -122,9 +138,10 @@ class OverlayFontZoomOrder(unittest.TestCase):
         with self.assertRaises(AssertionError):
             verify_overlay_font_zoom_order(source)
 
-    def test_actual_overlay_order_includes_both_dialogs(self):
+    def test_actual_overlay_order_includes_all_dialogs(self):
         self.assertEqual(verify_overlay_font_zoom_order(MAIN),
                          ('render_floating_panels', 'render_vim9_dialog',
+                          'render_workspace_cli_delete_confirmation',
                           'render_window_close_confirmation', 'handle_font_zoom'))
 
     def test_comments_and_whitespace_are_not_layout_dependencies(self):
@@ -151,6 +168,11 @@ class OverlayFontZoomOrder(unittest.TestCase):
                             'if false { ' + call + ' }']:
             with self.subTest(replacement=replacement):
                 self.rejected(MAIN.replace(call, replacement, 1))
+
+    def test_cli_delete_confirmation_cannot_move_after_zoom(self):
+        call = 'self.render_workspace_cli_delete_confirmation(ctx);'
+        self.rejected(MAIN.replace(call, '', 1).replace(
+            'self.handle_font_zoom(ctx);', 'self.handle_font_zoom(ctx); ' + call, 1))
 
     def test_no_later_overlay_after_zoom(self):
         self.rejected(MAIN.replace('self.handle_font_zoom(ctx);',

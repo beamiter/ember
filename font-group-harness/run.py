@@ -29,7 +29,8 @@ assert "let workspace_rect = root_ui.max_rect();" in main
 assert ".register_workspace(workspace_rect, main_panel.inner, root_ui.layer_id());" in main
 assert "self.render_reference_canvas_header(ui);" in main
 assert "ui.advance_cursor_after_rect(rect);" in workspace
-assert "                    self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);" in main
+# The semantic guard below checks the exact renderer and both input gates,
+# independently of rustfmt line wrapping.
 verify_workspace_font_group_wiring(main)
 # Files moves between a background dock and a modeless Area. Its measured
 # response, not the old root layer, owns the current-frame UI font region.
@@ -37,8 +38,8 @@ verify_files_font_group_wiring(main, workspace)
 assert "theme::configure_workspace_text(ui.style_mut(), self.config.font_size);" in main
 assert "theme::configure_workspace_text(root_ui.style_mut(), self.config.effective_ui_font_size());" in main
 # Every overlay must establish its current-frame input owner before zoom is
-# drained. Pin the real executable tail, including both Vim and whole-window
-# close confirmation, without allowing comments or dead blocks to satisfy it.
+# drained. Pin the real executable tail, including Vim, CLI session deletion and
+# whole-window close confirmation, without allowing comments or dead blocks to satisfy it.
 verify_overlay_font_zoom_order(main)
 assert "self.config.font_size" not in tabs
 assert "ctrl_wheel_zoom_delta" not in input_source

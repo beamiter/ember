@@ -93,6 +93,7 @@ def verify_overlay_font_zoom_order(main):
     """Every final modal establishes input ownership before draining zoom."""
     render = _function(main, 'render_ui')
     methods = ('render_floating_panels', 'render_vim9_dialog',
+               'render_workspace_cli_delete_confirmation',
                'render_window_close_confirmation', 'handle_font_zoom')
     calls = [_code(f'self.{method}(ctx);') for method in methods]
     for method, call in zip(methods, calls):
@@ -100,7 +101,7 @@ def verify_overlay_font_zoom_order(main):
         assert len(matches) == 1 and _top_level(render, matches[0]), \
             f'{method} must run exactly once at render_ui top level'
     assert render.strip().endswith(' '.join(calls)), \
-        'render_ui must finish overlays and both dialogs before draining font zoom'
+        'render_ui must finish overlays and all three dialogs before draining font zoom'
     return methods
 
 
@@ -130,10 +131,13 @@ def verify_workspace_font_group_wiring(main):
                 .id_salt("workspace-task-canvas")
                 .show(ui, |ui| self.render_sidebar_tasks(ui));
         } else {
-            self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);
+            self.render_terminal_content(ui, ctx, frame_pointer_input_blocked, frame_selection_input_blocked);
             self.render_reference_rich_canvas(ui);
         }
     ''')
+    # The final comma changes layout only. Normalize this exact call suffix,
+    # not surrounding tokens or either of the two safety arguments.
+    body = body.replace('frame_selection_input_blocked , ) ;', 'frame_selection_input_blocked ) ;')
     assert body == expected, 'API, Task and terminal must exclusively render inside the clipped main-font scope'
     assert render[end:].startswith(' ) ; content } ) ;'), 'Center must return its measured content rectangle'
     registration = _code('''self.font_zoom.register_workspace(
