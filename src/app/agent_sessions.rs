@@ -1,6 +1,7 @@
 //! Discover and resume existing provider-owned CLI conversations.
 //! Discovery never runs on the event thread; launch uses argv, not shell text.
 use super::state::TerminalApp;
+use crate::workspace_scope::{conversation_summary, project_choices, ConversationScope};
 use eframe::egui;
 use jterm_core::agent_sessions::{
     validate_session_batch_tag, validate_session_details, AgentSession, SessionArchiveFilter,
@@ -42,6 +43,7 @@ const fn editor_char_limit(max_bytes: usize) -> usize {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FilterKey {
     text: String,
+    scope: ConversationScope,
     provider: Option<SessionProvider>,
     status: Option<SessionStatus>,
     live_only: bool,
@@ -303,6 +305,7 @@ pub(crate) struct AgentSessionsState {
     index: SessionSearchIndex,
     cached_visible: RefCell<Option<VisibleRows>>,
     query: String,
+    scope: ConversationScope,
     provider: Option<SessionProvider>,
     status: Option<SessionStatus>,
     live_only: bool,
@@ -341,6 +344,7 @@ pub(crate) struct AgentSessionsState {
 impl AgentSessionsState {
     fn workspace_filter(&self) -> jterm_core::agent_workspace::WorkspaceFilter {
         let mut query = self.query.clone();
+        self.scope.qualify(&mut query);
         if let Some(provider) = self.provider {
             query.push_str(&format!(
                 " provider:{}",
@@ -379,7 +383,36 @@ impl AgentSessionsState {
         query
     }
 
+    fn narrows_library(&self) -> bool {
+        self.scope != ConversationScope::All
+            || !self.query.trim().is_empty()
+            || self.provider.is_some()
+            || self.pinned_only
+            || self.archive != SessionArchiveFilter::Active
+            || self.filter_project().is_some()
+    }
+
+    fn has_workspace_filters(&self) -> bool {
+        self.narrows_library() || self.status.is_some() || self.live_only
+    }
+
+    fn project_workspace_rows(
+        &self,
+        filter: &jterm_core::agent_workspace::WorkspaceFilter,
+        rows: &[jterm_core::agent_workspace::WorkspaceRow],
+    ) -> Vec<jterm_core::agent_workspace::WorkspaceRow> {
+        let mut rows = filter.project(rows);
+        if let Some(project) = self.filter_project() {
+            rows.retain(|row| Path::new(&row.cwd).starts_with(project));
+        }
+        rows
+    }
+
     fn workspace_visible(&self) -> Vec<usize> {
+        use jterm_core::agent_workspace::ConversationKind;
+        if !self.scope.includes(ConversationKind::Cli) {
+            return Vec::new();
+        }
         let filter = self.workspace_filter();
         if filter.query_error().is_some() {
             return Vec::new();
@@ -459,6 +492,7 @@ impl AgentSessionsState {
     fn filter_key(&self) -> FilterKey {
         FilterKey {
             text: self.query.clone(),
+            scope: self.scope,
             provider: self.provider,
             status: self.status,
             live_only: self.live_only,
@@ -473,6 +507,7 @@ impl AgentSessionsState {
     /// Compare the current filters without copying the query or project.
     fn filter_matches(&self, key: &FilterKey) -> bool {
         key.text == self.query
+            && key.scope == self.scope
             && key.provider == self.provider
             && key.status == self.status
             && key.live_only == self.live_only
@@ -930,6 +965,7 @@ impl AgentSessionsState {
 
     fn clear_filters(&mut self) {
         self.query.clear();
+        self.scope = ConversationScope::All;
         self.provider = None;
         self.status = None;
         self.live_only = false;
@@ -2160,23 +2196,6 @@ impl TerminalApp {
             .workspace_summaries(self.config.ai_redact_secrets);
         self.agent_sessions.review.start();
         let task_rows = self.workspace_task_rows();
-        let needs_count = self
-            .agent_sessions
-            .workspace
-            .rows
-            .values()
-            .chain(chats.iter())
-            .filter(|row| row.attention().is_some())
-            .count()
-            + self.agent_sessions.missions.host.needs_attention()
-            + if self.config.experimental_task_sidebar {
-                task_rows
-                    .iter()
-                    .filter(|(_, row)| row.attention().is_some())
-                    .count()
-            } else {
-                0
-            };
         let old_filter = self.agent_sessions.filter_key();
         let search = ui.add(
             egui::TextEdit::singleline(&mut self.agent_sessions.query)
@@ -2185,52 +2204,100 @@ impl TerminalApp {
                 .hint_text("Search · provider:codex status:review")
                 .desired_width(f32::INFINITY),
         );
-        if search.changed() {
-            self.agent_sessions.filters_changed();
-        }
-        let search_query = self.agent_sessions.workspace_search_query();
-        self.agent_sessions.tools.set_search(
-            &search_query,
-            None,
-            self.agent_sessions.archive != SessionArchiveFilter::Active,
-        );
-        if self.agent_sessions.tools.searching() || self.agent_sessions.tools.document_loading {
-            ctx.request_repaint_after(Duration::from_millis(180));
-        }
         let selected_project = self
             .agent_sessions
-            .project_filter
-            .as_ref()
+            .filter_project()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "All projects".into());
-        egui::ComboBox::from_id_salt("workspace-project")
-            .selected_text(selected_project)
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
+        let projects = project_choices(
+            self.agent_sessions
+                .projects
+                .iter()
+                .map(|project| project.root.clone())
+                .chain(
+                    chats
+                        .iter()
+                        .chain(task_rows.iter().map(|(_, row)| row))
+                        .map(|row| PathBuf::from(&row.cwd)),
+                ),
+        );
+        let project_menu = ui.menu_button(format!("{selected_project} ▾"), |ui| {
+            if ui
+                .selectable_value(
                     &mut self.agent_sessions.project_filter,
                     None,
                     "All projects",
-                );
-                for project in self.agent_sessions.projects.clone() {
-                    let label = project
-                        .root
-                        .file_name()
-                        .unwrap_or(project.root.as_os_str())
-                        .to_string_lossy();
-                    ui.selectable_value(
+                )
+                .clicked()
+            {
+                self.agent_sessions.project_only = false;
+                ui.close();
+            }
+            for project in projects {
+                let label = project
+                    .file_name()
+                    .unwrap_or(project.as_os_str())
+                    .to_string_lossy();
+                if ui
+                    .selectable_value(
                         &mut self.agent_sessions.project_filter,
-                        Some(project.root.clone()),
+                        Some(project.clone()),
                         label,
-                    );
+                    )
+                    .on_hover_text(project.to_string_lossy())
+                    .clicked()
+                {
+                    self.agent_sessions.project_only = false;
+                    ui.close();
+                }
+            }
+        });
+        let mut filter_popups = vec![egui::Popup::default_response_id(&project_menu.response)];
+        ui.horizontal_wrapped(|ui| {
+            let kind = ui.menu_button(format!("{} ▾", self.agent_sessions.scope.label()), |ui| {
+                for scope in ConversationScope::ALL {
+                    if ui
+                        .selectable_value(&mut self.agent_sessions.scope, scope, scope.label())
+                        .clicked()
+                    {
+                        ui.close();
+                    }
                 }
             });
+            filter_popups.push(egui::Popup::default_response_id(&kind.response));
+            kind.response.on_hover_text("Conversation type");
+            let archive = ui.menu_button(
+                format!("{} ▾", self.agent_sessions.archive.label()),
+                |ui| {
+                    for archive in SessionArchiveFilter::ALL {
+                        if ui
+                            .selectable_value(
+                                &mut self.agent_sessions.archive,
+                                archive,
+                                archive.label(),
+                            )
+                            .clicked()
+                        {
+                            ui.close();
+                        }
+                    }
+                },
+            );
+            filter_popups.push(egui::Popup::default_response_id(&archive.response));
+            archive.response.on_hover_text("Conversation library");
+            ui.checkbox(&mut self.agent_sessions.pinned_only, "Pinned only");
+        });
+        for id in filter_popups {
+            if !self.agent_sessions.workspace_menu_ids.contains(&id) {
+                self.agent_sessions.workspace_menu_ids.push(id);
+            }
+        }
         ui.horizontal_wrapped(|ui| {
             if ui
                 .selectable_label(
                     !self.agent_sessions.live_only && self.agent_sessions.status.is_none(),
-                    "All",
+                    "All activity",
                 )
                 .clicked()
             {
@@ -2248,7 +2315,7 @@ impl TerminalApp {
             if ui
                 .selectable_label(
                     self.agent_sessions.status == Some(SessionStatus::Waiting),
-                    format!("Needs you · {needs_count}"),
+                    "Needs you",
                 )
                 .on_hover_text(
                     "Current requests, validation, review and unresolved execution outcomes",
@@ -2268,7 +2335,9 @@ impl TerminalApp {
         {
             self.agent_sessions.missions.open();
         }
-        if self.agent_sessions.status == Some(SessionStatus::Waiting) {
+        if self.agent_sessions.status == Some(SessionStatus::Waiting)
+            && !self.agent_sessions.narrows_library()
+        {
             for item in self.agent_sessions.missions.attention_rows() {
                 let location = item
                     .repository
@@ -2300,11 +2369,48 @@ impl TerminalApp {
                 }
             }
         }
-        if !self.agent_sessions.filter_matches(&old_filter) {
+        let cleared = self.agent_sessions.has_workspace_filters()
+            && ui.small_button("Clear filters").clicked();
+        if cleared {
+            self.agent_sessions.clear_filters();
+            search.request_focus();
+        } else if !self.agent_sessions.filter_matches(&old_filter) {
             self.agent_sessions.filters_changed();
         }
-        if let Some(error) = self.agent_sessions.workspace_filter().query_error() {
+        let filter = self.agent_sessions.workspace_filter();
+        let search_query = self.agent_sessions.workspace_search_query();
+        self.agent_sessions
+            .tools
+            .set_search(&search_query, None, filter.include_archived);
+        if self.agent_sessions.tools.searching() || self.agent_sessions.tools.document_loading {
+            ctx.request_repaint_after(Duration::from_millis(180));
+        }
+        let cli_rows = self.agent_sessions.workspace_visible();
+        let api_rows = self.agent_sessions.project_workspace_rows(&filter, &chats);
+        let projected_tasks = if self.config.experimental_task_sidebar {
+            let rows = task_rows
+                .iter()
+                .map(|(_, row)| row.clone())
+                .collect::<Vec<_>>();
+            self.agent_sessions.project_workspace_rows(&filter, &rows)
+        } else {
+            Vec::new()
+        };
+        if let Some(error) = filter.query_error() {
             ui.colored_label(ui.visuals().error_fg_color, error);
+        } else {
+            let task_count = projected_tasks
+                .iter()
+                .filter(|row| row.facts.task_id.is_some())
+                .count();
+            ui.weak(conversation_summary(
+                cli_rows.len() + api_rows.len() + task_count,
+                self.agent_sessions.has_workspace_filters(),
+                self.agent_sessions
+                    .scope
+                    .includes(jterm_core::agent_workspace::ConversationKind::Cli)
+                    && self.agent_sessions.scanner.is_scanning(),
+            ));
         }
         if let Some(error) = self.agent_sessions.error.as_ref().or(self
             .agent_sessions
@@ -2385,9 +2491,7 @@ impl TerminalApp {
         }
 
         let epoch = self.agent_sessions.catalog_epoch;
-        let rows: Vec<_> = self
-            .agent_sessions
-            .workspace_visible()
+        let rows: Vec<_> = cli_rows
             .iter()
             .map(|&index| {
                 let session = self.agent_sessions.catalog.sessions[index].clone();
@@ -2468,13 +2572,6 @@ impl TerminalApp {
                 });
             });
         }
-        if rows.is_empty() {
-            ui.weak(if self.agent_sessions.scanner.is_scanning() {
-                "Discovering local sessions…"
-            } else {
-                "No CLI conversations match"
-            });
-        }
         if let Some((session, pinned)) = pin {
             self.agent_sessions.error = self
                 .agent_sessions
@@ -2486,21 +2583,13 @@ impl TerminalApp {
             self.activate_workspace_session(reference, &ctx);
         }
 
-        let filter = self.agent_sessions.workspace_filter();
-        let api_rows = filter.project(&chats);
         let mut api_choice = None;
         let mut api_pin = None;
-        ui.add_space(8.0);
-        ui.weak("API CONVERSATIONS");
-        for chat in api_rows.iter().filter(|chat| {
-            true && (!self.agent_sessions.live_only || chat.runtime.is_live())
-                && (self.agent_sessions.status != Some(SessionStatus::Waiting)
-                    || chat.attention().is_some())
-                && self
-                    .agent_sessions
-                    .filter_project()
-                    .is_none_or(|project| std::path::Path::new(&chat.cwd).starts_with(project))
-        }) {
+        if !api_rows.is_empty() {
+            ui.add_space(8.0);
+            ui.weak("API CONVERSATIONS");
+        }
+        for chat in &api_rows {
             let selected = self.ai_chat_panel.is_open
                 && self.ai_chat_panel.workspace_active_id().as_ref() == Some(&chat.id);
             let presentation = chat.presentation();
@@ -2542,25 +2631,14 @@ impl TerminalApp {
             self.reference_navigation_entered_canvas(&ctx);
         }
 
-        if self.config.experimental_task_sidebar {
+        if projected_tasks
+            .iter()
+            .any(|row| row.facts.task_id.is_some())
+        {
             ui.add_space(8.0);
             ui.weak("TASK CONVERSATIONS");
             let mut task_choice = None;
-            let projected_tasks = filter.project(
-                &task_rows
-                    .iter()
-                    .map(|(_, row)| row.clone())
-                    .collect::<Vec<_>>(),
-            );
-            for row in projected_tasks.iter().filter(|row| {
-                true && (!self.agent_sessions.live_only || row.runtime.is_live())
-                    && (self.agent_sessions.status != Some(SessionStatus::Waiting)
-                        || row.attention().is_some())
-                    && self
-                        .agent_sessions
-                        .filter_project()
-                        .is_none_or(|project| std::path::Path::new(&row.cwd).starts_with(project))
-            }) {
+            for row in &projected_tasks {
                 let Some(task_id) = row.facts.task_id else {
                     continue;
                 };
@@ -3240,6 +3318,28 @@ mod tests {
             ..Default::default()
         });
         assert!(!workspace_reference_current(&state, &reference));
+    }
+
+    #[test]
+    fn workspace_scope_applies_to_history_and_withdraws_hidden_cli_actions() {
+        let first = session(SessionProvider::Codex, "exact-id", "Renderer");
+        let mut state = state_with(vec![first.clone()]);
+        let reference = WorkspaceSessionRef {
+            epoch: state.catalog_epoch,
+            session: first,
+        };
+        assert!(workspace_reference_current(&state, &reference));
+        state.scope = ConversationScope::Api;
+        state.query = "Renderer".into();
+        assert!(!workspace_reference_current(&state, &reference));
+        assert!(state.workspace_search_query().contains(" kind:api"));
+        state.archive = SessionArchiveFilter::Archived;
+        state.pinned_only = true;
+        let search = state.workspace_search_query();
+        assert!(search.contains(" is:archived") && search.contains(" is:pinned"));
+        state.clear_filters();
+        assert!(state.workspace_search_query().is_empty());
+        assert_eq!(state.scope, ConversationScope::All);
     }
 
     #[test]

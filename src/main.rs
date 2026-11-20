@@ -88,6 +88,7 @@ mod workspace_review;
 mod workspace_sessions_bridge;
 mod workspace_tools;
 mod workspace_visibility;
+mod workspace_scope;
 
 // Xlib window IDs use c_ulong, which is u32 on some targets and u64 on others.
 fn widen_native_window_id(value: impl Into<u64>) -> u64 {

@@ -8,6 +8,14 @@ The left navigation holds CLI sessions, API chats, native tasks and ordinary ter
 
 At compact widths the navigation and inspector become drawers. They can be closed to recover the center width; resizing does not replace the underlying native terminal or conversation. Session rows use stable source identities. Frost retains keyed row trees across reordering; Ember uses stable widget IDs. A stale pointer callback still has to pass the current source and selection checks.
 
+Use **All types** to narrow the list to CLI sessions, API chats or tasks.
+The library selector covers active, archived or all conversations. **Pinned only**
+and the project selector can be used with either filter. Projects include roots
+from CLI sessions, API chats and native tasks. **All activity**, **Running** and
+**Needs you** keep the type, library, project and search filters in place.
+The result count reflects the current conversation list. **Clear filters**
+restores the default view, and ordinary terminals remain directly accessible.
+
 Search uses the shared workspace query language for metadata and indexed history. Supported fields include `provider:`, `kind:`, `status:`, `runtime:`, `validation:`, `attention:`, `project:`, `branch:`, `tag:` and `body:`. Examples:
 
 ```text
