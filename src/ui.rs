@@ -13570,7 +13570,7 @@ mod transcript_canvas_tests {
                           terminal: &mut TerminalState,
                           retain: bool,
                           events| {
-                let _ = ctx.run_ui(
+                let mut output = ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(rect),
                         events,
@@ -13601,6 +13601,8 @@ mod transcript_canvas_tests {
                         );
                     },
                 );
+                // No GPU upload in this headless interaction test.
+                output.textures_delta.clear();
             };
             render(&mut renderer, &mut terminal, false, vec![]);
             let origin = renderer.last_content_rect.unwrap().min;
