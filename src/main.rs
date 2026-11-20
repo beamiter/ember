@@ -5792,7 +5792,12 @@ impl TerminalApp {
     }
 
     #[allow(deprecated)]
-    fn render_ui(&mut self, root_ui: &mut egui::Ui, frame_pointer_input_blocked: bool) {
+    fn render_ui(
+        &mut self,
+        root_ui: &mut egui::Ui,
+        frame_pointer_input_blocked: bool,
+        frame_selection_input_blocked: bool,
+    ) {
         // egui 0.35 起 Panel/CentralPanel 都改成在 Ui 上 .show(ui, ...) 调用;
         // 但仍有部分代码(浮窗 Window、各种 input/viewport 操作)需要 &Context,
         // 这里克隆一份作为局部 ctx 供下游使用(Arc 引用计数,几乎零成本)。
@@ -5887,7 +5892,9 @@ impl TerminalApp {
                             .id_salt("workspace-task-canvas")
                             .show(ui, |ui| self.render_sidebar_tasks(ui));
                     } else {
-                        self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);
+                        self.render_terminal_content(
+                            ui, ctx, frame_pointer_input_blocked, frame_selection_input_blocked,
+                        );
                         self.render_reference_rich_canvas(ui);
                     }
                 });
@@ -6797,6 +6804,7 @@ impl eframe::App for TerminalApp {
                 .organism
                 .native_control_owns_pointer(ctx, &active_session_id);
         terminal_pointer_input_blocked |= organism_pointer_claimed;
+        let frame_selection_input_blocked = terminal_pointer_input_blocked;
 
         // Step 4: 处理普通键盘输入
         // 当搜索面板或配置面板打开时，不处理普通键盘输入（面板会处理输入）
@@ -7400,11 +7408,12 @@ impl eframe::App for TerminalApp {
             projected_viewport_for_session(session, renderer)
         };
 
-        if !mouse_projection_viewport.is_available()
-            || session
-                .terminal_presentation
-                .holding_frame(&session.terminal.lock(), std::time::Instant::now())
-        {
+        let pointer_coordinates_held = {
+            let terminal = session.terminal.lock();
+            session.terminal_presentation.holding_frame(&terminal, std::time::Instant::now())
+                || terminal.inline_drag_holds_frame()
+        };
+        if !mouse_projection_viewport.is_available() || pointer_coordinates_held {
             terminal_pointer_input_blocked = true;
             self.terminal_mouse_capture = None;
             self.last_terminal_mouse_motion = None;
@@ -8635,6 +8644,7 @@ impl eframe::App for TerminalApp {
             // during its own pointer-only control. Every other barrier stays
             // active; the main PTY pointer route above remains blocked.
             (terminal_pointer_input_blocked && !organism_pointer_claimed) || link_press_override,
+            frame_selection_input_blocked || link_press_override,
         );
 
         if !terminal_pointer_input_blocked && !self.terminal_input_blocked(ctx) {

@@ -131,6 +131,10 @@ const REPAINT_LIMIT: Duration = Duration::from_secs(1);
 pub(crate) struct PublishedTerminalFrame {
     pub viewport: ProjectedViewport,
     pub canvas: crate::transcript_canvas::CanvasGeometry,
+    pub inline_text_scope: Option<(u64, Option<u64>)>,
+    pub terminal_size: (usize, usize),
+    pub pane_rect: egui::Rect,
+    pub cell_size: egui::Vec2,
 }
 
 #[derive(Default)]

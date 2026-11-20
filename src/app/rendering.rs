@@ -1625,12 +1625,47 @@ fn prepare_terminal_projection(
     ctx: &egui::Context,
     content_rect: egui::Rect,
     interaction_enabled: bool,
+    retained_selection_enabled: bool,
     focused: bool,
 ) -> crate::terminal::ProjectedViewport {
     let held = session.terminal_presentation.settle(terminal, ctx);
-    if held {
-        if let Some(frame) = &session.terminal_presentation.last_frame {
-            renderer.set_retained_projection_frame(terminal, frame.viewport.clone(), frame.canvas);
+    let scope = terminal.inline_text_scope();
+    let terminal_size = terminal.get_dimensions();
+    let cell_size = egui::vec2(renderer.char_width, renderer.line_height);
+    let dragging = terminal.inline_text_dragging();
+    let matching_selection_surface = retained_selection_enabled
+        && (held || dragging)
+        && session
+            .terminal_presentation
+            .last_frame
+            .as_ref()
+            .is_some_and(|frame| {
+                frame.inline_text_scope == scope
+                    && scope.is_some()
+                    && frame.terminal_size == terminal_size
+                    && frame.pane_rect == content_rect
+                    && frame.cell_size == cell_size
+                    && frame.viewport.unavailable_reason().is_none()
+                    && terminal.projection_unavailable().is_none()
+            });
+    if dragging
+        && (!matching_selection_surface
+            || !ctx.input(|input| {
+                input.focused
+                    && (input.pointer.primary_down()
+                        || input.pointer.button_released(egui::PointerButton::Primary))
+            }))
+    {
+        terminal.finish_inline_text_selection(false);
+    }
+    if let Some(frame) = &session.terminal_presentation.last_frame {
+        if held || terminal.inline_drag_holds_frame() {
+            renderer.set_retained_projection_frame(
+                terminal,
+                frame.viewport.clone(),
+                frame.canvas,
+                matching_selection_surface,
+            );
             return frame.viewport.clone();
         }
     }
@@ -1658,8 +1693,27 @@ fn prepare_terminal_projection(
             .then(|| crate::session::PublishedTerminalFrame {
                 viewport: viewport.clone(),
                 canvas: renderer.canvas_geometry,
+                inline_text_scope: scope,
+                terminal_size,
+                pane_rect: content_rect,
+                cell_size,
             });
     viewport
+}
+
+fn copy_retained_terminal_selection(
+    renderer: &mut crate::ui::TerminalRenderer,
+    terminal: &crate::terminal::TerminalState,
+    clipboard: Option<&crate::clipboard::ClipboardManager>,
+    frame_pointer_input_blocked: bool,
+) {
+    if renderer.take_retained_selection_release() && frame_pointer_input_blocked {
+        if let (Some(clipboard), Some(text)) = (clipboard, terminal.copy_selection()) {
+            if !text.is_empty() {
+                let _ = clipboard.copy_primary(&text);
+            }
+        }
+    }
 }
 
 fn prune_permanently_unavailable_collapses(
@@ -2632,6 +2686,7 @@ impl TerminalApp {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         frame_pointer_input_blocked: bool,
+        frame_selection_input_blocked: bool,
     ) {
         // Visibility belongs to every pane of the active tab, not just its
         // focused session. Hidden canvases retain reading intent, but must not
@@ -2695,6 +2750,9 @@ impl TerminalApp {
         // from accepting input beneath the newly opened surface.
         let interaction_enabled = interaction_enabled && !self.terminal_input_blocked(ctx);
         let terminal_interaction_enabled = interaction_enabled && !workspace_drag_active;
+        let retained_selection_enabled = !frame_selection_input_blocked
+            && !workspace_drag_active
+            && !self.terminal_input_blocked(ctx);
         let chat_controls_enabled = super::input::chat_controls_allow_enter_state(
             self.prompt_fill_enter_down,
             self.prompt_fill_enter_latch,
@@ -2902,6 +2960,7 @@ impl TerminalApp {
                         ctx,
                         content_rect,
                         terminal_interaction_enabled,
+                        retained_selection_enabled,
                         terminal_interaction_enabled && pane.focused,
                     );
                     let projection_view_state = &mut session.projection_view_state;
@@ -2958,6 +3017,9 @@ impl TerminalApp {
                         &links,
                         pane_hovered_link,
                         content_rect,
+                    );
+                    copy_retained_terminal_selection(
+                        renderer, &terminal_guard, self.clipboard.as_ref(), frame_pointer_input_blocked,
                     );
                     if pane.focused {
                         companion_surface =
@@ -3187,6 +3249,7 @@ impl TerminalApp {
                     ctx,
                     single_presentation_rect,
                     terminal_interaction_enabled,
+                    retained_selection_enabled,
                     terminal_interaction_enabled,
                 );
                 let projection_view_state = &mut session.projection_view_state;
@@ -3218,6 +3281,9 @@ impl TerminalApp {
                     &self.cached_links,
                     &self.hovered_link,
                     single_presentation_rect,
+                );
+                copy_retained_terminal_selection(
+                    &mut self.renderer, &terminal_guard, self.clipboard.as_ref(), frame_pointer_input_blocked,
                 );
                 companion_surface = self
                     .renderer

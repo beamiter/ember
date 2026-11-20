@@ -413,6 +413,14 @@ pub struct Selection {
     pub mode: SelectionMode,
 }
 
+struct InlineTextSelection {
+    // Resolve and copy the published cells directly. New output can revoke
+    // their live coordinate mapping while these immutable bytes still paint.
+    viewport: ProjectedViewport,
+    range: Selection,
+    dragging: bool,
+}
+
 /// Selection coordinates in a transformed projected document. These cannot
 /// be mixed with raw scrollback indices because collapse summaries introduce
 /// holes and synthetic rows.
@@ -478,6 +486,7 @@ pub struct TerminalState {
     pub scrollback: VecDeque<ScrollbackLine>,
     pub selection: Option<Selection>,
     projected_selection: Option<ProjectedSelection>,
+    inline_text_selection: Option<InlineTextSelection>,
     selection_link_text: Option<(String, String, bool)>,
     selection_revision: u64,
     pub scroll_offset: usize,
