@@ -8,7 +8,7 @@ use jterm_core::agent_workspace::{
     session_id, ConversationId, ConversationKind, WorkspaceClient, WorkspaceCommand as Command,
     WorkspaceEvent, WorkspaceOrganization, WorkspaceReply, WorkspaceRow,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -67,9 +67,17 @@ fn index_sources(catalog: SessionCatalog, legacy: SessionLibrarySnapshot) -> Ind
     (identities, rows)
 }
 
+enum Pending {
+    Refresh,
+    Write,
+    Delete(ConversationId),
+}
+
 pub(crate) struct WorkspaceSessions {
     client: WorkspaceClient,
-    pending: HashMap<u64, bool>,
+    pending: HashMap<u64, Pending>,
+    deleted: HashSet<ConversationId>,
+    deletion_updates: Vec<Result<ConversationId, String>>,
     indexed: Vec<WorkspaceRow>,
     identities: HashMap<SourceKey, ConversationId>,
     index_job: Option<Receiver<IndexedSources>>,
@@ -85,6 +93,8 @@ impl Default for WorkspaceSessions {
         Self {
             client: WorkspaceClient::new(),
             pending: HashMap::new(),
+            deleted: HashSet::new(),
+            deletion_updates: Vec::new(),
             indexed: Vec::new(),
             identities: HashMap::new(),
             index_job: None,
@@ -98,15 +108,53 @@ impl Default for WorkspaceSessions {
 }
 
 impl WorkspaceSessions {
-    fn send(&mut self, command: Command, refresh: bool) -> Result<(), String> {
+    fn send(&mut self, command: Command, pending: Pending) -> Result<(), String> {
         let request = self.client.send(command)?;
-        self.pending.insert(request, refresh);
+        self.pending.insert(request, pending);
         Ok(())
     }
+
+    pub(crate) fn delete(
+        &mut self,
+        id: ConversationId,
+        session: AgentSession,
+    ) -> Result<(), String> {
+        if self.row(&session).is_none_or(|row| row.id != id) {
+            return Err("This session source changed. Refresh before deleting it.".into());
+        }
+        if self
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Delete(target) if target == &id))
+        {
+            return Err("This session is already being deleted.".into());
+        }
+        self.send(
+            Command::DeleteCliSession {
+                id: id.clone(),
+                session: Box::new(session),
+            },
+            Pending::Delete(id),
+        )
+    }
+
+    pub(crate) fn is_deleted(&self, session: &AgentSession) -> bool {
+        self.identities
+            .get(&raw_key(session))
+            .is_some_and(|id| self.deleted.contains(id))
+    }
+
+    pub(crate) fn take_deletion_updates(&mut self) -> Vec<Result<ConversationId, String>> {
+        std::mem::take(&mut self.deletion_updates)
+    }
     pub(crate) fn refresh(&mut self) {
-        if !self.pending.values().any(|refresh| !refresh) {
+        if !self
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Refresh))
+        {
             self.refresh_at = Instant::now();
-            if let Err(error) = self.send(Command::Refresh, false) {
+            if let Err(error) = self.send(Command::Refresh, Pending::Refresh) {
                 self.notice = Some(error);
             }
         }
@@ -120,11 +168,11 @@ impl WorkspaceSessions {
     ) -> bool {
         let mut changed = false;
         for WorkspaceEvent::Reply { request_id, result } in self.client.poll() {
-            let Some(refresh) = self.pending.remove(&request_id) else {
+            let Some(pending) = self.pending.remove(&request_id) else {
                 continue;
             };
-            match result {
-                Ok(WorkspaceReply::Catalog { rows }) => {
+            match (pending, result) {
+                (Pending::Refresh, Ok(WorkspaceReply::Catalog { rows })) => {
                     let rows = rows
                         .into_iter()
                         .filter(|row| row.kind == ConversationKind::Cli)
@@ -134,9 +182,20 @@ impl WorkspaceSessions {
                     self.rows = rows;
                     self.notice = None;
                 }
-                Ok(_) if refresh => self.refresh(),
-                Ok(_) => {}
-                Err(error) => self.notice = Some(error),
+                (Pending::Delete(id), Ok(WorkspaceReply::Ack)) => {
+                    self.rows.remove(&id);
+                    self.deleted.insert(id.clone());
+                    self.deletion_updates.push(Ok(id));
+                    changed = true;
+                    self.refresh();
+                }
+                (Pending::Delete(_), Err(error)) => self.deletion_updates.push(Err(error)),
+                (Pending::Delete(_), Ok(_)) => self.deletion_updates.push(Err(
+                    "Unexpected acknowledgement for session deletion.".into(),
+                )),
+                (Pending::Write, Ok(_)) => self.refresh(),
+                (_, Err(error)) => self.notice = Some(error),
+                _ => {}
             }
         }
         if let Some(result) = self.index_job.as_ref().and_then(|job| job.try_recv().ok()) {
@@ -148,7 +207,7 @@ impl WorkspaceSessions {
                     Command::IndexSessions {
                         sessions: rows.clone(),
                     },
-                    true,
+                    Pending::Write,
                 ) {
                     Ok(()) => self.indexed = rows,
                     Err(error) => {
@@ -186,7 +245,9 @@ impl WorkspaceSessions {
         changed
     }
     pub(crate) fn busy(&self) -> bool {
-        self.pending.values().any(|refresh| *refresh)
+        self.pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Write))
     }
     pub(crate) fn projection(
         &self,
@@ -280,7 +341,7 @@ impl WorkspaceSessions {
             }
             changes.push(change);
         }
-        self.send(Command::Organize { changes }, true)?;
+        self.send(Command::Organize { changes }, Pending::Write)?;
         Ok(sessions.len())
     }
     pub(crate) fn row(&self, session: &AgentSession) -> Option<&WorkspaceRow> {
@@ -304,7 +365,7 @@ impl WorkspaceSessions {
                 id: session_id(session)?,
                 pinned,
             },
-            true,
+            Pending::Write,
         )
     }
     pub(crate) fn set_archived(
@@ -317,7 +378,7 @@ impl WorkspaceSessions {
                 id: session_id(session)?,
                 archived,
             },
-            true,
+            Pending::Write,
         )
     }
     pub(crate) fn set_details(
@@ -344,7 +405,7 @@ impl WorkspaceSessions {
             Command::Organize {
                 changes: vec![change],
             },
-            true,
+            Pending::Write,
         )
     }
 }

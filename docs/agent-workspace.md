@@ -16,6 +16,11 @@ from CLI sessions, API chats and native tasks. **All activity**, **Running** and
 The result count reflects the current conversation list. **Clear filters**
 restores the default view, and ordinary terminals remain directly accessible.
 
+Select **Delete…** on a CLI session row and confirm **Delete session**. This
+removes the session from the shared workspace and its history search. The
+original Codex or Claude history remains on disk. Stop a running session before
+deleting it.
+
 Search uses the shared workspace query language for metadata and indexed history. Supported fields include `provider:`, `kind:`, `status:`, `runtime:`, `validation:`, `attention:`, `project:`, `branch:`, `tag:` and `body:`. Examples:
 
 ```text

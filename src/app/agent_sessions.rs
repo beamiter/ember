@@ -285,6 +285,7 @@ pub(crate) struct AgentSessionsState {
     pub(crate) missions: crate::workspace_missions::MissionPanel,
     pub(crate) workspace_menu_ids: Vec<egui::Id>,
     pub(crate) tools: crate::workspace_tools::WorkspaceTools,
+    delete_confirmation: Option<WorkspaceCliDeletion>,
     pub(crate) workspace_scroll: crate::workspace_visibility::ScrollBookmark,
     pub(crate) is_open: bool,
     /// Sidebar activation is nonmodal. Only a conflict opens the full manager.
@@ -342,6 +343,38 @@ pub(crate) struct AgentSessionsState {
 }
 
 impl AgentSessionsState {
+    fn delete_cli_session(&mut self, target: &WorkspaceCliDeletion) -> Result<(), String> {
+        let session = self
+            .catalog
+            .sessions
+            .iter()
+            .find(|session| same_launch_target(session, &target.session))
+            .ok_or("This session source changed. Refresh before deleting it.")?;
+        if self
+            .workspace
+            .row(session)
+            .is_some_and(|row| row.runtime.is_live())
+            || !self.catalog.live_pids(session).is_empty()
+        {
+            return Err("Stop the running CLI session before deleting it.".into());
+        }
+        self.workspace.delete(target.id.clone(), session.clone())
+    }
+
+    fn settle_cli_deletions(
+        &mut self,
+    ) -> Vec<Result<jterm_core::agent_workspace::ConversationId, String>> {
+        let updates = self.workspace.take_deletion_updates();
+        if updates.iter().any(Result::is_ok) {
+            for id in updates.iter().filter_map(|result| result.as_ref().ok()) {
+                self.tools.retire_conversation(id);
+            }
+            self.replace_catalog(self.catalog.clone());
+            self.scanner.refresh();
+        }
+        updates
+    }
+
     fn workspace_filter(&self) -> jterm_core::agent_workspace::WorkspaceFilter {
         let mut query = self.query.clone();
         self.scope.qualify(&mut query);
@@ -579,7 +612,10 @@ impl AgentSessionsState {
             .and_then(|cached| cached.query_error.clone())
     }
 
-    fn replace_catalog(&mut self, catalog: SessionCatalog) -> bool {
+    fn replace_catalog(&mut self, mut catalog: SessionCatalog) -> bool {
+        catalog
+            .sessions
+            .retain(|session| !self.workspace.is_deleted(session));
         if self.catalog == catalog {
             return false;
         }
@@ -1937,6 +1973,12 @@ struct WorkspaceSessionRef {
     session: AgentSession,
 }
 
+#[derive(Clone, Debug)]
+struct WorkspaceCliDeletion {
+    id: jterm_core::agent_workspace::ConversationId,
+    session: AgentSession,
+}
+
 fn workspace_reference_current(
     state: &AgentSessionsState,
     reference: &WorkspaceSessionRef,
@@ -2175,6 +2217,13 @@ impl TerminalApp {
                         .projection(&state.catalog, state.library.snapshot()),
                 );
             }
+        }
+        for update in self.agent_sessions.settle_cli_deletions() {
+            let message = update.map_or_else(
+                |error| error,
+                |_| "Session deleted from Agent Workspace.".into(),
+            );
+            self.set_status_for(message, Duration::from_secs(5));
         }
         self.agent_sessions.sync_preflight();
         self.finish_pending_agent_resume(&ctx);
@@ -2510,6 +2559,15 @@ impl TerminalApp {
         let mut pin = None;
         let mut group = None;
         for (session, title, pinned, terminal) in &rows {
+            let deletion_id = self
+                .agent_sessions
+                .workspace
+                .row(session)
+                .filter(|row| {
+                    !row.runtime.is_live()
+                        && self.agent_sessions.catalog.live_pids(session).is_empty()
+                })
+                .map(|row| row.id.clone());
             let presentation = self
                 .agent_sessions
                 .workspace
@@ -2548,7 +2606,7 @@ impl TerminalApp {
                     }
                     let response = ui
                         .add_sized(
-                            [ui.available_width(), 42.0],
+                            [(ui.available_width() - 58.0).max(0.0), 42.0],
                             egui::Button::new(format!(
                                 "{}\n{} · {}",
                                 crate::review_text::visible_bounded(title, 70),
@@ -2566,6 +2624,16 @@ impl TerminalApp {
                     if response.clicked() {
                         chosen = Some(WorkspaceSessionRef {
                             epoch,
+                            session: session.clone(),
+                        });
+                    }
+                    let delete = ui.add_enabled(
+                        deletion_id.is_some(),
+                        egui::Button::new(egui::RichText::new("Delete…").small()),
+                    );
+                    if let Some(id) = deletion_id.filter(|_| delete.clicked()) {
+                        self.agent_sessions.delete_confirmation = Some(WorkspaceCliDeletion {
+                            id,
                             session: session.clone(),
                         });
                     }
@@ -2741,6 +2809,45 @@ impl TerminalApp {
         }
     }
 
+    pub(crate) fn render_workspace_cli_delete_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(reference) = self.agent_sessions.delete_confirmation.as_ref() else {
+            return;
+        };
+        let title = crate::review_text::visible_bounded(
+            self.agent_sessions.workspace.title(&reference.session),
+            180,
+        );
+        let provider = reference.session.provider.label();
+        let dialog = egui::Modal::new(egui::Id::new("workspace-cli-delete"))
+            .frame(crate::theme::workspace_frame(14))
+            .show(ctx, |ui| {
+                ui.set_max_width(410.0);
+                ui.heading("Delete CLI session?");
+                ui.label(format!("Delete “{title}” from Agent Workspace and its history search? The original {provider} history is kept."));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel = ui.button("Cancel").clicked();
+                    let delete = ui.button(egui::RichText::new("Delete session").color(ui.visuals().error_fg_color)).clicked();
+                    (cancel, delete)
+                }).inner
+            });
+        let (cancel, delete) = dialog.inner;
+        if cancel || dialog.should_close() {
+            self.agent_sessions.delete_confirmation = None;
+        } else if delete {
+            let reference = self
+                .agent_sessions
+                .delete_confirmation
+                .take()
+                .expect("open deletion dialog");
+            let message = self
+                .agent_sessions
+                .delete_cli_session(&reference)
+                .map_or_else(|error| error, |()| "Deleting session…".into());
+            self.set_status_for(message, Duration::from_secs(5));
+        }
+    }
+
     fn activate_workspace_session(&mut self, reference: WorkspaceSessionRef, ctx: &egui::Context) {
         if !workspace_reference_current(&self.agent_sessions, &reference) {
             return;
@@ -2807,6 +2914,9 @@ impl TerminalApp {
     /// Own the complete key batch, including the frame that closes or resumes.
     /// PTY pumping and app persistence continue in the main event loop.
     pub(crate) fn handle_agent_sessions_input(&mut self, ctx: &egui::Context) -> bool {
+        if self.agent_sessions.delete_confirmation.is_some() {
+            return true;
+        }
         let tasks: Vec<_> = self
             .workspace_task_rows()
             .into_iter()
