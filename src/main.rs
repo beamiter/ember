@@ -33,6 +33,8 @@ mod history_picker;
 mod image_drop;
 mod immersive_command;
 mod jsh_ui;
+#[path = "../vendor/jwm-remote/client.rs"]
+mod jwm_remote_session;
 mod keybindings;
 mod kitty_graphics;
 mod layout;
@@ -51,11 +53,9 @@ mod persistence_file;
 mod pty;
 mod reference_conversation_ui;
 mod reference_workspace;
+mod remote_desktop;
 mod remote_fs;
 mod remote_picker;
-mod remote_desktop;
-#[path = "../vendor/jwm-remote/client.rs"]
-mod jwm_remote_session;
 mod review_text;
 mod runtime_wake;
 mod search;
