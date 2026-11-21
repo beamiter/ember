@@ -48,6 +48,9 @@ mod reference_conversation_ui;
 mod reference_workspace;
 mod remote_fs;
 mod remote_picker;
+mod remote_desktop;
+#[path = "../vendor/jwm-remote/client.rs"]
+mod jwm_remote_session;
 mod review_text;
 mod runtime_wake;
 mod search;
@@ -2970,6 +2973,7 @@ impl TerminalApp {
             tab_bar_drop_rects: Vec::new(),
             help_panel: help::HelpPanel::new(),
             remote_picker: Default::default(),
+            remote_desktop: None,
             config_panel: config_panel::ConfigPanel::new(),
             organism: organism_ui::OrganismHost::default(),
             debug_panel: debug_panel::DebugPanel::new(),

@@ -193,6 +193,7 @@ pub enum Command {
     // === 远程 ===
     /// 打开远程主机选择器（`[[remote_hosts]]` 配置的 ssh/容器目标）。
     RemotePicker,
+    RemoteDesktop,
 }
 
 impl std::fmt::Display for Command {
@@ -310,6 +311,7 @@ impl std::fmt::Display for Command {
             Command::AiChatToggle => write!(f, "ai_chat:toggle"),
             Command::JshInstall => write!(f, "jsh:install"),
             Command::RemotePicker => write!(f, "remote:picker"),
+            Command::RemoteDesktop => write!(f, "remote:desktop"),
         }
     }
 }
@@ -426,6 +428,7 @@ impl std::str::FromStr for Command {
             "ai_chat:toggle" => Ok(Command::AiChatToggle),
             "jsh:install" => Ok(Command::JshInstall),
             "remote:picker" => Ok(Command::RemotePicker),
+            "remote:desktop" => Ok(Command::RemoteDesktop),
             s if s.starts_with("session:jump:") => {
                 let num_str = &s[13..];
                 let num = num_str

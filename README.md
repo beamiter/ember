@@ -55,6 +55,12 @@ moving its text or covering Vim's separator/status rows.
 
 ## Highlights
 
+- JWM remote desktop in the command palette (`Ctrl+Shift+P`, **Remote Desktop**).
+  Install `jwm-remote` on PATH and enter the host address. Connections default to
+  view-only. The panel shows authorized sources, live presentation metrics and
+  controls for releasing input and disconnecting. Wayland keyboard and pointer
+  control uses the host's one-shot lease for a fixed source.
+
 - WGPU terminal grid rendering with a CPU/Glow fallback
 - Tabs, drag-to-reorder, rename, activity indicators and split-layout restore
 - Drag a single-pane tab to a target pane edge to merge it as a split, or drag

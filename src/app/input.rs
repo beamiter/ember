@@ -1234,6 +1234,7 @@ impl TerminalApp {
 
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
         self.organism.eva.close_dialog_owns_input()
+            || self.remote_desktop.is_some()
             || self.reference_navigation_drawer_rect(ctx).is_some()
             || self.organism.eva.card_owns_input()
             || self.block_review.is_some()
@@ -1804,6 +1805,12 @@ impl TerminalApp {
             }
             keybindings::Command::JshInstall => {
                 self.install_or_update_jsh();
+            }
+            keybindings::Command::RemoteDesktop => {
+                if self.remote_desktop.is_none() {
+                    self.remote_desktop = Some(crate::remote_desktop::Panel::new());
+                }
+                ctx.request_repaint();
             }
             keybindings::Command::RemotePicker => {
                 self.remote_picker.toggle();
