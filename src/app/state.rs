@@ -411,6 +411,7 @@ pub struct TerminalApp {
     // Help panel
     pub help_panel: help::HelpPanel,
     pub remote_picker: crate::remote_picker::RemotePicker,
+    pub(crate) remote_desktop: Option<crate::remote_desktop::Panel>,
 
     // Config panel
     pub config_panel: config_panel::ConfigPanel,

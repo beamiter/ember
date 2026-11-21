@@ -674,6 +674,12 @@ impl CommandPalette {
                 crate::keybindings::Command::RemotePicker,
             ),
             CommandInfo::new(
+                "Remote Desktop",
+                CommandCategory::Session,
+                "Open a JWM remote desktop viewer",
+                crate::keybindings::Command::RemoteDesktop,
+            ),
+            CommandInfo::new(
                 "Install or update jsh",
                 CommandCategory::Terminal,
                 "Install jterm's companion shell, or update the installed one, in a new session",
@@ -1666,6 +1672,7 @@ mod tests {
             Command::TaskToggle,
             Command::AiChatToggle,
             Command::JshInstall,
+            Command::RemoteDesktop,
         ];
 
         for command in fixed_commands {

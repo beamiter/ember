@@ -3405,6 +3405,13 @@ impl TerminalApp {
 
     #[allow(deprecated)]
     pub fn render_floating_panels(&mut self, ctx: &egui::Context) {
+        if let Some(panel) = self.remote_desktop.as_mut() {
+            if panel.show(ctx) {
+                self.remote_desktop = None;
+                self.return_focus_to_terminal(ctx);
+            }
+            return;
+        }
         self.render_block_review(ctx);
         self.render_agent_sessions(ctx);
         self.render_workspace_missions(ctx);
