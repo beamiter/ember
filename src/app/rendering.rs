@@ -3019,7 +3019,10 @@ impl TerminalApp {
                         content_rect,
                     );
                     copy_retained_terminal_selection(
-                        renderer, &terminal_guard, self.clipboard.as_ref(), frame_pointer_input_blocked,
+                        renderer,
+                        &terminal_guard,
+                        self.clipboard.as_ref(),
+                        frame_pointer_input_blocked,
                     );
                     if pane.focused {
                         companion_surface =
@@ -3283,7 +3286,10 @@ impl TerminalApp {
                     single_presentation_rect,
                 );
                 copy_retained_terminal_selection(
-                    &mut self.renderer, &terminal_guard, self.clipboard.as_ref(), frame_pointer_input_blocked,
+                    &mut self.renderer,
+                    &terminal_guard,
+                    self.clipboard.as_ref(),
+                    frame_pointer_input_blocked,
                 );
                 companion_surface = self
                     .renderer

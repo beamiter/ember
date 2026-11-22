@@ -6331,14 +6331,16 @@ impl super::TerminalState {
 
     #[allow(dead_code)] // The binary workspace controls frame publication.
     pub(crate) fn inline_drag_holds_frame(&self) -> bool {
-        self.inline_text_selection.as_ref().is_some_and(|selection| {
-            let key = selection.viewport.key();
-            selection.dragging
-                && (key.grid_version != self.grid_version
-                    || key.row_identity_revision != self.row_identity_revision
-                    || key.total_lines_scrolled != self.total_lines_scrolled
-                    || key.scrollback_len != self.scrollback.len())
-        })
+        self.inline_text_selection
+            .as_ref()
+            .is_some_and(|selection| {
+                let key = selection.viewport.key();
+                selection.dragging
+                    && (key.grid_version != self.grid_version
+                        || key.row_identity_revision != self.row_identity_revision
+                        || key.total_lines_scrolled != self.total_lines_scrolled
+                        || key.scrollback_len != self.scrollback.len())
+            })
     }
 
     pub(crate) fn start_inline_text_selection(
@@ -7576,9 +7578,10 @@ impl super::TerminalState {
         display_row: usize,
     ) -> Option<(usize, usize)> {
         if let Some(selection) = &self.inline_text_selection {
-            return (viewport.unavailable_reason().is_none() && viewport.key() == selection.viewport.key())
-                .then(|| selection.columns(display_row))
-                .flatten();
+            return (viewport.unavailable_reason().is_none()
+                && viewport.key() == selection.viewport.key())
+            .then(|| selection.columns(display_row))
+            .flatten();
         }
         if viewport.is_transformed() {
             let selection = self.projected_selection.as_ref()?;

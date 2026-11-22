@@ -41,7 +41,6 @@ mod layout;
 mod link;
 mod local_preview;
 mod local_preview_panel;
-mod preview_navigation;
 mod local_reference;
 mod native_enter;
 mod navigation_drawer;
@@ -50,6 +49,7 @@ mod organism_ui;
 mod output_batch;
 mod pane_header;
 mod persistence_file;
+mod preview_navigation;
 mod pty;
 mod reference_conversation_ui;
 mod reference_workspace;
@@ -88,10 +88,10 @@ mod workspace_missions;
 mod workspace_remote;
 mod workspace_remote_ui;
 mod workspace_review;
+mod workspace_scope;
 mod workspace_sessions_bridge;
 mod workspace_tools;
 mod workspace_visibility;
-mod workspace_scope;
 
 // Xlib window IDs use c_ulong, which is u32 on some targets and u64 on others.
 fn widen_native_window_id(value: impl Into<u64>) -> u64 {
@@ -5899,7 +5899,10 @@ impl TerminalApp {
                             .show(ui, |ui| self.render_sidebar_tasks(ui));
                     } else {
                         self.render_terminal_content(
-                            ui, ctx, frame_pointer_input_blocked, frame_selection_input_blocked,
+                            ui,
+                            ctx,
+                            frame_pointer_input_blocked,
+                            frame_selection_input_blocked,
                         );
                         self.render_reference_rich_canvas(ui);
                     }
@@ -7417,7 +7420,9 @@ impl eframe::App for TerminalApp {
 
         let pointer_coordinates_held = {
             let terminal = session.terminal.lock();
-            session.terminal_presentation.holding_frame(&terminal, std::time::Instant::now())
+            session
+                .terminal_presentation
+                .holding_frame(&terminal, std::time::Instant::now())
                 || terminal.inline_drag_holds_frame()
         };
         if !mouse_projection_viewport.is_available() || pointer_coordinates_held {
