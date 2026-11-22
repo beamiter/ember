@@ -19,23 +19,7 @@ pub fn set_auto_vim_gui(enabled: bool) {
 /// stringified these messages into its own domain error.
 pub(crate) use jterm_core::agent_task::pinned_dir::PinnedDirectory;
 
-/// PTY 读取结果。流关闭与子进程退出必须分开判断：Linux 的 EIO/Hangup
-/// 只说明当前没有 slave fd，子进程仍可能存活；只有 waitpid 才能确认退出。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadOutcome {
-    Data(usize),
-    WouldBlock,
-    Eof,
-    Hangup,
-}
-
-/// PTY 写入结果。区分"写入了 n 字节(可能少于请求,即 partial write)"与
-/// "缓冲区已满(WouldBlock,需 poll 等待可写)"。EINTR 在内部重试,不外泄。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteOutcome {
-    Written(usize),
-    WouldBlock,
-}
+pub use jterm_core::session_actor::{ReadOutcome, WriteOutcome};
 
 #[cfg(unix)]
 mod unix_pty {
@@ -976,33 +960,6 @@ mod unix_pty {
             self.master
         }
 
-        pub fn wait_fd_readable(fd: RawFd, timeout_ms: i32) -> Result<bool> {
-            let mut poll_fd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-
-            // SAFETY: poll_fd 是有效的栈上变量，libc::poll 接受可变指针和长度，
-            // 超时参数是合法的毫秒值。poll 调用是原子的，不会导致数据竞争。
-            loop {
-                let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-                if ready < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue; // EINTR:被信号打断,重试
-                    }
-                    return Err(anyhow!("Failed to poll PTY: {}", err));
-                } else if ready == 0 {
-                    return Ok(false);
-                } else {
-                    return Ok(
-                        (poll_fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0,
-                    );
-                }
-            }
-        }
-
         /// 单次非阻塞写入。返回写入的字节数(可能 partial),或 WouldBlock 表示缓冲区满。
         pub fn write(&mut self, data: &[u8]) -> Result<WriteOutcome> {
             // SAFETY: self.master 是有效的文件描述符，data.as_ptr() 指向有效的内存，
@@ -1022,31 +979,9 @@ mod unix_pty {
         }
 
         pub fn read(&mut self, buf: &mut [u8]) -> Result<ReadOutcome> {
-            // SAFETY: self.master 是有效的文件描述符，buf.as_mut_ptr() 指向有效的可变内存，
-            // buf.len() 是正确的缓冲区大小。read 不会超出边界。
-            loop {
-                let n = unsafe { libc::read(self.master, buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n > 0 {
-                    return Ok(ReadOutcome::Data(n as usize));
-                } else if n == 0 {
-                    // read 返回 0 表示对端(slave)已关闭 —— EOF。
-                    return Ok(ReadOutcome::Eof);
-                } else {
-                    let err = std::io::Error::last_os_error();
-                    // Linux PTY masters report EIO (rather than read(2) == 0)
-                    // once the final slave fd closes. Keep it distinct from
-                    // process exit: the reader must stop polling this fd and
-                    // waitpid at a bounded cadence, not fabricate an exit code.
-                    if err.raw_os_error() == Some(libc::EIO) {
-                        return Ok(ReadOutcome::Hangup);
-                    }
-                    match err.kind() {
-                        std::io::ErrorKind::Interrupted => continue, // EINTR:重试
-                        std::io::ErrorKind::WouldBlock => return Ok(ReadOutcome::WouldBlock),
-                        _ => return Err(anyhow!("Failed to read from PTY: {}", err)),
-                    }
-                }
-            }
+            use std::os::fd::AsFd;
+            jterm_core::pty_reader::read_master(self.as_fd(), buf)
+                .map_err(|error| anyhow!("Failed to read from PTY: {error}"))
         }
 
         pub fn resize(&mut self, cols: usize, rows: usize) -> Result<()> {
@@ -1077,13 +1012,9 @@ mod unix_pty {
         /// 这样 `exit_code_cached.is_some()` 等价于"PID 已被回收、可能被复用";
         /// kill 路径据此判断是否还能安全发信号,避免误杀复用了该 PID 的无辜进程。
         fn cache_status(&mut self, status: i32) {
-            let code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status) as i32
-            } else if libc::WIFSIGNALED(status) {
-                -(libc::WTERMSIG(status) as i32)
-            } else {
-                -1
-            };
+            let code = jterm_core::process::decode_wait_status(status)
+                .and_then(jterm_core::process::ChildExitOutcome::negative_signal_code)
+                .unwrap_or(-1);
             self.exit_code_cached = Some(code);
             self.lifecycle = ChildLifecycle::Reaped;
         }
@@ -1107,19 +1038,8 @@ mod unix_pty {
         // Keep a single syscall available to deadline-bound callers: retrying
         // EINTR here indefinitely would bypass their timeout check.
         fn observe_child_exit_once(child_pid: i32, nonblocking: bool) -> std::io::Result<bool> {
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let options =
-                libc::WEXITED | libc::WNOWAIT | if nonblocking { libc::WNOHANG } else { 0 };
-            // SAFETY: `info` is writable, P_PID scopes observation to our forked
-            // child, and WNOWAIT preserves its status for cleanup/reaping.
-            let result =
-                unsafe { libc::waitid(libc::P_PID, child_pid as libc::id_t, &mut info, options) };
-            if result < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: successful waitid initializes siginfo. WNOHANG's zero
-            // si_pid means no exit; EINTR never reads unspecified siginfo.
-            Ok(unsafe { info.si_pid() } == child_pid)
+            jterm_core::process::observe_child_exit(child_pid, nonblocking)
+                .map(|status| status.is_some())
         }
 
         /// The direct child is known to be exited but deliberately unreaped.
@@ -1786,6 +1706,49 @@ mod unix_pty {
             pty.terminate().expect("repeated terminate is a no-op");
             assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
         }
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for Pty {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: Pty owns the descriptor for its lifetime.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.master_fd()) }
+    }
+}
+
+#[cfg(unix)]
+impl jterm_core::session_actor::SessionTransport for Pty {
+    fn read(&mut self, buffer: &mut [u8]) -> std::result::Result<ReadOutcome, String> {
+        Pty::read(self, buffer).map_err(|error| error.to_string())
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> std::result::Result<WriteOutcome, String> {
+        Pty::write(self, bytes).map_err(|error| error.to_string())
+    }
+
+    fn resize(&mut self, cols: usize, rows: usize) -> std::result::Result<(), String> {
+        Pty::resize(self, cols, rows).map_err(|error| error.to_string())
+    }
+
+    fn is_alive(&mut self) -> bool {
+        Pty::is_alive(self)
+    }
+
+    fn try_reap(&mut self) -> Option<i32> {
+        Pty::try_reap(self)
+    }
+
+    fn wait_timeout(&mut self, timeout_ms: u64) -> std::result::Result<i32, String> {
+        Pty::wait_timeout(self, timeout_ms).map_err(|error| error.to_string())
+    }
+
+    fn signal_terminate(&mut self) {
+        Pty::signal_terminate(self);
+    }
+
+    fn force_kill_and_reap(&mut self) {
+        Pty::force_kill_and_reap(self);
     }
 }
 

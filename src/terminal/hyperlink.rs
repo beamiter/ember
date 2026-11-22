@@ -1,66 +1,34 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use jterm_core::link::is_openable_osc8;
 
-/// Maximum OSC 8 parameter payload accepted from an attached process.
-pub(super) const MAX_OSC8_PARAMS_BYTES: usize = 256;
-/// Maximum OSC 8 target accepted from an attached process.
 #[cfg(test)]
-pub(super) const MAX_OSC8_URI_BYTES: usize = jterm_core::link::MAX_OPENABLE_URL_BYTES;
-/// Bound hyperlink metadata independently of terminal scrollback size.
+pub(super) use jterm_engine::hyperlink::{MAX_OSC8_PARAMS_BYTES, MAX_OSC8_URI_BYTES};
+#[cfg(test)]
 const MAX_HYPERLINKS: usize = 4096;
 
 pub use jterm_engine::HyperlinkId;
 
 /// Return whether an OSC 8 target may become a click action.
 ///
-/// The policy lives in `jterm_core::link::is_openable_url` and is shared by
-/// every jterm: an allow-list of exactly one shape, an absolute HTTP(S) URL
-/// with an authority and no userinfo. Everything a terminal-controlled string
-/// could otherwise reach — `javascript:`, `data:`, `file:` (a click that opens
-/// a local file with its default application), `ssh:` and `git:` (a click that
-/// starts a network client), or `https://user:token@host` (a credential the
-/// user never typed) — fails closed there rather than at the opener.
+/// The same policy admits OSC 8 metadata and resolves user click actions.
 pub(crate) fn is_supported_hyperlink_uri(uri: &str) -> bool {
-    !uri.contains('\u{fffd}') && jterm_core::link::is_openable_url(uri)
-}
-
-fn params_are_valid(params: &str) -> bool {
-    params.len() <= MAX_OSC8_PARAMS_BYTES
-        && !params.contains('\u{fffd}')
-        && !params.chars().any(char::is_control)
-        && !jterm_core::review_input::contains_visual_spoofing(params)
+    is_openable_osc8("", uri)
 }
 
 #[derive(Debug, Default)]
-pub(super) struct HyperlinkTable {
-    targets: Vec<Arc<str>>,
-    ids_by_target: HashMap<Arc<str>, HyperlinkId>,
-}
+pub(super) struct HyperlinkTable(jterm_engine::hyperlink::HyperlinkTable);
 
 impl HyperlinkTable {
-    /// Validate and intern a target. Existing targets remain usable when the
-    /// table reaches capacity; only genuinely new entries are refused.
+    #[cfg(test)]
     pub(super) fn intern(&mut self, params: &str, uri: &str) -> Option<HyperlinkId> {
-        if !params_are_valid(params) || !is_supported_hyperlink_uri(uri) {
-            return None;
-        }
-        if let Some(id) = self.ids_by_target.get(uri) {
-            return Some(*id);
-        }
-        if self.targets.len() >= MAX_HYPERLINKS {
-            return None;
-        }
+        self.0.intern(params, uri, is_openable_osc8)
+    }
 
-        let target: Arc<str> = Arc::from(uri);
-        let id = HyperlinkId::from_raw((self.targets.len() + 1) as u16);
-        self.targets.push(Arc::clone(&target));
-        self.ids_by_target.insert(target, id);
-        Some(id)
+    pub(super) fn apply_osc8(&mut self, fields: &str) -> HyperlinkId {
+        self.0.apply_osc8(fields, is_openable_osc8)
     }
 
     pub(super) fn resolve(&self, id: HyperlinkId) -> Option<&str> {
-        let index = usize::from(id.as_raw()).checked_sub(1)?;
-        self.targets.get(index).map(AsRef::as_ref)
+        self.0.resolve(id)
     }
 }
 

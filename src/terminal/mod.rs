@@ -8,8 +8,7 @@ use base64::Engine;
 use jterm_core::click_cursor;
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
 use jterm_engine::screen::{
-    Charset, RegionDirection, RegionMutation, RowMutation, ScreenState, VerticalDeparture,
-    VerticalMotion,
+    Charset, RegionMutation, RowMutation, ScreenState, VerticalDeparture, VerticalMotion,
 };
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -70,8 +69,6 @@ fn is_token_suffix_wrapper(c: char) -> bool {
     )
 }
 
-const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?65;1;9c";
-const SECONDARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[>1;7802;0c";
 const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
 pub use jterm_engine::MAX_TERMINAL_COLS;
 pub const MAX_TERMINAL_ROWS: usize = 512;

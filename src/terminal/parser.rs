@@ -125,24 +125,7 @@ impl super::TerminalState {
                     );
                     crate::debug_log!("[OSC7] cwd set to {:?}", self.current_working_dir);
                 } else if command == "8" {
-                    // OSC 8 - Hyperlinks
-                    // Format: ESC ] 8 ; params ; URI ST
-                    // Empty URI closes the current hyperlink. Invalid,
-                    // oversized, or unsafe openings also clear it so a
-                    // rejected sequence cannot accidentally extend the
-                    // preceding safe link over later text.
-                    if let Some((params, uri)) = value.split_once(';') {
-                        if uri.is_empty() {
-                            self.screen.current_hyperlink = HyperlinkId::NONE;
-                        } else {
-                            self.screen.current_hyperlink = self
-                                .hyperlinks
-                                .intern(params, uri)
-                                .unwrap_or(HyperlinkId::NONE);
-                        }
-                    } else {
-                        self.screen.current_hyperlink = HyperlinkId::NONE;
-                    }
+                    self.screen.current_hyperlink = self.hyperlinks.apply_osc8(value);
                 } else if command == "4" {
                     self.handle_osc_palette(value);
                 } else if command == "104" {
@@ -521,23 +504,6 @@ impl super::TerminalState {
             'n' if private_prefix == Some(b'?') && params.first() == Some(&996) => {
                 let response = format!("\x1b[?997;{}n", self.color_scheme_report());
                 self.output_buffer.extend(response.as_bytes());
-            }
-            'c' => {
-                if intermediates.is_empty() {
-                    match private_prefix {
-                        None => {
-                            crate::debug_log!("[DA] primary device attributes request");
-                            self.output_buffer
-                                .extend_from_slice(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE);
-                        }
-                        Some(b'>') => {
-                            crate::debug_log!("[DA] secondary device attributes request");
-                            self.output_buffer
-                                .extend_from_slice(SECONDARY_DEVICE_ATTRIBUTES_RESPONSE);
-                        }
-                        _ => {}
-                    }
-                }
             }
             'h' => {
                 // 区分 DEC 私有模式(CSI ? Pn h)与 ANSI 模式(CSI Pn h)。

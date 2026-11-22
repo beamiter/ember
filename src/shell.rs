@@ -1,369 +1,18 @@
-use crate::output_batch::{OutputBuffer, OutputSource};
+//! Product and platform launch policy for Ember's shared session actor.
 use crate::pty::Pty;
 use crate::terminal::clamp_terminal_dimensions;
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::Receiver;
 use jterm_core::runtime_wake::WakeSink;
-use parking_lot::{Condvar, Mutex};
-use std::collections::VecDeque;
-use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
+use jterm_core::session_actor::SessionActor;
 
-#[derive(Clone, Debug)]
-pub enum ShellEvent {
-    Output(OutputBuffer),
-    Exit(i32),
-    Error(String),
-}
+pub use jterm_core::session_actor::{
+    SessionEvent as ShellEvent, WriteError as ShellWriteError, WriteSender as ShellWriteSender,
+};
 
-// An exited leader may leave bytes readable after the ordinary 128 KiB
-// batch cut-off. Bound the final drain by bytes and stop on EOF, WouldBlock
-// or Hangup. Existing blocking event sends and read EINTR retries mean this
-// is not a wall-clock bound on Exit delivery.
-const EXIT_DRAIN_BYTE_CAP: usize = 1024 * 1024;
-
-fn drain_exited_pty_output(
-    source: &mut OutputSource,
-    buffer: &mut [u8],
-    mut read: impl FnMut(&mut [u8]) -> Result<crate::pty::ReadOutcome, String>,
-    mut emit: impl FnMut(ShellEvent) -> bool,
-    mut cancelled: impl FnMut() -> bool,
-) -> bool {
-    let mut drained = 0usize;
-    loop {
-        if cancelled() {
-            return false;
-        }
-        if drained == EXIT_DRAIN_BYTE_CAP {
-            return emit(ShellEvent::Error(format!(
-                "PTY exit output drain reached the {EXIT_DRAIN_BYTE_CAP}-byte limit; remaining output may be omitted"
-            )));
-        }
-        let available = buffer.len().min(EXIT_DRAIN_BYTE_CAP - drained);
-        match read(&mut buffer[..available]) {
-            Ok(crate::pty::ReadOutcome::Data(0)) => {
-                return emit(ShellEvent::Error(
-                    "PTY exit output drain returned zero bytes without EOF".to_string(),
-                ));
-            }
-            Ok(crate::pty::ReadOutcome::Data(bytes)) => {
-                let read_at = std::time::Instant::now();
-                drained += bytes;
-                if !emit(ShellEvent::Output(
-                    source.batch(buffer[..bytes].to_vec(), read_at),
-                )) {
-                    return false;
-                }
-            }
-            Ok(
-                crate::pty::ReadOutcome::WouldBlock
-                | crate::pty::ReadOutcome::Eof
-                | crate::pty::ReadOutcome::Hangup,
-            ) => return true,
-            Err(error) => {
-                return emit(ShellEvent::Error(format!(
-                    "PTY exit output drain failed; remaining output may be omitted: {error}"
-                )));
-            }
-        }
-    }
-}
-
-/// 事件 channel 容量上限。每个事件最多 ~128KB(BATCH_SIZE_THRESHOLD),
-/// 256 * 128KB ≈ 32MB 为内存上界,既能吸收突发又能阻止无限堆积。
-const EVENT_CHANNEL_CAP: usize = 256;
-
-/// PTY writer 的硬上限包含等待队列和正在执行的 OS write。OSC 5522 会把
-/// 32 MiB 剪贴板内容编码为约 43 MiB 的单条响应，因此单消息上限需留足空间。
-const WRITE_QUEUE_BYTE_CAP: usize = 64 * 1024 * 1024;
-const WRITE_MESSAGE_BYTE_CAP: usize = 48 * 1024 * 1024;
-const WRITE_QUEUE_MESSAGE_CAP: usize = 8192;
-
-/// bulk 写入不能占用最后这部分容量，尽量保证它阻塞时短按键、DSR 回复仍可入队。
-const WRITE_INTERACTIVE_RESERVE_BYTES: usize = 64 * 1024;
-const WRITE_INTERACTIVE_RESERVE_MESSAGES: usize = 256;
-const WRITE_INTERACTIVE_MAX_BYTES: usize = 64;
-
-#[derive(Clone, Copy)]
-struct WriteQueueLimits {
-    byte_capacity: usize,
-    message_capacity: usize,
-    max_message_bytes: usize,
-    interactive_reserve_bytes: usize,
-    interactive_reserve_messages: usize,
-    interactive_max_bytes: usize,
-}
-
-impl WriteQueueLimits {
-    const PRODUCTION: Self = Self {
-        byte_capacity: WRITE_QUEUE_BYTE_CAP,
-        message_capacity: WRITE_QUEUE_MESSAGE_CAP,
-        max_message_bytes: WRITE_MESSAGE_BYTE_CAP,
-        interactive_reserve_bytes: WRITE_INTERACTIVE_RESERVE_BYTES,
-        interactive_reserve_messages: WRITE_INTERACTIVE_RESERVE_MESSAGES,
-        interactive_max_bytes: WRITE_INTERACTIVE_MAX_BYTES,
-    };
-}
-
-/// 非阻塞 PTY 写入的可判别失败原因。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ShellWriteError {
-    /// 当前按字节或消息计数的队列已满；调用方可保留输入并在后续帧重试。
-    Full {
-        requested_bytes: usize,
-        queued_bytes: usize,
-        byte_capacity: usize,
-        queued_messages: usize,
-        message_capacity: usize,
-    },
-    /// 单条消息永远不可能进入队列；拆分协议消息或拒绝该操作。
-    TooLarge {
-        requested_bytes: usize,
-        max_message_bytes: usize,
-    },
-    /// writer 已停止，后续数据不会被接受。
-    Closed,
-}
-
-impl ShellWriteError {
-    /// Full is transient and guarantees zero-byte enqueue, so callers can
-    /// retain their exact input and retry. TooLarge/Closed cannot recover
-    /// merely by waiting for queue capacity.
-    pub fn is_backpressure(&self) -> bool {
-        matches!(self, Self::Full { .. })
-    }
-}
-
-impl fmt::Display for ShellWriteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Full {
-                requested_bytes,
-                queued_bytes,
-                byte_capacity,
-                queued_messages,
-                message_capacity,
-            } => write!(
-                f,
-                "PTY writer queue full: requested {requested_bytes} bytes, \
-                 {queued_bytes}/{byte_capacity} bytes and \
-                 {queued_messages}/{message_capacity} messages are accounted"
-            ),
-            Self::TooLarge {
-                requested_bytes,
-                max_message_bytes,
-            } => write!(
-                f,
-                "PTY write message is too large: {requested_bytes} bytes exceeds the \
-                 {max_message_bytes}-byte limit"
-            ),
-            Self::Closed => f.write_str("PTY writer has stopped"),
-        }
-    }
-}
-
-impl std::error::Error for ShellWriteError {}
-
-struct WriteQueueState {
-    pending: VecDeque<Vec<u8>>,
-    /// 包含 pending 和已 pop、尚未完成/失败的 in-flight 消息。
-    accounted_bytes: usize,
-    accounted_messages: usize,
-    closed: bool,
-}
-
-struct WriteQueue {
-    state: Mutex<WriteQueueState>,
-    ready: Condvar,
-    limits: WriteQueueLimits,
-}
-
-impl WriteQueue {
-    fn new(limits: WriteQueueLimits) -> Self {
-        debug_assert!(limits.max_message_bytes <= limits.byte_capacity);
-        debug_assert!(limits.interactive_reserve_bytes < limits.byte_capacity);
-        debug_assert!(limits.interactive_reserve_messages < limits.message_capacity);
-        Self {
-            state: Mutex::new(WriteQueueState {
-                pending: VecDeque::new(),
-                accounted_bytes: 0,
-                accounted_messages: 0,
-                closed: false,
-            }),
-            ready: Condvar::new(),
-            limits,
-        }
-    }
-
-    fn effective_capacity(&self, message_bytes: usize) -> (usize, usize) {
-        if message_bytes <= self.limits.interactive_max_bytes {
-            (self.limits.byte_capacity, self.limits.message_capacity)
-        } else {
-            (
-                self.limits
-                    .byte_capacity
-                    .saturating_sub(self.limits.interactive_reserve_bytes),
-                self.limits
-                    .message_capacity
-                    .saturating_sub(self.limits.interactive_reserve_messages),
-            )
-        }
-    }
-
-    fn validate_message(&self, requested_bytes: usize) -> Result<(), ShellWriteError> {
-        if requested_bytes > self.limits.max_message_bytes {
-            Err(ShellWriteError::TooLarge {
-                requested_bytes,
-                max_message_bytes: self.limits.max_message_bytes,
-            })
-        } else {
-            Ok(())
-        }
-    }
-
-    fn has_capacity(&self, state: &WriteQueueState, requested_bytes: usize) -> bool {
-        let (byte_capacity, message_capacity) = self.effective_capacity(requested_bytes);
-        state
-            .accounted_bytes
-            .checked_add(requested_bytes)
-            .is_some_and(|bytes| bytes <= byte_capacity)
-            && state.accounted_messages < message_capacity
-    }
-
-    fn full_error(&self, state: &WriteQueueState, requested_bytes: usize) -> ShellWriteError {
-        let (byte_capacity, message_capacity) = self.effective_capacity(requested_bytes);
-        ShellWriteError::Full {
-            requested_bytes,
-            queued_bytes: state.accounted_bytes,
-            byte_capacity,
-            queued_messages: state.accounted_messages,
-            message_capacity,
-        }
-    }
-
-    fn enqueue_locked(&self, state: &mut WriteQueueState, data: Vec<u8>) {
-        state.accounted_bytes += data.len();
-        state.accounted_messages += 1;
-        state.pending.push_back(data);
-        self.ready.notify_one();
-    }
-
-    fn try_enqueue(&self, data: Vec<u8>) -> Result<(), ShellWriteError> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        self.validate_message(data.len())?;
-        let mut state = self.state.lock();
-        if state.closed {
-            return Err(ShellWriteError::Closed);
-        }
-        if !self.has_capacity(&state, data.len()) {
-            return Err(self.full_error(&state, data.len()));
-        }
-        self.enqueue_locked(&mut state, data);
-        Ok(())
-    }
-
-    fn try_enqueue_slice(&self, data: &[u8]) -> Result<(), ShellWriteError> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        self.validate_message(data.len())?;
-        let mut state = self.state.lock();
-        if state.closed {
-            return Err(ShellWriteError::Closed);
-        }
-        if !self.has_capacity(&state, data.len()) {
-            return Err(self.full_error(&state, data.len()));
-        }
-        // Clone only after capacity succeeds, so rejected large pastes do not
-        // transiently duplicate their full allocation on the UI thread.
-        self.enqueue_locked(&mut state, data.to_vec());
-        Ok(())
-    }
-
-    fn take(&self) -> Option<Vec<u8>> {
-        let mut state = self.state.lock();
-        loop {
-            if let Some(data) = state.pending.pop_front() {
-                // accounted_* 在 OS write 完成或失败前保持不变。
-                return Some(data);
-            }
-            if state.closed {
-                return None;
-            }
-            self.ready.wait(&mut state);
-        }
-    }
-
-    fn finish(&self, bytes: usize) {
-        let mut state = self.state.lock();
-        debug_assert!(state.accounted_bytes >= bytes);
-        debug_assert!(state.accounted_messages > 0);
-        state.accounted_bytes = state.accounted_bytes.saturating_sub(bytes);
-        state.accounted_messages = state.accounted_messages.saturating_sub(1);
-    }
-
-    fn drained(&self) -> Result<bool, ShellWriteError> {
-        let state = self.state.lock();
-        if state.closed {
-            Err(ShellWriteError::Closed)
-        } else {
-            // `take()` does not release this accounting: an empty pending
-            // deque alone would allow a native command to overtake OS writes.
-            Ok(state.accounted_bytes == 0 && state.accounted_messages == 0)
-        }
-    }
-
-    fn close(&self) {
-        let mut state = self.state.lock();
-        if state.closed {
-            return;
-        }
-        state.closed = true;
-        let dropped_bytes = state.pending.iter().map(Vec::len).sum::<usize>();
-        let dropped_messages = state.pending.len();
-        state.pending.clear();
-        state.accounted_bytes = state.accounted_bytes.saturating_sub(dropped_bytes);
-        state.accounted_messages = state.accounted_messages.saturating_sub(dropped_messages);
-        self.ready.notify_all();
-    }
-}
-
-/// 可克隆的统一 PTY 写入口。成功返回表示整条消息已按字节计入 FIFO；
-/// 不表示内核已经写完。任何错误都保证消息没有部分入队。
-#[derive(Clone)]
-pub struct ShellWriteSender {
-    queue: Arc<WriteQueue>,
-}
-
-impl ShellWriteSender {
-    /// UI/输入路径使用：从不等待容量。
-    pub fn try_send(&self, data: Vec<u8>) -> Result<(), ShellWriteError> {
-        self.queue.try_enqueue(data)
-    }
-}
-
-/// ShellSession 管理 PTY 和后台 I/O 线程
 pub struct ShellSession {
-    output_source: Option<u64>,
-    pty: Arc<Mutex<Pty>>,
-    event_rx: Receiver<ShellEvent>,
-    child_pid: i32,            // 存储 shell 子进程的 PID
-    shutdown: Arc<AtomicBool>, // 通知 IO 线程退出
-    // 所有 PTY 写入都经此 channel 交给单一 writer 线程串行执行,保证每条消息原子写入、
-    // 互不交错(否则键盘输入与异步粘贴会逐块交错,劈开括号粘贴标记 ESC[200~..201~)。
-    write_tx: ShellWriteSender,
-    /// When the child was spawned. A shell that dies within moments of this
-    /// point never reached an interactive prompt, so the app must report the
-    /// failure instead of treating it as the user typing `exit`.
+    actor: SessionActor<Pty>,
+    child_pid: i32,
     started_at: std::time::Instant,
-    /// Absolute shell executable resolved when an interactive session was
-    /// created. One-shot command sessions have no source-shell identity.
     shell_program: Option<String>,
     shell_identity: companion_host::shell_identity::ShellIdentity,
 }
@@ -422,7 +71,7 @@ impl ShellSession {
             None
         };
         let spawn_shell = shell_program.as_deref().or(configured_shell);
-        match Pty::new_with_pinned_cwd(
+        let pty = Pty::new_with_pinned_cwd(
             cols,
             rows,
             cwd,
@@ -430,113 +79,30 @@ impl ShellSession {
             spawn_shell,
             command_argv,
             pinned_cwd,
-        ) {
-            Ok(pty) => {
-                // 在把 pty 放入 Arc<Mutex> 前获取 child_pid
-                let child_pid = pty.get_child_pid();
-                let shell_identity = companion_host::shell_identity::ShellIdentity::capture(
-                    child_pid,
-                    shell_program.as_deref().map(std::path::Path::new),
-                );
-
-                // 有界 channel 提供背压:UI 消费不及时,IO 线程会阻塞在 send 上,
-                // 停止读取 PTY → 内核 PTY 缓冲填满 → 高产出进程(如 yes)自身阻塞,
-                // 避免 unbounded channel 无限增长导致 OOM。
-                let (event_tx, event_rx) = bounded::<ShellEvent>(EVENT_CHANNEL_CAP);
-                let shutdown = Arc::new(AtomicBool::new(false));
-
-                let pty = Arc::new(Mutex::new(pty));
-                let pty_clone = Arc::clone(&pty);
-                let repaint_ctx_clone = repaint_ctx.clone();
-                let shutdown_clone = Arc::clone(&shutdown);
-                let writer_event_tx = event_tx.clone();
-                let writer_repaint_ctx = repaint_ctx.clone();
-
-                let source = OutputSource::default();
-                let output_source = source.epoch();
-                thread::spawn(move || {
-                    Self::io_loop(
-                        pty_clone,
-                        event_tx,
-                        repaint_ctx_clone,
-                        shutdown_clone,
-                        source,
-                    );
-                });
-
-                // 单一 writer 线程串行消费按字节和消息数双重有界的 FIFO。
-                // accounted_bytes 在 OS write 完成前不会释放，避免一个 43 MiB
-                // in-flight 消息之外又堆满 64 MiB pending 数据。
-                let write_queue = Arc::new(WriteQueue::new(WriteQueueLimits::PRODUCTION));
-                let write_tx = ShellWriteSender {
-                    queue: Arc::clone(&write_queue),
-                };
-                let pty_writer = Arc::clone(&pty);
-                let shutdown_writer = Arc::clone(&shutdown);
-                let writer_result =
-                    thread::Builder::new()
-                        .name("pty-writer".to_string())
-                        .spawn(move || {
-                            while let Some(data) = write_queue.take() {
-                                let message_bytes = data.len();
-                                if shutdown_writer.load(Ordering::Relaxed) {
-                                    // Mark closed before releasing in-flight capacity;
-                                    // otherwise a waking producer could enqueue an Ok
-                                    // message in the gap and have it silently discarded.
-                                    write_queue.close();
-                                    write_queue.finish(message_bytes);
-                                    break;
-                                }
-                                if let Err(e) = Self::write_to_pty(&pty_writer, &data) {
-                                    eprintln!("[ERROR] Failed to write to PTY: {}", e);
-                                    // Partial/timeout 后继续下一条会把协议尾部接到残缺消息后。
-                                    // 关闭队列，让所有生产者获得 Closed，而不是继续损坏字节流。
-                                    write_queue.close();
-                                    write_queue.finish(message_bytes);
-                                    drop(data);
-                                    let _ = Self::send_event(
-                                        &writer_event_tx,
-                                        &writer_repaint_ctx,
-                                        ShellEvent::Error(format!(
-                                        "PTY writer stopped after a partial or failed write: {e}"
-                                    )),
-                                    );
-                                    return;
-                                }
-                                write_queue.finish(message_bytes);
-                            }
-                            write_queue.close();
-                        });
-
-                if let Err(error) = writer_result {
-                    write_tx.queue.close();
-                    shutdown.store(true, Ordering::Relaxed);
-                    return Err(format!("Failed to spawn PTY writer: {error}"));
-                }
-
-                Ok(ShellSession {
-                    output_source,
-                    pty,
-                    event_rx,
-                    child_pid,
-                    shutdown,
-                    write_tx,
-                    started_at: std::time::Instant::now(),
-                    shell_program,
-                    shell_identity,
-                })
-            }
-            Err(e) => Err(format!("Failed to create shell session: {}", e)),
-        }
+        )
+        .map_err(|error| format!("Failed to create shell session: {error}"))?;
+        let child_pid = pty.get_child_pid();
+        let shell_identity = companion_host::shell_identity::ShellIdentity::capture(
+            child_pid,
+            shell_program.as_deref().map(std::path::Path::new),
+        );
+        let actor = SessionActor::start(pty, repaint_ctx)?;
+        Ok(Self {
+            actor,
+            child_pid,
+            started_at: std::time::Instant::now(),
+            shell_program,
+            shell_identity,
+        })
     }
 
     pub fn output_source(&self) -> Option<u64> {
-        self.output_source
+        self.actor.output_source()
     }
 
     /// 获取事件接收器（用于读取 shell 事件）
     pub fn events(&self) -> &Receiver<ShellEvent> {
-        &self.event_rx
+        self.actor.events()
     }
 
     /// 子进程启动至今的时长。用于区分"用户主动 exit"与"shell 根本没起来"。
@@ -553,913 +119,54 @@ impl ShellSession {
     }
 
     pub fn session_activity(&self) -> companion_host::pty_session::Activity {
-        self.pty.lock().session_activity()
+        self.actor.inspect_transport(Pty::session_activity)
     }
 
-    fn send_event(
-        event_tx: &crossbeam_channel::Sender<ShellEvent>,
-        repaint_ctx: &WakeSink,
-        event: ShellEvent,
-    ) -> bool {
-        if event_tx.send(event).is_err() {
-            return false;
-        }
-        repaint_ctx.wake();
-        true
-    }
-
-    /// Publish the final event only after any already-readable exit tail.
-    /// Ordinary read errors retain their existing behavior; only a confirmed
-    /// Exit enters this byte-bounded drain using the existing nonblocking read.
-    /// Sends remain outside locks and retain existing channel backpressure;
-    /// neither sends nor read EINTR retries have a new wall-clock deadline.
-    fn send_final_io_event(
-        pty: &Arc<Mutex<Pty>>,
-        event_tx: &crossbeam_channel::Sender<ShellEvent>,
-        repaint_ctx: &WakeSink,
-        shutdown: &AtomicBool,
-        buffer: &mut [u8],
-        source: &mut OutputSource,
-        event: ShellEvent,
-    ) {
-        if matches!(&event, ShellEvent::Exit(_))
-            && !drain_exited_pty_output(
-                source,
-                buffer,
-                |buffer| pty.lock().read(buffer).map_err(|error| error.to_string()),
-                |output| Self::send_event(event_tx, repaint_ctx, output),
-                || shutdown.load(Ordering::Relaxed),
-            )
-        {
-            return;
-        }
-        let _ = Self::send_event(event_tx, repaint_ctx, event);
-    }
-
-    /// 后台 I/O 循环 - 阻塞等待 PTY 可读，避免忙轮询
-    /// P3 优化：批量读取 PTY 数据，累积后一次性发送事件
-    fn io_loop(
-        pty: Arc<Mutex<Pty>>,
-        event_tx: crossbeam_channel::Sender<ShellEvent>,
-        repaint_ctx: WakeSink,
-        shutdown: Arc<AtomicBool>,
-        mut source: OutputSource,
-    ) {
-        const BUFFER_SIZE: usize = 65536;
-        const BATCH_SIZE_THRESHOLD: usize = 131072;
-        const BATCH_TIMEOUT_MS: u64 = 2;
-        const ALIVE_CHECK_MS: u64 = 250;
-
-        let master_fd = pty.lock().master_fd();
-
-        let mut buf = vec![0u8; BUFFER_SIZE];
-        let mut accumulated = Vec::with_capacity(BATCH_SIZE_THRESHOLD);
-        let mut first_read_at = None;
-        let mut last_alive_check = std::time::Instant::now();
-        let mut last_batch_time = std::time::Instant::now();
-        // EOF/EIO means the slave stream is closed, not necessarily that the
-        // child has exited. Once set, stop polling the permanently-ready master
-        // fd and reap at a bounded cadence instead of emitting a fabricated exit.
-        let mut read_closed = false;
-        let mut hangup_probe_delay = Duration::from_millis(50);
-        // 非 hangup 的重复读取错误只报告一次，直到再次读到数据。
-        let mut read_error_reported = false;
-
-        crate::debug_log!("[IOLoop] 后台 I/O 线程启动 (P3 批处理优化)");
-
-        loop {
-            // 检查 shutdown 标志
-            if shutdown.load(Ordering::Relaxed) {
-                crate::debug_log!("[IOLoop] 收到 shutdown 信号，退出 IO 线程");
-                return;
-            }
-
-            if read_closed {
-                if !accumulated.is_empty() {
-                    let data = std::mem::take(&mut accumulated);
-                    if !Self::send_event(
-                        &event_tx,
-                        &repaint_ctx,
-                        ShellEvent::Output(source.coalesced(data, first_read_at.take())),
-                    ) {
-                        return;
-                    }
-                }
-                // Hangup can be transient: a live child may later reopen
-                // /dev/tty. Probe non-blockingly before reaping so that Data or
-                // WouldBlock returns the loop to normal poll-based reading.
-                let recovery_probe = {
-                    let mut pty_guard = pty.lock();
-                    pty_guard.read(&mut buf)
-                };
-                match recovery_probe {
-                    Ok(crate::pty::ReadOutcome::Data(n)) => {
-                        if n > 0 && accumulated.is_empty() {
-                            first_read_at = Some(std::time::Instant::now());
-                        }
-                        accumulated.extend_from_slice(&buf[..n]);
-                        read_error_reported = false;
-                        read_closed = false;
-                        hangup_probe_delay = Duration::from_millis(50);
-                        continue;
-                    }
-                    Ok(crate::pty::ReadOutcome::WouldBlock) => {
-                        read_error_reported = false;
-                        read_closed = false;
-                        hangup_probe_delay = Duration::from_millis(50);
-                        continue;
-                    }
-                    Ok(crate::pty::ReadOutcome::Eof | crate::pty::ReadOutcome::Hangup) => {}
-                    Err(error) if !read_error_reported => {
-                        read_error_reported = true;
-                        if !Self::send_event(
-                            &event_tx,
-                            &repaint_ctx,
-                            ShellEvent::Error(format!(
-                                "Read error while waiting for PTY recovery: {error}"
-                            )),
-                        ) {
-                            return;
-                        }
-                    }
-                    Err(_) => {}
-                }
-                let exit_code = { pty.lock().try_reap() };
-                if let Some(exit_code) = exit_code {
-                    Self::send_final_io_event(
-                        &pty,
-                        &event_tx,
-                        &repaint_ctx,
-                        &shutdown,
-                        &mut buf,
-                        &mut source,
-                        ShellEvent::Exit(exit_code),
-                    );
-                    return;
-                }
-                // POLLHUP/EIO remains immediately ready forever. Back off to
-                // four probes/second for a child that intentionally keeps the
-                // slave closed, while retaining fast transient recovery.
-                std::thread::sleep(hangup_probe_delay);
-                hangup_probe_delay = std::cmp::min(
-                    hangup_probe_delay.saturating_mul(2),
-                    Duration::from_millis(250),
-                );
-                continue;
-            }
-
-            // 动态计算超时：累积数据时快速超时，空闲时正常超时
-            let timeout_ms = if !accumulated.is_empty() {
-                // 已有累积数据，快速超时以便发送
-                let elapsed_ms = last_batch_time.elapsed().as_millis() as i32;
-                let remaining_ms = BATCH_TIMEOUT_MS as i32 - elapsed_ms;
-                remaining_ms.clamp(1, 100)
-            } else {
-                // 无累积数据，使用标准超时（减去 alive_check 耗时）
-                (ALIVE_CHECK_MS as i32)
-                    .saturating_sub(last_alive_check.elapsed().as_millis() as i32)
-                    .max(1)
-            };
-
-            match Pty::wait_fd_readable(master_fd, timeout_ms) {
-                Ok(true) => {
-                    // 锁内仅读取/累积数据并捕获终止动作;所有 send 移到锁外,
-                    // 避免有界 channel 满时持锁阻塞,与 UI 线程 write() 形成死锁。
-                    enum After {
-                        Continue,
-                        ContinueWith(ShellEvent),
-                        Stop(ShellEvent),
-                        // 流关闭与进程退出是两件事；锁外进入低频 try_reap 状态。
-                        ReadClosed,
-                    }
-                    let after = {
-                        let mut pty_guard = pty.lock();
-                        let mut after = After::Continue;
-                        loop {
-                            match pty_guard.read(&mut buf) {
-                                Ok(crate::pty::ReadOutcome::Data(n)) => {
-                                    read_error_reported = false;
-                                    if n > 0 && accumulated.is_empty() {
-                                        first_read_at = Some(std::time::Instant::now());
-                                    }
-                                    accumulated.extend_from_slice(&buf[..n]);
-                                    if accumulated.len() >= BATCH_SIZE_THRESHOLD {
-                                        break;
-                                    }
-                                }
-                                Ok(crate::pty::ReadOutcome::WouldBlock) => break,
-                                Ok(crate::pty::ReadOutcome::Eof) => {
-                                    after = After::ReadClosed;
-                                    break;
-                                }
-                                Ok(crate::pty::ReadOutcome::Hangup) => {
-                                    // Linux PTY master 的 EIO 表示当前没有 slave fd。
-                                    // 子进程仍可能活着，绝不能在这里伪造 Exit(-1)。
-                                    after = After::ReadClosed;
-                                    break;
-                                }
-                                Err(e) => {
-                                    crate::debug_log!("[IOLoop] 读取错误: {}", e);
-                                    if !pty_guard.is_alive() {
-                                        after = After::Stop(match pty_guard.wait_timeout(0) {
-                                            Ok(exit_code) => ShellEvent::Exit(exit_code),
-                                            Err(e) => ShellEvent::Error(format!(
-                                                "Process exit error: {}",
-                                                e
-                                            )),
-                                        });
-                                    } else if !read_error_reported {
-                                        // 仅首次报告，避免异常 fd 向 UI 持续刷屏。
-                                        read_error_reported = true;
-                                        after = After::ContinueWith(ShellEvent::Error(format!(
-                                            "Read error: {}",
-                                            e
-                                        )));
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        after
-                    };
-                    // 锁已释放,以下 send 可安全阻塞(背压生效点)
-                    if !accumulated.is_empty()
-                        && (accumulated.len() >= BATCH_SIZE_THRESHOLD
-                            || last_batch_time.elapsed().as_millis() >= BATCH_TIMEOUT_MS as u128
-                            || !matches!(after, After::Continue))
-                    {
-                        let data = std::mem::take(&mut accumulated);
-                        if !Self::send_event(
-                            &event_tx,
-                            &repaint_ctx,
-                            ShellEvent::Output(source.coalesced(data, first_read_at.take())),
-                        ) {
-                            return;
-                        }
-                        last_batch_time = std::time::Instant::now();
-                    }
-                    match after {
-                        After::Continue => {}
-                        After::ContinueWith(ev) => {
-                            if !Self::send_event(&event_tx, &repaint_ctx, ev) {
-                                return;
-                            }
-                        }
-                        After::Stop(ev) => {
-                            Self::send_final_io_event(
-                                &pty,
-                                &event_tx,
-                                &repaint_ctx,
-                                &shutdown,
-                                &mut buf,
-                                &mut source,
-                                ev,
-                            );
-                            return;
-                        }
-                        After::ReadClosed => {
-                            read_closed = true;
-                        }
-                    }
-                }
-                Ok(false) => {
-                    // 超时，检查是否需要发送累积的数据
-                    if !accumulated.is_empty()
-                        && last_batch_time.elapsed().as_millis() >= BATCH_TIMEOUT_MS as u128
-                    {
-                        let data = std::mem::take(&mut accumulated);
-                        if !Self::send_event(
-                            &event_tx,
-                            &repaint_ctx,
-                            ShellEvent::Output(source.coalesced(data, first_read_at.take())),
-                        ) {
-                            crate::debug_log!("[IOLoop] 接收者已断开，退出循环");
-                            return;
-                        }
-                        last_batch_time = std::time::Instant::now();
-                    }
-                }
-                Err(e) => {
-                    if !Self::send_event(
-                        &event_tx,
-                        &repaint_ctx,
-                        ShellEvent::Error(format!("Poll error: {}", e)),
-                    ) {
-                        return;
-                    }
-                }
-            }
-
-            // 检查进程是否存活（250ms 检查一次，空闲时降低唤醒频率）
-            if last_alive_check.elapsed() >= Duration::from_millis(ALIVE_CHECK_MS) {
-                // 在锁内判定退出并取退出码,锁外再发送事件(同样为避免持锁阻塞)
-                let exit_event = {
-                    let mut pty_guard = pty.lock();
-                    if !pty_guard.is_alive() {
-                        crate::debug_log!("[IOLoop] 检测到子进程已退出");
-                        Some(match pty_guard.wait_timeout(0) {
-                            Ok(exit_code) => {
-                                crate::debug_log!("[IOLoop] 子进程退出码: {}", exit_code);
-                                ShellEvent::Exit(exit_code)
-                            }
-                            Err(e) => ShellEvent::Error(format!("Process exit error: {}", e)),
-                        })
-                    } else {
-                        None
-                    }
-                };
-                if let Some(exit_event) = exit_event {
-                    if !accumulated.is_empty() {
-                        let data = std::mem::take(&mut accumulated);
-                        let _ = Self::send_event(
-                            &event_tx,
-                            &repaint_ctx,
-                            ShellEvent::Output(source.coalesced(data, first_read_at.take())),
-                        );
-                    }
-                    Self::send_final_io_event(
-                        &pty,
-                        &event_tx,
-                        &repaint_ctx,
-                        &shutdown,
-                        &mut buf,
-                        &mut source,
-                        exit_event,
-                    );
-                    return;
-                }
-                last_alive_check = std::time::Instant::now();
-            }
-        }
-    }
-
-    /// 处理大数据写入：循环写入并在 poll 等待时释放锁，避免与 io_loop 死锁。
-    /// Normal FIFO writes run only on the writer thread. The optional immediate
-    /// one-byte control path excludes queued/in-flight work under the same
-    /// queue lock, so it cannot interleave with this loop.
-    fn write_to_pty(pty: &Arc<Mutex<Pty>>, data: &[u8]) -> std::result::Result<(), String> {
-        let mut offset = 0;
-        let mut last_progress = std::time::Instant::now();
-        let stall_timeout = std::time::Duration::from_secs(10);
-
-        // 先获取 master_fd（不需要长期持锁）
-        let master_fd = {
-            let pty = pty.lock();
-            pty.master_fd()
-        };
-
-        while offset < data.len() {
-            if last_progress.elapsed() > stall_timeout {
-                return Err(format!(
-                    "PTY write stalled for 10 seconds, wrote {}/{} bytes",
-                    offset,
-                    data.len()
-                ));
-            }
-
-            // 获取锁，尝试写入，然后立即释放锁
-            {
-                let mut pty = pty.lock();
-                match pty.write(&data[offset..]) {
-                    Ok(crate::pty::WriteOutcome::Written(n)) if n > 0 => {
-                        offset += n;
-                        last_progress = std::time::Instant::now();
-                        continue; // 写成功(可能 partial)，立刻尝试写剩余部分
-                    }
-                    Ok(crate::pty::WriteOutcome::Written(_)) => {
-                        return Err(format!(
-                            "PTY write returned zero after {offset}/{} bytes",
-                            data.len()
-                        ));
-                    }
-                    Ok(crate::pty::WriteOutcome::WouldBlock) => {
-                        // 缓冲区满，需要 poll 等待可写 — 释放锁（落到下面）
-                    }
-                    Err(e) => {
-                        return Err(format!("Write error: {}", e));
-                    }
-                }
-            }
-            // 锁已释放！io_loop 可以读取 PTY 输出，vim 可以排空缓冲区
-            // poll 等待 PTY 可写
-            let mut pfd = libc::pollfd {
-                fd: master_fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            loop {
-                // SAFETY: pfd 是有效的栈变量，fd 在 Pty Arc 存活期间保持打开。
-                let result = unsafe { libc::poll(&mut pfd, 1, 50) };
-                if result >= 0 {
-                    break;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(format!("poll(POLLOUT) failed: {error}"));
-                }
-            }
-            if pfd.revents & libc::POLLOUT == 0
-                && pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
-            {
-                return Err(format!(
-                    "PTY became unavailable during write after {offset}/{} bytes (revents={:#x})",
-                    data.len(),
-                    pfd.revents
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// 向 shell 非阻塞发送输入。Ok 表示整条消息已入 FIFO；Full/TooLarge/Closed
-    /// 都保证一个字节也没有入队，调用方可以安全保留原输入后重试。
     pub fn write(&self, data: &[u8]) -> Result<(), ShellWriteError> {
-        self.write_tx.queue.try_enqueue_slice(data)
+        self.actor.write(data)
     }
 
-    /// True only after every queued and in-flight PTY write has completed.
     pub fn input_drained(&self) -> Result<bool, ShellWriteError> {
-        self.write_tx.queue.drained()
+        self.actor.input_drained()
     }
 
-    /// Observe the actual PTY foreground owner for a rendered Chat gesture.
-    /// Missing or contended native state disables the optional control.
     pub fn foreground_pgid(&self) -> Option<i32> {
-        let pty = self.pty.try_lock()?;
-        // SAFETY: the live Pty guard pins the master descriptor.
-        let pgid = unsafe { libc::tcgetpgrp(pty.master_fd()) };
-        (pgid > 0).then_some(pgid)
+        self.actor.foreground_pgid()
     }
 
-    /// Single-byte, non-retrying control admission on the existing writer's
-    /// synchronization boundary. Holding queue state excludes every producer
-    /// and proves there is no queued/in-flight writer. Never enqueue a Chat
-    /// control for later delivery, and never partially send an escape sequence.
     pub(crate) fn try_write_control_byte(
         &self,
         byte: u8,
         validate: impl FnOnce(i32) -> bool,
     ) -> bool {
-        let Some(state) = self.write_tx.queue.state.try_lock() else {
-            return false;
-        };
-        if state.closed || state.accounted_messages != 0 || self.shutdown.load(Ordering::Relaxed) {
-            return false;
-        }
-        let Some(mut pty) = self.pty.try_lock() else {
-            return false;
-        };
-        if !pty.is_alive() {
-            return false;
-        }
-        // The constructor's best-effort flag setup is not sufficient for an
-        // immediate UI-thread write. Fail closed unless this live descriptor
-        // can be confirmed nonblocking, before invoking lifecycle validation.
-        // SAFETY: the live Pty guard pins the descriptor through the write.
-        let flags = unsafe { libc::fcntl(pty.master_fd(), libc::F_GETFL) };
-        if flags < 0 || flags & libc::O_NONBLOCK == 0 {
-            return false;
-        }
-        // SAFETY: the live Pty guard pins the master descriptor. Foreground
-        // validation and the one-byte nonblocking write share this boundary.
-        let foreground = unsafe { libc::tcgetpgrp(pty.master_fd()) };
-        if foreground <= 0 || !validate(foreground) {
-            return false;
-        }
-        // One syscall only: even EINTR is a refusal, never a later retry.
-        // SAFETY: the guard pins the nonblocking master; one byte cannot have
-        // a partially-written escape-sequence suffix.
-        unsafe { libc::write(pty.master_fd(), (&byte as *const u8).cast(), 1) == 1 }
+        self.actor.try_write_control_byte(byte, validate)
     }
 
-    /// 返回写入队列的发送端,供需要先做阻塞 I/O(如读剪贴板)再写 PTY 的后台线程使用。
-    /// 经由它入队的数据同样被 writer 线程串行写入,保证不与其他写入交错。
     pub fn write_sender(&self) -> ShellWriteSender {
-        self.write_tx.clone()
+        self.actor.write_sender()
     }
 
-    /// Stop every producer after the child exit event has been consumed while
-    /// keeping the already-rendered terminal transcript alive. Closing the
-    /// queue wakes an idle writer thread and makes every outstanding sender
-    /// fail closed; draining discards only events ordered after the observed
-    /// `Exit` (for example, a racing writer error).
     pub(crate) fn freeze_after_exit(&self) {
-        self.write_tx.queue.close();
-        self.shutdown.store(true, Ordering::Relaxed);
-        while self.event_rx.try_recv().is_ok() {}
+        self.actor.freeze_after_exit();
     }
 
-    pub fn resize(&self, cols: usize, rows: usize) -> std::result::Result<(), String> {
-        let mut pty = self.pty.lock();
-        pty.resize(cols, rows)
-            .map_err(|e| format!("Resize error: {}", e))
+    pub fn resize(&self, cols: usize, rows: usize) -> Result<(), String> {
+        self.actor.resize(cols, rows)
     }
 
-    /// 获取 shell 子进程的 PID
     pub fn get_child_pid(&self) -> i32 {
         self.child_pid
     }
 }
 
-impl Drop for ShellSession {
-    /// 清理shell进程及其子进程
-    ///
-    /// 多层保护机制确保jsh进程在ember退出时被清理：
-    /// 1. 正常退出：Drop被调用，发送SIGHUP/SIGTERM/SIGKILL到进程组
-    /// 2. SIGINT/SIGTERM：信号处理器触发正常退出，Drop被调用
-    /// 3. SIGKILL或panic：PR_SET_PDEATHSIG确保子进程收到SIGTERM
-    ///
-    /// 进程组杀死：使用负PID向整个进程组发送信号，因为shell通过
-    /// setsid()创建了新会话，所以child_pid就是进程组ID
-    fn drop(&mut self) {
-        // 先关闭生产入口，保证任何并发 sender 的 Ok 都不会在 shutdown
-        // 窗口内被丢弃；再唤醒/通知两个后台线程退出。
-        self.write_tx.queue.close();
-        self.shutdown.store(true, Ordering::Relaxed);
-
-        // 所有发信号/回收都经由 Pty 的互斥锁,与 io_loop 的回收路径串行化;
-        // 并且仅在子进程尚未被回收(exit_code_cached 为空)时才 kill。
-        // 这样杜绝了"先被 io_loop reap、PID 被复用、随后 kill 误杀无辜进程"的竞争。
-        {
-            let mut pty = self.pty.lock();
-            pty.signal_terminate(); // 瞬时:SIGHUP 进程组 + SIGTERM
-        }
-
-        // 把 "等待 → SIGKILL → 回收僵尸" 放到独立线程,避免在 UI 线程 sleep。
-        // 关闭多个会话时,这能把累计阻塞降到接近 0。reaper 持有 Pty 的 Arc,
-        // 保证 Pty 在回收完成前不被释放。
-        let pty = Arc::clone(&self.pty);
-        let _ = thread::Builder::new()
-            .name("pty-reaper".to_string())
-            .spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(30));
-                pty.lock().force_kill_and_reap();
-            });
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn runtime_wake_follows_successful_publication_only() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let wake_count = std::sync::Arc::new(AtomicUsize::new(0));
-        let observed = wake_count.clone();
-        let wake = jterm_core::runtime_wake::WakeSink::new(move || {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        assert!(super::ShellSession::send_event(
-            &tx,
-            &wake,
-            super::ShellEvent::Exit(0)
-        ));
-        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
-        assert!(matches!(rx.recv().unwrap(), super::ShellEvent::Exit(0)));
-        drop(rx);
-        assert!(!super::ShellSession::send_event(
-            &tx,
-            &wake,
-            super::ShellEvent::Exit(0)
-        ));
-        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
-    }
-
     use super::*;
-
-    enum ExitDrainStep {
-        Bytes(Vec<u8>),
-        Stop(crate::pty::ReadOutcome),
-        Error(&'static str),
-    }
-
-    fn exercise_exit_drain(
-        steps: Vec<ExitDrainStep>,
-        buffer_size: usize,
-    ) -> (bool, Vec<ShellEvent>, usize) {
-        let mut steps: std::collections::VecDeque<_> = steps.into();
-        let mut events = Vec::new();
-        let mut read_calls = 0;
-        let result = drain_exited_pty_output(
-            &mut OutputSource::default(),
-            &mut vec![0; buffer_size],
-            |buffer| {
-                read_calls += 1;
-                match steps.pop_front().expect("unexpected extra tail read") {
-                    ExitDrainStep::Bytes(mut bytes) => {
-                        let count = buffer.len().min(bytes.len());
-                        buffer[..count].copy_from_slice(&bytes[..count]);
-                        if count < bytes.len() {
-                            bytes.drain(..count);
-                            steps.push_front(ExitDrainStep::Bytes(bytes));
-                        }
-                        Ok(crate::pty::ReadOutcome::Data(count))
-                    }
-                    ExitDrainStep::Stop(outcome) => Ok(outcome),
-                    ExitDrainStep::Error(error) => Err(error.to_string()),
-                }
-            },
-            |event| {
-                events.push(event);
-                true
-            },
-            || false,
-        );
-        (result, events, read_calls)
-    }
-
-    #[test]
-    fn exited_tail_keeps_the_same_reader_epoch_and_sequence_allocator() {
-        let mut source = OutputSource::default();
-        let read_at = std::time::Instant::now();
-        let ordinary = source.coalesced(b"before".to_vec(), Some(read_at));
-        let first = ordinary.fragments().next().unwrap().origin.unwrap();
-        let mut read_once = false;
-        let mut events = Vec::new();
-        let finish = drain_exited_pty_output(
-            &mut source,
-            &mut [0; 8],
-            |buffer| {
-                if read_once {
-                    return Ok(crate::pty::ReadOutcome::WouldBlock);
-                }
-                read_once = true;
-                buffer[..4].copy_from_slice(b"tail");
-                Ok(crate::pty::ReadOutcome::Data(4))
-            },
-            |event| {
-                events.push(event);
-                true
-            },
-            || false,
-        );
-        assert!(finish);
-        let ShellEvent::Output(tail) = &events[0] else {
-            panic!("missing tail");
-        };
-        let last = tail.fragments().next().unwrap().origin.unwrap();
-        assert_eq!(last.source, first.source);
-        assert_eq!(last.sequence, first.sequence + 1);
-        assert!(last.read_at >= first.read_at);
-    }
-
-    #[test]
-    fn exited_tail_stops_immediately_at_would_block_eof_or_hangup() {
-        for stop in [
-            crate::pty::ReadOutcome::WouldBlock,
-            crate::pty::ReadOutcome::Eof,
-            crate::pty::ReadOutcome::Hangup,
-        ] {
-            let (finish, events, reads) = exercise_exit_drain(
-                vec![
-                    ExitDrainStep::Bytes(b"tail".to_vec()),
-                    ExitDrainStep::Stop(stop),
-                    ExitDrainStep::Error("must never poll or wait after this stop"),
-                ],
-                8,
-            );
-            assert!(finish);
-            assert_eq!(reads, 2);
-            assert_eq!(events.len(), 1);
-            assert!(matches!(&events[0], ShellEvent::Output(bytes) if bytes.as_bytes() == b"tail"));
-        }
-    }
-
-    #[test]
-    fn exited_tail_error_follows_retained_output_before_exit_permission() {
-        let (finish, events, reads) = exercise_exit_drain(
-            vec![
-                ExitDrainStep::Bytes(b"tail".to_vec()),
-                ExitDrainStep::Error("read fixture failure"),
-            ],
-            8,
-        );
-        assert!(finish);
-        assert_eq!(reads, 2);
-        assert_eq!(events.len(), 2);
-        assert!(matches!(&events[0], ShellEvent::Output(bytes) if bytes.as_bytes() == b"tail"));
-        assert!(
-            matches!(&events[1], ShellEvent::Error(error) if error.contains("read fixture failure") && error.contains("may be omitted"))
-        );
-    }
-
-    #[test]
-    fn exited_tail_byte_cap_is_explicit_and_never_overread() {
-        let (finish, events, reads) = exercise_exit_drain(
-            vec![ExitDrainStep::Bytes(vec![b'x'; EXIT_DRAIN_BYTE_CAP + 1])],
-            65_536,
-        );
-        assert!(finish);
-        assert_eq!(reads, EXIT_DRAIN_BYTE_CAP / 65_536);
-        let bytes = events
-            .iter()
-            .map(|event| match event {
-                ShellEvent::Output(bytes) => bytes.len(),
-                _ => 0,
-            })
-            .sum::<usize>();
-        assert_eq!(bytes, EXIT_DRAIN_BYTE_CAP);
-        assert!(
-            matches!(events.last(), Some(ShellEvent::Error(error)) if error.contains("limit") && error.contains("may be omitted"))
-        );
-    }
-
-    #[test]
-    fn exited_tail_cancellation_and_receiver_loss_stop_without_exit_permission() {
-        let finish = drain_exited_pty_output(
-            &mut OutputSource::default(),
-            &mut [0; 8],
-            |_| panic!("cancelled tail must not read"),
-            |_| panic!("cancelled tail must not publish"),
-            || true,
-        );
-        assert!(!finish);
-
-        let mut reads = 0;
-        let finish = drain_exited_pty_output(
-            &mut OutputSource::default(),
-            &mut [0; 8],
-            |buffer| {
-                reads += 1;
-                buffer[0] = b'x';
-                Ok(crate::pty::ReadOutcome::Data(1))
-            },
-            |_| false,
-            || false,
-        );
-        assert!(!finish);
-        assert_eq!(reads, 1);
-    }
-
-    #[test]
-    fn exited_tail_zero_data_reports_error_instead_of_spinning() {
-        let (finish, events, reads) = exercise_exit_drain(
-            vec![ExitDrainStep::Stop(crate::pty::ReadOutcome::Data(0))],
-            8,
-        );
-        assert!(finish);
-        assert_eq!(reads, 1);
-        assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], ShellEvent::Error(error) if error.contains("zero bytes")));
-    }
-
-    fn tiny_limits() -> WriteQueueLimits {
-        WriteQueueLimits {
-            byte_capacity: 10,
-            message_capacity: 4,
-            max_message_bytes: 8,
-            interactive_reserve_bytes: 2,
-            interactive_reserve_messages: 1,
-            interactive_max_bytes: 2,
-        }
-    }
-
-    fn test_sender(limits: WriteQueueLimits) -> (Arc<WriteQueue>, ShellWriteSender) {
-        let queue = Arc::new(WriteQueue::new(limits));
-        let sender = ShellWriteSender {
-            queue: Arc::clone(&queue),
-        };
-        (queue, sender)
-    }
-
-    #[test]
-    fn native_action_barrier_waits_for_inflight_write_and_rejects_closed_writer() {
-        let (queue, sender) = test_sender(tiny_limits());
-        assert_eq!(queue.drained(), Ok(true));
-        sender.try_send(b"edit".to_vec()).unwrap();
-        assert_eq!(queue.drained(), Ok(false));
-        let bytes = queue.take().unwrap();
-        // No pending message remains, but the OS write has not completed.
-        assert!(queue.state.lock().pending.is_empty());
-        assert_eq!(queue.drained(), Ok(false));
-        queue.finish(bytes.len());
-        assert_eq!(queue.drained(), Ok(true));
-        queue.close();
-        assert_eq!(queue.drained(), Err(ShellWriteError::Closed));
-    }
-
-    #[test]
-    fn write_queue_is_fifo_byte_bounded_and_keeps_inflight_accounted() {
-        let (queue, sender) = test_sender(tiny_limits());
-
-        sender.try_send(vec![1; 8]).unwrap();
-        let first = queue.take().unwrap();
-        assert_eq!(first, vec![1; 8]);
-
-        // pop 后仍计入 8 bytes；bulk 保留的 2-byte 交互区仍可接收短输入。
-        sender.try_send(vec![2; 2]).unwrap();
-        let error = sender.try_send(vec![3]).unwrap_err();
-        assert!(matches!(
-            error,
-            ShellWriteError::Full {
-                requested_bytes: 1,
-                queued_bytes: 10,
-                ..
-            }
-        ));
-
-        queue.finish(first.len());
-        let second = queue.take().unwrap();
-        assert_eq!(second, vec![2; 2]);
-        queue.finish(second.len());
-
-        let state = queue.state.lock();
-        assert_eq!(state.accounted_bytes, 0);
-        assert_eq!(state.accounted_messages, 0);
-    }
-
-    #[test]
-    fn write_queue_distinguishes_too_large_full_and_closed() {
-        let (queue, sender) = test_sender(tiny_limits());
-
-        assert!(matches!(
-            sender.try_send(vec![0; 9]),
-            Err(ShellWriteError::TooLarge {
-                requested_bytes: 9,
-                max_message_bytes: 8
-            })
-        ));
-
-        sender.try_send(vec![0; 8]).unwrap();
-        assert!(matches!(
-            sender.try_send(vec![0; 3]),
-            Err(ShellWriteError::Full { .. })
-        ));
-        queue.close();
-        assert!(matches!(
-            sender.try_send(vec![1]),
-            Err(ShellWriteError::Closed)
-        ));
-        // Empty writes never allocate or enqueue and are harmless even after close.
-        sender.try_send(Vec::new()).unwrap();
-    }
-
-    #[test]
-    fn closing_queue_drops_pending_but_keeps_inflight_accounted_until_finish() {
-        let limits = WriteQueueLimits {
-            byte_capacity: 5,
-            message_capacity: 2,
-            max_message_bytes: 4,
-            interactive_reserve_bytes: 0,
-            interactive_reserve_messages: 0,
-            interactive_max_bytes: 4,
-        };
-        let (queue, sender) = test_sender(limits);
-        sender.try_send(vec![1; 4]).unwrap();
-        let in_flight = queue.take().unwrap();
-
-        sender.try_send(vec![2]).unwrap();
-        queue.close();
-        assert!(matches!(
-            sender.try_send(vec![3]),
-            Err(ShellWriteError::Closed)
-        ));
-
-        {
-            let state = queue.state.lock();
-            assert_eq!(state.accounted_bytes, in_flight.len());
-            assert_eq!(state.accounted_messages, 1);
-            assert!(state.pending.is_empty());
-        }
-        queue.finish(in_flight.len());
-        let state = queue.state.lock();
-        assert_eq!(state.accounted_bytes, 0);
-        assert_eq!(state.accounted_messages, 0);
-    }
-
-    #[test]
-    fn write_queue_caps_message_count_as_well_as_bytes() {
-        let limits = WriteQueueLimits {
-            byte_capacity: 100,
-            message_capacity: 2,
-            max_message_bytes: 50,
-            interactive_reserve_bytes: 0,
-            interactive_reserve_messages: 0,
-            interactive_max_bytes: 50,
-        };
-        let (_queue, sender) = test_sender(limits);
-        sender.try_send(vec![1]).unwrap();
-        sender.try_send(vec![2]).unwrap();
-        assert!(matches!(
-            sender.try_send(vec![3]),
-            Err(ShellWriteError::Full {
-                queued_messages: 2,
-                message_capacity: 2,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn osc5522_maximum_legal_response_fits_single_message_limit() {
-        const RAW_BYTES: usize = 32 * 1024 * 1024;
-        const CHUNK_BYTES: usize = 4096;
-        // Base64 plus a deliberately generous 256 bytes of OSC framing per chunk.
-        let base64_bytes = RAW_BYTES.div_ceil(3) * 4;
-        let chunks = RAW_BYTES.div_ceil(CHUNK_BYTES);
-        let conservative_response_bytes = base64_bytes + chunks * 256 + 1024;
-        assert!(conservative_response_bytes <= WRITE_MESSAGE_BYTE_CAP);
-    }
+    use parking_lot::Mutex;
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     #[cfg(unix)]
     #[test]
@@ -1491,23 +198,23 @@ mod tests {
             assert!(Instant::now() < deadline);
         }
         // A real FIFO write becomes in-flight while its PTY lock is held.
-        let pty = shell.pty.lock();
+        let pty = shell.actor.test_transport();
         shell.write(b"older").unwrap();
         assert!(!shell.try_write_control_byte(3, |_| panic!("must reject before validation")));
-        while !shell.write_tx.queue.state.lock().pending.is_empty() {
+        while shell.actor.test_input_counts().0 != 0 {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
-        assert_eq!(shell.write_tx.queue.state.lock().accounted_messages, 1);
+        assert_eq!(shell.actor.test_input_counts().1, 1);
         assert!(
             !shell.try_write_control_byte(3, |_| panic!("in-flight bytes still own the writer"))
         );
         drop(pty);
-        while shell.write_tx.queue.state.lock().accounted_messages != 0 {
+        while shell.actor.test_input_counts().1 != 0 {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
-        shell.write_tx.queue.close();
+        shell.actor.test_close_input();
         let terminal = Arc::new(Mutex::new(crate::terminal::TerminalState::new(80, 24)));
         terminal
             .lock()
@@ -1585,7 +292,7 @@ mod tests {
         let responses =
             crate::session_manager::ProtocolResponseSender::new(eframe::egui::Context::default());
         let set_flags = |flags: libc::c_int| {
-            let pty = session.shell.pty.lock();
+            let pty = session.shell.actor.test_transport();
             // SAFETY: the live guard pins this idle fixture's master fd.
             assert_eq!(
                 unsafe { libc::fcntl(pty.master_fd(), libc::F_SETFL, flags) },
@@ -1593,7 +300,7 @@ mod tests {
             );
         };
         let flags = {
-            let pty = session.shell.pty.lock();
+            let pty = session.shell.actor.test_transport();
             // SAFETY: the live guard pins the descriptor queried here.
             unsafe { libc::fcntl(pty.master_fd(), libc::F_GETFL) }
         };
@@ -1618,7 +325,7 @@ mod tests {
         let accepted =
             session.try_chat_input(action, b"\r", foreground, None, &barriers, &responses);
         {
-            let pty = session.shell.pty.lock();
+            let pty = session.shell.actor.test_transport();
             // SAFETY: restore before assertions; the live guard pins the fd.
             assert_eq!(
                 unsafe { libc::fcntl(pty.master_fd(), libc::F_SETFL, flags) },
@@ -1628,11 +335,8 @@ mod tests {
         assert!(!accepted);
         assert!(session.pending_input.is_empty());
         assert!(action.is_current(&session.terminal.lock()));
-        assert_eq!(
-            session.shell.write_tx.queue.state.lock().accounted_messages,
-            0
-        );
-        assert!(session.shell.write_tx.queue.state.lock().pending.is_empty());
+        assert_eq!(session.shell.actor.test_input_counts().1, 0);
+        assert_eq!(session.shell.actor.test_input_counts().0, 0);
         assert!(session.try_chat_input(action, b"\r", foreground, None, &barriers, &responses));
         assert!(!action.is_current(&session.terminal.lock()));
     }
@@ -1669,7 +373,7 @@ mod tests {
         // Saturate the real nonblocking kernel PTY while its child is not
         // reading. This fixture holds the same descriptor lock as production.
         for _ in 0..3 {
-            let mut pty = shell.pty.lock();
+            let mut pty = shell.actor.test_transport();
             let mut written = 0;
             loop {
                 match pty.write(b"x") {
@@ -1683,17 +387,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!shell.try_write_control_byte(b'\r', |_| true));
-        assert_eq!(shell.write_tx.queue.state.lock().accounted_messages, 0);
-        assert!(shell.write_tx.queue.state.lock().pending.is_empty());
+        assert_eq!(shell.actor.test_input_counts().1, 0);
+        assert_eq!(shell.actor.test_input_counts().0, 0);
     }
 
     #[cfg(unix)]
     #[test]
-    fn freezing_an_exited_command_closes_every_writer() {
+    fn reader_closes_every_writer_before_the_ui_observes_exit() {
         let argv = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            "exit 0".to_string(),
+            "printf 'FINAL_TAIL'; exit 0".to_string(),
         ];
         let session = ShellSession::new_with_cwd(
             80,
@@ -1706,19 +410,29 @@ mod tests {
         )
         .unwrap();
 
+        let cloned_writer = session.write_sender();
         let deadline = Instant::now() + Duration::from_secs(2);
+        while session.input_drained() != Err(ShellWriteError::Closed) {
+            assert!(Instant::now() < deadline, "writer survived child exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            cloned_writer.try_send(b"ignored".to_vec()),
+            Err(ShellWriteError::Closed)
+        );
+        let mut received = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(!remaining.is_zero(), "timed out waiting for command exit");
             match session.events().recv_timeout(remaining).unwrap() {
                 ShellEvent::Exit(0) => break,
-                ShellEvent::Output(_) => {}
+                ShellEvent::Output(output) => received.extend_from_slice(output.as_bytes()),
                 ShellEvent::Exit(code) => panic!("unexpected exit code {code}"),
                 ShellEvent::Error(error) => panic!("unexpected shell error: {error}"),
             }
         }
+        assert_eq!(received, b"FINAL_TAIL");
 
-        let cloned_writer = session.write_sender();
         session.freeze_after_exit();
         assert!(matches!(
             session.write(b"ignored"),

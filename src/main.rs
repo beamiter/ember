@@ -33,8 +33,7 @@ mod history_picker;
 mod image_drop;
 mod immersive_command;
 mod jsh_ui;
-#[path = "../vendor/jwm-remote/client.rs"]
-mod jwm_remote_session;
+use jterm_core::jterm_remote_client as jwm_remote_session;
 mod keybindings;
 mod kitty_graphics;
 mod layout;
@@ -82,15 +81,15 @@ mod windows_compat;
 mod workflow_picker;
 mod workflows;
 mod workspace_chat_bridge;
-mod workspace_context;
+use jterm_core::agent_workspace::controllers::context as workspace_context;
 mod workspace_inspector;
 mod workspace_missions;
-mod workspace_remote;
+use jterm_core::agent_workspace::controllers::remote as workspace_remote;
 mod workspace_remote_ui;
-mod workspace_review;
-mod workspace_scope;
-mod workspace_sessions_bridge;
-mod workspace_tools;
+use jterm_core::agent_workspace::controllers::cli_sessions as workspace_sessions_bridge;
+use jterm_core::agent_workspace::controllers::review as workspace_review;
+use jterm_core::agent_workspace::controllers::scope as workspace_scope;
+use jterm_core::agent_workspace::controllers::tools as workspace_tools;
 mod workspace_visibility;
 
 // Xlib window IDs use c_ulong, which is u32 on some targets and u64 on others.
