@@ -2200,7 +2200,7 @@ impl TerminalApp {
             Workbench::new(session, &self.config.vim9),
         );
         self.tabs.on_session_inserted(created.session_index);
-        self.tabs.insert_tab_after_active(created.session_index);
+        self.insert_tab_and_suspend_canvas(created.session_index);
         self.activate_session(created.session_index);
         self.force_resize_session = true;
         let active_id = self

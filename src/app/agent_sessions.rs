@@ -3184,7 +3184,7 @@ impl TerminalApp {
                     .opened
                     .insert(key, created.session_id.clone());
                 self.tabs.on_session_inserted(created.session_index);
-                self.tabs.insert_tab_after_active(created.session_index);
+                self.insert_tab_and_suspend_canvas(created.session_index);
                 let activated = self.activate_session(created.session_index);
                 self.schedule_session_save();
                 self.claim_enter_for_prompt_recall();

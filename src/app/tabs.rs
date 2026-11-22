@@ -500,13 +500,24 @@ impl TerminalApp {
     /// render_terminal_content to find hidden sessions would replay A's target.
     pub(super) fn select_tab_and_suspend_canvas(&mut self, tab_idx: usize) {
         if tab_idx < self.tabs.len() && tab_idx != self.tabs.active_index() {
-            for session_idx in self.tabs.sessions_in(self.tabs.active_index()) {
-                if let Some(session) = self.session_manager.sessions_mut().get_mut(session_idx) {
-                    session.transcript_canvas.suspend();
-                }
-            }
+            self.suspend_active_tab_canvas();
         }
         self.tabs.set_active(tab_idx);
+    }
+
+    fn suspend_active_tab_canvas(&mut self) {
+        for session_idx in self.tabs.sessions_in(self.tabs.active_index()) {
+            if let Some(session) = self.session_manager.sessions_mut().get_mut(session_idx) {
+                session.transcript_canvas.suspend();
+            }
+        }
+    }
+
+    /// TabManager activates the new tab as part of insertion. Suspend the
+    /// previous tab before that mutation, not later in activate_session.
+    pub(crate) fn insert_tab_and_suspend_canvas(&mut self, session_idx: usize) -> usize {
+        self.suspend_active_tab_canvas();
+        self.tabs.insert_tab_after_active(session_idx)
     }
 
     /// 切换到某个 tab,并把键盘/剪贴板路由交给它当前选中的窗格。
@@ -587,7 +598,7 @@ impl TerminalApp {
             self.set_status("Failed to create session");
             return None;
         }
-        let tab_idx = self.tabs.insert_tab_after_active(session_idx);
+        let tab_idx = self.insert_tab_and_suspend_canvas(session_idx);
         self.activate_session(session_idx);
         self.force_resize_session = true;
         self.schedule_session_save();

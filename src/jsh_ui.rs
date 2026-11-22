@@ -171,7 +171,7 @@ impl TerminalApp {
             return;
         };
         self.tabs.on_session_inserted(index);
-        self.tabs.insert_tab_after_active(index);
+        self.insert_tab_and_suspend_canvas(index);
         self.activate_session(index);
         self.set_status(status);
     }
@@ -249,7 +249,7 @@ impl TerminalApp {
         self.tabs.on_session_inserted(index);
         // 安装脚本自己就是进度界面，给它一个独立 tab，而不是塞进当前
         // tab 的某个窗格里。
-        self.tabs.insert_tab_after_active(index);
+        self.insert_tab_and_suspend_canvas(index);
         self.activate_session(index);
         self.set_status("Installing jsh in a new session");
     }
@@ -305,7 +305,7 @@ impl TerminalApp {
         };
         self.tabs.on_session_inserted(index);
         // 远程会话拿独立 tab，而不是塞进当前 tab 的分屏里。
-        self.tabs.insert_tab_after_active(index);
+        self.insert_tab_and_suspend_canvas(index);
         self.activate_session(index);
         self.set_status(status);
     }

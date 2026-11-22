@@ -3904,7 +3904,7 @@ impl TerminalApp {
         }
 
         self.tabs.on_session_inserted(created.session_index);
-        self.tabs.insert_tab_after_active(created.session_index);
+        self.insert_tab_and_suspend_canvas(created.session_index);
         self.activate_session(created.session_index);
         self.schedule_session_save();
         self.set_status(if brief_written {
@@ -3974,7 +3974,7 @@ impl TerminalApp {
                     .owned_validation_tabs
                     .insert(key, created.session_id);
                 self.tabs.on_session_inserted(created.session_index);
-                self.tabs.insert_tab_after_active(created.session_index);
+                self.insert_tab_and_suspend_canvas(created.session_index);
                 self.activate_session(created.session_index);
                 self.agent_sessions.workspace_task = None;
                 self.ai_chat_panel.close();
@@ -4071,7 +4071,7 @@ impl TerminalApp {
         }
 
         self.tabs.on_session_inserted(created.session_index);
-        self.tabs.insert_tab_after_active(created.session_index);
+        self.insert_tab_and_suspend_canvas(created.session_index);
         self.activate_session(created.session_index);
         self.schedule_session_save();
         self.set_status(format!(
