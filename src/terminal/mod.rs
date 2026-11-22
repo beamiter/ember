@@ -7,6 +7,7 @@ use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use jterm_core::click_cursor;
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
+use jterm_engine::retained_history::RetainedHistory;
 use jterm_engine::screen::{
     Charset, RegionMutation, RowMutation, ScreenState, VerticalDeparture, VerticalMotion,
 };
@@ -480,7 +481,7 @@ pub struct TerminalState {
     search_source_epoch: u64,
     search_source_revision: u64,
     search_scrollback_epoch: u64,
-    pub scrollback: VecDeque<ScrollbackLine>,
+    pub scrollback: RetainedHistory<ScrollbackLine>,
     pub selection: Option<Selection>,
     projected_selection: Option<ProjectedSelection>,
     inline_text_selection: Option<InlineTextSelection>,

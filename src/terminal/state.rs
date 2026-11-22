@@ -315,7 +315,7 @@ impl super::TerminalState {
         TerminalState {
             screen: ScreenState::with_grids(grid, alt_grid),
             host_context,
-            scrollback: VecDeque::new(),
+            scrollback: RetainedHistory::default(),
             selection: None,
             projected_selection: None,
             inline_text_selection: None,
@@ -1083,12 +1083,15 @@ impl super::TerminalState {
         if self.screen.use_alt_buffer && !allow_alt_buffer {
             return;
         }
-        if self.scrollback.len() >= self.max_scrollback {
-            if let Some(evicted) = self.scrollback.pop_front() {
-                self.forget_output_provenance_for_raw_row(evicted.raw_row_id());
-                self.rebase_raw_selection_after_prefix_trim(1);
-            }
+        let mut trimmed = 0;
+        while self.scrollback.needs_room_for(&line, self.max_scrollback) {
+            let Some(evicted) = self.scrollback.pop_front() else {
+                break;
+            };
+            self.forget_output_provenance_for_raw_row(evicted.raw_row_id());
+            trimmed += 1;
         }
+        self.rebase_raw_selection_after_prefix_trim(trimmed);
         self.scrollback.push_back(line);
         self.total_lines_scrolled = self.total_lines_scrolled.saturating_add(1);
         // Pin the viewport while the user is reading history. `scroll_offset`
@@ -1478,10 +1481,12 @@ impl super::TerminalState {
             .set_max_scrollback_rows(self.max_scrollback);
 
         let old_len = self.scrollback.len();
-        while self.scrollback.len() > self.max_scrollback {
-            if let Some(evicted) = self.scrollback.pop_front() {
-                self.forget_output_provenance_for_raw_row(evicted.raw_row_id());
-            }
+        while self.scrollback.over_budget(self.max_scrollback) {
+            let evicted = self
+                .scrollback
+                .pop_front()
+                .expect("scrollback has charged rows");
+            self.forget_output_provenance_for_raw_row(evicted.raw_row_id());
         }
         if self.scrollback.len() != old_len {
             self.rebase_raw_selection_after_prefix_trim(old_len - self.scrollback.len());
@@ -7511,18 +7516,17 @@ impl super::TerminalState {
         // Archive policy stays with the host: only a shrinking primary screen
         // transfers old top rows, after discarding trimmable blanks below the
         // cursor first. Alternate applications redraw after SIGWINCH.
-        let transfer_top = if rows < old_rows && !self.screen.use_alt_buffer {
-            let blank_below = (self.screen.cursor_row + 1..old_rows)
-                .rev()
-                .take_while(|&row| {
+        let transfer_top = if !self.screen.use_alt_buffer {
+            jterm_engine::screen::rows_to_archive_on_height_shrink(
+                old_rows,
+                rows,
+                self.screen.cursor_row,
+                |row| {
                     self.screen.grid[row]
                         .iter()
                         .all(TerminalCell::is_reflow_trimmable_blank)
-                })
-                .count();
-            (old_rows - rows)
-                .saturating_sub(blank_below)
-                .min(self.screen.cursor_row)
+                },
+            )
         } else {
             0
         };

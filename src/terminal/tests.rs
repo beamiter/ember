@@ -15,6 +15,35 @@ use super::{
     MAX_OSC_133_ID_BYTES, MAX_PENDING_ESCAPE, MAX_TITLE_STACK_DEPTH, MAX_WINDOW_TITLE_CHARS,
 };
 
+#[test]
+fn dense_scroll_history_evicts_old_rows_at_the_shared_byte_limit() {
+    use jterm_engine::retained_history::{RetainedRow, RETAINED_HISTORY_BYTES};
+
+    let mut terminal = TerminalState::new(8, 4);
+    let cells: Vec<_> = (0..512)
+        .map(|column| TerminalCell {
+            character: 'λ',
+            background: Color::Rgb(column as u8, (column / 256) as u8, 88),
+            ..TerminalCell::default()
+        })
+        .collect();
+    let dense = ScrollbackLine::compress(&cells, false);
+    let charge = dense.clone().retained_bytes();
+    let keep = RETAINED_HISTORY_BYTES / charge;
+    terminal.set_max_scrollback(keep + 8);
+    terminal.push_scrollback_compressed(dense.clone());
+    let oldest = terminal.scrollback.front().unwrap().raw_row_id();
+    for _ in 0..=keep {
+        terminal.push_scrollback_compressed(dense.clone());
+    }
+
+    assert_eq!(terminal.total_lines_scrolled, (keep + 2) as u64);
+    assert_eq!(terminal.scrollback.len(), keep);
+    assert_eq!(terminal.scrollback.retained_bytes(), keep * charge);
+    assert_ne!(terminal.scrollback.front().unwrap().raw_row_id(), oldest);
+    assert_eq!(terminal.scrollback.back().unwrap().decompress(), cells);
+}
+
 fn emit_completed_block(terminal: &mut TerminalState, index: usize) -> u64 {
     terminal.process_input(
         format!(
@@ -1341,7 +1370,9 @@ fn identity_full_document_plan_matches_eager_history_and_grid_across_widths() {
         for line in history.iter().cloned() {
             terminal.push_scrollback_compressed(line);
         }
-        terminal.scrollback[3].set_raw_row_id(RawRowId::UNTRACKED);
+        let mut archived = terminal.scrollback[3].clone();
+        archived.set_raw_row_id(RawRowId::UNTRACKED);
+        terminal.scrollback.replace(3, archived).unwrap();
         terminal.screen.grid.get_mut(0, 0).character = 'G';
         terminal.screen.grid.get_mut(1, 0).character = 'H';
         terminal.screen.grid.row_wrapped[0] = true;
@@ -1389,7 +1420,9 @@ fn identity_full_document_plan_materializes_a_narrow_wide_body() {
     history[2].character = 'Z';
     history[3].hyperlink_id = HyperlinkId::from_raw(1);
     terminal.push_scrollback_compressed(ScrollbackLine::compress(&history, false));
-    terminal.scrollback[0].set_raw_row_id(RawRowId::UNTRACKED);
+    let mut archived = terminal.scrollback[0].clone();
+    archived.set_raw_row_id(RawRowId::UNTRACKED);
+    terminal.scrollback.replace(0, archived).unwrap();
     terminal.screen.grid.get_mut(0, 0).character = 'G';
 
     let plan = terminal.identity_projection_plan(1);

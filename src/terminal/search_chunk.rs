@@ -2,7 +2,13 @@
 //! history-wide identity search. Copy/render extraction is deliberately separate.
 use super::{BufferAnchor, RawRowId, TerminalState, MAX_COMMAND_MARKS, MAX_OSC_133_ID_BYTES};
 use crate::block_mode::{block_search_literal_normalize, block_search_literal_scalar};
+#[cfg(test)]
+use jterm_engine::retained_history::RetainedHistory;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// Keep the 100,000-row search-work tests independent of desktop retention.
+#[cfg(test)]
+const SEARCH_FIXTURE_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 
 static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
 pub(super) fn next_source_epoch() -> u64 {
@@ -517,6 +523,7 @@ mod tests {
     use super::*;
     fn terminal(output: &str, cols: usize, history: usize) -> TerminalState {
         let mut terminal = TerminalState::new(cols, 4);
+        terminal.scrollback = RetainedHistory::with_byte_limit(SEARCH_FIXTURE_HISTORY_BYTES);
         terminal.set_max_scrollback(history);
         terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=raw\x07");
         terminal.process_input(output.as_bytes());
@@ -1293,6 +1300,7 @@ mod seal_tests {
 
     fn terminal(lines: usize, history: usize) -> (TerminalState, u64) {
         let mut t = TerminalState::new(96, 4);
+        t.scrollback = RetainedHistory::with_byte_limit(SEARCH_FIXTURE_HISTORY_BYTES);
         t.set_max_scrollback(history);
         t.process_input(b"\x1b]133;A\x07\x1b]133;C;id=sealed\x07");
         let line = format!("{}\r\n", "x".repeat(95));
