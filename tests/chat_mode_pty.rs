@@ -69,6 +69,7 @@ fn poll_until(session: &mut Session, predicate: impl Fn(&TerminalState, &[u8]) -
                     session.terminal.lock().process_input(fragment.bytes);
                 }
             }
+            Ok(ShellEvent::ExitTail(tail)) => panic!("incomplete PTY exit output: {tail:?}"),
             Ok(ShellEvent::Error(error)) => panic!("PTY failed: {error}"),
             Ok(ShellEvent::Exit(code)) => panic!("interactive shell exited unexpectedly: {code}"),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}

@@ -6309,16 +6309,21 @@ impl eframe::App for TerminalApp {
         // 可能往任意方向漂移。ID 查不到就说明它已经被前一次关闭带走了。
         // 在关闭 tab 前先把真实 child wait status 交给 TaskManager，否则
         // opaque Agent PTY 只能得到一个无意义的“消失了”状态。
-        let exited_sessions: Vec<(String, Option<i32>)> = background_pump
-            .exited_sessions
-            .drain(..)
-            .map(|exited| (exited.session_id, exited.exit_code))
-            .collect();
-        for (session_id, exit_code) in exited_sessions {
+        let mut background_exit_notice = None;
+        for exited in std::mem::take(&mut background_pump.exited_sessions) {
+            let session_id = exited.session_id;
+            let exit_code = exited.exit_code;
+            if exited.exit_output_notice.is_some() {
+                background_exit_notice = exited.exit_output_notice;
+            }
             if let Some(editor) = self.vim9_editors.remove(&session_id) {
                 editor.session.revoke();
             }
             if self.finish_shell_vim_exit(&session_id, exit_code, ctx) {
+                if let Some(notice) = background_exit_notice {
+                    self.set_status_for(notice, Duration::from_secs(8));
+                    ctx.request_repaint();
+                }
                 return;
             }
             if self.handle_agent_session_terminal_exit(&session_id) {
@@ -6341,6 +6346,9 @@ impl eframe::App for TerminalApp {
                 self.close_session_or_owning_tab(session_idx);
                 self.schedule_session_save();
             }
+        }
+        if let Some(notice) = background_exit_notice {
+            self.set_status_for(notice, Duration::from_secs(8));
         }
         let background_processed_bytes = background_pump.bytes_processed;
         let active_output_budget = self
@@ -6522,7 +6530,7 @@ impl eframe::App for TerminalApp {
         let mut shell_exited = false;
         let mut shell_exit_observed = false;
         let mut shell_exit_code = None;
-        let mut retain_exited_task_terminal = false;
+        let mut retain_exited_terminal = false;
         // A shell that dies before it could ever have shown a prompt is a
         // startup failure, not the user leaving. Closing the window on it
         // makes ember look like it "exits as soon as it runs", hiding the
@@ -7055,6 +7063,7 @@ impl eframe::App for TerminalApp {
                             break;
                         }
                     }
+                    Ok(ShellEvent::ExitTail(tail)) => session.exit_tail = tail,
                     Ok(ShellEvent::Exit(code)) => {
                         if let Some(editor) = self.vim9_editors.remove(&session.metadata.session_id)
                         {
@@ -7063,7 +7072,7 @@ impl eframe::App for TerminalApp {
                         crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
                         shell_exit_observed = true;
                         shell_exit_code = Some(code);
-                        retain_exited_task_terminal = active_task_terminal.is_some();
+                        retain_exited_terminal = active_task_terminal.is_some();
                         let uptime = session.shell.uptime();
                         if active_task_terminal.is_some() {
                             // Task feedback is composed after applying the authoritative exit below.
@@ -7092,7 +7101,7 @@ impl eframe::App for TerminalApp {
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         shell_exit_observed = true;
-                        retain_exited_task_terminal = active_task_terminal.is_some();
+                        retain_exited_terminal = active_task_terminal.is_some();
                         shell_exited = true;
                         break;
                     }
@@ -8622,18 +8631,45 @@ impl eframe::App for TerminalApp {
             projected_cursor_visible_for_session(session, renderer)
         };
 
+        let exit_output_notice = if shell_exit_observed && shell_startup_failed {
+            session
+                .exit_tail
+                .notice()
+                .map(|notice| format!("{} {notice}", self.status_message))
+        } else if shell_exit_observed {
+            session.exit_output_notice(shell_exit_code)
+        } else {
+            None
+        };
+
         // 结束 session 的可变借用，render_ui 需要 &mut self
         #[allow(dropping_references)]
         drop(session);
 
         if shell_exit_observed {
             if self.finish_shell_vim_exit(&active_session_id, shell_exit_code, ctx) {
+                if let Some(notice) = exit_output_notice {
+                    self.set_status_for(notice, Duration::from_secs(8));
+                    ctx.request_repaint();
+                }
                 return;
             }
             self.handle_task_terminal_exit(&active_session_id, shell_exit_code);
-            if retain_exited_task_terminal {
+            if retain_exited_terminal {
                 self.session_manager
                     .retain_exited_command(&active_session_id);
+            }
+            if let Some(notice) = exit_output_notice {
+                if session_count_before == 1 && !retain_exited_terminal {
+                    retain_exited_terminal = self
+                        .session_manager
+                        .retain_incomplete_exit(&active_session_id);
+                }
+                if shell_startup_failed {
+                    self.status_message = notice;
+                } else {
+                    self.set_status_for(notice, Duration::from_secs(8));
+                }
             }
         }
 
@@ -8728,8 +8764,8 @@ impl eframe::App for TerminalApp {
                 "[SHELL EXIT] handling shell exit, session_count: {}",
                 session_count_before
             );
-            if retain_exited_task_terminal {
-                crate::debug_log!("[SHELL EXIT] retaining task terminal for review");
+            if retain_exited_terminal {
+                crate::debug_log!("[SHELL EXIT] retaining terminal for review");
             } else if session_count_before > 1 {
                 // Close the current session if there are multiple sessions.
                 // If it was its tab's only pane, the tab goes with it.

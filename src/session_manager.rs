@@ -443,6 +443,7 @@ pub struct BackgroundPumpResult {
 pub struct ExitedSession {
     pub session_id: String,
     pub exit_code: Option<i32>,
+    pub exit_output_notice: Option<String>,
 }
 
 /// Successful result from creating a session. Callers that keep a long-lived
@@ -766,6 +767,7 @@ impl SessionManager {
                                 break;
                             }
                         }
+                        Ok(ShellEvent::ExitTail(tail)) => session.exit_tail = tail,
                         Ok(ShellEvent::Exit(code)) => {
                             exit_code = Some(code);
                             exited = true;
@@ -873,6 +875,7 @@ impl SessionManager {
                 result.exited_sessions.push(ExitedSession {
                     session_id: session.metadata.session_id.clone(),
                     exit_code,
+                    exit_output_notice: session.exit_output_notice(exit_code),
                 });
             }
             if protocol_responses.has_pending()
@@ -1029,17 +1032,33 @@ impl SessionManager {
         else {
             return false;
         };
-        match self.sessions[index].purpose {
-            SessionPurpose::Interactive => return false,
-            SessionPurpose::EphemeralCommand => {
-                self.sessions[index].purpose = SessionPurpose::RetainedCommand;
-            }
-            SessionPurpose::RetainedCommand => {}
+        if self.sessions[index].purpose == SessionPurpose::Interactive {
+            return false;
         }
-        self.sessions[index].pending_input.clear();
-        self.sessions[index].shell.freeze_after_exit();
-        self.protocol_responses[index].close();
+        self.freeze_exited_terminal(index);
         true
+    }
+
+    /// A last shell with an incomplete tail stays available for review after
+    /// its exit is observed, so the window can show the notice and transcript.
+    #[allow(dead_code)] // Called by the binary app.
+    pub(crate) fn retain_incomplete_exit(&mut self, session_id: &str) -> bool {
+        let Some(index) = self.index_of(session_id) else {
+            return false;
+        };
+        if self.sessions[index].exit_tail.notice().is_none() {
+            return false;
+        }
+        self.freeze_exited_terminal(index);
+        true
+    }
+
+    fn freeze_exited_terminal(&mut self, index: usize) {
+        let session = &mut self.sessions[index];
+        session.purpose = SessionPurpose::RetainedCommand;
+        session.pending_input.clear();
+        session.shell.freeze_after_exit();
+        self.protocol_responses[index].close();
     }
 
     fn insert_session(
@@ -1479,6 +1498,47 @@ mod tests {
             critical_reserve_bytes: 2,
             critical_reserve_messages: 1,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_exit_keeps_the_last_shell_available_for_review() {
+        let repaint = egui::Context::default();
+        let argv = vec!["/bin/sh".into(), "-c".into(), "exit 17".into()];
+        let shell = ShellSession::new_with_cwd(
+            80,
+            24,
+            Some("/tmp"),
+            None,
+            None,
+            Some(&argv),
+            crate::runtime_wake::egui_wake(repaint.clone()),
+        )
+        .unwrap();
+        let crate::shell::ShellEvent::Exit(code) =
+            shell.events().recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected the fixture shell to exit");
+        };
+        assert_eq!(code, 17);
+        let session = Session::new(
+            "Fixture shell".to_string(),
+            Vec::new(),
+            Arc::new(ParkingMutex::new(TerminalState::new(80, 24))),
+            shell,
+        );
+        let id = session.metadata.session_id.clone();
+        let mut manager = SessionManager::new(session, repaint, None);
+        assert!(!manager.retain_incomplete_exit(&id));
+        let session = manager.get_active_session_mut();
+        session.exit_tail = jterm_core::exit_status::ExitTail::ReadFailed;
+        let status = session.exit_output_notice(Some(code)).unwrap();
+        assert!(status.starts_with("Fixture shell exited with code 17."));
+        assert!(status.contains("Some final output may have been omitted."));
+        assert!(manager.retain_incomplete_exit(&id));
+        let session = manager.get_active_session_mut();
+        assert_eq!(session.purpose, SessionPurpose::RetainedCommand);
+        assert!(!session.queue_input(b"ignored"));
     }
 
     #[test]

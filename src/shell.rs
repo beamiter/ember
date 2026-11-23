@@ -427,6 +427,9 @@ mod tests {
             match session.events().recv_timeout(remaining).unwrap() {
                 ShellEvent::Exit(0) => break,
                 ShellEvent::Output(output) => received.extend_from_slice(output.as_bytes()),
+                ShellEvent::ExitTail(tail) => {
+                    panic!("unexpected incomplete shell output: {tail:?}")
+                }
                 ShellEvent::Exit(code) => panic!("unexpected exit code {code}"),
                 ShellEvent::Error(error) => panic!("unexpected shell error: {error}"),
             }
@@ -483,6 +486,9 @@ mod tests {
             match session.events().recv_timeout(remaining).unwrap() {
                 ShellEvent::Exit(0) => break,
                 ShellEvent::Output(_) => {}
+                ShellEvent::ExitTail(tail) => {
+                    panic!("unexpected incomplete shell output: {tail:?}")
+                }
                 ShellEvent::Exit(code) => panic!("unexpected exit code {code}"),
                 ShellEvent::Error(error) => panic!("unexpected shell error: {error}"),
             }
@@ -559,6 +565,9 @@ mod tests {
             assert!(!remaining.is_zero(), "timed out waiting for the test shell");
             match session.events().recv_timeout(remaining).unwrap() {
                 ShellEvent::Output(bytes) => output.extend_from_slice(bytes.as_bytes()),
+                ShellEvent::ExitTail(tail) => {
+                    panic!("unexpected incomplete shell output: {tail:?}")
+                }
                 ShellEvent::Exit(code) => break code,
                 ShellEvent::Error(error) => panic!("unexpected shell error: {error}"),
             }

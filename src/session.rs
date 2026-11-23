@@ -118,8 +118,7 @@ pub enum SessionPurpose {
     /// Exact-argv helper or Agent CLI. Its argv/lifecycle owner is not part of
     /// the ordinary shell snapshot, so restoring it as a shell would be false.
     EphemeralCommand,
-    /// An Agent CLI whose child has exited. Keep its terminal buffer available
-    /// for explicit human review, but never poll or restore it as a live shell.
+    /// An exited shell or command with a read-only transcript for review.
     RetainedCommand,
 }
 
@@ -247,6 +246,9 @@ pub struct Session {
     /// stream into the newly active terminal corrupts both its screen and its
     /// terminal modes.
     pub pending_output: crate::output_batch::OutputBuffer,
+    /// Exit tail and exit status can arrive in different frames or on either
+    /// side of a focus change. Keep the notice with the originating shell.
+    pub(crate) exit_tail: jterm_core::exit_status::ExitTail,
     pub(crate) terminal_presentation: TerminalPresentation,
     /// Session-owned view policy. Renderers are reused across tabs/panes and
     /// must never carry collapse state or projected scroll between sessions.
@@ -266,6 +268,15 @@ pub struct Session {
 }
 
 impl Session {
+    pub(crate) fn exit_output_notice(&self, code: Option<i32>) -> Option<String> {
+        let notice = self.exit_tail.notice()?;
+        let name = &self.metadata.name;
+        Some(match code {
+            Some(code) => format!("{name} exited with code {code}. {notice}"),
+            None => format!("{name} exited. {notice}"),
+        })
+    }
+
     #[allow(dead_code)] // The library type is also built without the workspace.
     pub(crate) fn resize_terminal(
         &mut self,
@@ -409,6 +420,7 @@ impl Session {
             purpose: SessionPurpose::Interactive,
             pending_input: Vec::new(),
             pending_output: crate::output_batch::OutputBuffer::default(),
+            exit_tail: jterm_core::exit_status::ExitTail::Complete,
             terminal_presentation: TerminalPresentation::default(),
             projection_policy: ProjectionPolicy::new(),
             projection_view_state: ProjectionViewState::new(),
