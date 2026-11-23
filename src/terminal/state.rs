@@ -1477,6 +1477,8 @@ impl super::TerminalState {
     pub fn set_max_scrollback(&mut self, max_scrollback: usize) {
         self.invalidate_search_source();
         self.max_scrollback = max_scrollback.max(1);
+        self.scrollback
+            .scale_byte_limit_for_rows(self.max_scrollback);
         self.kitty_graphics
             .set_max_scrollback_rows(self.max_scrollback);
 
