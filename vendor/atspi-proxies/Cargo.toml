@@ -64,7 +64,7 @@ features = ["derive"]
 default-features = false
 
 [dependencies.zbus]
-version = "=6.2.1"
+version = "=6.4.0"
 features = ["proxy"]
 default-features = false
 
