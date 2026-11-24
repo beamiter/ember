@@ -541,7 +541,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=80195416ed2a16e4d3f13418b5c05493076839f5#80195416ed2a16e4d3f13418b5c05493076839f5"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=53cbdb92ce9c54dd848824270a3e41d5ab08e341#53cbdb92ce9c54dd848824270a3e41d5ab08e341"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -551,12 +551,17 @@ dependencies = [
  "eva-character-atlas",
  "fuzzy-matcher",
  "jagent",
+ "jterm_engine",
+ "jterm_protocol",
+ "jterm_remote_client",
+ "jterm_runtime",
  "libc",
  "log",
  "lru",
  "memchr",
  "once_cell",
  "parking_lot",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
@@ -571,9 +576,40 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=80195416ed2a16e4d3f13418b5c05493076839f5#80195416ed2a16e4d3f13418b5c05493076839f5"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=53cbdb92ce9c54dd848824270a3e41d5ab08e341#53cbdb92ce9c54dd848824270a3e41d5ab08e341"
 dependencies = [
  "smallvec",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "jterm_protocol"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=53cbdb92ce9c54dd848824270a3e41d5ab08e341#53cbdb92ce9c54dd848824270a3e41d5ab08e341"
+dependencies = [
+ "jterm_engine",
+ "serde",
+]
+
+[[package]]
+name = "jterm_remote_client"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=53cbdb92ce9c54dd848824270a3e41d5ab08e341#53cbdb92ce9c54dd848824270a3e41d5ab08e341"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "jterm_runtime"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=53cbdb92ce9c54dd848824270a3e41d5ab08e341#53cbdb92ce9c54dd848824270a3e41d5ab08e341"
+dependencies = [
+ "crossbeam-channel",
+ "libc",
+ "log",
+ "parking_lot",
 ]
 
 [[package]]
@@ -1102,9 +1138,9 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-width"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
 name = "unsafe-libyaml-norway"
