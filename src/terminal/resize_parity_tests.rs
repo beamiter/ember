@@ -408,6 +408,19 @@ fn resize_matches_pre_extraction_production() {
 }
 
 #[test]
+fn height_shrink_keeps_the_saved_prompt_origin_on_its_live_row() {
+    let mut terminal = TerminalState::new(12, 6);
+    terminal.process_input(b"one\r\ntwo\r\noutput\r\n\x1b7prompt\r\ndraft\r\nstatus");
+    terminal.on_resize(9, 4);
+    assert_eq!(terminal.scrollback.len(), 2);
+
+    terminal.process_input(b"\x1b8\x1b[Jrepaint");
+    assert_eq!(terminal.screen.grid[0][0].character, 'o');
+    assert_eq!(terminal.screen.grid[1][0].character, 'r');
+    assert_eq!(terminal.screen.grid[2][0].character, ' ');
+}
+
+#[test]
 #[ignore = "explicit capture tooling only; never rewrites the committed baseline"]
 fn print_resize_baseline() {
     for case in cases() {
