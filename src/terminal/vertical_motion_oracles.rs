@@ -87,10 +87,12 @@ thread_local! {
 pub(in crate::terminal) fn observe(t: &TerminalState, event: &str, detail: String) {
     TRACE.with(|slot| {
         if let Some(trace) = slot.borrow_mut().as_mut() {
-            // The frozen identity trace predates the opt-in archive gap marker.
-            // Preserve the legacy Debug shape only for its default (false) value.
+            // The frozen identity trace predates the archived row flags.
+            // Omit their default values and keep non-default flags visible.
             let detail = if event == "identity" {
-                detail.replace(", synthetic_margin_gap: false", "")
+                detail
+                    .replace(", synthetic_margin_gap: false", "")
+                    .replace(", printed_spaces: false, cols:", ", cols:")
             } else {
                 detail
             };
