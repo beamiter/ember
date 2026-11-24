@@ -338,7 +338,7 @@ offers an explicit continuation through the ordinary terminal CLI fallback.
 ## Build and run
 
 The Cargo lock resolves the engine and session core at
-`1e3d1f0bb0fa9b6463de12edb3e9faee66668c65`. Ember uses the shared session
+`902a84287aab38bee2d6e8baaac924101f1127cc`. Ember uses the shared session
 actor for terminal input and PTY output. Its native PTY adapter handles launch,
 and egui applies output to Ember's terminal state.
 The history byte allowance scales with the configured scrollback row limit
