@@ -92,7 +92,7 @@ def _block_end(code, opening):
 def verify_overlay_font_zoom_order(main):
     """Every final modal establishes input ownership before draining zoom."""
     render = _function(main, 'render_ui')
-    methods = ('render_floating_panels', 'render_vim9_dialog',
+    methods = ('render_floating_panels', 'notebook_panel.show', 'render_vim9_dialog',
                'render_workspace_cli_delete_confirmation',
                'render_window_close_confirmation', 'handle_font_zoom')
     calls = [_code(f'self.{method}(ctx);') for method in methods]
@@ -100,8 +100,10 @@ def verify_overlay_font_zoom_order(main):
         matches = list(re.finditer(re.escape(call), render))
         assert len(matches) == 1 and _top_level(render, matches[0]), \
             f'{method} must run exactly once at render_ui top level'
-    assert render.strip().endswith(' '.join(calls)), \
-        'render_ui must finish overlays and all three dialogs before draining font zoom'
+    # The Notebook panel is built only on Unix.
+    tail = ' '.join([calls[0], _code('#[cfg(unix)]'), *calls[1:]])
+    assert render.strip().endswith(tail), \
+        'render_ui must finish overlays and dialogs before draining font zoom'
     return methods
 
 

@@ -140,7 +140,7 @@ class OverlayFontZoomOrder(unittest.TestCase):
 
     def test_actual_overlay_order_includes_all_dialogs(self):
         self.assertEqual(verify_overlay_font_zoom_order(MAIN),
-                         ('render_floating_panels', 'render_vim9_dialog',
+                         ('render_floating_panels', 'notebook_panel.show', 'render_vim9_dialog',
                           'render_workspace_cli_delete_confirmation',
                           'render_window_close_confirmation', 'handle_font_zoom'))
 
@@ -177,6 +177,10 @@ class OverlayFontZoomOrder(unittest.TestCase):
     def test_no_later_overlay_after_zoom(self):
         self.rejected(MAIN.replace('self.handle_font_zoom(ctx);',
                                    'self.handle_font_zoom(ctx); self.other_modal(ctx);', 1))
+
+    def test_notebook_keeps_its_unix_guard(self):
+        call = 'self.notebook_panel.show(ctx);'
+        self.rejected(MAIN.replace('#[cfg(unix)]\n        ' + call, call, 1))
 
 
 if __name__ == '__main__':
