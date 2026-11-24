@@ -510,36 +510,11 @@ impl super::TerminalState {
         if value.len() > Self::MAX_OSC7_URI_BYTES {
             return None;
         }
-        let path_part = if let Some(rest) = value.strip_prefix("file://") {
-            let slash = rest.find('/')?;
-            let host = &rest[..slash];
-            if !self.host_context.osc7_host_is_local(host) {
-                return None;
-            }
-            &rest[slash..]
-        } else if value.starts_with('/') {
-            value
-        } else {
-            return None;
-        };
-        // Percent-decode. We don't pull in a url crate — the alphabet is small.
-        let bytes = path_part.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
-                let byte = u8::from_str_radix(hex, 16).ok()?;
-                out.push(byte);
-                i += 3;
-            } else {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-        String::from_utf8(out)
-            .ok()
-            .filter(|cwd| jterm_core::execution_journal::is_valid_jsh_cwd(cwd))
+        jterm_engine::shell_markers::decode_osc7_cwd(
+            value,
+            |host| self.host_context.osc7_host_is_local(host),
+            jterm_core::review_input::is_terminal_visual_spoofing_character,
+        )
     }
 
     #[cfg(test)]

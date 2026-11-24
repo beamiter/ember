@@ -2043,6 +2043,7 @@ fn osc7_rejects_remote_host_paths_for_local_session_restore() {
         terminal.decode_osc7_cwd("file://definitely-remote.invalid/etc"),
         None
     );
+    assert_eq!(terminal.decode_osc7_cwd("file:///tmp/%EF%BF%B9"), None);
 }
 
 #[test]
