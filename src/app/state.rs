@@ -276,6 +276,8 @@ pub struct TerminalApp {
     // File-tree sidebar
     pub sidebar: sidebar::Sidebar,
     pub local_preview_panel: crate::local_preview_panel::LocalPreviewPanel,
+    #[cfg(unix)]
+    pub(crate) notebook_panel: crate::notebook::Panel,
     pub(crate) reference_inspector: ReferenceInspectorState,
     /// 文件树名称输入对话框（New File / New Folder / Rename）。
     pub sidebar_name_dialog: Option<crate::FsNameDialog>,

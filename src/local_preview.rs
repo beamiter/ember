@@ -21,7 +21,7 @@ pub enum PreviewContent {
 // Linux O_PATH obtains an inert handle: it does not invoke a device's open
 // operation. Verify that handle before reopening the same inode for reads.
 #[cfg(target_os = "linux")]
-fn open_regular(path: &Path) -> Result<std::fs::File, String> {
+pub(crate) fn open_regular(path: &Path) -> Result<std::fs::File, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let handle = std::fs::OpenOptions::new()
@@ -45,7 +45,7 @@ fn open_regular(path: &Path) -> Result<std::fs::File, String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_regular(path: &Path) -> Result<std::fs::File, String> {
+pub(crate) fn open_regular(path: &Path) -> Result<std::fs::File, String> {
     // Reject known special files before opening as well as checking the final
     // descriptor. Unlike Linux O_PATH, this fallback is not race-proof against
     // replacement with a device between inspection and open.

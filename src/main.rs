@@ -43,6 +43,8 @@ mod local_preview_panel;
 mod local_reference;
 mod native_enter;
 mod navigation_drawer;
+#[cfg(unix)]
+mod notebook;
 mod organism;
 mod organism_ui;
 mod output_batch;
@@ -2953,6 +2955,8 @@ impl TerminalApp {
             hovered_link: None,
             pending_link_activation: None,
             local_preview_panel: Default::default(),
+            #[cfg(unix)]
+            notebook_panel: Default::default(),
             cached_links: Vec::new(),
             cached_links_projection_key: None,
             cached_links_terminal_ptr: usize::MAX,
@@ -4701,18 +4705,7 @@ impl TerminalApp {
             }
         }
         if let Some(path) = open_file_path.take() {
-            if !self.vim9_open_file(&path) {
-                match crate::link::open_local_path(&path) {
-                    Ok(()) => self.set_status_for(
-                        format!("Opened {}", path.display()),
-                        Duration::from_secs(3),
-                    ),
-                    Err(error) => self.set_status_for(
-                        format!("Could not open {}: {error}", path.display()),
-                        Duration::from_secs(5),
-                    ),
-                }
-            }
+            self.open_workspace_file(path, true);
         }
         if follow_toggled {
             let next = !self.sidebar.follow_local_cwd();
@@ -5408,14 +5401,7 @@ impl TerminalApp {
                     self.set_status(format!("Copied {} paths", paths.len()));
                 }
             }
-            FsMenuAction::Open(path) => match crate::link::open_local_path(&path) {
-                Ok(()) => self
-                    .set_status_for(format!("Opened {}", path.display()), Duration::from_secs(3)),
-                Err(error) => self.set_status_for(
-                    format!("Could not open {}: {error}", path.display()),
-                    Duration::from_secs(5),
-                ),
-            },
+            FsMenuAction::Open(path) => self.open_workspace_file(path, false),
             FsMenuAction::Preview(path) => {
                 if !self.sidebar.location().is_remote() {
                     let session_id = self
@@ -5435,6 +5421,26 @@ impl TerminalApp {
                     );
                 }
             }
+        }
+    }
+
+    fn open_workspace_file(&mut self, path: std::path::PathBuf, prefer_editor: bool) {
+        #[cfg(unix)]
+        if !self.sidebar.location().is_remote() && notebook::is_path(&path) {
+            self.notebook_panel.open(path);
+            return;
+        }
+        if prefer_editor && self.vim9_open_file(&path) {
+            return;
+        }
+        match crate::link::open_local_path(&path) {
+            Ok(()) => {
+                self.set_status_for(format!("Opened {}", path.display()), Duration::from_secs(3))
+            }
+            Err(error) => self.set_status_for(
+                format!("Could not open {}: {error}", path.display()),
+                Duration::from_secs(5),
+            ),
         }
     }
 
@@ -5927,6 +5933,8 @@ impl TerminalApp {
         self.font_zoom
             .register_workspace(workspace_rect, main_panel.inner, root_ui.layer_id());
         self.render_floating_panels(ctx);
+        #[cfg(unix)]
+        self.notebook_panel.show(ctx);
         self.render_vim9_dialog(ctx);
         self.render_workspace_cli_delete_confirmation(ctx);
         self.render_window_close_confirmation(ctx);

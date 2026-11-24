@@ -1233,6 +1233,10 @@ impl TerminalApp {
     }
 
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
+        #[cfg(unix)]
+        if self.notebook_panel.is_open() {
+            return true;
+        }
         self.window_close_confirmation.is_some()
             || self.organism.eva.close_dialog_owns_input()
             || self.remote_desktop.is_some()

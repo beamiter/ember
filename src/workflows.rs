@@ -39,8 +39,8 @@
 //! already adopted it before the union, while anvil still followed a planted
 //! symlink out of the workflow directory.
 //!
-//! `welcome_notebook_path` is still not ported: ember has no notebook surface,
-//! and the core deliberately left that lookup in the two apps that have one.
+//! The installed welcome notebook lookup remains in the Forge and Anvil
+//! adapters. Ember opens selected `.jtnb.md` files from the local Files view.
 //!
 //! The native picker opens immediately and performs discovery and scanning on
 //! the shared background worker. Its persistent refresh owner coalesces opens
