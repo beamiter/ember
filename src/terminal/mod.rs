@@ -6,6 +6,8 @@ mod watch;
 use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use jterm_core::click_cursor;
+use jterm_core::screen_replay::{CapturedExecutionSource, RunningExecutionSource};
+use jterm_engine::command_blocks::{ShellMarkerClock, ShellMarkerPosition};
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
 use jterm_engine::retained_history::RetainedHistory;
 use jterm_engine::screen::{
@@ -224,6 +226,8 @@ pub struct CommandRecord {
     /// Bounded normalized output captured at D. This survives scrollback
     /// eviction; `truncated`/`total_bytes` describe the original range.
     pub captured_output: Option<ExtractedText>,
+    pub output_source: Option<CapturedExecutionSource>,
+    running_output_source: Option<RunningExecutionSource>,
     /// Display-only bounded preview, cached with the finalized capture.
     pub output_preview: String,
     started_instant: Option<std::time::Instant>,
@@ -645,6 +649,8 @@ pub struct TerminalState {
 
     watch: watch::ParserWatch,
     command_records: VecDeque<CommandRecord>,
+    shell_marker_clock: ShellMarkerClock,
+    output_stream: Option<uuid::Uuid>,
     next_command_sequence: u64,
     /// Recently closed OSC execution ids. Records can be evicted or cleared
     /// by RIS, so this bounded authority prevents a delayed duplicate D from

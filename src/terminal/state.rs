@@ -148,6 +148,7 @@ struct Osc133StartIdentity {
     session_id: Option<String>,
     seq: Option<u64>,
     started_at_ms: Option<u64>,
+    position: Option<ShellMarkerPosition>,
 }
 
 /// Streaming UTF-8 head+tail collector. It retains the full value while it
@@ -397,6 +398,8 @@ impl super::TerminalState {
             command_marks: VecDeque::new(),
             watch: super::watch::ParserWatch::default(),
             command_records: VecDeque::new(),
+            shell_marker_clock: ShellMarkerClock::default(),
+            output_stream: None,
             next_command_sequence: 1,
             consumed_command_ids: VecDeque::new(),
             finished_output_provenance: HashMap::new(),
@@ -1343,6 +1346,8 @@ impl super::TerminalState {
         let pending_completed_command_outputs =
             std::mem::take(&mut self.pending_completed_command_outputs);
         let consumed_command_ids = std::mem::take(&mut self.consumed_command_ids);
+        let shell_marker_clock = std::mem::take(&mut self.shell_marker_clock);
+        let output_stream = self.output_stream;
         let cols = self.screen.grid.row_len();
         let rows = self.screen.grid.rows();
         let max_scrollback = self.max_scrollback;
@@ -1364,6 +1369,8 @@ impl super::TerminalState {
         self.watch = watch;
         self.pending_completed_command_outputs = pending_completed_command_outputs;
         self.consumed_command_ids = consumed_command_ids;
+        self.shell_marker_clock = shell_marker_clock;
+        self.output_stream = output_stream;
         self.colors = ColorState::new(default_colors);
         // A reset replaces every physical row but must never restart the
         // allocator and let an old external origin retarget into the new grid.
@@ -2362,6 +2369,8 @@ impl super::TerminalState {
             finished_at: None,
             agent_generation: None,
             captured_output: None,
+            output_source: None,
+            running_output_source: None,
             output_preview: String::new(),
             started_instant: None,
         });
@@ -2395,6 +2404,7 @@ impl super::TerminalState {
         command: Option<&str>,
         cwd: Option<&str>,
         command_truncated: bool,
+        position: Option<ShellMarkerPosition>,
     ) {
         // Bypass the alt buffer entirely (less / vim emit no marks; if they
         // did, they'd contaminate the primary-screen command history).
@@ -2451,6 +2461,7 @@ impl super::TerminalState {
                 None,
                 None,
                 crate::block_mode::CompletionProvenance::BoundaryInferred,
+                position,
             );
         }
 
@@ -2537,6 +2548,10 @@ impl super::TerminalState {
 
         self.apply_record_metadata(index, id, command, cwd, command_truncated);
         let mut initialize_provenance = false;
+        let grid_size = (
+            self.screen.grid.row_len() as u16,
+            self.screen.grid.rows() as u16,
+        );
         if let Some(record) = self.command_records.get_mut(index) {
             if record.command.is_none() && !record.command_truncated {
                 record.command = reconstructed;
@@ -2552,6 +2567,9 @@ impl super::TerminalState {
             // otherwise rebind an already-observed Start generation to output
             // that was captured for the first one.
             if !record.start_mark_seen {
+                record.running_output_source = start_identity
+                    .position
+                    .map(|position| RunningExecutionSource::new(position, grid_size));
                 Self::observe_organism_directory(
                     &mut self.organism_working_dir,
                     record.cwd.as_deref(),
@@ -2685,6 +2703,15 @@ impl super::TerminalState {
                 self.extract_text_range(start, end, MAX_COMPLETED_COMMAND_OUTPUT_BYTES)
             });
         let output_available = extracted.is_some();
+        let head_dropped = record_before_capture.output_start.is_some_and(|start| {
+            start.line_id
+                < self
+                    .total_lines_scrolled
+                    .saturating_sub(self.scrollback.len() as u64)
+        });
+        if let Some(source) = self.command_records[index].output_source.as_mut() {
+            source.execution.head_dropped = head_dropped;
+        }
         if let Some(output) = extracted.as_ref() {
             self.store_captured_command_output(index, output.clone());
         }
@@ -2814,6 +2841,7 @@ impl super::TerminalState {
         exit_code: Option<i32>,
         duration_ms: Option<u64>,
         completion_provenance: crate::block_mode::CompletionProvenance,
+        position: Option<ShellMarkerPosition>,
     ) {
         let publish_completion = completion_provenance
             == crate::block_mode::CompletionProvenance::ShellReported
@@ -2829,7 +2857,21 @@ impl super::TerminalState {
         if let Some((provenance, _, _)) = exact_output.as_ref() {
             self.register_finished_output_provenance(provenance.clone());
         }
+        let capture_size = (
+            self.screen.grid.row_len() as u16,
+            self.screen.grid.rows() as u16,
+        );
         if let Some(record) = self.command_records.get_mut(index) {
+            if let Some((start, end)) = record.running_output_source.take().zip(position) {
+                let stream = *self.output_stream.get_or_insert_with(uuid::Uuid::new_v4);
+                record.output_source =
+                    start
+                        .finish(stream, end)
+                        .map(|execution| CapturedExecutionSource {
+                            execution,
+                            capture_size,
+                        });
+            }
             if let Some((_, output_start, output_end)) = exact_output {
                 record.output_start = Some(output_start);
                 record.output_end = Some(output_end);
@@ -2877,6 +2919,7 @@ impl super::TerminalState {
         exit_code: Option<i32>,
         duration_ms: Option<u64>,
         command_truncated: bool,
+        position: Option<ShellMarkerPosition>,
     ) {
         if self.screen.use_alt_buffer {
             return;
@@ -2947,6 +2990,7 @@ impl super::TerminalState {
             exit_code,
             duration_ms,
             crate::block_mode::CompletionProvenance::ShellReported,
+            position,
         );
         if let Some(mark) = self.command_marks.back_mut() {
             mark.exit_code = exit_code;
@@ -3000,7 +3044,7 @@ impl super::TerminalState {
     /// complete", so a repeat fails closed to truncated instead. This is
     /// `jterm_core::parser::CommandMeta::from_fields`'s rule, and the two
     /// decoders read the same packets.
-    pub(super) fn handle_osc_133(&mut self, value: &str) {
+    pub(super) fn handle_osc_133(&mut self, value: &str, position: Option<ShellMarkerPosition>) {
         let mut parts = value.split(';');
         let kind = parts.next().unwrap_or("");
         // `session_id`, `seq` and `started_at_ms` are Start identity: jsh sends
@@ -3131,7 +3175,13 @@ impl super::TerminalState {
 
         match kind {
             "A" => {
-                self.record_prompt_start_with_metadata(id, command, cwd, command_truncated);
+                self.record_prompt_start_with_metadata(
+                    id,
+                    command,
+                    cwd,
+                    command_truncated,
+                    position,
+                );
             }
             "B" => self.record_command_start(id, command, cwd, command_truncated),
             "C" => self.record_output_start(
@@ -3143,6 +3193,7 @@ impl super::TerminalState {
                     session_id,
                     seq,
                     started_at_ms,
+                    position,
                 },
             ),
             "D" => self.record_command_exit_with_metadata(
@@ -3152,6 +3203,7 @@ impl super::TerminalState {
                 exit_code,
                 duration_ms,
                 command_truncated,
+                position,
             ),
             _ => {}
         }

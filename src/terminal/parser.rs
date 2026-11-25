@@ -92,7 +92,12 @@ impl super::TerminalState {
     /// Dispatch a complete OSC payload (the bytes between `ESC ]` and the
     /// BEL/ST terminator). Shared by the single-batch parser and the streaming
     /// resume path so fragmented OSCs behave exactly like unfragmented ones.
-    fn handle_osc_payload(&mut self, payload: &[u8], bel_terminated: bool) {
+    fn handle_osc_payload(
+        &mut self,
+        payload: &[u8],
+        bel_terminated: bool,
+        packet_end: Option<u64>,
+    ) {
         self.osc_reply_terminator = Self::osc_reply_terminator_for(bel_terminated);
         if let Ok(payload) = std::str::from_utf8(payload) {
             // OSC 104/110/111/112 are valid without a
@@ -187,7 +192,14 @@ impl super::TerminalState {
                     // Parameters are parsed centrally so C can carry
                     // Kitty's `cmdline_url` and jsh can correlate all
                     // phases with `jsh_id`/`id`.
-                    self.handle_osc_133(value);
+                    let position = match value.split(';').next() {
+                        Some("A" | "B" | "C" | "D") => {
+                            self.shell_marker_clock
+                                .osc(packet_end, payload.len(), bel_terminated)
+                        }
+                        _ => None,
+                    };
+                    self.handle_osc_133(value, position);
                 } else if command == "5522" {
                     let (metadata, osc_payload) =
                         if let Some((metadata, osc_payload)) = value.split_once(';') {
@@ -268,6 +280,7 @@ impl super::TerminalState {
             self.invalidate_search_source();
         }
         self.parser.begin_feed();
+        let stream_start = self.shell_marker_clock.begin_feed(input.len());
         let mut at = 0;
         loop {
             let rejected_before = self.parser.rejected_count();
@@ -352,7 +365,11 @@ impl super::TerminalState {
                     payload,
                     bel_terminated,
                 } => match kind {
-                    StringKind::Osc => self.handle_osc_payload(&payload, bel_terminated),
+                    StringKind::Osc => self.handle_osc_payload(
+                        &payload,
+                        bel_terminated,
+                        stream_start.map(|start| start + at as u64),
+                    ),
                     StringKind::Dcs => {} // Non-DECRQSS DCS remains opaque.
                     StringKind::Apc => self.handle_kitty_apc_payload(&payload),
                     StringKind::Sos | StringKind::Pm => {}
