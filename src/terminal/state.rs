@@ -2345,13 +2345,7 @@ impl super::TerminalState {
                     self.active_output_provenance = None;
                 }
                 self.captured_command_output_bytes =
-                    self.captured_command_output_bytes.saturating_sub(
-                        evicted
-                            .captured_output
-                            .as_ref()
-                            .map(|output| output.text.len())
-                            .unwrap_or(0),
-                    );
+                    self.captured_command_output_bytes.saturating_sub(evicted.captured_bytes());
             }
         }
         self.command_records.push_back(CommandRecord {
@@ -2381,6 +2375,7 @@ impl super::TerminalState {
             finished_at: None,
             agent_generation: None,
             captured_output: None,
+            captured_annotations: None,
             output_source: None,
             running_output_source: None,
             output_preview: String::new(),
@@ -2654,21 +2649,24 @@ impl super::TerminalState {
         }
     }
 
-    pub(super) fn store_captured_command_output(&mut self, index: usize, output: ExtractedText) {
+    pub(super) fn store_captured_command_output(
+        &mut self,
+        index: usize,
+        output: ExtractedText,
+        annotations: Option<ArchiveAnnotations>,
+    ) {
         let previous_bytes = self
             .command_records
             .get_mut(index)
-            .and_then(|record| {
-                record.output_preview.clear();
-                record.captured_output.take()
-            })
-            .map(|previous| previous.text.len())
-            .unwrap_or(0);
+            .map_or(0, CommandRecord::retire_capture);
         self.captured_command_output_bytes = self
             .captured_command_output_bytes
             .saturating_sub(previous_bytes);
 
-        let output_bytes = output.text.len();
+        let annotations = annotations.filter(|attributes| {
+            output.text.len() + attributes.retained_bytes() <= MAX_CAPTURED_COMMAND_OUTPUT_BYTES
+        });
+        let output_bytes = output.text.len() + annotations.as_ref().map_or(0, ArchiveAnnotations::retained_bytes);
         while self
             .captured_command_output_bytes
             .saturating_add(output_bytes)
@@ -2685,11 +2683,12 @@ impl super::TerminalState {
             else {
                 break;
             };
-            self.command_records[evict_index].output_preview.clear();
-            if let Some(evicted) = self.command_records[evict_index].captured_output.take() {
-                self.captured_command_output_bytes = self
-                    .captured_command_output_bytes
-                    .saturating_sub(evicted.text.len());
+            let evicted = &mut self.command_records[evict_index];
+            let source_changed = evicted.output_source.is_some();
+            self.captured_command_output_bytes = self.captured_command_output_bytes
+                .saturating_sub(evicted.retire_capture());
+            if source_changed {
+                self.mark_completed_history_changed();
             }
         }
 
@@ -2700,6 +2699,7 @@ impl super::TerminalState {
             if let Some(record) = self.command_records.get_mut(index) {
                 record.output_preview = crate::fold_preview::from_plain(&output.text);
                 record.captured_output = Some(output);
+                record.captured_annotations = annotations.map(Arc::new);
             }
         }
     }
@@ -2708,12 +2708,13 @@ impl super::TerminalState {
         let Some(record_before_capture) = self.command_records.get(index).cloned() else {
             return;
         };
-        let extracted = record_before_capture
+        let (extracted, annotations) = record_before_capture
             .output_start
             .zip(record_before_capture.output_end)
             .and_then(|(start, end)| {
-                self.extract_text_range(start, end, MAX_COMPLETED_COMMAND_OUTPUT_BYTES)
-            });
+                self.extract_finished_output(start, end, MAX_COMPLETED_COMMAND_OUTPUT_BYTES)
+            })
+            .map_or((None, None), |(text, annotations)| (Some(text), annotations));
         let output_available = extracted.is_some();
         let head_dropped = record_before_capture.output_start.is_some_and(|start| {
             start.line_id
@@ -2725,7 +2726,7 @@ impl super::TerminalState {
             source.execution.head_dropped = head_dropped;
         }
         if let Some(output) = extracted.as_ref() {
-            self.store_captured_command_output(index, output.clone());
+            self.store_captured_command_output(index, output.clone(), annotations);
         }
         let Some(record) = self.command_records.get(index).cloned() else {
             return;
@@ -3274,13 +3275,7 @@ impl super::TerminalState {
         let mut captured_output_bytes = 0usize;
         let mut provenance = Vec::new();
         for record in &cleared {
-            captured_output_bytes = captured_output_bytes.saturating_add(
-                record
-                    .captured_output
-                    .as_ref()
-                    .map(|output| output.text.len())
-                    .unwrap_or(0),
-            );
+            captured_output_bytes = captured_output_bytes.saturating_add(record.captured_bytes());
             if let Some(entry) = self
                 .finished_output_provenance
                 .get(&record.sequence)
@@ -3345,13 +3340,7 @@ impl super::TerminalState {
                 evicted = evicted.saturating_add(1);
                 self.unregister_finished_output_zone(record.sequence);
                 self.captured_command_output_bytes =
-                    self.captured_command_output_bytes.saturating_sub(
-                        record
-                            .captured_output
-                            .as_ref()
-                            .map(|output| output.text.len())
-                            .unwrap_or(0),
-                    );
+                    self.captured_command_output_bytes.saturating_sub(record.captured_bytes());
             }
         }
         // Clear moved the old payloads outside the live cache budget; new
@@ -3362,14 +3351,8 @@ impl super::TerminalState {
             if self.captured_command_output_bytes <= MAX_CAPTURED_COMMAND_OUTPUT_BYTES {
                 break;
             }
-            if let Some(output) = {
-                record.output_preview.clear();
-                record.captured_output.take()
-            } {
-                self.captured_command_output_bytes = self
-                    .captured_command_output_bytes
-                    .saturating_sub(output.text.len());
-            }
+            self.captured_command_output_bytes = self.captured_command_output_bytes
+                .saturating_sub(record.retire_capture());
         }
         self.mark_finished_output_provenance_changed();
         self.mark_completed_history_changed();
@@ -3960,6 +3943,50 @@ impl super::TerminalState {
         end: BufferAnchor,
         max_bytes: usize,
     ) -> Option<ExtractedText> {
+        let mut extracted = BoundedTextBuilder::new(max_bytes);
+        self.visit_text_range(start, end, |character, _| extracted.push(character))?;
+        Some(extracted.finish())
+    }
+
+    fn extract_finished_output(
+        &self,
+        start: BufferAnchor,
+        end: BufferAnchor,
+        max_bytes: usize,
+    ) -> Option<(ExtractedText, Option<ArchiveAnnotations>)> {
+        let mut extracted = BoundedTextBuilder::new(max_bytes);
+        let mut attributes = ArchiveAnnotationBuilder::default();
+        self.visit_text_range(start, end, |character, cell| {
+            let offset = extracted.total_bytes;
+            extracted.push(character);
+            if let Some(cell) = cell {
+                attributes.push(
+                    offset..extracted.total_bytes,
+                    ArchiveStyle::from_rendition(cell.foreground, cell.background, Color::Default, cell.flags),
+                    self.hyperlink_uri(cell.hyperlink_id),
+                );
+            }
+        })?;
+        let mut annotations = attributes.finish();
+        if let Some(attributes) = annotations.as_mut().filter(|_| extracted.truncated) {
+            let total = extracted.total_bytes;
+            attributes.retain_head_tail(
+                extracted.head.len(),
+                total.saturating_sub(extracted.tail_bytes)..total,
+                extracted.head.len() + extracted.marker.len(),
+            );
+        }
+        let output = extracted.finish();
+        let annotations = annotations.filter(|snapshot| !snapshot.is_empty() && snapshot.valid_for(&output.text));
+        Some((output, annotations))
+    }
+
+    fn visit_text_range(
+        &self,
+        start: BufferAnchor,
+        end: BufferAnchor,
+        mut visit: impl FnMut(char, Option<&TerminalCell>),
+    ) -> Option<()> {
         if end < start {
             return None;
         }
@@ -3969,7 +3996,6 @@ impl super::TerminalState {
             return None;
         }
 
-        let mut extracted = BoundedTextBuilder::new(max_bytes);
         for absolute_row in start_row..=end_row {
             let cells = self.absolute_row_cells(absolute_row)?;
             let row_start = if absolute_row == start_row {
@@ -3990,17 +4016,17 @@ impl super::TerminalState {
             }
             for cell in &cells[row_start..row_end] {
                 if !cell.flags.wide_continuation() {
-                    extracted.push(cell.character);
+                    visit(cell.character, Some(cell));
                 }
             }
 
             if absolute_row < end_row
                 && !self.absolute_row_is_wrapped(absolute_row).unwrap_or(false)
             {
-                extracted.push('\n');
+                visit('\n', None);
             }
         }
-        Some(extracted.finish())
+        Some(())
     }
 
     /// Same extraction API for callers that already hold raw absolute buffer

@@ -1,4 +1,7 @@
-use super::{BufferAnchor, CommandRecord, CommandState, ExtractedText, TerminalState};
+use super::{
+    Arc, ArchiveAnnotations, BufferAnchor, CommandRecord, CommandState, ExtractedText,
+    TerminalState,
+};
 use jterm_core::completed_history::{
     Card, Checkpoint, Output, MAX_RECORDS, MAX_RETAINED_TEXT_BYTES,
 };
@@ -60,22 +63,19 @@ impl TerminalState {
                 source,
                 output: None,
             };
-            let Some(text_budget) = remaining.checked_sub(card.retained_text_bytes()) else {
+            let Some(payload_budget) = remaining.checked_sub(card.retained_bytes()) else {
                 break;
             };
-            remaining = text_budget;
-            if let Some(output) = record
-                .captured_output
-                .as_ref()
-                .filter(|output| output.text.len() <= remaining)
-            {
-                remaining -= output.text.len();
-                card.output = Some(Output {
-                    text: output.text.clone(),
-                    truncated: output.truncated,
-                    total_bytes: output.total_bytes as u64,
-                });
-            }
+            card.output = record.captured_output.as_ref().and_then(|output| {
+                Output::capture(
+                    &output.text,
+                    output.truncated,
+                    output.total_bytes as u64,
+                    record.captured_annotations.as_deref(),
+                    payload_budget,
+                )
+            });
+            remaining = payload_budget - card.output.as_ref().map_or(0, Output::retained_bytes);
             cards.push(card);
             if cards.len() == MAX_RECORDS {
                 break;
@@ -97,14 +97,24 @@ impl TerminalState {
         let (next_sequence, cards) = checkpoint.into_records();
         self.next_command_sequence = next_sequence;
         for card in cards {
-            let captured_output = card.output.map(|output| ExtractedText {
-                text: output.text,
-                truncated: output.truncated,
-                total_bytes: usize::try_from(output.total_bytes).unwrap_or(usize::MAX),
+            let mut captured_annotations = None;
+            let captured_output = card.output.map(|output| {
+                captured_annotations = output
+                    .annotations
+                    .and_then(|annotations| annotations.restore(&output.text))
+                    .map(Arc::new);
+                ExtractedText {
+                    text: output.text,
+                    truncated: output.truncated,
+                    total_bytes: usize::try_from(output.total_bytes).unwrap_or(usize::MAX),
+                }
             });
             self.captured_command_output_bytes += captured_output
                 .as_ref()
-                .map_or(0, |output| output.text.len());
+                .map_or(0, |output| output.text.len())
+                + captured_annotations
+                    .as_deref()
+                    .map_or(0, ArchiveAnnotations::retained_bytes);
             let output_preview = captured_output.as_ref().map_or_else(String::new, |output| {
                 crate::fold_preview::from_plain(&output.text)
             });
@@ -138,6 +148,7 @@ impl TerminalState {
                 finished_at: epoch_time(card.finished_at_ms),
                 agent_generation: None,
                 captured_output,
+                captured_annotations,
                 output_source: Some(card.source),
                 running_output_source: None,
                 output_preview,
@@ -154,7 +165,7 @@ mod tests {
 
     #[test]
     fn restore_keeps_exact_source_and_accepts_a_same_named_live_completion() {
-        const EXECUTION: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07source proof\r\n\x1b]133;C;id=proof;cmdline_url=source%20proof\x07visible\r\n\x1b]133;D;0;id=proof\x07";
+        const EXECUTION: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07source proof\r\n\x1b]133;C;id=proof;cmdline_url=source%20proof\x07\x1b[1;38;2;31;171;193mvisible\x1b[0m\r\n\x1b]133;D;0;id=proof\x07";
         let mut original = TerminalState::new(80, 24);
         original.process_input(EXECUTION);
         let source = original
@@ -172,6 +183,14 @@ mod tests {
         assert!(old.is_archived());
         assert_eq!(old.observed_execution_id(), "proof");
         assert_eq!(old.output_source.as_ref(), Some(&source));
+        let annotations = old.captured_annotations.as_ref().unwrap();
+        let text = &old.captured_output.as_ref().unwrap().text;
+        assert_eq!(&text[annotations.spans[0].bytes.clone()], "visible");
+        assert_eq!(
+            annotations.spans[0].style.foreground,
+            super::super::Color::Rgb(31, 171, 193)
+        );
+        assert!(annotations.spans[0].style.flags.bold());
         assert!(restored
             .buffer_anchor_to_absolute(old.prompt_start)
             .is_none());

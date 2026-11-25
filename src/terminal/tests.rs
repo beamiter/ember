@@ -5828,6 +5828,7 @@ fn undo_clear_blocks_reapplies_the_captured_output_budget_oldest_first() {
                 truncated: false,
                 total_bytes: per_record,
             },
+            None,
         );
         // Completion delivery is a separate bounded application queue.
         terminal.take_completed_command_events();
@@ -5911,6 +5912,7 @@ fn captured_output_cache_evicts_oldest_payloads_at_session_cap() {
                 truncated: false,
                 total_bytes: MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
             },
+            None,
         );
     }
 
@@ -9751,6 +9753,7 @@ fn finalized_preview_cache_is_replaced_and_evicted_with_its_capture() {
                 truncated: false,
                 total_bytes: text.len(),
             },
+            None,
         );
         assert_eq!(
             terminal.command_records()[index].output_preview,
@@ -9766,6 +9769,7 @@ fn finalized_preview_cache_is_replaced_and_evicted_with_its_capture() {
             truncated: false,
             total_bytes: MAX_CAPTURED_COMMAND_OUTPUT_BYTES + 1,
         },
+        None,
     );
     assert!(terminal.command_records()[index].captured_output.is_none());
     assert!(terminal.command_records()[index].output_preview.is_empty());

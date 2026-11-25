@@ -699,6 +699,10 @@ fn configure_fonts_and_gpu(
         organism_bold_fallbacks.clone(),
     );
     fonts.families.insert(
+        egui::FontFamily::Name("terminal-monospace-bold".into()),
+        organism_bold_fallbacks.clone(),
+    );
+    fonts.families.insert(
         egui::FontFamily::Name("organism-monospace-bold".into()),
         organism_bold_fallbacks,
     );

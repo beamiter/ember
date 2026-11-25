@@ -9,6 +9,7 @@ use crate::execution_journal::{self, HistoryLoad, HistoryRequestError, Persisted
 use crate::terminal::{CommandRecord, CommandState, MAX_COMPLETED_COMMAND_OUTPUT_BYTES};
 use eframe::egui;
 use jterm_core::block_contract::{classify_completed, CompletedBlockOutcome};
+use jterm_engine::archived_text::ArchiveAnnotations;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
@@ -321,6 +322,7 @@ struct DetailTextSnapshot {
     text: String,
     truncated: bool,
     total_bytes: usize,
+    annotations: Option<ArchiveAnnotations>,
 }
 
 #[derive(Clone, Debug)]
@@ -701,6 +703,7 @@ impl TerminalApp {
                             false,
                             command.len(),
                             COMMAND_DETAIL_COMMAND_BYTES,
+                            None,
                         )
                     });
                     let output = record.captured_output.as_ref().map(|output| {
@@ -709,6 +712,7 @@ impl TerminalApp {
                             output.truncated,
                             output.total_bytes,
                             COMMAND_DETAIL_OUTPUT_BYTES,
+                            record.captured_annotations.as_deref(),
                         )
                     });
                     let output_copy_available = record
@@ -1026,6 +1030,7 @@ impl TerminalApp {
                                     detail,
                                     replay_guard,
                                     preferred_fix_provider,
+                                    &self.current_theme,
                                     &mut action,
                                     &mut clear_selection,
                                 );
@@ -5344,6 +5349,7 @@ fn enrich_live_detail_from_history(
                 output.truncated,
                 usize::try_from(output.total_bytes).unwrap_or(usize::MAX),
                 COMMAND_DETAIL_OUTPUT_BYTES,
+                None,
             ));
             detail.output_from_history = true;
         }
@@ -5428,6 +5434,7 @@ fn render_command_detail(
     detail: &CommandDetailSnapshot,
     replay_guard: ReplayGuardSnapshot,
     preferred_fix_provider: crate::agent::AgentProvider,
+    theme: &crate::theme::Theme,
     action: &mut Option<CommandAction>,
     clear_selection: &mut bool,
 ) {
@@ -5655,13 +5662,12 @@ fn render_command_detail(
                         .max_height(180.0)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&output.text).monospace().small(),
-                                )
-                                .selectable(true)
-                                .wrap(),
-                            );
+                            let content: egui::WidgetText = if let Some(annotations) = &output.annotations {
+                                annotated_output(ui, &output.text, annotations, theme).into()
+                            } else {
+                                egui::RichText::new(&output.text).monospace().small().into()
+                            };
+                            ui.add(egui::Label::new(content).selectable(true).wrap());
                         });
                 }
                 (CommandState::Complete, None) => {
@@ -5843,12 +5849,14 @@ fn detail_text_snapshot(
     source_truncated: bool,
     total_bytes: usize,
     max_bytes: usize,
+    annotations: Option<&ArchiveAnnotations>,
 ) -> DetailTextSnapshot {
     if value.len() <= max_bytes {
         return DetailTextSnapshot {
             text: value.to_owned(),
             truncated: source_truncated,
             total_bytes: total_bytes.max(value.len()),
+            annotations: annotations.cloned(),
         };
     }
 
@@ -5873,11 +5881,71 @@ fn detail_text_snapshot(
     text.push_str(marker);
     text.push_str(&value[tail_start..]);
     debug_assert!(text.len() <= max_bytes);
+    let annotations = annotations.cloned().and_then(|mut annotations| {
+        annotations.retain_head_tail(head_end, tail_start..value.len(), head_end + marker.len());
+        (!annotations.is_empty() && annotations.valid_for(&text)).then_some(annotations)
+    });
     DetailTextSnapshot {
         text,
         truncated: true,
         total_bytes: total_bytes.max(value.len()),
+        annotations,
     }
+}
+
+fn annotated_output(
+    ui: &egui::Ui,
+    text: &str,
+    annotations: &ArchiveAnnotations,
+    theme: &crate::theme::Theme,
+) -> egui::text::LayoutJob {
+    use crate::color::{resolve_bg, resolve_fg};
+    use jterm_engine::{Color, UnderlineStyle};
+
+    let size = egui::TextStyle::Small.resolve(ui.style()).size;
+    let normal = egui::TextFormat {
+        font_id: egui::FontId::monospace(size),
+        color: ui.visuals().text_color(),
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    let mut offset = 0;
+    for span in &annotations.spans {
+        job.append(&text[offset..span.bytes.start], 0.0, normal.clone());
+        let style = span.style;
+        let flags = style.flags;
+        let mut foreground = resolve_fg(style.foreground, theme, flags.bold(), flags.dim());
+        let mut background = resolve_bg(style.background, theme);
+        if flags.inverse() {
+            std::mem::swap(&mut foreground, &mut background);
+        } else if style.background == Color::Default {
+            background = egui::Color32::TRANSPARENT;
+        }
+        let line_color = if style.underline_color == Color::Default {
+            foreground
+        } else {
+            resolve_fg(style.underline_color, theme, false, false)
+        };
+        let format = egui::TextFormat {
+            font_id: if flags.bold() {
+                egui::FontId::new(size, egui::FontFamily::Name("terminal-monospace-bold".into()))
+            } else {
+                normal.font_id.clone()
+            },
+            color: foreground,
+            background,
+            italics: flags.italic(),
+            underline: if flags.underline() == UnderlineStyle::None { egui::Stroke::NONE }
+                       else { egui::Stroke::new(1.0, line_color) },
+            strikethrough: if flags.strikethrough() { egui::Stroke::new(1.0, foreground) }
+                           else { egui::Stroke::NONE },
+            ..Default::default()
+        };
+        job.append(&text[span.bytes.clone()], 0.0, format);
+        offset = span.bytes.end;
+    }
+    job.append(&text[offset..], 0.0, normal);
+    job
 }
 
 fn format_byte_count(bytes: usize) -> String {
@@ -6952,7 +7020,7 @@ mod tests {
     #[test]
     fn command_detail_preview_is_utf8_safe_bounded_and_keeps_both_ends() {
         let value = format!("start-{}-end", "雪".repeat(40));
-        let preview = detail_text_snapshot(&value, false, value.len(), 48);
+        let preview = detail_text_snapshot(&value, false, value.len(), 48, None);
 
         assert!(preview.truncated);
         assert_eq!(preview.total_bytes, value.len());
@@ -6965,7 +7033,7 @@ mod tests {
 
     #[test]
     fn command_detail_preview_preserves_source_truncation_and_total_size() {
-        let preview = detail_text_snapshot("short", true, 4096, 128);
+        let preview = detail_text_snapshot("short", true, 4096, 128, None);
         assert_eq!(preview.text, "short");
         assert!(preview.truncated);
         assert_eq!(preview.total_bytes, 4096);

@@ -8,6 +8,7 @@
 use crate::block_mode;
 use crate::persistence_file;
 use crate::terminal::{CommandRecord, TerminalState, MAX_COMPLETED_COMMAND_OUTPUT_BYTES};
+use jterm_core::completed_history::OutputAnnotations;
 use jterm_core::screen_replay::CapturedExecutionSource;
 use serde::Serialize;
 use std::io::{self, Write};
@@ -80,6 +81,8 @@ pub struct SessionExportBlock {
     pub output_unavailable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_source: Option<CapturedExecutionSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_annotations: Option<OutputAnnotations>,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
@@ -294,8 +297,10 @@ pub fn snapshot_session(
                 Some(text) => (text.text, text.truncated, false),
                 None => (String::new(), false, true),
             };
+        let output_annotations = export_annotations(record, &output);
         let record_bytes = output
             .len()
+            .saturating_add(output_annotations.as_ref().map_or(0, OutputAnnotations::retained_bytes))
             .saturating_add(record.command.as_ref().map_or(0, String::len))
             .saturating_add(record.cwd.as_ref().map_or(0, String::len))
             .saturating_add(128);
@@ -318,6 +323,7 @@ pub fn snapshot_session(
             output_truncated,
             output_unavailable,
             output_source: record.output_source.clone(),
+            output_annotations,
             exit_code: record.exit_code,
             duration_ms: record.duration_ms,
             finished_at_ms: record
@@ -412,8 +418,10 @@ fn snapshot_selected_records<'a>(
         if output.len() > MAX_COMPLETED_COMMAND_OUTPUT_BYTES {
             return Err(too_large());
         }
+        let output_annotations = export_annotations(record, output);
         let record_bytes = output
             .len()
+            .saturating_add(output_annotations.as_ref().map_or(0, OutputAnnotations::retained_bytes))
             .saturating_add(record.command.as_ref().map_or(0, String::len))
             .saturating_add(record.cwd.as_ref().map_or(0, String::len))
             .saturating_add(128);
@@ -437,6 +445,7 @@ fn snapshot_selected_records<'a>(
                 .is_some_and(|text| text.truncated || text.total_bytes > text.text.len()),
             output_unavailable: captured.is_none(),
             output_source: record.output_source.clone(),
+            output_annotations,
             exit_code: record.exit_code,
             duration_ms: record.duration_ms,
             finished_at_ms: record
@@ -463,6 +472,14 @@ fn snapshot_selected_records<'a>(
         scope: SessionExportScope::Selection,
         blocks,
     })
+}
+
+fn export_annotations(record: &CommandRecord, output: &str) -> Option<OutputAnnotations> {
+    let captured = record.captured_output.as_ref()?;
+    if captured.text != output {
+        return None;
+    }
+    OutputAnnotations::new(output, record.captured_annotations.as_deref()?)
 }
 
 struct BoundedBuffer {
@@ -712,6 +729,7 @@ mod tests {
             output_truncated: false,
             output_unavailable: false,
             output_source: None,
+            output_annotations: None,
             exit_code: Some(0),
             duration_ms: Some(1250),
             finished_at_ms: Some(0),

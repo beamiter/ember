@@ -9,6 +9,7 @@ use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use jterm_core::click_cursor;
 use jterm_core::screen_replay::{CapturedExecutionSource, RunningExecutionSource};
+use jterm_engine::archived_text::{ArchiveAnnotationBuilder, ArchiveAnnotations, ArchiveStyle};
 use jterm_engine::command_blocks::{ShellMarkerClock, ShellMarkerPosition};
 use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
 use jterm_engine::retained_history::RetainedHistory;
@@ -17,6 +18,7 @@ use jterm_engine::screen::{
 };
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 pub use watch::{WatchCommand, WatchParsed};
 
 /// An explicit Chat button action bound to one observed shell lifecycle.
@@ -229,6 +231,7 @@ pub struct CommandRecord {
     /// Bounded normalized output captured at D. This survives scrollback
     /// eviction; `truncated`/`total_bytes` describe the original range.
     pub captured_output: Option<ExtractedText>,
+    pub captured_annotations: Option<Arc<ArchiveAnnotations>>,
     pub output_source: Option<CapturedExecutionSource>,
     running_output_source: Option<RunningExecutionSource>,
     /// Display-only bounded preview, cached with the finalized capture.
@@ -237,6 +240,19 @@ pub struct CommandRecord {
 }
 
 impl CommandRecord {
+    fn captured_bytes(&self) -> usize {
+        self.captured_output.as_ref().map_or(0, |output| output.text.len())
+            + self.captured_annotations.as_deref().map_or(0, ArchiveAnnotations::retained_bytes)
+    }
+
+    fn retire_capture(&mut self) -> usize {
+        let bytes = self.captured_bytes();
+        self.captured_output = None;
+        self.captured_annotations = None;
+        self.output_preview.clear();
+        bytes
+    }
+
     /// The original OSC identity, which can recur in a different PTY. Restored
     /// cards have a separate view identity and cannot consume live markers.
     pub fn observed_execution_id(&self) -> &str {
