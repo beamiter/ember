@@ -6,6 +6,7 @@ mod ai_chat_store;
 mod ai_command_suggestion;
 mod app;
 mod block_export;
+mod completed_history;
 mod block_mode;
 mod block_search;
 mod bottom_bar;
@@ -2650,7 +2651,7 @@ impl TerminalApp {
         );
 
         // 尝试获取实例锁，成功表示没有其他实例在运行
-        let lock_file = session_persistence::try_acquire_instance_lock();
+        let lock_file = session_persistence::try_acquire_instance_lock().map(Arc::new);
         let is_first_instance = lock_file.is_some();
 
         let mut session_restore_notice = None;
@@ -2791,9 +2792,16 @@ impl TerminalApp {
         }
         let mut session_manager = SessionManager::new(session, repaint_ctx, configured_shell);
 
-        // 恢复额外的会话（包括 restorable commands 回放）
+        let mut pane_history = completed_history::PaneHistory::default();
+        // Attach history only to pane IDs admitted by the restored layout.
         if let Some(snap) = saved_snapshot {
+            if !session_persistence_blocked && jterm_core::execution_journal::output_capture_enabled() {
+                if let Ok(path) = cfg.resolved_session_history_path() {
+                    pane_history.bind_layout(&path, &snap);
+                }
+            }
             session_manager.restore_from_snapshots(snap.sessions, saved_active_index);
+            pane_history.restore(session_manager.sessions());
             eprintln!(
                 "[SessionPersistence] Restored {} sessions",
                 session_manager.len()
@@ -3009,6 +3017,7 @@ impl TerminalApp {
             session_save_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
             session_persistence_blocked,
             session_recovery,
+            pane_history,
             ui_history_persistence,
             _lock_file: lock_file,
             mouse_line_wheel: jterm_core::wheel::WheelAccumulator::default(),
@@ -8764,6 +8773,13 @@ impl eframe::App for TerminalApp {
         // Debounce 保存配置和会话
         self.flush_config_save();
         self.flush_session_save();
+        if self.config.restore_session && !self.session_persistence_blocked
+            && jterm_core::execution_journal::output_capture_enabled()
+        {
+            if let Some(owner) = self._lock_file.as_ref() {
+                self.pane_history.tick(self.session_manager.sessions(), owner, ctx);
+            }
+        }
         self.check_config_hot_reload(ctx);
 
         // Handle shell exit: close current session
@@ -8839,13 +8855,16 @@ impl Drop for TerminalApp {
 
         // 保存当前会话到持久化存储（包含每个 session 的 cwd）。只有持有实例锁
         // 的主实例能更新共享快照，避免后开的临时窗口在退出时覆盖完整状态。
-        if self._lock_file.is_some() && !self.session_persistence_blocked {
+        if let Some(owner) = self._lock_file.as_ref().filter(|_| !self.session_persistence_blocked) {
             if let Ok(session_history_path) = self.config.resolved_session_history_path() {
                 let _ = session_persistence::ensure_session_history_dir(&session_history_path);
 
                 let snapshot = self.current_sessions_snapshot();
                 if let Err(e) = snapshot.save(&session_history_path) {
                     eprintln!("[SessionPersistence] Failed to save sessions: {}", e);
+                } else if self.config.restore_session && jterm_core::execution_journal::output_capture_enabled() {
+                    self.pane_history.bind_layout(&session_history_path, &snapshot);
+                    self.pane_history.flush(self.session_manager.sessions(), owner, Duration::from_secs(2));
                 }
             }
         }

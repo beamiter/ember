@@ -420,7 +420,14 @@ impl TerminalApp {
             }
             let result = save_resolved_session_snapshot(
                 self.config.resolved_session_history_path(),
-                |path| self.current_sessions_snapshot().save(path),
+                |path| {
+                    let snapshot = self.current_sessions_snapshot();
+                    snapshot.save(path)?;
+                    if self.config.restore_session && jterm_core::execution_journal::output_capture_enabled() {
+                        self.pane_history.bind_layout(path, &snapshot);
+                    }
+                    Ok(())
+                },
             );
             if let Err(error) = result {
                 use std::io::Write;

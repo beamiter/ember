@@ -460,13 +460,14 @@ pub struct TerminalApp {
     /// overwritten by the fresh fallback session on debounce or Drop.
     pub session_persistence_blocked: bool,
     pub session_recovery: Option<crate::session_recovery::SessionRecovery>,
+    pub pane_history: crate::completed_history::PaneHistory,
 
     /// A failed UI-history load/save pauses retries and keeps its recovery
     /// notice visible after ordinary transient status messages expire.
     pub ui_history_persistence: crate::history_persistence::UiHistoryPersistence,
 
     // Lock file to detect running instances
-    pub _lock_file: Option<crate::session_persistence::InstanceLock>,
+    pub _lock_file: Option<std::sync::Arc<crate::session_persistence::InstanceLock>>,
 
     // 鼠标报告模式下的滚轮累积器
     pub mouse_line_wheel: jterm_core::wheel::WheelAccumulator,

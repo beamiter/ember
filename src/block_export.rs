@@ -310,7 +310,7 @@ pub fn snapshot_session(
             .and_then(block_mode::epoch_secs)
             .unwrap_or(now_ms / 1000);
         blocks.push(SessionExportBlock {
-            id: record.id.clone(),
+            id: record.observed_execution_id().to_owned(),
             sequence: record.sequence,
             command: record.command.clone(),
             command_exact: record.command_exact,
@@ -428,7 +428,7 @@ fn snapshot_selected_records<'a>(
             .and_then(block_mode::epoch_secs)
             .unwrap_or(now_ms / 1000);
         blocks.push(SessionExportBlock {
-            id: record.id.clone(),
+            id: record.observed_execution_id().to_owned(),
             sequence: record.sequence,
             command: record.command.clone(),
             command_exact: record.command_exact,

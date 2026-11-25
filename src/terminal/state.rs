@@ -401,6 +401,7 @@ impl super::TerminalState {
             shell_marker_clock: ShellMarkerClock::default(),
             output_stream: None,
             next_command_sequence: 1,
+            completed_history_revision: 0,
             consumed_command_ids: VecDeque::new(),
             finished_output_provenance: HashMap::new(),
             finished_output_owners: HashMap::new(),
@@ -1357,6 +1358,8 @@ impl super::TerminalState {
         let next_raw_row_id = self.next_raw_row_id;
         let row_identity_revision = self.row_identity_revision;
         let next_command_sequence = self.next_command_sequence;
+        let completed_history_revision = self.completed_history_revision;
+        let had_completed_history = self.command_records.iter().any(|record| record.output_source.is_some());
         let direct_inline_cli = self.inline_cli_launch_floor.is_some();
         self.watch.prompt();
         let watch = std::mem::take(&mut self.watch);
@@ -1377,6 +1380,10 @@ impl super::TerminalState {
         self.next_raw_row_id = next_raw_row_id;
         self.row_identity_revision = row_identity_revision;
         self.next_command_sequence = next_command_sequence;
+        self.completed_history_revision = completed_history_revision;
+        if had_completed_history {
+            self.mark_completed_history_changed();
+        }
         self.set_inline_cli_launch(direct_inline_cli);
         self.screen.grid.row_ids_mut().fill(RawRowId::UNTRACKED);
         self.screen.alt_grid.row_ids_mut().fill(RawRowId::UNTRACKED);
@@ -2162,6 +2169,7 @@ impl super::TerminalState {
         // only for controls, so a right-to-left override or an invisible
         // joiner inside an id passed straight through to the UI.
         if id.is_empty()
+            || id.starts_with(ARCHIVED_COMMAND_ID_PREFIX)
             || id.chars().any(char::is_control)
             || id
                 .chars()
@@ -2326,6 +2334,9 @@ impl super::TerminalState {
         let (sequence, local_id) = self.next_command_identity()?;
         if self.command_records.len() >= MAX_COMMAND_MARKS {
             if let Some(evicted) = self.command_records.pop_front() {
+                if evicted.output_source.is_some() {
+                    self.mark_completed_history_changed();
+                }
                 self.unregister_finished_output_zone(evicted.sequence);
                 if self
                     .active_output_provenance
@@ -2345,6 +2356,7 @@ impl super::TerminalState {
         }
         self.command_records.push_back(CommandRecord {
             id: local_id,
+            archived_shell_id: None,
             sequence,
             command: None,
             command_exact: false,
@@ -2904,6 +2916,9 @@ impl super::TerminalState {
         if publish_completion {
             self.capture_and_queue_completed_command_output(index);
         }
+        if self.command_records.get(index).is_some_and(|record| record.output_source.is_some()) {
+            self.mark_completed_history_changed();
+        }
         let consumed_id = self
             .command_records
             .get(index)
@@ -3284,6 +3299,7 @@ impl super::TerminalState {
             provenance,
             captured_output_bytes,
         });
+        self.mark_completed_history_changed();
         cleared_count
     }
 
@@ -3356,6 +3372,7 @@ impl super::TerminalState {
             }
         }
         self.mark_finished_output_provenance_changed();
+        self.mark_completed_history_changed();
         stashed.saturating_sub(evicted.min(stashed))
     }
 

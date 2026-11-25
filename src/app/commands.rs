@@ -330,10 +330,12 @@ struct CommandDetailSnapshot {
     command_exact: bool,
     command_omitted: bool,
     output: Option<DetailTextSnapshot>,
+    source: Option<jterm_core::screen_replay::CapturedExecutionSource>,
     output_copy_available: bool,
     state: CommandState,
     command_from_history: bool,
     output_from_history: bool,
+    restored: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -725,10 +727,12 @@ impl TerminalApp {
                             && replayable_command.is_some(),
                         command_omitted: record.command_truncated && record.command.is_none(),
                         output,
+                        source: record.output_source.clone(),
                         output_copy_available,
                         state: record.state,
                         command_from_history: false,
                         output_from_history: false,
+                        restored: record.is_archived(),
                     })
                 });
             (
@@ -5281,7 +5285,7 @@ fn persisted_execution_matches_snapshot(
 fn persisted_execution_matches_live(live: &CommandRecord, persisted: &PersistedExecution) -> bool {
     persisted_execution_matches_snapshot(
         LiveExecutionIdentity {
-            id: &live.id,
+            id: live.observed_execution_id(),
             command: live.command.as_deref(),
             command_exact: live.command_exact,
             command_truncated: live.command_truncated,
@@ -5594,6 +5598,12 @@ fn render_command_detail(
             }
 
             ui.separator();
+            if let Some(source) = detail.source.as_ref() {
+                ui.label(egui::RichText::new(source.to_string().replace('`', "")).small());
+                if source.execution.head_dropped || source.execution.tail_dropped {
+                    ui.label(egui::RichText::new("Some terminal output was lost before capture.").small());
+                }
+            }
             match (detail.state, detail.output.as_ref()) {
                 (CommandState::Complete, Some(output)) if output.text.is_empty() => {
                     ui.label(
@@ -5603,7 +5613,9 @@ fn render_command_detail(
                     );
                 }
                 (CommandState::Complete, Some(output)) => {
-                    let output_source = if detail.output_from_history {
+                    let output_source = if detail.restored {
+                        "Restored output"
+                    } else if detail.output_from_history {
                         "Persisted output"
                     } else {
                         "Output"

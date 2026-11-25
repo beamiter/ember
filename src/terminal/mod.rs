@@ -1,4 +1,6 @@
+mod completed_history;
 mod projection_budget;
+use completed_history::ARCHIVED_COMMAND_ID_PREFIX;
 pub use projection_budget::ProjectionUnavailable;
 pub mod search_chunk;
 pub mod search_worker;
@@ -175,6 +177,7 @@ pub enum CommandState {
 pub struct CommandRecord {
     /// Shell supplied `jsh_id`/`id`, or a terminal-local stable fallback.
     pub id: String,
+    archived_shell_id: Option<String>,
     pub sequence: u64,
     /// Exact command supplied as `cmdline_url`, when available. For generic
     /// shells this may be reconstructed from the final displayed input.
@@ -231,6 +234,18 @@ pub struct CommandRecord {
     /// Display-only bounded preview, cached with the finalized capture.
     pub output_preview: String,
     started_instant: Option<std::time::Instant>,
+}
+
+impl CommandRecord {
+    /// The original OSC identity, which can recur in a different PTY. Restored
+    /// cards have a separate view identity and cannot consume live markers.
+    pub fn observed_execution_id(&self) -> &str {
+        self.archived_shell_id.as_deref().unwrap_or(&self.id)
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.archived_shell_id.is_some()
+    }
 }
 
 // Keep the original semantic trace stable. Source records have separate
@@ -689,6 +704,7 @@ pub struct TerminalState {
     shell_marker_clock: ShellMarkerClock,
     output_stream: Option<uuid::Uuid>,
     next_command_sequence: u64,
+    completed_history_revision: u64,
     /// Recently closed OSC execution ids. Records can be evicted or cleared
     /// by RIS, so this bounded authority prevents a delayed duplicate D from
     /// being adopted by a later terminal-local placeholder.
