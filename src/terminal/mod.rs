@@ -171,7 +171,7 @@ pub enum CommandState {
 /// A complete OSC 133 A/B/C/D lifecycle. The legacy [`CommandMark`] list is
 /// retained for source compatibility, while this is the canonical semantic
 /// representation used by command-history UI and AI context capture.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CommandRecord {
     /// Shell supplied `jsh_id`/`id`, or a terminal-local stable fallback.
     pub id: String,
@@ -231,6 +231,43 @@ pub struct CommandRecord {
     /// Display-only bounded preview, cached with the finalized capture.
     pub output_preview: String,
     started_instant: Option<std::time::Instant>,
+}
+
+// Keep the original semantic trace stable. Source records have separate
+// tests for byte positions and identities across read boundaries.
+impl std::fmt::Debug for CommandRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandRecord")
+            .field("id", &self.id)
+            .field("sequence", &self.sequence)
+            .field("command", &self.command)
+            .field("command_exact", &self.command_exact)
+            .field("command_truncated", &self.command_truncated)
+            .field("cwd", &self.cwd)
+            .field("cwd_after", &self.cwd_after)
+            .field("session_id", &self.session_id)
+            .field("seq", &self.seq)
+            .field("started_at_ms", &self.started_at_ms)
+            .field("prompt_start", &self.prompt_start)
+            .field("command_start", &self.command_start)
+            .field("output_start", &self.output_start)
+            .field("output_end", &self.output_end)
+            .field("end", &self.end)
+            .field("exit_code", &self.exit_code)
+            .field("duration_ms", &self.duration_ms)
+            .field("state", &self.state)
+            .field("complete", &self.complete)
+            .field("start_mark_seen", &self.start_mark_seen)
+            .field("completion_provenance", &self.completion_provenance)
+            .field("started_at", &self.started_at)
+            .field("finished_at", &self.finished_at)
+            .field("agent_generation", &self.agent_generation)
+            .field("captured_output", &self.captured_output)
+            .field("output_preview", &self.output_preview)
+            .field("started_instant", &self.started_instant)
+            .finish()
+    }
 }
 
 /// Plain-text terminal extraction with explicit capacity/truncation metadata.
