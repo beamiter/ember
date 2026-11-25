@@ -11,10 +11,10 @@ categories = ["command-line-utilities", "gui"]
 
 [dependencies]
 # The Git declarations are the published baseline for the local family candidate.
-jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "7e7a4fb1c31b89f64deab582d0e1f045706afc9c" }
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 libc = "0.2"
-jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "7e7a4fb1c31b89f64deab582d0e1f045706afc9c" }
+jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -57,7 +57,7 @@ harfrust = "0.14.0"
 sha2 = "0.10"
 # Test-only lossless original-production oracle transport.
 flate2 = "=1.1.9"
-jterm_core = { version = "0.2.0", features = ["session-parity-tests", "terminal-session-actor-test-hooks"], git = "https://github.com/beamiter/jterm_core.git", rev = "7e7a4fb1c31b89f64deab582d0e1f045706afc9c" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests", "terminal-session-actor-test-hooks"], git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
