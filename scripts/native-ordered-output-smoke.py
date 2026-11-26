@@ -88,6 +88,7 @@ def run(binary, output, backend):
     smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "block"\napp_renderer = "glow"\n'
                             'restore_session = false\nosc52_clipboard_write = true\n'
                             'initial_width = 1100\ninitial_height = 800\neva_companion_enabled = false\n')
+    smoke.config.chmod(0o600)
     result = {'backend': backend, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
               'cases': {}}
 
