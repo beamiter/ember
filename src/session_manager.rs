@@ -778,10 +778,7 @@ impl SessionManager {
                 session.metadata.unseen_output = false;
             }
             let mut data = std::mem::take(&mut session.pending_output);
-            let mut exit_code = None;
-            let mut exited = false;
-
-            if share > 0 && data.len() < share {
+            if share > 0 && session.pending_exit.is_none() && data.len() < share {
                 loop {
                     match session.shell.events().try_recv() {
                         Ok(ShellEvent::Output(chunk)) => {
@@ -792,8 +789,7 @@ impl SessionManager {
                         }
                         Ok(ShellEvent::ExitTail(tail)) => session.exit_tail = tail,
                         Ok(ShellEvent::Exit(code)) => {
-                            exit_code = Some(code);
-                            exited = true;
+                            session.pending_exit = Some((Some(code), std::time::Instant::now()));
                             break;
                         }
                         Ok(ShellEvent::Error(error)) => {
@@ -802,7 +798,7 @@ impl SessionManager {
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => break,
                         Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                            exited = true;
+                            session.pending_exit = Some((None, std::time::Instant::now()));
                             break;
                         }
                     }
@@ -894,12 +890,14 @@ impl SessionManager {
                 }
             }
 
-            if exited {
-                result.exited_sessions.push(ExitedSession {
-                    session_id: session.metadata.session_id.clone(),
-                    exit_code,
-                    exit_output_notice: session.exit_output_notice(exit_code),
-                });
+            if session.pending_output.is_empty() {
+                if let Some((exit_code, _)) = session.pending_exit.take() {
+                    result.exited_sessions.push(ExitedSession {
+                        session_id: session.metadata.session_id.clone(),
+                        exit_code,
+                        exit_output_notice: session.exit_output_notice(exit_code),
+                    });
+                }
             }
             if protocol_responses.has_pending()
                 || !session.pending_output.is_empty()

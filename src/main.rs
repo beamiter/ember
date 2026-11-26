@@ -125,7 +125,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use terminal::{clamp_terminal_dimensions, TerminalState};
 use ui::{grid_position_from_content, TerminalRenderer};
 
@@ -7176,7 +7176,10 @@ impl eframe::App for TerminalApp {
         // 从 channel 中收集数据，直到达到字节上限
         let shell_events_are_live =
             session.purpose != crate::session::SessionPurpose::RetainedCommand;
-        if shell_events_are_live && accumulated_data.len() < max_bytes_per_frame {
+        if shell_events_are_live
+            && session.pending_exit.is_none()
+            && accumulated_data.len() < max_bytes_per_frame
+        {
             loop {
                 match session.shell.events().try_recv() {
                     Ok(ShellEvent::Output(data)) => {
@@ -7189,30 +7192,7 @@ impl eframe::App for TerminalApp {
                     }
                     Ok(ShellEvent::ExitTail(tail)) => session.exit_tail = tail,
                     Ok(ShellEvent::Exit(code)) => {
-                        if let Some(editor) = self.vim9_editors.remove(&session.metadata.session_id)
-                        {
-                            editor.session.revoke();
-                        }
-                        crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
-                        shell_exit_observed = true;
-                        shell_exit_code = Some(code);
-                        retain_exited_terminal = active_task_terminal.is_some();
-                        let uptime = session.shell.uptime();
-                        if active_task_terminal.is_some() {
-                            // Task feedback is composed after applying the authoritative exit below.
-                        } else if code != 0 && uptime < SHELL_STARTUP_GRACE {
-                            shell_startup_failed = true;
-                            self.status_message = format!(
-                                "Shell failed to start (exit code {code}). Check the `shell` setting in the config panel."
-                            );
-                            self.status_expires_at = None;
-                        } else {
-                            self.status_message = format!("Shell exited with code: {}", code);
-                            self.status_expires_at =
-                                Some(std::time::Instant::now() + Duration::from_secs(6));
-                        }
-                        has_new_output = true;
-                        shell_exited = true;
+                        session.pending_exit = Some((Some(code), Instant::now()));
                         break;
                     }
                     Ok(ShellEvent::Error(e)) => {
@@ -7224,9 +7204,7 @@ impl eframe::App for TerminalApp {
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        shell_exit_observed = true;
-                        retain_exited_terminal = active_task_terminal.is_some();
-                        shell_exited = true;
+                        session.pending_exit = Some((None, Instant::now()));
                         break;
                     }
                 }
@@ -7318,6 +7296,36 @@ impl eframe::App for TerminalApp {
                         log::warn!(
                             "jsh execution output journal queue rejected an event: {error:?}"
                         );
+                    }
+                }
+            }
+        }
+
+        // Apply the exit only after the final ordered output batch has been parsed.
+        if session.pending_output.is_empty() {
+            if let Some((code, observed_at)) = session.pending_exit.take() {
+                if let Some(editor) = self.vim9_editors.remove(&session.metadata.session_id) {
+                    editor.session.revoke();
+                }
+                shell_exit_observed = true;
+                shell_exit_code = code;
+                retain_exited_terminal = active_task_terminal.is_some();
+                has_new_output |= code.is_some();
+                shell_exited = true;
+                if let Some(code) = code {
+                    crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
+                    let uptime = session.shell.uptime_at(observed_at);
+                    if active_task_terminal.is_some() {
+                        // Task feedback is composed after applying the authoritative exit below.
+                    } else if code != 0 && uptime < SHELL_STARTUP_GRACE {
+                        shell_startup_failed = true;
+                        self.status_message = format!(
+                            "Shell failed to start (exit code {code}). Check the `shell` setting in the config panel."
+                        );
+                        self.status_expires_at = None;
+                    } else {
+                        self.status_message = format!("Shell exited with code: {code}");
+                        self.status_expires_at = Some(Instant::now() + Duration::from_secs(6));
                     }
                 }
             }

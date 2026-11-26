@@ -250,6 +250,8 @@ pub struct Session {
     /// Exit tail and exit status can arrive in different frames or on either
     /// side of a focus change. Keep the notice with the originating shell.
     pub(crate) exit_tail: jterm_core::exit_status::ExitTail,
+    // Hold the status with its observation time until the parser consumes the tail.
+    pub(crate) pending_exit: Option<(Option<i32>, Instant)>,
     pub(crate) terminal_presentation: TerminalPresentation,
     /// Session-owned view policy. Renderers are reused across tabs/panes and
     /// must never carry collapse state or projected scroll between sessions.
@@ -439,6 +441,7 @@ impl Session {
             pending_input: Vec::new(),
             pending_output: crate::output_batch::OutputBuffer::default(),
             exit_tail: jterm_core::exit_status::ExitTail::Complete,
+            pending_exit: None,
             terminal_presentation: TerminalPresentation::default(),
             projection_policy: ProjectionPolicy::new(),
             projection_view_state: ProjectionViewState::new(),

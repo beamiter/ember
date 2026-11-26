@@ -145,6 +145,10 @@ impl ShellSession {
         self.started_at.elapsed()
     }
 
+    pub fn uptime_at(&self, observed_at: std::time::Instant) -> std::time::Duration {
+        observed_at.saturating_duration_since(self.started_at)
+    }
+
     pub fn shell_program(&self) -> Option<&str> {
         self.shell_program.as_deref()
     }
