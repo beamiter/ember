@@ -162,9 +162,7 @@ fn bench_dense_search(c: &mut Criterion) {
     let mut group = c.benchmark_group("dense_search");
     for cols in [128, 512, ember::terminal::MAX_TERMINAL_COLS] {
         let mut terminal = TerminalState::new(cols, 1);
-        for col in 0..cols {
-            terminal.screen.grid.get_mut(0, col).character = 'µ';
-        }
+        terminal.process_batch("µ".repeat(cols).as_bytes());
         for (name, regex, sensitive) in [
             ("literal", false, true),
             ("folded_literal", false, false),
