@@ -409,12 +409,9 @@ mod unix_pty {
                 };
 
                 // 工作目录的 C 字符串(若指定)
-                let cwd_cstr = match cwd {
-                    Some(dir) => {
-                        Some(CString::new(dir).map_err(|_| anyhow!("Invalid working directory"))?)
-                    }
-                    None => None,
-                };
+                let cwd_cstr = cwd.map(CString::new).transpose().map_err(|error| {
+                    PtyLaunchError::PrepareWorkingDirectory(std::io::Error::from(error))
+                })?;
                 let cwd_directory = match (cwd, pinned_cwd) {
                     (Some(_), directory @ Some(_)) => directory,
                     (None, Some(_)) => {
@@ -508,6 +505,8 @@ mod unix_pty {
                         session: companion_host::pty_session::PtySession::capture(child_pid),
                     })
                 })
+                .map_err(PtyLaunchError::ExecConfirmed)
+                .map_err(Into::into)
             }
         }
 

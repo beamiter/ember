@@ -4769,7 +4769,7 @@ impl TerminalApp {
             let kitty_memory_mb = terminal.kitty_graphics.image_memory_mb();
             let scrollback_max = terminal.max_scrollback();
             drop(terminal);
-            let pending_output_bytes = session.pending_output.len();
+            let pending_output_bytes = session.shell.buffered_output_bytes();
             let session_count = self.session_manager.len();
             let texture_cache_size = self.renderer.texture_cache_len();
             let frame_budget_kb = self.adaptive_frame_budget / 1024;

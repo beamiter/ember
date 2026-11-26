@@ -1,6 +1,6 @@
 use crate::session::{Session, SessionPurpose};
 use crate::session_persistence;
-use crate::shell::{ShellEvent, ShellSession, ShellWriteError};
+use crate::shell::{OutputNotice, ShellSession, ShellWriteError};
 use crate::terminal::{
     clamp_terminal_dimensions, ClipboardReadRequest, CompletedCommandEvent, CompletedCommandOutput,
     TerminalDefaultColors, TerminalState,
@@ -777,66 +777,28 @@ impl SessionManager {
             if visible_session_indices.contains(&session_idx) && window_focused {
                 session.metadata.unseen_output = false;
             }
-            let mut data = std::mem::take(&mut session.pending_output);
-            if share > 0 && session.pending_exit.is_none() && data.len() < share {
-                loop {
-                    match session.shell.events().try_recv() {
-                        Ok(ShellEvent::Output(chunk)) => {
-                            data.extend(chunk);
-                            if data.len() >= share {
-                                break;
-                            }
-                        }
-                        Ok(ShellEvent::ExitTail(tail)) => session.exit_tail = tail,
-                        Ok(ShellEvent::Exit(code)) => {
-                            session.pending_exit = Some((Some(code), std::time::Instant::now()));
-                            break;
-                        }
-                        Ok(ShellEvent::Error(error)) => {
-                            result.errors.push((session_idx, error));
-                            break;
-                        }
-                        Err(crossbeam_channel::TryRecvError::Empty) => break,
-                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                            session.pending_exit = Some((None, std::time::Instant::now()));
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if share == 0 {
-                data.quarantine();
-                session.pending_output = data;
-                data = crate::output_batch::OutputBuffer::default();
-                if !session.pending_output.is_empty() || !session.shell.events().is_empty() {
-                    result.has_more = true;
-                }
-            } else if data.len() > share {
-                session.pending_output = data.split_off(share);
-            }
-
-            if !data.is_empty() {
+            let mut terminal = session.terminal.lock();
+            let progress = session.shell.poll_output(
+                share,
+                || !protocol_responses.has_pending(),
+                |data, _| {
+                    terminal.process_output_buffer(data, |_| {});
+                    session
+                        .terminal_presentation
+                        .note_output(std::time::Instant::now());
+                },
+            );
+            if progress.bytes_applied != 0 {
                 result.had_output = true;
-                result.bytes_processed += data.len();
-                remaining_budget = remaining_budget.saturating_sub(data.len());
-                // A split pane is already visible even when it is not the
-                // focused session; only hidden tabs should gain an unread dot.
+                result.bytes_processed += progress.bytes_applied;
+                remaining_budget = remaining_budget.saturating_sub(progress.bytes_applied);
+                // Visible split panes already display their output.
                 if !visible_session_indices.contains(&session_idx) {
                     session.metadata.unseen_output = true;
                 }
             }
 
-            // Protocol timers and side effects must progress even in a silent
-            // PTY. In particular, synchronized-output mode otherwise remains
-            // frozen forever if an application dies after its begin marker.
-            let mut terminal = session.terminal.lock();
-            if !data.is_empty() {
-                terminal.process_output_buffer(&data, |_| {});
-                session
-                    .terminal_presentation
-                    .note_output(std::time::Instant::now());
-            }
+            // Timers and terminal side effects also progress when a PTY is silent.
             terminal.check_sync_output_timeout();
             let response = terminal.get_output();
             if let Err((error, mut response)) = protocol_responses.try_enqueue(response) {
@@ -890,21 +852,19 @@ impl SessionManager {
                 }
             }
 
-            if session.pending_output.is_empty() {
-                if let Some((exit_code, _)) = session.pending_exit.take() {
+            match progress.notice {
+                Some(OutputNotice::Exited { code, tail, .. }) => {
+                    session.exit_tail = tail;
                     result.exited_sessions.push(ExitedSession {
                         session_id: session.metadata.session_id.clone(),
-                        exit_code,
-                        exit_output_notice: session.exit_output_notice(exit_code),
+                        exit_code: code,
+                        exit_output_notice: session.exit_output_notice(code),
                     });
                 }
+                Some(OutputNotice::Error(error)) => result.errors.push((session_idx, error)),
+                None => {}
             }
-            if protocol_responses.has_pending()
-                || !session.pending_output.is_empty()
-                || !session.shell.events().is_empty()
-            {
-                result.has_more = true;
-            }
+            result.has_more |= progress.has_more || protocol_responses.has_pending();
         }
 
         result
@@ -1053,7 +1013,8 @@ impl SessionManager {
         else {
             return false;
         };
-        if self.sessions[index].purpose == SessionPurpose::Interactive {
+        let session = &self.sessions[index];
+        if session.purpose == SessionPurpose::Interactive || !session.shell.output_finished() {
             return false;
         }
         self.freeze_exited_terminal(index);
@@ -1086,7 +1047,6 @@ impl SessionManager {
         let session = &mut self.sessions[index];
         session.purpose = SessionPurpose::RetainedCommand;
         session.pending_input.clear();
-        session.shell.freeze_after_exit();
         self.protocol_responses[index].close();
     }
 
@@ -1160,7 +1120,8 @@ impl SessionManager {
             command_argv.as_deref(),
             pinned_cwd,
             crate::runtime_wake::egui_wake(self.repaint_ctx.clone()),
-        )?;
+        )
+        .map_err(|error| format!("{error:#}"))?;
         let mut terminal = self.new_terminal_state(cols, rows);
         if let Some(argv) = command_argv.as_deref() {
             terminal.set_inline_cli_launch(crate::agent_cli::is_inline_launch(argv));
@@ -1244,8 +1205,7 @@ impl SessionManager {
             .filter(|index| *index != self.active_index)
     }
 
-    /// 扫描所有后台会话:若其 shell 事件通道有未消费数据,标记 unseen_output。
-    /// 主循环每帧只 drain active session,这里用通道非空作为"后台有产出"的代理。
+    /// Mark background output that is queued or awaiting the parser.
     pub fn refresh_unseen_flags(&mut self, visible_session_indices: &[usize]) {
         let active = self.active_index;
         for (i, s) in self.sessions.iter_mut().enumerate() {
@@ -1253,7 +1213,7 @@ impl SessionManager {
                 s.metadata.unseen_output,
                 i == active,
                 visible_session_indices.contains(&i),
-                !s.shell.events().is_empty(),
+                s.shell.has_pending_output(),
             );
         }
     }
@@ -1395,26 +1355,28 @@ impl SessionManager {
             let session_id = restored_or_fresh_session_id(session_id, &used_session_ids);
             used_session_ids.insert(session_id.clone());
             let cwd_ref = cwd.as_deref();
-            let mut shell_result = ShellSession::new_with_cwd(
+            let mut shell_result = ShellSession::new_with_pinned_cwd(
                 80,
                 24,
                 cwd_ref,
                 Some(&session_id),
                 self.configured_shell.as_deref(),
                 None,
+                None,
                 crate::runtime_wake::egui_wake(self.repaint_ctx.clone()),
             );
             if let Err(error) = &shell_result {
-                if cwd_ref.is_some() {
+                if cwd_ref.is_some() && ShellSession::failed_working_directory(error) {
                     eprintln!(
-                        "Failed to restore session in saved cwd ({error}); retrying in default cwd"
+                        "Failed to restore session in saved cwd ({error:#}); retrying in default cwd"
                     );
-                    shell_result = ShellSession::new_with_cwd(
+                    shell_result = ShellSession::new_with_pinned_cwd(
                         80,
                         24,
                         None,
                         Some(&session_id),
                         self.configured_shell.as_deref(),
+                        None,
                         None,
                         crate::runtime_wake::egui_wake(self.repaint_ctx.clone()),
                     );
@@ -1432,7 +1394,7 @@ impl SessionManager {
                     restored_indices[snapshot_idx] = Some(self.sessions.len() - 1);
                 }
                 Err(e) => {
-                    eprintln!("Failed to restore session: {}", e);
+                    eprintln!("Failed to restore session: {e:#}");
                 }
             }
         }
@@ -1530,6 +1492,27 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn wait_for_exit(manager: &mut SessionManager, session_id: &str) -> super::ExitedSession {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let barriers = SessionInputBarriers::default();
+        loop {
+            let status = manager.pump_all_sessions(4096, None, &barriers);
+            if let Some(exit) = status
+                .exited_sessions
+                .into_iter()
+                .find(|exit| exit.session_id == session_id)
+            {
+                return exit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture shell did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn incomplete_exit_keeps_the_last_shell_available_for_review() {
         let repaint = egui::Context::default();
@@ -1544,12 +1527,6 @@ mod tests {
             crate::runtime_wake::egui_wake(repaint.clone()),
         )
         .unwrap();
-        let crate::shell::ShellEvent::Exit(code) =
-            shell.events().recv_timeout(Duration::from_secs(2)).unwrap()
-        else {
-            panic!("expected the fixture shell to exit");
-        };
-        assert_eq!(code, 17);
         let session = Session::new(
             "Fixture shell".to_string(),
             Vec::new(),
@@ -1558,10 +1535,12 @@ mod tests {
         );
         let id = session.metadata.session_id.clone();
         let mut manager = SessionManager::new(session, repaint, None);
+        let code = wait_for_exit(&mut manager, &id).exit_code;
+        assert_eq!(code, Some(17));
         assert!(!manager.retain_incomplete_exit(&id));
         let session = manager.get_active_session_mut();
         session.exit_tail = jterm_core::exit_status::ExitTail::ReadFailed;
-        let status = session.exit_output_notice(Some(code)).unwrap();
+        let status = session.exit_output_notice(code).unwrap();
         assert!(status.starts_with("Fixture shell exited with code 17."));
         assert!(status.contains("Some final output may have been omitted."));
         assert!(manager.retain_incomplete_exit(&id));
@@ -1626,6 +1605,11 @@ mod tests {
         assert_eq!(
             manager.sessions()[created.session_index].purpose,
             SessionPurpose::EphemeralCommand
+        );
+        assert!(!manager.retain_exited_command(&created.session_id));
+        assert_eq!(
+            wait_for_exit(&mut manager, &created.session_id).exit_code,
+            Some(0)
         );
         assert!(manager.retain_exited_command(&created.session_id));
         assert_eq!(

@@ -118,7 +118,7 @@ pub(crate) use jterm_core::char_width;
 use parking_lot::Mutex as ParkingMutex;
 use session::Session;
 use session_manager::{ProtocolResponseQueueError, ProtocolResponseSender, SessionManager};
-use shell::{ShellEvent, ShellSession};
+use shell::{OutputNotice, OutputProgress, ShellSession};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
@@ -2947,28 +2947,26 @@ impl TerminalApp {
 
         let configured_shell = std::env::var("EMBER_SHELL").ok().or(cfg.shell.clone());
 
-        let shell = match ShellSession::new_with_cwd(
+        let shell = match ShellSession::new_with_pinned_cwd(
             cols,
             rows,
             first_cwd.as_deref(),
             Some(&first_session_id),
             configured_shell.as_deref(),
             startup_argv.as_deref(),
+            None,
             crate::runtime_wake::egui_wake(repaint_ctx.clone()),
         ) {
             Ok(session) => {
                 eprintln!("✓ Shell session started successfully");
                 session
             }
-            Err(e) => {
-                if startup_editor.is_some() {
-                    return Err(format!("Vim9 editor process could not start: {e}"));
-                }
-                eprintln!(
-                    "✗ Failed to start shell with saved cwd, falling back: {}",
-                    e
-                );
-                match ShellSession::new_with_cwd(
+            Err(error) if startup_editor.is_some() => {
+                return Err(format!("Vim9 editor process could not start: {error:#}"));
+            }
+            Err(error) if first_cwd.is_some() && ShellSession::failed_working_directory(&error) => {
+                eprintln!("✗ Failed to start shell with saved cwd, falling back: {error:#}");
+                ShellSession::new_with_cwd(
                     cols,
                     rows,
                     None,
@@ -2976,16 +2974,12 @@ impl TerminalApp {
                     configured_shell.as_deref(),
                     None,
                     crate::runtime_wake::egui_wake(repaint_ctx.clone()),
-                ) {
-                    Ok(session) => session,
-                    Err(e2) => {
-                        return Err(format!(
-                            "Cannot create shell session: {} (after fallback from: {})",
-                            e2, e
-                        ));
-                    }
-                }
+                )
+                .map_err(|retry| {
+                    format!("Cannot create shell session: {retry} (after fallback from: {error:#})")
+                })?
             }
+            Err(error) => return Err(format!("Cannot create shell session: {error:#}")),
         };
 
         let mut session = Session::with_default_name_and_session_id(
@@ -7156,154 +7150,92 @@ impl eframe::App for TerminalApp {
             ctx.request_repaint();
         }
 
-        // Step 6: 处理 shell 事件
-        // 关键：限制每帧处理的总字节数，防止大量 ANSI 数据阻塞 UI 线程导致假死。
-        // 超出限制的数据保存到当前 session 自己的 pending_output，
-        // 下一帧继续处理。绝不能放在 TerminalApp 全局缓冲中：帧间切 tab
-        // 会把旧 session 的 ANSI 字节流喂给新 session，造成串屏和终端模式污染。
-        // 使用自适应帧预算，根据帧时间动态调整
-        let mut has_new_output = false;
-        let max_bytes_per_frame = active_output_budget;
-        let mut has_more_data = false;
-        let mut active_processed_bytes = 0;
-
-        // 先取回上一帧未处理完的数据
-        let mut accumulated_data = std::mem::take(&mut session.pending_output);
-        if !accumulated_data.is_empty() {
-            has_new_output = true;
-        }
-
-        // 从 channel 中收集数据，直到达到字节上限
-        let shell_events_are_live =
-            session.purpose != crate::session::SessionPurpose::RetainedCommand;
-        if shell_events_are_live
-            && session.pending_exit.is_none()
-            && accumulated_data.len() < max_bytes_per_frame
-        {
-            loop {
-                match session.shell.events().try_recv() {
-                    Ok(ShellEvent::Output(data)) => {
-                        accumulated_data.extend(data);
-                        has_new_output = true;
-                        if accumulated_data.len() >= max_bytes_per_frame {
-                            has_more_data = true;
-                            break;
+        // The shared output owner keeps any unparsed bytes with this PTY.
+        let progress = if session.purpose == crate::session::SessionPurpose::RetainedCommand {
+            OutputProgress::default()
+        } else {
+            session.shell.poll_output(
+                active_output_budget,
+                || !active_protocol_responses.has_pending(),
+                |data, backlogged| {
+                    let mut terminal = session.terminal.lock();
+                    let active_parse_started = std::time::Instant::now();
+                    terminal.process_output_buffer(data, |update| {
+                        self.organism
+                            .watch_parsed(&active_session_id, update, backlogged);
+                    });
+                    session
+                        .terminal_presentation
+                        .note_output(std::time::Instant::now());
+                    terminal.check_sync_output_timeout();
+                    terminal_parse_time += active_parse_started.elapsed();
+                    let completed_outputs = terminal.take_completed_command_events();
+                    self.organism.batch(
+                        &active_session_id,
+                        terminal.command_records(),
+                        &completed_outputs,
+                        terminal.is_alt_buffer_active(),
+                        backlogged,
+                    );
+                    let rang_bell = terminal.take_pending_bell();
+                    // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
+                    // 按时长自动过期,否则任何快速输出都会把瞬时反馈瞬间吞掉。
+                    // 有输出时更新最后活动时间
+                    self.last_activity_time = std::time::Instant::now();
+                    drop(terminal);
+                    if rang_bell {
+                        if crate::session_manager::bell_sets_unseen(window_focused, true) {
+                            session.metadata.unseen_output = true;
                         }
-                    }
-                    Ok(ShellEvent::ExitTail(tail)) => session.exit_tail = tail,
-                    Ok(ShellEvent::Exit(code)) => {
-                        session.pending_exit = Some((Some(code), Instant::now()));
-                        break;
-                    }
-                    Ok(ShellEvent::Error(e)) => {
-                        self.status_message = format!("Error: {}", e);
-                        self.status_expires_at =
-                            Some(std::time::Instant::now() + Duration::from_secs(6));
-                        has_new_output = true;
-                        break;
-                    }
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        session.pending_exit = Some((None, Instant::now()));
-                        break;
-                    }
-                }
-            }
-        } else if accumulated_data.len() >= max_bytes_per_frame {
-            has_more_data = true;
-        }
-
-        // 如果累积数据超过帧限制，将多余部分保存到下一帧
-        if accumulated_data.len() > max_bytes_per_frame {
-            session.pending_output = accumulated_data.split_off(max_bytes_per_frame);
-            has_more_data = true;
-        }
-        // 也检查 channel 中是否还有数据
-        if shell_events_are_live && !has_more_data && !session.shell.events().is_empty() {
-            has_more_data = true;
-        }
-
-        // 处理本帧的数据
-        if !accumulated_data.is_empty() {
-            if active_protocol_responses.has_pending() {
-                // Preserve PTY byte order and stop accepting more protocol
-                // requests until their older replies have entered the bounded
-                // shell writer. The current chunk precedes the split-off tail.
-                accumulated_data.append(&mut session.pending_output);
-                accumulated_data.quarantine();
-                self.organism.watch_parked(&active_session_id);
-                session.pending_output = accumulated_data;
-                has_more_data = true;
-            } else {
-                let mut terminal = session.terminal.lock();
-                let active_parse_started = std::time::Instant::now();
-                terminal.process_output_buffer(&accumulated_data, |update| {
-                    self.organism
-                        .watch_parsed(&active_session_id, update, has_more_data);
-                });
-                session
-                    .terminal_presentation
-                    .note_output(std::time::Instant::now());
-                terminal.check_sync_output_timeout();
-                terminal_parse_time += active_parse_started.elapsed();
-                active_processed_bytes = accumulated_data.len();
-                let completed_outputs = terminal.take_completed_command_events();
-                self.organism.batch(
-                    &active_session_id,
-                    terminal.command_records(),
-                    &completed_outputs,
-                    terminal.is_alt_buffer_active(),
-                    has_more_data,
-                );
-                let rang_bell = terminal.take_pending_bell();
-                // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
-                // 按时长自动过期,否则任何快速输出都会把瞬时反馈瞬间吞掉。
-                // 有输出时更新最后活动时间
-                self.last_activity_time = std::time::Instant::now();
-                drop(terminal);
-                if rang_bell {
-                    if crate::session_manager::bell_sets_unseen(window_focused, true) {
-                        session.metadata.unseen_output = true;
-                    }
-                    maybe_notify_bell(
-                        window_focused,
-                        &mut session.last_bell_toast,
-                        &session.metadata.name,
-                    );
-                }
-                for completed in completed_outputs {
-                    self.agent_panel
-                        .handle_completed(&session.metadata.session_id, &completed);
-                    self.command_correction.handle_completed(
-                        &self.config,
-                        self.agent_panel.session_active(),
-                        &session.metadata.session_id,
-                        &completed,
-                    );
-                    self.git_strip_cache
-                        .mark_command_finished(&session.metadata.session_id);
-                    // The active pane is on screen, so its completion was
-                    // watched whenever the window itself had focus.
-                    maybe_notify_long_command(
-                        &self.config,
-                        &mut self.notification_window_started,
-                        &mut self.notifications_in_window,
-                        &completed,
-                        window_focused,
-                    );
-                    record_command_history(&self.config, &completed);
-                    if let Err(error) = execution_journal::submit(completed) {
-                        log::warn!(
-                            "jsh execution output journal queue rejected an event: {error:?}"
+                        maybe_notify_bell(
+                            window_focused,
+                            &mut session.last_bell_toast,
+                            &session.metadata.name,
                         );
                     }
-                }
-            }
+                    for completed in completed_outputs {
+                        self.agent_panel
+                            .handle_completed(&session.metadata.session_id, &completed);
+                        self.command_correction.handle_completed(
+                            &self.config,
+                            self.agent_panel.session_active(),
+                            &session.metadata.session_id,
+                            &completed,
+                        );
+                        self.git_strip_cache
+                            .mark_command_finished(&session.metadata.session_id);
+                        // The active pane is on screen, so its completion was
+                        // watched whenever the window itself had focus.
+                        maybe_notify_long_command(
+                            &self.config,
+                            &mut self.notification_window_started,
+                            &mut self.notifications_in_window,
+                            &completed,
+                            window_focused,
+                        );
+                        record_command_history(&self.config, &completed);
+                        if let Err(error) = execution_journal::submit(completed) {
+                            log::warn!(
+                                "jsh execution output journal queue rejected an event: {error:?}"
+                            );
+                        }
+                    }
+                },
+            )
+        };
+        let mut has_more_data = progress.has_more;
+        let active_processed_bytes = progress.bytes_applied;
+        let mut has_new_output = active_processed_bytes != 0 || progress.parked;
+        if progress.parked {
+            self.organism.watch_parked(&active_session_id);
         }
-
-        // Apply the exit only after the final ordered output batch has been parsed.
-        if session.pending_output.is_empty() {
-            if let Some((code, observed_at)) = session.pending_exit.take() {
+        match progress.notice {
+            Some(OutputNotice::Exited {
+                code,
+                observed_at,
+                tail,
+            }) => {
+                session.exit_tail = tail;
                 if let Some(editor) = self.vim9_editors.remove(&session.metadata.session_id) {
                     editor.session.revoke();
                 }
@@ -7329,6 +7261,12 @@ impl eframe::App for TerminalApp {
                     }
                 }
             }
+            Some(OutputNotice::Error(error)) => {
+                self.status_message = format!("Error: {error}");
+                self.status_expires_at = Some(Instant::now() + Duration::from_secs(6));
+                has_new_output = true;
+            }
+            None => {}
         }
 
         let processed_bytes = background_processed_bytes.saturating_add(active_processed_bytes);
@@ -8856,7 +8794,7 @@ impl eframe::App for TerminalApp {
             let has_pending_data = if !has_new_output {
                 let session = self.session_manager.get_active_session_mut();
                 session.purpose != crate::session::SessionPurpose::RetainedCommand
-                    && !session.shell.events().is_empty()
+                    && session.shell.has_pending_output()
             } else {
                 false
             };
