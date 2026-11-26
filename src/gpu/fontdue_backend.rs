@@ -2,10 +2,13 @@ use super::font_backend::{
     create_gpu_resources, empty_glyph_region, upload_bitmap, AtlasGlyphKey, DirtyRect, FontBackend,
     GlyphRegion, ShapedGlyph, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE,
 };
+use jterm_engine::retained_bytes::{RetainedBytes, RetainedBytesBudget};
 use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+const PROCESS_SHAPED_RUN_BYTES: usize = 16 * 1024 * 1024;
 
 /// Cache key for a shaped run: run text + style + subpixel bin.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -13,6 +16,52 @@ struct ShapeCacheKey {
     text: String,
     bold: bool,
     subpixel_offset: u8,
+}
+
+struct CachedShape {
+    glyphs: Arc<Vec<ShapedGlyph>>,
+    _lease: RetainedBytes,
+}
+
+type ShapeCache = LruCache<ShapeCacheKey, CachedShape>;
+
+fn cache_shaped_run(
+    cache: &mut ShapeCache,
+    budget: &Arc<RetainedBytesBudget>,
+    key: ShapeCacheProbe<'_>,
+    glyphs: &Arc<Vec<ShapedGlyph>>,
+) {
+    let bytes = shaped_run_charge(key.text, glyphs.capacity());
+    let lease = budget.reserve(bytes).or_else(|| {
+        if bytes > budget.usage().capacity_bytes {
+            return None;
+        }
+        // Bound eviction work per miss. A run still paints if it cannot be cached.
+        drop(cache.pop_lru());
+        budget.reserve(bytes)
+    });
+    if let Some(lease) = lease {
+        cache.put(
+            ShapeCacheKey {
+                text: key.text.to_owned(),
+                bold: key.bold,
+                subpixel_offset: key.subpixel_offset,
+            },
+            CachedShape {
+                glyphs: Arc::clone(glyphs),
+                _lease: lease,
+            },
+        );
+    }
+}
+
+fn shaped_run_charge(text: &str, glyph_capacity: usize) -> usize {
+    // Include both owned allocations and the cache's node and map overhead.
+    let overhead =
+        size_of::<(ShapeCacheKey, CachedShape, Vec<ShapedGlyph>)>() + 8 * size_of::<usize>();
+    overhead
+        .saturating_add(text.len())
+        .saturating_add(glyph_capacity.saturating_mul(size_of::<ShapedGlyph>()))
 }
 
 /// Borrowed view of a [`ShapeCacheKey`], used to probe the LRU without
@@ -202,7 +251,7 @@ pub struct FontdueAtlas {
     gid_cache: LruCache<GidGlyphKey, GlyphRegion>,
     /// Cache of fully shaped runs, keyed by text+style. Holds atlas UVs, so it is
     /// cleared whenever the atlas grows or resets (regions would otherwise be stale).
-    shape_cache: LruCache<ShapeCacheKey, Arc<Vec<ShapedGlyph>>>,
+    shape_cache: ShapeCache,
     /// Incremented on every atlas grow/reset; used to detect a grow that happens
     /// mid-run so we don't cache regions captured against the old atlas size.
     atlas_generation: u64,
@@ -880,7 +929,7 @@ impl FontBackend for FontdueAtlas {
             subpixel_offset,
         };
         if let Some(cached) = self.shape_cache.get(&probe as &dyn ShapeCacheKeyView) {
-            return Arc::clone(cached);
+            return Arc::clone(&cached.glyphs);
         }
 
         // Snapshot generation so we can detect a grow triggered while rasterizing
@@ -968,12 +1017,10 @@ impl FontBackend for FontdueAtlas {
         // rescales UVs and would leave the earlier glyphs in this vec pointing at the
         // wrong region.
         if self.atlas_generation == generation_before {
-            let cache_key = ShapeCacheKey {
-                text: text.to_string(),
-                bold,
-                subpixel_offset,
-            };
-            self.shape_cache.put(cache_key, Arc::clone(&arc));
+            static PROCESS: OnceLock<Arc<RetainedBytesBudget>> = OnceLock::new();
+            let budget = PROCESS
+                .get_or_init(|| Arc::new(RetainedBytesBudget::new(PROCESS_SHAPED_RUN_BYTES)));
+            cache_shaped_run(&mut self.shape_cache, budget, probe, &arc);
         }
 
         arc
@@ -1101,5 +1148,43 @@ mod tests {
                 "probe ({text:?}, {bold}, {subpixel_offset}) must not hit"
             );
         }
+    }
+
+    #[test]
+    fn shaped_run_cache_shares_process_bytes_and_reclaims_the_least_recent_run() {
+        let glyphs = Arc::new(Vec::with_capacity(2));
+        let run_bytes = shaped_run_charge("aa", glyphs.capacity());
+        let budget = Arc::new(RetainedBytesBudget::new(run_bytes));
+        let mut left = ShapeCache::new(NonZeroUsize::new(2).unwrap());
+        let mut right = ShapeCache::new(NonZeroUsize::new(2).unwrap());
+        let first = || ShapeCacheProbe {
+            text: "aa",
+            bold: false,
+            subpixel_offset: 0,
+        };
+        let second = || ShapeCacheProbe {
+            text: "bb",
+            ..first()
+        };
+        cache_shaped_run(&mut left, &budget, first(), &glyphs);
+        assert_eq!(budget.usage().retained_bytes, run_bytes);
+        cache_shaped_run(&mut right, &budget, second(), &glyphs);
+        assert!(right.is_empty());
+        assert!(Arc::ptr_eq(
+            &left
+                .peek(&first() as &dyn ShapeCacheKeyView)
+                .unwrap()
+                .glyphs,
+            &glyphs,
+        ));
+
+        cache_shaped_run(&mut left, &budget, second(), &glyphs);
+        assert!(left.peek(&first() as &dyn ShapeCacheKeyView).is_none());
+        assert!(left.peek(&second() as &dyn ShapeCacheKeyView).is_some());
+        assert_eq!(budget.usage().peak_retained_bytes, run_bytes);
+        left.clear();
+        assert_eq!(budget.usage().retained_bytes, 0);
+        cache_shaped_run(&mut right, &budget, first(), &glyphs);
+        assert_eq!(right.len(), 1);
     }
 }

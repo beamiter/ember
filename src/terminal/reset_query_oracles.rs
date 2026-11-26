@@ -4,33 +4,33 @@ use std::collections::BTreeMap;
 
 impl TerminalState {
     fn frozen_soft_reset(&mut self) {
-        self.screen.current_fg = Color::Default;
-        self.screen.current_bg = Color::Default;
+        self.vt.screen.current_fg = Color::Default;
+        self.vt.screen.current_bg = Color::Default;
         self.global_bg = Color::Default;
-        self.screen.current_flags = StyleFlags::default();
-        self.screen.g0_charset = Charset::Ascii;
-        self.screen.g1_charset = Charset::Ascii;
-        self.screen.active_charset = Charset::Ascii;
-        self.screen.scroll_region_top = 0;
-        self.screen.scroll_region_bottom = self.screen.grid.rows().saturating_sub(1);
-        self.screen.saved_state = None;
-        self.screen.origin_mode = false;
-        self.screen.insert_mode = false;
+        self.vt.screen.current_flags = StyleFlags::default();
+        self.vt.screen.g0_charset = Charset::Ascii;
+        self.vt.screen.g1_charset = Charset::Ascii;
+        self.vt.screen.active_charset = Charset::Ascii;
+        self.vt.screen.scroll_region_top = 0;
+        self.vt.screen.scroll_region_bottom = self.vt.screen.grid.rows().saturating_sub(1);
+        self.vt.screen.saved_state = None;
+        self.vt.screen.origin_mode = false;
+        self.vt.screen.insert_mode = false;
         // DECTCEM and DECAWM on, DECCKM (application cursor keys) off,
         // DECKPAM (application keypad) off. Alternate Scroll returns to the
         // xterm-resource default (enabled).
-        self.protocol.modes_mut().insert(25);
-        self.protocol.modes_mut().insert(7);
-        self.protocol.modes_mut().insert(1007);
-        self.protocol.modes_mut().remove(&1);
-        self.protocol.modes_mut().remove(&66);
-        self.screen.pending_wrap = false;
+        self.vt.protocol.modes_mut().insert(25);
+        self.vt.protocol.modes_mut().insert(7);
+        self.vt.protocol.modes_mut().insert(1007);
+        self.vt.protocol.modes_mut().remove(&1);
+        self.vt.protocol.modes_mut().remove(&66);
+        self.vt.screen.pending_wrap = false;
     }
 
     fn frozen_handle_decrqss(&mut self, pt: &[u8]) {
         let reply = match pt {
             b" q" => {
-                let n = match self.screen.cursor_shape {
+                let n = match self.vt.screen.cursor_shape {
                     CursorShape::Underline => 4,
                     CursorShape::Beam => 6,
                     _ => 2,
@@ -39,11 +39,11 @@ impl TerminalState {
             }
             b"r" => format!(
                 "\x1bP1$r{};{}r\x1b\\",
-                self.screen.scroll_region_top + 1,
-                self.screen.scroll_region_bottom + 1
+                self.vt.screen.scroll_region_top + 1,
+                self.vt.screen.scroll_region_bottom + 1
             ),
             b"\"q" => {
-                let n = if self.screen.current_flags.protected() {
+                let n = if self.vt.screen.current_flags.protected() {
                     1
                 } else {
                     0
@@ -59,16 +59,16 @@ impl TerminalState {
 
     fn frozen_decrqss_sgr_payload(&self) -> String {
         let mut params: Vec<String> = Vec::new();
-        if self.screen.current_flags.bold() {
+        if self.vt.screen.current_flags.bold() {
             params.push("1".into());
         }
-        if self.screen.current_flags.dim() {
+        if self.vt.screen.current_flags.dim() {
             params.push("2".into());
         }
-        if self.screen.current_flags.italic() {
+        if self.vt.screen.current_flags.italic() {
             params.push("3".into());
         }
-        match self.screen.current_flags.underline() {
+        match self.vt.screen.current_flags.underline() {
             UnderlineStyle::None => {}
             UnderlineStyle::Single => params.push("4".into()),
             UnderlineStyle::Double => params.push("21".into()),
@@ -76,17 +76,17 @@ impl TerminalState {
             UnderlineStyle::Dotted => params.push("4:4".into()),
             UnderlineStyle::Dashed => params.push("4:5".into()),
         }
-        if self.screen.current_flags.blink() {
+        if self.vt.screen.current_flags.blink() {
             params.push("5".into());
         }
-        if self.screen.current_flags.inverse() {
+        if self.vt.screen.current_flags.inverse() {
             params.push("7".into());
         }
-        if self.screen.current_flags.strikethrough() {
+        if self.vt.screen.current_flags.strikethrough() {
             params.push("9".into());
         }
-        params.extend(Self::frozen_sgr_color_params(self.screen.current_fg, true));
-        params.extend(Self::frozen_sgr_color_params(self.screen.current_bg, false));
+        params.extend(Self::frozen_sgr_color_params(self.vt.screen.current_fg, true));
+        params.extend(Self::frozen_sgr_color_params(self.vt.screen.current_bg, false));
         if params.is_empty() {
             "0m".into()
         } else {
@@ -154,15 +154,21 @@ fn snapshot(t: &TerminalState) -> Snapshot {
     macro_rules! host {
         ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
     }
+    out.insert(
+        "pending_osc52_clipboard_set".into(),
+        format!("{:?}", t.osc52.pending_set),
+    );
+    out.insert(
+        "pending_osc52_clipboard_queries".into(),
+        format!("{:?}", t.osc52.pending_queries),
+    );
+    out.insert("sync_output_active".into(), format!("{:?}", t.vt.sync_output.active));
     host!(
-        sync_output_active,
         current_working_dir,
         ime_enabled,
         preedit_text,
         preedit_cursor,
         host_window_focused,
-        pending_osc52_clipboard_set,
-        pending_osc52_clipboard_queries,
         pending_notifications,
         pending_bell,
         chat_pending_submit,
@@ -173,9 +179,9 @@ fn snapshot(t: &TerminalState) -> Snapshot {
     );
     out.insert(
         "sync_start_present".into(),
-        t.sync_output_start.is_some().to_string(),
+        t.vt.sync_output.started.is_some().to_string(),
     );
-    out.insert("parser".into(), format!("{:?}", t.parser.snapshot()));
+    out.insert("parser".into(), format!("{:?}", t.vt.parser.snapshot()));
     out.insert(
         "kitty_image_count".into(),
         t.kitty_graphics.image_count().to_string(),
@@ -195,19 +201,19 @@ fn seeded(seed: usize) -> TerminalState {
     t.process_input(
         b"\x1b[?1;66;1000;1004;2004h\x1b[?7;25;1007l\x1b[4h\x1b[?6h\x1b[2;4r\x1b[2;3H\x1b7",
     );
-    t.screen.cursor_shape = match seed % 3 {
+    t.vt.screen.cursor_shape = match seed % 3 {
         0 => CursorShape::Block,
         1 => CursorShape::Beam,
         _ => CursorShape::Underline,
     };
-    t.screen.current_flags.set_protected(seed & 1 != 0);
-    t.screen.g1_charset = Charset::DecSpecialGraphics;
-    t.screen.active_charset = Charset::DecSpecialGraphics;
-    t.screen.current_fg = Color::Rgb(1, 2, 3);
-    t.screen.current_bg = Color::Indexed(201);
+    t.vt.screen.current_flags.set_protected(seed & 1 != 0);
+    t.vt.screen.g1_charset = Charset::DecSpecialGraphics;
+    t.vt.screen.active_charset = Charset::DecSpecialGraphics;
+    t.vt.screen.current_fg = Color::Rgb(1, 2, 3);
+    t.vt.screen.current_bg = Color::Indexed(201);
     t.global_bg = Color::Blue;
-    t.screen.current_flags.set_underline(UnderlineStyle::Curly);
-    t.screen.pending_wrap = true;
+    t.vt.screen.current_flags.set_underline(UnderlineStyle::Curly);
+    t.vt.screen.pending_wrap = true;
     t.output_buffer = b"existing-reply".to_vec();
     super::super::structural_parity_tests::prime(&mut t);
     t
@@ -289,7 +295,7 @@ fn for_each_partition(mut check: impl FnMut(usize, usize, usize, &TerminalState)
         for (cmd, bytes) in COMMANDS.iter().enumerate() {
             for mask in 0..(1usize << (bytes.len() - 1)) {
                 let mut t = seeded(seed);
-                let start_time = t.sync_output_start;
+                let start_time = t.vt.sync_output.started;
                 let mut start = 0;
                 for end in 1..=bytes.len() {
                     if end == bytes.len() || mask & (1 << (end - 1)) != 0 {
@@ -297,7 +303,7 @@ fn for_each_partition(mut check: impl FnMut(usize, usize, usize, &TerminalState)
                         start = end;
                     }
                 }
-                assert_eq!(t.sync_output_start, start_time, "watchdog must not restart");
+                assert_eq!(t.vt.sync_output.started, start_time, "watchdog must not restart");
                 check(seed, cmd, mask, &t);
             }
         }
@@ -412,13 +418,13 @@ fn reset_query_mutation_negative_controls() {
         let mut mutant = seeded(3);
         mutant.soft_reset();
         match mutation {
-            0 => mutant.screen.cursor_row += 1,
-            1 => mutant.protocol.modes_mut().remove(&1007),
-            2 => mutant.protocol.modes_mut().insert(1),
-            3 => mutant.protocol.modes_mut().insert(66),
+            0 => mutant.vt.screen.cursor_row += 1,
+            1 => mutant.vt.protocol.modes_mut().remove(&1007),
+            2 => mutant.vt.protocol.modes_mut().insert(1),
+            3 => mutant.vt.protocol.modes_mut().insert(66),
             4 => mutant.global_bg = Color::Red,
-            5 => mutant.sync_output_active = false,
-            _ => mutant.screen.grid[0][0].character = '!',
+            5 => mutant.vt.sync_output.active = false,
+            _ => mutant.vt.screen.grid[0][0].character = '!',
         }
         assert_ne!(
             snapshot(&mutant),
@@ -444,7 +450,7 @@ fn reset_query_frost_policy_must_not_be_migrated_as_ember() {
     // Frozen Frost 9322..9345 resets only 6/4/25/7. This is a contract contrast,
     // not a claim to execute Frost's own production implementation here.
     let mut ember = seeded(0);
-    let mut frost_modes = ember.protocol.modes().clone();
+    let mut frost_modes = ember.vt.protocol.modes().clone();
     frost_modes.remove(&6);
     frost_modes.remove(&4);
     frost_modes.insert(25);
@@ -452,10 +458,10 @@ fn reset_query_frost_policy_must_not_be_migrated_as_ember() {
     ember.soft_reset();
     for mode in [1, 66] {
         assert!(frost_modes.contains(&mode));
-        assert!(!ember.protocol.modes().contains(&mode));
+        assert!(!ember.vt.protocol.modes().contains(&mode));
     }
     assert!(!frost_modes.contains(&1007));
-    assert!(ember.protocol.modes().contains(&1007));
+    assert!(ember.vt.protocol.modes().contains(&1007));
 }
 
 #[test]
@@ -471,23 +477,23 @@ fn reset_query_sync_lifecycle_survives_decstr() {
             t.sync_output_clock =
                 super::super::SyncOutputClock::new(move || *clock.lock().unwrap());
             t.process_input(b"\x1b[?2026h");
-            let start = t.sync_output_start;
+            let start = t.vt.sync_output.started;
             *now.lock().unwrap() = base + Duration::from_millis(750);
             t.process_input(b"\x1b[!p\x1bP$qm\x1b\\");
-            assert!(t.sync_output_active);
-            assert_eq!(t.sync_output_start, start);
-            assert_eq!(t.screen.use_alt_buffer, alt);
+            assert!(t.vt.sync_output.active);
+            assert_eq!(t.vt.sync_output.started, start);
+            assert_eq!(t.vt.screen.use_alt_buffer, alt);
             if explicit_end {
                 t.process_input(b"\x1b[?2026l");
             } else {
                 *now.lock().unwrap() = base + Duration::from_secs(1);
                 t.check_sync_output_timeout();
-                assert!(t.sync_output_active);
+                assert!(t.vt.sync_output.active);
                 *now.lock().unwrap() = base + Duration::from_millis(1001);
                 t.check_sync_output_timeout();
             }
-            assert!(!t.sync_output_active);
-            assert!(t.sync_output_start.is_none());
+            assert!(!t.vt.sync_output.active);
+            assert!(t.vt.sync_output.started.is_none());
         }
     }
 }

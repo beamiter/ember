@@ -291,6 +291,8 @@ impl WorkflowArgsState {
         self
     }
 
+    pub fn target_session_id(&self)->Option<&str>{self.target_session_id.as_deref()}
+
     /// Return true only after whole-message queue admission. A refusal keeps
     /// this exact opening and its raw buffers available for explicit retry.
     pub fn submit_with(&mut self, admit: impl FnOnce(&str, &str) -> Result<(), String>) -> bool {

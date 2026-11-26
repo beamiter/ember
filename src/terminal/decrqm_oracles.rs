@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 impl TerminalState {
     fn frozen_decrqm_private_mode_state(&self, mode: u16) -> u8 {
         let set = match mode {
-            6 => self.screen.origin_mode,
+            6 => self.vt.screen.origin_mode,
             1
             | 7
             | 12
@@ -20,7 +20,7 @@ impl TerminalState {
             | 2004
             | 2026
             | 2031
-            | 5522 => self.protocol.modes().contains(&mode),
+            | 5522 => self.vt.protocol.modes().contains(&mode),
             _ => return 0,
         };
         if set {
@@ -32,7 +32,7 @@ impl TerminalState {
 
     fn frozen_decrqm_ansi_mode_state(&self, mode: u16) -> u8 {
         match mode {
-            4 if self.screen.insert_mode => 1,
+            4 if self.vt.screen.insert_mode => 1,
             4 => 2,
             20 => 4,
             _ => 0,
@@ -58,15 +58,21 @@ fn snapshot(t: &TerminalState) -> Snapshot {
     macro_rules! host {
         ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
     }
+    out.insert(
+        "pending_osc52_clipboard_set".into(),
+        format!("{:?}", t.osc52.pending_set),
+    );
+    out.insert(
+        "pending_osc52_clipboard_queries".into(),
+        format!("{:?}", t.osc52.pending_queries),
+    );
+    out.insert("sync_output_active".into(), format!("{:?}", t.vt.sync_output.active));
     host!(
-        sync_output_active,
         current_working_dir,
         ime_enabled,
         preedit_text,
         preedit_cursor,
         host_window_focused,
-        pending_osc52_clipboard_set,
-        pending_osc52_clipboard_queries,
         pending_notifications,
         pending_bell,
         chat_pending_submit,
@@ -77,9 +83,9 @@ fn snapshot(t: &TerminalState) -> Snapshot {
     );
     out.insert(
         "sync_start_present".into(),
-        t.sync_output_start.is_some().to_string(),
+        t.vt.sync_output.started.is_some().to_string(),
     );
-    out.insert("parser".into(), format!("{:?}", t.parser.snapshot()));
+    out.insert("parser".into(), format!("{:?}", t.vt.parser.snapshot()));
     out.insert(
         "kitty_image_count".into(),
         t.kitty_graphics.image_count().to_string(),
@@ -88,7 +94,7 @@ fn snapshot(t: &TerminalState) -> Snapshot {
         "paste_grant".into(),
         format!(
             "{:?}",
-            t.pending_paste_grant.as_ref().map(|g| (
+            t.osc5522.pending_paste_grant.as_ref().map(|g| (
                 &g.token,
                 g.offered_mimes
                     .iter()
@@ -111,24 +117,24 @@ fn seeded(seed: usize) -> TerminalState {
     t.process_input(
         b"\x1b[?1;66;1000;1004;2004h\x1b[?7;25;1007l\x1b[4h\x1b[?6h\x1b[2;4r\x1b[2;3H\x1b7",
     );
-    t.screen.cursor_shape = match seed % 3 {
+    t.vt.screen.cursor_shape = match seed % 3 {
         0 => CursorShape::Block,
         1 => CursorShape::Beam,
         _ => CursorShape::Underline,
     };
-    t.screen.current_flags.set_protected(seed & 1 != 0);
-    t.screen.g1_charset = Charset::DecSpecialGraphics;
-    t.screen.active_charset = Charset::DecSpecialGraphics;
-    t.screen.current_fg = Color::Rgb(1, 2, 3);
-    t.screen.current_bg = Color::Indexed(201);
+    t.vt.screen.current_flags.set_protected(seed & 1 != 0);
+    t.vt.screen.g1_charset = Charset::DecSpecialGraphics;
+    t.vt.screen.active_charset = Charset::DecSpecialGraphics;
+    t.vt.screen.current_fg = Color::Rgb(1, 2, 3);
+    t.vt.screen.current_bg = Color::Indexed(201);
     t.global_bg = Color::Blue;
-    t.screen.current_flags.set_underline(UnderlineStyle::Curly);
-    t.screen.pending_wrap = true;
+    t.vt.screen.current_flags.set_underline(UnderlineStyle::Curly);
+    t.vt.screen.pending_wrap = true;
     t.output_buffer = b"existing-reply".to_vec();
     // Modes 4/6/1016 have no TerminalModes storage slots. Use the real
     // authoritative booleans; true values detect mistaken protocol reads.
-    t.screen.origin_mode = seed & 1 == 0;
-    t.screen.insert_mode = seed & 2 == 0;
+    t.vt.screen.origin_mode = seed & 1 == 0;
+    t.vt.screen.insert_mode = seed & 2 == 0;
     super::super::structural_parity_tests::prime(&mut t);
     assert!(t.command_records.back().is_some_and(
         |record| !record.complete && record.state == super::super::CommandState::Running
@@ -140,14 +146,14 @@ fn seeded(seed: usize) -> TerminalState {
     t.current_working_dir = Some("/baseline/decrqm".into());
     t.preedit_text = "输入中".into();
     t.preedit_cursor = 1;
-    t.pending_osc52_clipboard_set = Some("clipboard sentinel".into());
-    t.pending_osc52_clipboard_queries.push_back(b"\x07");
+    t.osc52.pending_set = Some("clipboard sentinel".into());
+    t.osc52.pending_queries.push_back(b"\x07");
     t.pending_notifications = vec![("title sentinel".into(), "body sentinel".into())];
     t.colors.dynamic_fg = Some((1, 2, 3));
     t.colors.dynamic_bg = Some((4, 5, 6));
     t.colors.dynamic_cursor_color = Some((7, 8, 9));
     t.pending_bell = true;
-    t.pending_paste_grant = Some(super::super::PendingPasteGrant {
+    t.osc5522.pending_paste_grant = Some(super::super::PendingPasteGrant {
         token: "decrqm-grant".into(),
         offered_mimes: ["text/plain".to_owned()].into_iter().collect(),
         expires_at: now + std::time::Duration::from_secs(600),
@@ -200,15 +206,15 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
             let data = bytes(&input.bytes_hex);
             for (partition, ends) in partitions(data.len()).into_iter().enumerate() {
                 let mut t = seeded(seed);
-                let start_time = t.sync_output_start;
+                let start_time = t.vt.sync_output.started;
                 let clock_reading = t.sync_output_clock.now();
-                let grant_expiry = t.pending_paste_grant.as_ref().map(|g| g.expires_at);
+                let grant_expiry = t.osc5522.pending_paste_grant.as_ref().map(|g| g.expires_at);
                 let mut start = 0;
                 for (feed, end) in ends.into_iter().enumerate() {
                     t.process_input(&data[start..end]);
                     start = end;
                     assert_eq!(
-                        t.sync_output_start, start_time,
+                        t.vt.sync_output.started, start_time,
                         "query must not restart sync clock"
                     );
                     assert_eq!(
@@ -217,7 +223,7 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
                         "clock behavior retained"
                     );
                     assert_eq!(
-                        t.pending_paste_grant.as_ref().map(|g| g.expires_at),
+                        t.osc5522.pending_paste_grant.as_ref().map(|g| g.expires_at),
                         grant_expiry,
                         "paste expiry retained"
                     );
@@ -282,9 +288,9 @@ fn decrqm_frozen_lookup_exhaustive() {
         for mode in 0..=u16::MAX {
             for stored in [false, true] {
                 if stored {
-                    t.protocol.modes_mut().insert(mode);
+                    t.vt.protocol.modes_mut().insert(mode);
                 } else {
-                    t.protocol.modes_mut().remove(&mode);
+                    t.vt.protocol.modes_mut().remove(&mode);
                 }
                 assert_eq!(
                     t.decrqm_private_mode_state(mode),

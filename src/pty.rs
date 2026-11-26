@@ -24,27 +24,23 @@ pub use jterm_core::session_actor::{ReadOutcome, WriteOutcome};
 #[cfg(unix)]
 mod unix_pty {
     use super::*;
+    use jterm_core::native_pty_launch::{
+        launch_pty, PtyLaunch, PtyLaunchError, StartupError, StartupStage, WorkingDirectory,
+    };
+    use jterm_core::pty_io::{resize_master, write_native_master, PtyWriteAttempt};
     use std::ffi::OsStr;
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    // Keep local launches effectively immediate while allowing automounts and
-    // network-backed working directories a reasonable window to resolve.
-    // Most importantly, this bounds the synchronous fork-to-exec handshake.
-    const CHILD_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-
     /// 子进程生命周期状态机。TerminationStarted 之后,分离的升级回收线程
     /// 独占该 pid,is_alive/waitpid 等路径绝不能再对它发信号或 wait。
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum ChildLifecycle {
-        Running,
-        TerminationStarted,
-        Reaped,
-    }
+    use jterm_core::process::{NativeChildPhase as ChildLifecycle, NativePtyChild};
 
     /// Retry an interrupted syscall while preserving every other error for
     /// the caller to classify. In particular, waitpid errors other than
     /// ECHILD must not be mistaken for a successfully reaped child.
+    #[cfg(test)]
     pub(super) fn retry_on_eintr<T>(
         mut operation: impl FnMut() -> std::io::Result<T>,
     ) -> std::io::Result<T> {
@@ -52,286 +48,6 @@ mod unix_pty {
             match operation() {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 result => return result,
-            }
-        }
-    }
-
-    /// 异步信号安全地向 stderr 写一条静态消息(fork 后、execve 前只能用此类调用)。
-    /// SAFETY: 仅调用 write(2),它在 POSIX 异步信号安全函数列表中。
-    unsafe fn write_stderr(msg: &[u8]) {
-        let _ = libc::write(
-            libc::STDERR_FILENO,
-            msg.as_ptr() as *const libc::c_void,
-            msg.len(),
-        );
-    }
-
-    /// Create a close-on-exec pipe used to report setup failures from the
-    /// post-fork child. EOF means `execve` succeeded and closed the write end.
-    /// The read end is non-blocking: poll(2) is the authority for waiting, so
-    /// the read after readiness must never stall on a partial status record.
-    fn startup_status_pipe() -> std::io::Result<[RawFd; 2]> {
-        let mut pipe_fds = [-1; 2];
-
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let result = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
-
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let result = unsafe {
-            let result = libc::pipe(pipe_fds.as_mut_ptr());
-            if result == 0 {
-                for fd in pipe_fds {
-                    let flags = libc::fcntl(fd, libc::F_GETFD, 0);
-                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
-                        libc::close(pipe_fds[0]);
-                        libc::close(pipe_fds[1]);
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-            }
-            result
-        };
-
-        if result != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let flags = unsafe { libc::fcntl(pipe_fds[0], libc::F_GETFL, 0) };
-        if flags < 0
-            || unsafe { libc::fcntl(pipe_fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-        {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(pipe_fds[0]);
-                libc::close(pipe_fds[1]);
-            }
-            return Err(error);
-        }
-        Ok(pipe_fds)
-    }
-
-    /// 读取调用线程的 errno,仅供 fork 后的子进程分支在失败的 libc 调用之后
-    /// 立即使用。它只读线程局部变量、不分配内存,满足 fork→execve 之间
-    /// 只允许异步信号安全调用的约束。
-    fn current_errno() -> libc::c_int {
-        std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO)
-    }
-
-    /// Only async-signal-safe syscalls are allowed between fork and exec.
-    /// The fixed (stage, errno) record is far below PIPE_BUF; retry EINTR
-    /// until the parent receives every status byte — a short write followed
-    /// by EOF would otherwise be mistaken for a successful exec.
-    unsafe fn report_startup_failure(fd: RawFd, code: u8, errno: libc::c_int) {
-        let record = [code as libc::c_int, errno];
-        let mut offset = 0usize;
-        let len = std::mem::size_of_val(&record);
-        let ptr = record.as_ptr().cast::<u8>();
-        while offset < len {
-            let written = libc::write(fd, ptr.add(offset).cast::<libc::c_void>(), len - offset);
-            if written > 0 {
-                offset += written as usize;
-            } else if written < 0 && current_errno() == libc::EINTR {
-                continue;
-            } else {
-                return;
-            }
-        }
-    }
-
-    /// Blocking waitpid used only on startup-failure paths, where the child
-    /// is already SIGKILLed (or self-exited) and cannot outlive the wait.
-    unsafe fn reap_child_blocking(child_pid: libc::pid_t) {
-        let mut status = 0;
-        loop {
-            let result = libc::waitpid(child_pid, &mut status, 0);
-            if result >= 0 || current_errno() != libc::EINTR {
-                break;
-            }
-        }
-    }
-
-    unsafe fn kill_and_reap_child(child_pid: libc::pid_t) {
-        // The child may or may not have completed setsid(), so target both its
-        // prospective process group and the process itself.
-        let _ = libc::kill(-child_pid, libc::SIGKILL);
-        let _ = libc::kill(child_pid, libc::SIGKILL);
-        reap_child_blocking(child_pid);
-    }
-
-    fn startup_timeout_ms(remaining: Duration) -> libc::c_int {
-        // Round up: a sub-millisecond remainder must still yield a nonzero
-        // poll timeout rather than an instant (busy-looping) zero.
-        let rounded_ms =
-            remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
-        rounded_ms.clamp(1, libc::c_int::MAX as u128) as libc::c_int
-    }
-
-    unsafe fn abort_child_startup(
-        startup_read: RawFd,
-        child_pid: libc::pid_t,
-        error: anyhow::Error,
-    ) -> Result<()> {
-        // Close first so a child still attempting to report an error cannot
-        // keep the handshake alive while it is being torn down.
-        libc::close(startup_read);
-        kill_and_reap_child(child_pid);
-        Err(error)
-    }
-
-    /// Wait for either a child setup failure record or CLOEXEC EOF from
-    /// execve, bounded by `timeout` — a child stuck between fork and execve
-    /// (for example an fchdir into a hung network mount) must not hang pane
-    /// spawn forever.
-    ///
-    /// `startup_read` is owned by this function. Every return path closes it;
-    /// error paths also kill (process group AND pid) and reap the child
-    /// before returning, so the caller only has to dispose of `master`.
-    unsafe fn wait_for_child_startup(
-        startup_read: RawFd,
-        child_pid: libc::pid_t,
-        timeout: Duration,
-    ) -> Result<()> {
-        let mut record = [0 as libc::c_int; 2];
-        let record_len = std::mem::size_of_val(&record);
-        let mut received = 0usize;
-        let started = Instant::now();
-
-        loop {
-            let elapsed = started.elapsed();
-            if elapsed >= timeout {
-                return abort_child_startup(
-                    startup_read,
-                    child_pid,
-                    anyhow!(
-                        "Timed out after {} ms during shell fork-to-exec startup \
-                         (received {received}/{record_len} status bytes)",
-                        timeout.as_millis()
-                    ),
-                );
-            }
-
-            let mut poll_fd = libc::pollfd {
-                fd: startup_read,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = libc::poll(
-                &mut poll_fd,
-                1,
-                startup_timeout_ms(timeout.saturating_sub(elapsed)),
-            );
-            if ready < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return abort_child_startup(
-                    startup_read,
-                    child_pid,
-                    anyhow!("Failed to poll shell startup status: {error}"),
-                );
-            }
-            if ready == 0 {
-                return abort_child_startup(
-                    startup_read,
-                    child_pid,
-                    anyhow!(
-                        "Timed out after {} ms during shell fork-to-exec startup \
-                         (received {received}/{record_len} status bytes)",
-                        timeout.as_millis()
-                    ),
-                );
-            }
-
-            let revents = poll_fd.revents;
-            if revents & libc::POLLNVAL != 0 {
-                return abort_child_startup(
-                    startup_read,
-                    child_pid,
-                    anyhow!("Invalid shell startup status fd"),
-                );
-            }
-            if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
-                return abort_child_startup(
-                    startup_read,
-                    child_pid,
-                    anyhow!(
-                        "Unexpected poll events 0x{revents:x} during shell fork-to-exec startup"
-                    ),
-                );
-            }
-
-            // POLLHUP may arrive together with POLLIN. Always read first so a
-            // complete or partial failure record already in the pipe is not
-            // mistaken for successful exec EOF.
-            let n = libc::read(
-                startup_read,
-                record
-                    .as_mut_ptr()
-                    .cast::<u8>()
-                    .add(received)
-                    .cast::<libc::c_void>(),
-                record_len - received,
-            );
-            if n > 0 {
-                received += n as usize;
-                if received < record_len {
-                    continue;
-                }
-
-                // A failed child self-exits after reporting, so reaping — not
-                // killing — is the cleanup here. Decode the (stage, errno)
-                // record into the message the pane can show.
-                libc::close(startup_read);
-                reap_child_blocking(child_pid);
-                let code = record[0] as u8;
-                let errno = record[1];
-                let error = std::io::Error::from_raw_os_error(errno);
-                return Err(match code {
-                    b'C' => {
-                        anyhow!("Failed to enter saved working directory: {error} (errno {errno})")
-                    }
-                    b'E' => anyhow!("Failed to execute shell: {error} (errno {errno})"),
-                    _ => anyhow!("Shell failed during startup: {error} (errno {errno})"),
-                });
-            }
-            if n == 0 {
-                if received != 0 {
-                    return abort_child_startup(
-                        startup_read,
-                        child_pid,
-                        anyhow!(
-                            "Incomplete shell startup status during fork-to-exec startup \
-                             ({received}/{record_len} bytes)"
-                        ),
-                    );
-                }
-                if revents & libc::POLLERR != 0 {
-                    return abort_child_startup(
-                        startup_read,
-                        child_pid,
-                        anyhow!("Shell startup status pipe failed"),
-                    );
-                }
-
-                // EOF without an error record is the success signal: execve
-                // closed the child's CLOEXEC write end.
-                libc::close(startup_read);
-                return Ok(());
-            }
-
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) if revents & libc::POLLERR == 0 => continue,
-                _ => {
-                    return abort_child_startup(
-                        startup_read,
-                        child_pid,
-                        anyhow!("Failed to read shell startup status: {error}"),
-                    );
-                }
             }
         }
     }
@@ -513,11 +229,9 @@ mod unix_pty {
     }
 
     pub struct Pty {
-        master: RawFd,
-        child_pid: i32,
+        master: OwnedFd,
+        child: NativePtyChild,
         session: companion_host::pty_session::PtySession,
-        exit_code_cached: Option<i32>,
-        lifecycle: ChildLifecycle,
     }
 
     impl Pty {
@@ -570,18 +284,7 @@ mod unix_pty {
                 .or(configured_agent.as_deref())
                 .map(crate::agent_cli::inline_argv);
             let command_argv = inline_command.as_deref();
-            // SAFETY: 这个 unsafe 块包含多个 libc 系统调用用于 PTY 创建和进程 fork。
-            // 所有的 libc 调用都检查了返回值并正确处理错误。
-            // 文件描述符的生命周期被正确管理（成功时存储在 PtySession 中，失败时关闭）。
-            // fork 后的子进程分支永不返回（通过 execve 或 exit），避免了未定义行为。
-            unsafe {
-                let win_size = libc::winsize {
-                    ws_row: rows as u16,
-                    ws_col: cols as u16,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
-
+            {
                 // Before opening file descriptors, complete every fallible
                 // allocation, PATH lookup and CString conversion. This both
                 // keeps the post-fork child async-signal-safe and avoids
@@ -705,10 +408,6 @@ mod unix_pty {
                     }
                 };
 
-                let mut argv_ptrs: Vec<*const libc::c_char> =
-                    argv_cstrings.iter().map(|arg| arg.as_ptr()).collect();
-                argv_ptrs.push(std::ptr::null());
-
                 // 工作目录的 C 字符串(若指定)
                 let cwd_cstr = match cwd {
                     Some(dir) => {
@@ -769,187 +468,51 @@ mod unix_pty {
                     jterm_core::child_env::envp(&child_environment(), &extra_environment)
                         .map(crate::agent_cli::environment)
                         .map_err(|error| anyhow!("Invalid child environment: {error}"))?;
-                let mut envp: Vec<*const libc::c_char> =
-                    env_cstrings.iter().map(|c| c.as_ptr()).collect();
-                envp.push(std::ptr::null());
-
-                // Create the PTY only after all `?` exits above are behind us.
-                let mut master = 0;
-                let mut slave = 0;
-                if libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &win_size,
-                ) != 0
-                {
-                    return Err(anyhow!("Failed to open PTY"));
-                }
-
-                // 设置 master 非阻塞模式
-                let flags = libc::fcntl(master, libc::F_GETFL, 0);
-                if flags >= 0 {
-                    let _ = libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
-
-                // 设置 FD_CLOEXEC，防止子进程继承
-                let fd_flags = libc::fcntl(master, libc::F_GETFD, 0);
-                if fd_flags >= 0 {
-                    let _ = libc::fcntl(master, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
-                }
-
-                // The child reports chdir/exec failures through this pipe.
-                // Successful exec closes its CLOEXEC write end, so the parent
-                // does not return Ok until shell startup has actually crossed
-                // the exec boundary.
-                let startup_pipe = match startup_status_pipe() {
-                    Ok(pipe) => pipe,
-                    Err(error) => {
-                        libc::close(master);
-                        libc::close(slave);
-                        return Err(anyhow!("Failed to create shell startup pipe: {error}"));
-                    }
+                let directory = match cwd_directory.as_ref() {
+                    Some(directory) => WorkingDirectory::Descriptor(directory.as_fd()),
+                    None => cwd_cstr
+                        .as_deref()
+                        .map_or(WorkingDirectory::Inherit, WorkingDirectory::Path),
                 };
-                // Capture process-global state before fork. The child branch
-                // then needs only async-signal-safe syscalls.
-                let inherited_instance_lock_fd =
-                    crate::session_persistence::inherited_instance_lock_fd();
-                let mut default_signal_action: libc::sigaction = std::mem::zeroed();
-                default_signal_action.sa_sigaction = libc::SIG_DFL;
-                if libc::sigemptyset(&mut default_signal_action.sa_mask) != 0 {
-                    libc::close(master);
-                    libc::close(slave);
-                    libc::close(startup_pipe[0]);
-                    libc::close(startup_pipe[1]);
-                    return Err(anyhow!("Failed to prepare child signal state"));
-                }
-                #[cfg(target_os = "linux")]
-                let expected_parent_pid = libc::getpid();
-
-                // Fork 子进程
-                let fork_result = libc::fork();
-
-                if fork_result < 0 {
-                    libc::close(master);
-                    libc::close(slave);
-                    libc::close(startup_pipe[0]);
-                    libc::close(startup_pipe[1]);
-                    return Err(anyhow!("Failed to fork"));
-                }
-
-                if fork_result == 0 {
-                    // 子进程分支:从这里到 execve 只调用异步信号安全的 libc 函数。
-                    // A flock is tied to the inherited open-file description,
-                    // not merely this process. Close it before any operation
-                    // that could stall, so a PTY child can never outlive the
-                    // primary process while retaining the instance lock.
-                    if inherited_instance_lock_fd >= 0 {
-                        libc::close(inherited_instance_lock_fd);
+                launch_pty(PtyLaunch {
+                    executable: &exec_cstr,
+                    argv: &argv_cstrings,
+                    environment: &env_cstrings,
+                    directory,
+                    rows: rows as u16,
+                    columns: cols as u16,
+                    parent_death_signal: true,
+                })
+                .map_err(|error| {
+                    let context = match &error {
+                        PtyLaunchError::Start(StartupError::Child {
+                            stage: StartupStage::WorkingDirectory,
+                            ..
+                        }) => Some("Failed to enter saved working directory"),
+                        PtyLaunchError::Start(StartupError::Child {
+                            stage: StartupStage::Exec,
+                            ..
+                        }) => Some("Failed to execute shell"),
+                        _ => None,
+                    };
+                    let error = anyhow::Error::new(error);
+                    match context {
+                        Some(message) => error.context(message),
+                        None => error,
                     }
-                    libc::close(master);
-                    libc::close(startup_pipe[0]);
-
-                    // Do not inherit the GUI's graceful-shutdown handler. A
-                    // pre-exec child never polls SHUTDOWN_REQUESTED, so that
-                    // handler would neutralize the parent-death SIGTERM.
-                    if libc::sigaction(libc::SIGTERM, &default_signal_action, std::ptr::null_mut())
-                        != 0
-                    {
-                        let errno = current_errno();
-                        report_startup_failure(startup_pipe[1], b'S', errno);
-                        libc::_exit(127);
-                    }
-                    libc::sigaction(libc::SIGINT, &default_signal_action, std::ptr::null_mut());
-
-                    // 【关键】设置父进程死亡信号：当父进程(ember)死亡时，此进程会收到SIGTERM
-                    // 这是最后一道防线，确保即使ember被SIGKILL强制杀死或panic崩溃，
-                    // jsh进程也会收到退出信号，不会变成孤儿进程继续运行。
-                    #[cfg(target_os = "linux")]
-                    {
-                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                            let errno = current_errno();
-                            report_startup_failure(startup_pipe[1], b'S', errno);
-                            libc::_exit(127);
-                        }
-                        // The parent can die between fork and prctl. Detect
-                        // that race explicitly instead of waiting forever for
-                        // a signal the kernel could not retroactively deliver.
-                        if libc::getppid() != expected_parent_pid {
-                            libc::_exit(128 + libc::SIGTERM);
-                        }
-                    }
-
-                    // 创建新的会话和进程组（将此进程设为会话leader）
-                    libc::setsid();
-
-                    // 切换工作目录(使用 fork 前构建好的指针)
-                    if let Some(ref directory) = cwd_directory {
-                        if libc::fchdir(directory.as_raw_fd()) != 0 {
-                            let errno = current_errno();
-                            report_startup_failure(startup_pipe[1], b'C', errno);
-                            libc::_exit(127);
-                        }
-                        libc::close(directory.as_raw_fd());
-                    } else if let Some(ref dir_cstr) = cwd_cstr {
-                        if libc::chdir(dir_cstr.as_ptr()) != 0 {
-                            let errno = current_errno();
-                            report_startup_failure(startup_pipe[1], b'C', errno);
-                            libc::_exit(127);
-                        }
-                    }
-
-                    // 设置 slave 为控制终端
-                    if libc::ioctl(slave, libc::TIOCSCTTY, 0) != 0 {
-                        write_stderr(b"ember: ioctl TIOCSCTTY failed\n");
-                    }
-
-                    // 重定向 stdin/stdout/stderr 到 PTY slave
-                    libc::dup2(slave, libc::STDIN_FILENO);
-                    libc::dup2(slave, libc::STDOUT_FILENO);
-                    libc::dup2(slave, libc::STDERR_FILENO);
-                    if slave > libc::STDERR_FILENO {
-                        libc::close(slave);
-                    }
-
-                    // 执行 shell，使用 fork 前构建好的 argv/envp
-                    libc::execve(exec_cstr.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
-
-                    // 如果 execve 返回，说明出错
-                    let errno = current_errno();
-                    report_startup_failure(startup_pipe[1], b'E', errno);
-                    libc::_exit(127);
-                } else {
-                    // 父进程分支
-                    // 关闭 slave
-                    libc::close(slave);
-                    libc::close(startup_pipe[1]);
-
-                    // 有界等待 fork→execve 握手:子进程卡在 fork 与 execve 之间
-                    // (例如 fchdir 进入挂起的网络挂载)时,超时路径会杀死(进程组
-                    // 与进程本身)并回收子进程,pane 创建不再被永久挂起。
-                    if let Err(error) =
-                        wait_for_child_startup(startup_pipe[0], fork_result, CHILD_STARTUP_TIMEOUT)
-                    {
-                        libc::close(master);
-                        return Err(error);
-                    }
-
-                    Ok(Pty {
+                })?
+                .adopt(|master, child_pid| {
+                    Ok(Self {
                         master,
-                        child_pid: fork_result as i32,
-                        session: companion_host::pty_session::PtySession::capture(
-                            fork_result as i32,
-                        ),
-                        exit_code_cached: None,
-                        lifecycle: ChildLifecycle::Running,
+                        child: NativePtyChild::new(child_pid)?,
+                        session: companion_host::pty_session::PtySession::capture(child_pid),
                     })
-                }
+                })
             }
         }
 
         pub fn get_child_pid(&self) -> i32 {
-            self.child_pid
+            self.child.pid()
         }
 
         pub fn session_activity(&self) -> companion_host::pty_session::Activity {
@@ -957,25 +520,13 @@ mod unix_pty {
         }
 
         pub fn master_fd(&self) -> RawFd {
-            self.master
+            self.master.as_raw_fd()
         }
 
         /// 单次非阻塞写入。返回写入的字节数(可能 partial),或 WouldBlock 表示缓冲区满。
         pub fn write(&mut self, data: &[u8]) -> Result<WriteOutcome> {
-            // SAFETY: self.master 是有效的文件描述符，data.as_ptr() 指向有效的内存，
-            // data.len() 是正确的长度。write 系统调用不会超出缓冲区边界。
-            loop {
-                let n = unsafe { libc::write(self.master, data.as_ptr() as *const _, data.len()) };
-                if n >= 0 {
-                    return Ok(WriteOutcome::Written(n as usize));
-                }
-                let err = std::io::Error::last_os_error();
-                match err.kind() {
-                    std::io::ErrorKind::Interrupted => continue, // EINTR:重试
-                    std::io::ErrorKind::WouldBlock => return Ok(WriteOutcome::WouldBlock),
-                    _ => return Err(anyhow!("Failed to write to PTY: {}", err)),
-                }
-            }
+            write_native_master(self.master.as_fd(), data, PtyWriteAttempt::run)
+                .map_err(|error| anyhow!("Failed to write to PTY: {error}"))
         }
 
         pub fn read(&mut self, buf: &mut [u8]) -> Result<ReadOutcome> {
@@ -985,224 +536,49 @@ mod unix_pty {
         }
 
         pub fn resize(&mut self, cols: usize, rows: usize) -> Result<()> {
-            // SAFETY: win_size 是有效的栈上变量，符合 libc::winsize 的内存布局。
-            // ioctl TIOCSWINSZ 调用是标准的 PTY 窗口大小设置操作。
-            unsafe {
-                let win_size = libc::winsize {
-                    ws_row: rows as u16,
-                    ws_col: cols as u16,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
-
-                if libc::ioctl(
-                    self.master,
-                    libc::TIOCSWINSZ,
-                    (&win_size) as *const _ as *mut libc::c_void,
-                ) < 0
-                {
-                    return Err(anyhow!("Failed to resize PTY"));
-                }
-            }
-            Ok(())
+            resize_master(self.master.as_fd(), cols as u16, rows as u16)
+                .map_err(|_| anyhow!("Failed to resize PTY"))
         }
 
-        /// 把 waitpid 返回的 status 解码为退出码并缓存。
-        /// 关键不变量:任何 reap(回收僵尸)的路径都必须缓存退出码,
-        /// 这样 `exit_code_cached.is_some()` 等价于"PID 已被回收、可能被复用";
-        /// kill 路径据此判断是否还能安全发信号,避免误杀复用了该 PID 的无辜进程。
-        fn cache_status(&mut self, status: i32) {
-            let code = jterm_core::process::decode_wait_status(status)
-                .and_then(jterm_core::process::ChildExitOutcome::negative_signal_code)
-                .unwrap_or(-1);
-            self.exit_code_cached = Some(code);
-            self.lifecycle = ChildLifecycle::Reaped;
-        }
-
-        /// Observe the direct child without consuming its wait status. Keeping
-        /// the exited leader as a zombie preserves ownership of its numeric
-        /// PID/process-group identity until `finish_observed_exit` has killed
-        /// every same-group descendant. Reaping first would make a later
-        /// `kill(-pid, ...)` vulnerable to PID/PGID reuse.
+        #[cfg(test)]
         fn child_exit_observed(&self, nonblocking: bool) -> std::io::Result<bool> {
-            if self.exit_code_cached.is_some() {
+            if self.child.cached_code().is_some() {
                 return Ok(true);
             }
-            Self::observe_child_exit(self.child_pid, nonblocking)
+            NativePtyChild::observe(self.child.pid(), nonblocking)
         }
 
+        #[cfg(test)]
         fn observe_child_exit(child_pid: i32, nonblocking: bool) -> std::io::Result<bool> {
-            retry_on_eintr(|| Self::observe_child_exit_once(child_pid, nonblocking))
+            NativePtyChild::observe(child_pid, nonblocking)
         }
 
-        // Keep a single syscall available to deadline-bound callers: retrying
-        // EINTR here indefinitely would bypass their timeout check.
         fn observe_child_exit_once(child_pid: i32, nonblocking: bool) -> std::io::Result<bool> {
-            jterm_core::process::observe_child_exit(child_pid, nonblocking)
-                .map(|status| status.is_some())
+            NativePtyChild::observe_once(child_pid, nonblocking)
         }
 
-        /// The direct child is known to be exited but deliberately unreaped.
-        /// Kill its still-owned private process group first, then consume the
-        /// original leader status exactly once. SIGKILL cannot change a status
-        /// that is already waitable, so a successful CLI exit remains exit 0.
         fn finish_observed_exit(&mut self) -> std::io::Result<i32> {
-            if let Some(code) = self.exit_code_cached {
-                return Ok(code);
-            }
-            // Preserve the unreaped leader until separate background groups
-            // in its PTY session have also stopped. This never uses a reused
-            // numeric PID as a signal target.
-            self.session.drain_after_exit()?;
-            // SAFETY: WNOWAIT kept child_pid unreaped, so its process-group ID
-            // cannot be recycled between this signal and the waitpid below.
-            let killed = unsafe { libc::kill(-self.child_pid, libc::SIGKILL) };
-            if killed < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    // Preserve the zombie ownership anchor and retry rather
-                    // than publishing completion while a group we failed to
-                    // terminate may still be active.
-                    return Err(error);
-                }
-            }
-
-            let mut status = 0;
-            let child_pid = self.child_pid;
-            let result = retry_on_eintr(|| {
-                // SAFETY: the observed child is waitable and still owned by
-                // this Pty. No other Ember path can wait while its mutex is held.
-                let result = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-                if result < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(result)
-                }
-            });
-            match result {
-                Ok(result) if result == child_pid => {
-                    self.cache_status(status);
-                    Ok(self.exit_code_cached.unwrap_or(-1))
-                }
-                Ok(_) => Err(std::io::Error::other(
-                    "waitpid returned no status for an observed PTY exit",
-                )),
-                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                    self.exit_code_cached = Some(-1);
-                    self.lifecycle = ChildLifecycle::Reaped;
-                    Ok(-1)
-                }
-                Err(error) => Err(error),
-            }
+            let session = &self.session;
+            self.child
+                .finish_observed_exit(|| session.drain_after_exit())
         }
 
         pub fn is_alive(&mut self) -> bool {
-            // A detached reaper owns TerminationStarted children. Never issue
-            // another waitid/waitpid (or later signal) for a pid once teardown
-            // begins. A cached exit code likewise means the PID was reaped.
-            if self.lifecycle != ChildLifecycle::Running || self.exit_code_cached.is_some() {
-                return false;
-            }
-
-            match self.child_exit_observed(true) {
-                Ok(false) => true,
-                Ok(true) => match self.finish_observed_exit() {
-                    Ok(_) => false,
-                    Err(error) => {
-                        log::warn!("could not finish observed PTY child exit: {error}");
-                        true
-                    }
-                },
-                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                    // Another wait path reaped the PID without leaving a
-                    // status. Unknown must fail closed, never masquerade as a
-                    // successful child process.
-                    self.exit_code_cached = Some(-1);
-                    self.lifecycle = ChildLifecycle::Reaped;
-                    false
-                }
-                Err(error) => {
-                    // Conservatively keep the process live: an unrelated
-                    // waitid failure is not evidence that the PID was reaped.
-                    log::warn!("waitid(WNOWAIT) failed while checking PTY child: {error}");
-                    true
-                }
-            }
+            let session = &self.session;
+            self.child.is_alive(|| session.drain_after_exit())
         }
 
-        /// 优雅终止:仅在子进程尚未被回收时发送 SIGHUP(进程组)+SIGTERM。
-        /// 调用者必须持有 Pty 的互斥锁,以与 io_loop 的回收路径串行化。
         pub fn signal_terminate(&mut self) {
-            if self.exit_code_cached.is_some() {
-                return; // 已回收,PID 可能被复用,绝不再发信号
-            }
-            // 此时子进程尚未被 reap(僵尸或运行中),其 PID 仍为我们保留,kill 安全。
-            // SAFETY: 负 PID 向进程组发信号是标准做法;child_pid 来自 fork。
-            unsafe {
-                let pgid = -self.child_pid;
-                let _ = libc::kill(pgid, libc::SIGHUP);
-                let _ = libc::kill(self.child_pid, libc::SIGTERM);
-            }
+            self.child.signal_terminate();
         }
 
-        /// 强制终止并回收:仅在尚未被回收时 SIGKILL 进程组,然后阻塞 waitpid 恰好一次。
-        /// 调用者必须持有 Pty 的互斥锁。
         pub fn force_kill_and_reap(&mut self) {
-            if self.exit_code_cached.is_some() {
-                return; // 已被 io_loop 回收,跳过(避免误杀复用 PID)
-            }
-            // SAFETY: 同上,子进程尚未 reap,PID 仍保留,kill/waitpid 安全。
-            unsafe {
-                let pgid = -self.child_pid;
-                let _ = libc::kill(pgid, libc::SIGKILL);
-                let _ = libc::kill(self.child_pid, libc::SIGKILL);
-                let mut status = 0;
-                loop {
-                    let r = libc::waitpid(self.child_pid, &mut status, 0);
-                    if r > 0 {
-                        self.cache_status(status);
-                        break;
-                    } else if r < 0
-                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                    {
-                        continue; // EINTR:重试
-                    } else {
-                        // ECHILD 等:无法回收(已被回收),记一个强杀退出码。
-                        self.exit_code_cached = Some(-9);
-                        self.lifecycle = ChildLifecycle::Reaped;
-                        break;
-                    }
-                }
-            }
+            self.child.force_kill_and_reap();
         }
 
-        /// 单次非阻塞退出观察。已退出时先清理仍归属该 PTY 进程组的后代，
-        /// 再 waitpid 回收 leader；ECHILD → unknown，仍在运行 → None。
-        /// 调用方应在锁外做有界轮询,把 sleep 排除在 Pty 临界区之外,避免 UI
-        /// 线程的 resize/write 在子进程退出窗口内被阻塞数十毫秒。
         pub fn try_reap(&mut self) -> Option<i32> {
-            if let Some(code) = self.exit_code_cached {
-                return Some(code);
-            }
-            match self.child_exit_observed(true) {
-                Ok(false) => None,
-                Ok(true) => match self.finish_observed_exit() {
-                    Ok(code) => Some(code),
-                    Err(error) => {
-                        log::warn!("could not finish observed PTY child exit: {error}");
-                        None
-                    }
-                },
-                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                    self.exit_code_cached = Some(-1);
-                    self.lifecycle = ChildLifecycle::Reaped;
-                    Some(-1)
-                }
-                Err(error) => {
-                    log::warn!("waitid(WNOWAIT) failed while observing PTY child: {error}");
-                    None
-                }
-            }
+            let session = &self.session;
+            self.child.try_reap(|| session.drain_after_exit())
         }
 
         /// Poll for the direct child exit until `timeout_ms` expires. Zero makes
@@ -1221,17 +597,17 @@ mod unix_pty {
             timeout_ms: u64,
             mut finish: impl FnMut(&mut Self) -> std::io::Result<i32>,
         ) -> Result<i32> {
-            if let Some(code) = self.exit_code_cached {
+            if let Some(code) = self.child.cached_code() {
                 return Ok(code);
             }
-            if self.lifecycle != ChildLifecycle::Running {
+            if self.child.phase() != ChildLifecycle::Running {
                 return Err(anyhow!("PTY child is owned by the termination reaper"));
             }
 
             let started = Instant::now();
             let timeout = Duration::from_millis(timeout_ms);
             loop {
-                match Self::observe_child_exit_once(self.child_pid, true) {
+                match Self::observe_child_exit_once(self.child.pid(), true) {
                     Ok(true) => match finish(self) {
                         Ok(code) => return Ok(code),
                         // Session draining is bounded and may need more than one
@@ -1244,8 +620,7 @@ mod unix_pty {
                     Ok(false) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                        self.exit_code_cached = Some(-1);
-                        self.lifecycle = ChildLifecycle::Reaped;
+                        self.child.retire_unknown();
                         return Ok(-1);
                     }
                     Err(error) => return Err(anyhow!("waitid failed: {error}")),
@@ -1265,57 +640,9 @@ mod unix_pty {
         }
 
         pub fn terminate(&mut self) -> Result<()> {
-            // 生命周期检查必须先于任何信号:分离的回收线程启动后,再次调用
-            // terminate 绝不能再向可能已被 OS 复用的 pid/pgid 发信号。
-            if self.lifecycle != ChildLifecycle::Running {
-                return Ok(());
-            }
-            if !self.is_alive() {
-                return Ok(());
-            }
-
-            // 发信号前先认领拆除:随后的 terminate()(包括 Drop 触发的)都是
-            // no-op。此时子进程尚未被 reap,其 PID/PGID 仍为我们保留,kill 安全。
-            self.lifecycle = ChildLifecycle::TerminationStarted;
-            self.exit_code_cached = Some(-libc::SIGTERM);
-
-            // SAFETY: 负 PID 向进程组发信号;child_pid 经 setsid 成为会话/进程组
-            // leader。上面的 is_alive 检查确保子进程尚未被回收。
-            unsafe {
-                let pgid = -self.child_pid;
-                let _ = libc::kill(pgid, libc::SIGHUP);
-                let _ = libc::kill(self.child_pid, libc::SIGTERM);
-            }
-
-            // 升级路径(等待→SIGKILL→回收)放到分离线程,而不是在这里 sleep:
-            // terminate() 会从 Drop 调用,常常运行在 UI 线程上,绝不能为宽限期
-            // 阻塞。线程只捕获 pid(独占其进程组),与 self 无别名。
-            let child_pid = self.child_pid;
-            std::thread::spawn(move || unsafe {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                // Observe without reaping. Even if TERM already ended the
-                // leader, its zombie must pin the PID/PGID until we have killed
-                // same-group descendants that ignored HUP/TERM. Reaping first
-                // would both leak those jobs and permit numeric PID reuse.
-                if let Err(error) = Self::observe_child_exit(child_pid, true) {
-                    // ECHILD means ownership has already been lost; never send
-                    // a signal to a potentially recycled PID or process group.
-                    if error.raw_os_error() != Some(libc::ECHILD) {
-                        log::warn!("could not observe terminating PTY child: {error}");
-                    }
-                    return;
-                }
-                let _ = libc::kill(-child_pid, libc::SIGKILL);
-                let _ = libc::kill(child_pid, libc::SIGKILL);
-                let mut status = 0;
-                loop {
-                    if libc::waitpid(child_pid, &mut status, 0) >= 0
-                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
-                    {
-                        break;
-                    }
-                }
-            });
+            let session = &self.session;
+            self.child
+                .terminate(Duration::from_millis(50), || session.drain_after_exit());
             Ok(())
         }
     }
@@ -1325,125 +652,12 @@ mod unix_pty {
             if self.is_alive() {
                 let _ = self.terminate();
             }
-            // SAFETY: close 关闭文件描述符。master 是有效的 fd，
-            // 关闭后不会再使用（因为这是 Drop 实现）。
-            unsafe {
-                let _ = libc::close(self.master);
-            }
         }
     }
 
     #[cfg(test)]
     mod lifecycle_tests {
         use super::*;
-
-        unsafe fn make_test_startup_child(
-            partial_status: Option<u8>,
-            keep_writer_open: bool,
-        ) -> (RawFd, libc::pid_t) {
-            let [read_fd, write_fd] = startup_status_pipe().expect("create test startup pipe");
-            let pid = libc::fork();
-            if pid < 0 {
-                libc::close(read_fd);
-                libc::close(write_fd);
-                panic!(
-                    "fork test startup child: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            if pid == 0 {
-                libc::close(read_fd);
-                // The production child immediately execs, which closes every
-                // unrelated CLOEXEC descriptor. This fixture can deliberately
-                // pause before exit, so emulate that boundary explicitly: if
-                // it retained a process-wide flock opened by another parallel
-                // test, dropping the lock in the parent would not release it
-                // until this child was killed. Keep the status writer at one
-                // known descriptor and close everything above it.
-                const STATUS_FD: RawFd = 3;
-                if write_fd != STATUS_FD {
-                    if libc::dup2(write_fd, STATUS_FD) < 0 {
-                        libc::_exit(126);
-                    }
-                    libc::close(write_fd);
-                }
-                #[cfg(target_os = "linux")]
-                let close_range_unavailable =
-                    libc::close_range(STATUS_FD as libc::c_uint + 1, libc::c_uint::MAX, 0) != 0;
-                #[cfg(not(target_os = "linux"))]
-                let close_range_unavailable = true;
-                if close_range_unavailable {
-                    // This test module only exercises Unix targets. The
-                    // conservative old-kernel fallback avoids allocation
-                    // after fork. Test processes keep descriptors in this
-                    // low range; production takes the exec/CLOEXEC path.
-                    for fd in (STATUS_FD + 1)..1024 {
-                        libc::close(fd);
-                    }
-                }
-                if let Some(byte) = partial_status {
-                    let _ = libc::write(STATUS_FD, (&byte as *const u8).cast::<libc::c_void>(), 1);
-                }
-                if keep_writer_open {
-                    loop {
-                        libc::pause();
-                    }
-                }
-                libc::close(STATUS_FD);
-                libc::_exit(0);
-            }
-
-            libc::close(write_fd);
-            (read_fd, pid)
-        }
-
-        #[test]
-        fn startup_handshake_times_out_after_partial_record_and_reaps_child() {
-            let (read_fd, pid) = unsafe { make_test_startup_child(Some(1), true) };
-            let started = Instant::now();
-            let error = unsafe {
-                wait_for_child_startup(read_fd, pid, Duration::from_millis(50))
-                    .expect_err("a child holding a partial record must time out")
-            };
-
-            assert!(
-                error.to_string().contains("fork-to-exec startup"),
-                "unexpected error: {error:#}"
-            );
-            assert!(
-                error.to_string().contains("received 1/"),
-                "partial byte count missing from error: {error:#}"
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "startup timeout exceeded its bounded cleanup window"
-            );
-
-            // The timeout path must have killed (group and pid) and reaped
-            // the stuck child, so a second waitpid reports ECHILD.
-            let mut status = 0;
-            let wait_result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            assert_eq!(wait_result, -1, "startup child was not already reaped");
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ECHILD)
-            );
-        }
-
-        #[test]
-        fn startup_handshake_rejects_eof_after_partial_record() {
-            let (read_fd, pid) = unsafe { make_test_startup_child(Some(1), false) };
-            let error = unsafe {
-                wait_for_child_startup(read_fd, pid, Duration::from_secs(1))
-                    .expect_err("EOF after a partial record must be rejected")
-            };
-            assert!(
-                error
-                    .to_string()
-                    .contains("Incomplete shell startup status"),
-                "unexpected error: {error:#}"
-            );
-        }
 
         fn timed_test_child(script: &str) -> Pty {
             let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
@@ -1470,12 +684,12 @@ mod unix_pty {
                     elapsed < Duration::from_millis(250),
                     "wait exceeded its budget substantially"
                 );
-                assert_eq!(pty.lifecycle, ChildLifecycle::Running);
-                assert_eq!(pty.exit_code_cached, None);
+                assert_eq!(pty.child.phase(), ChildLifecycle::Running);
+                assert_eq!(pty.child.cached_code(), None);
                 assert!(pty.is_alive(), "timeout must not kill or reap the child");
             }
             assert_eq!(pty.wait_timeout(4000).unwrap(), 7);
-            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
+            assert_eq!(pty.child.phase(), ChildLifecycle::Reaped);
             for budget in [0, 50, u64::MAX] {
                 assert_eq!(pty.wait_timeout(budget).unwrap(), 7);
             }
@@ -1502,7 +716,7 @@ mod unix_pty {
                 .unwrap();
             assert!(attempts >= 2, "the transient drain must be retried");
             assert_eq!(code, 7);
-            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
+            assert_eq!(pty.child.phase(), ChildLifecycle::Reaped);
             assert_eq!(pty.wait_timeout(0).unwrap(), 7);
         }
 
@@ -1526,8 +740,8 @@ mod unix_pty {
                 error.downcast_ref::<std::io::Error>().unwrap().kind(),
                 std::io::ErrorKind::TimedOut
             );
-            assert_eq!(pty.lifecycle, ChildLifecycle::Running);
-            assert_eq!(pty.exit_code_cached, None);
+            assert_eq!(pty.child.phase(), ChildLifecycle::Running);
+            assert_eq!(pty.child.cached_code(), None);
             assert!(pty.child_exit_observed(true).unwrap());
             assert_eq!(pty.wait_timeout(4000).unwrap(), 7);
         }
@@ -1536,8 +750,8 @@ mod unix_pty {
         fn wait_timeout_drains_background_session_before_caching_leader_status() {
             let mut pty = timed_test_child("sleep 30 & exit 7");
             assert_eq!(pty.wait_timeout(4000).unwrap(), 7);
-            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
-            assert_eq!(pty.exit_code_cached, Some(7));
+            assert_eq!(pty.child.phase(), ChildLifecycle::Reaped);
+            assert_eq!(pty.child.cached_code(), Some(7));
             assert_eq!(pty.wait_timeout(0).unwrap(), 7);
         }
 
@@ -1550,7 +764,7 @@ mod unix_pty {
             // Simulate a foreign consumer having already reaped the child.
             let mut status = 0;
             let result = retry_on_eintr(|| {
-                let result = unsafe { libc::waitpid(pty.child_pid, &mut status, 0) };
+                let result = unsafe { libc::waitpid(pty.child.pid(), &mut status, 0) };
                 if result < 0 {
                     Err(std::io::Error::last_os_error())
                 } else {
@@ -1558,9 +772,9 @@ mod unix_pty {
                 }
             })
             .unwrap();
-            assert_eq!(result, pty.child_pid);
+            assert_eq!(result, pty.child.pid());
             assert_eq!(pty.wait_timeout(0).unwrap(), -1);
-            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
+            assert_eq!(pty.child.phase(), ChildLifecycle::Reaped);
             assert_eq!(pty.wait_timeout(50).unwrap(), -1);
             pty.terminate().unwrap();
         }
@@ -1586,8 +800,8 @@ mod unix_pty {
             barrier.wait();
             let mut pty = pty.lock().unwrap();
             pty.terminate().unwrap();
-            let pid = pty.child_pid;
-            assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+            let pid = pty.child.pid();
+            assert_eq!(pty.child.phase(), ChildLifecycle::TerminationStarted);
             for _ in 0..20 {
                 assert_eq!(pty.wait_timeout(0).unwrap(), -libc::SIGTERM);
                 assert_eq!(pty.try_reap(), Some(-libc::SIGTERM));
@@ -1660,7 +874,7 @@ mod unix_pty {
 
             pty.terminate().expect("terminate the leader");
             pty.terminate().expect("repeated terminate is harmless");
-            assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+            assert_eq!(pty.child.phase(), ChildLifecycle::TerminationStarted);
             // Do not reap here: the detached thread is the sole wait owner.
             std::thread::sleep(Duration::from_millis(850));
             let leader_handled_term = leader_exited.exists();
@@ -1669,7 +883,7 @@ mod unix_pty {
             let observed = unsafe {
                 libc::waitid(
                     libc::P_PID,
-                    pty.child_pid as libc::id_t,
+                    pty.child.pid() as libc::id_t,
                     &mut info,
                     libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
                 )
@@ -1692,7 +906,7 @@ mod unix_pty {
         fn terminate_is_idempotent_and_does_not_block_the_caller() {
             let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, Some("/bin/sh"), None)
                 .expect("start /bin/sh in a PTY");
-            assert_eq!(pty.lifecycle, ChildLifecycle::Running);
+            assert_eq!(pty.child.phase(), ChildLifecycle::Running);
 
             let started = Instant::now();
             pty.terminate().expect("first terminate succeeds");
@@ -1701,10 +915,10 @@ mod unix_pty {
                 started.elapsed() < Duration::from_millis(50),
                 "terminate must return before the grace-period escalation"
             );
-            assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+            assert_eq!(pty.child.phase(), ChildLifecycle::TerminationStarted);
 
             pty.terminate().expect("repeated terminate is a no-op");
-            assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+            assert_eq!(pty.child.phase(), ChildLifecycle::TerminationStarted);
         }
     }
 }

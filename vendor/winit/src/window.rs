@@ -657,23 +657,33 @@ impl Window {
         { false }
     }
 
-    /// Begin an opt-in JWM/X11 extended-counter frame, before native present.
-    /// `finish_native_frame_feedback` requires exact producer publication evidence.
+    /// Whether feedback is tied to a real Wayland surface commit. This does
+    /// not itself establish submission, presentation, or physical scanout.
+    pub fn native_frame_feedback_is_surface_bound(&self) -> bool {
+        #[cfg(any(x11_platform, wayland_platform))]
+        { return self.window.maybe_wait_on_main(|w| w.native_frame_feedback_is_surface_bound()); }
+        #[cfg(not(any(x11_platform, wayland_platform)))]
+        { false }
+    }
+
+    /// Begin an opt-in surface-bound Wayland or extended-counter X11 frame.
+    /// X11 requires producer completion; Wayland requires successful exact submission plus subsequent compositor presentation feedback.
     /// Unsupported compositors/platforms return false.
     pub fn begin_native_frame_feedback(&self, serial: u64, width: u32, height: u32) -> bool {
-        #[cfg(x11_platform)]
+        #[cfg(any(x11_platform, wayland_platform))]
         { return self.window.maybe_wait_on_main(move |w| w.begin_native_frame_feedback(serial, width, height)); }
-        #[cfg(not(x11_platform))]
+        #[cfg(not(any(x11_platform, wayland_platform)))]
         { let _ = (serial, width, height); false }
     }
 
-    /// Publish the even counter only for the exact, completed native present.
+    /// Confirm producer completion on X11, or exact submission on Wayland.
+    /// Wayland caller success is submission only; it never emits until real presented.
     /// Successful feedback arrives later as `NativeFramePresented`, carrying
     /// this original serial. This does not certify physical scanout.
     pub fn finish_native_frame_feedback(&self, serial: u64, published: bool) {
-        #[cfg(x11_platform)]
+        #[cfg(any(x11_platform, wayland_platform))]
         self.window.maybe_queue_on_main(move |w| w.finish_native_frame_feedback(serial, published));
-        #[cfg(not(x11_platform))]
+        #[cfg(not(any(x11_platform, wayland_platform)))]
         let _ = (serial, published);
     }
 

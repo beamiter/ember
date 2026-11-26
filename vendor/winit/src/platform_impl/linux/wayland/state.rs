@@ -37,10 +37,15 @@ use crate::platform_impl::wayland::window::{WindowRequests, WindowState};
 use crate::platform_impl::wayland::{WaylandError, WindowId};
 use crate::platform_impl::OsError;
 
+use crate::platform_impl::wayland::types::wp_presentation::PresentationState;
+
 /// Winit's Wayland state.
 pub struct WinitState {
     /// The WlRegistry.
     pub registry_state: RegistryState,
+
+    /// Optional real compositor presentation feedback.
+    pub presentation_state: Option<Arc<PresentationState>>,
 
     /// The state of the WlOutput handling.
     pub output_state: OutputState,
@@ -160,6 +165,7 @@ impl WinitState {
 
         Ok(Self {
             registry_state,
+            presentation_state: PresentationState::new(globals, queue_handle).ok().map(Arc::new),
             compositor_state: Arc::new(compositor_state),
             subcompositor_state: subcompositor_state.map(Arc::new),
             output_state,

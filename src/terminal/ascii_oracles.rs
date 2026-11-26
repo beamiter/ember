@@ -33,15 +33,21 @@ fn snapshot(t: &TerminalState, previous_epoch: Option<u64>) -> Snapshot {
     macro_rules! host {
         ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
     }
+    out.insert(
+        "pending_osc52_clipboard_set".into(),
+        format!("{:?}", t.osc52.pending_set),
+    );
+    out.insert(
+        "pending_osc52_clipboard_queries".into(),
+        format!("{:?}", t.osc52.pending_queries),
+    );
+    out.insert("sync_output_active".into(), format!("{:?}", t.vt.sync_output.active));
     host!(
-        sync_output_active,
         current_working_dir,
         ime_enabled,
         preedit_text,
         preedit_cursor,
         host_window_focused,
-        pending_osc52_clipboard_set,
-        pending_osc52_clipboard_queries,
         pending_notifications,
         pending_bell,
         osc_reply_terminator,
@@ -53,9 +59,9 @@ fn snapshot(t: &TerminalState, previous_epoch: Option<u64>) -> Snapshot {
     );
     out.insert(
         "sync_start_present".into(),
-        t.sync_output_start.is_some().to_string(),
+        t.vt.sync_output.started.is_some().to_string(),
     );
-    out.insert("parser".into(), format!("{:?}", t.parser.snapshot()));
+    out.insert("parser".into(), format!("{:?}", t.vt.parser.snapshot()));
     out.insert(
         "kitty_image_count".into(),
         t.kitty_graphics.image_count().to_string(),
@@ -64,7 +70,7 @@ fn snapshot(t: &TerminalState, previous_epoch: Option<u64>) -> Snapshot {
         "paste_grant".into(),
         format!(
             "{:?}",
-            t.pending_paste_grant.as_ref().map(|g| (
+            t.osc5522.pending_paste_grant.as_ref().map(|g| (
                 &g.token,
                 g.offered_mimes
                     .iter()
@@ -176,8 +182,8 @@ fn rich_seed(seed: usize) -> TerminalState {
     }
     t.preedit_text = "输入中".into();
     t.preedit_cursor = 1;
-    t.pending_osc52_clipboard_set = Some("clipboard sentinel".into());
-    t.pending_osc52_clipboard_queries.push_back(b"\x07");
+    t.osc52.pending_set = Some("clipboard sentinel".into());
+    t.osc52.pending_queries.push_back(b"\x07");
     t.pending_notifications = vec![("title sentinel".into(), "body sentinel".into())];
     t.output_buffer = b"existing-reply".to_vec();
     t
@@ -243,15 +249,15 @@ fn seeded(seed: usize, p: &Profile) -> TerminalState {
         t.process_input(b"\x1b[1;65535HX");
     }
     t.output_buffer = b"existing-reply".to_vec();
-    assert_eq!(t.screen.grid.row_len(), p.cols);
-    assert_eq!(t.screen.grid.rows(), p.rows);
-    assert!(t.screen.cursor_col < p.cols && t.screen.cursor_row < p.rows);
-    assert!(t.screen.scroll_region_top <= t.screen.scroll_region_bottom);
-    assert!(t.screen.scroll_region_bottom < p.rows);
-    assert_eq!(t.screen.active_charset, Charset::Ascii);
-    assert!(!t.screen.insert_mode);
-    assert_eq!(t.screen.use_alt_buffer, seed & 1 != 0);
-    assert_eq!(t.sync_output_active, seed & 2 != 0);
+    assert_eq!(t.vt.screen.grid.row_len(), p.cols);
+    assert_eq!(t.vt.screen.grid.rows(), p.rows);
+    assert!(t.vt.screen.cursor_col < p.cols && t.vt.screen.cursor_row < p.rows);
+    assert!(t.vt.screen.scroll_region_top <= t.vt.screen.scroll_region_bottom);
+    assert!(t.vt.screen.scroll_region_bottom < p.rows);
+    assert_eq!(t.vt.screen.active_charset, Charset::Ascii);
+    assert!(!t.vt.screen.insert_mode);
+    assert_eq!(t.vt.screen.use_alt_buffer, seed & 1 != 0);
+    assert_eq!(t.vt.sync_output.active, seed & 2 != 0);
     super::super::structural_parity_tests::prime(&mut t);
     t
 }
@@ -281,11 +287,11 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
                     t.process_input(&bytes(&input.setup_hex));
                     if input.id == "awm_l_pending" {
                         assert!(
-                            t.screen.pending_wrap,
+                            t.vt.screen.pending_wrap,
                             "DECAWM-off case must start with true latch"
                         );
-                        assert!(!t.protocol.modes().contains(&7));
-                        assert_eq!(t.screen.cursor_col, p.cols - 1);
+                        assert!(!t.vt.protocol.modes().contains(&7));
+                        assert_eq!(t.vt.screen.cursor_col, p.cols - 1);
                     }
 
                     visit(
@@ -297,15 +303,15 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
                     );
                     count += 1;
 
-                    if input.id == "initial_wrap_provenance" && !t.screen.use_alt_buffer {
+                    if input.id == "initial_wrap_provenance" && !t.vt.screen.use_alt_buffer {
                         let active = t
                             .active_output_provenance
                             .expect("active initial-wrap output");
-                        assert!(t.screen.pending_wrap);
+                        assert!(t.vt.screen.pending_wrap);
                         assert!(!active.invalid);
                         assert_eq!(
                             active.start_row_id,
-                            t.screen.grid.row_id(t.screen.cursor_row)
+                            t.vt.screen.grid.row_id(t.vt.screen.cursor_row)
                         );
                         assert!(active.extent.is_none() && active.last_write_end.is_none());
                     }
@@ -326,7 +332,7 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
                         count += 1;
                     }
                     assert_eq!(start, data.len());
-                    if input.id.starts_with("eviction_") && !t.screen.use_alt_buffer {
+                    if input.id.starts_with("eviction_") && !t.vt.screen.use_alt_buffer {
                         assert!(t.total_lines_scrolled.saturating_sub(scrolled_before) > 3);
                         assert_eq!(t.scrollback.len(), 3, "bounded history must actually evict");
                     }
@@ -356,22 +362,22 @@ fn ascii_seed_geometry_invariants() {
     for p in &corpus.profiles {
         for seed in 0..4 {
             let t = seeded(seed, p);
-            assert_eq!(t.screen.pending_wrap, seed & 1 != 0);
+            assert_eq!(t.vt.screen.pending_wrap, seed & 1 != 0);
             assert_eq!(t.max_scrollback, 3);
             // Published ScreenState::resize_geometry resizes both stores and
             // clamps alternate cursors; the6x5 no-op seed already has both6x5.
-            assert_eq!(t.screen.alt_grid.rows(), p.rows, "hidden rows {}", p.id);
-            assert_eq!(t.screen.alt_grid.row_len(), p.cols, "hidden cols {}", p.id);
-            assert!(t.screen.alt_cursor_row < t.screen.alt_grid.rows());
-            assert!(t.screen.alt_cursor_col < t.screen.alt_grid.row_len());
-            if !t.screen.use_alt_buffer {
+            assert_eq!(t.vt.screen.alt_grid.rows(), p.rows, "hidden rows {}", p.id);
+            assert_eq!(t.vt.screen.alt_grid.row_len(), p.cols, "hidden cols {}", p.id);
+            assert!(t.vt.screen.alt_cursor_row < t.vt.screen.alt_grid.rows());
+            assert!(t.vt.screen.alt_cursor_col < t.vt.screen.alt_grid.row_len());
+            if !t.vt.screen.use_alt_buffer {
                 assert!(!t.scrollback.is_empty(), "primary history {}", p.id);
                 assert!(t.scrollback.len() <= t.max_scrollback);
                 let active = t.active_output_provenance.expect("primary active output");
                 assert!(!active.invalid, "valid primary provenance {}", p.id);
                 assert_eq!(
                     active.start_row_id,
-                    t.screen.grid.row_id(t.screen.cursor_row)
+                    t.vt.screen.grid.row_id(t.vt.screen.cursor_row)
                 );
                 assert!(active.extent.is_none() && active.last_write_end.is_none());
             }

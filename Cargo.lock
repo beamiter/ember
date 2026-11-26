@@ -1221,6 +1221,7 @@ dependencies = [
  "image",
  "jterm_core",
  "jterm_engine",
+ "jterm_protocol",
  "libc",
  "log",
  "lru 0.18.5",
@@ -1333,7 +1334,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2045,7 +2046,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -2080,9 +2081,10 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "smallvec",
+ "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -2090,7 +2092,7 @@ dependencies = [
 [[package]]
 name = "jterm_protocol"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "jterm_engine",
  "serde",
@@ -2099,7 +2101,7 @@ dependencies = [
 [[package]]
 name = "jterm_remote_client"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "serde",
  "serde_json",
@@ -2108,7 +2110,7 @@ dependencies = [
 [[package]]
 name = "jterm_runtime"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -3390,7 +3392,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3760,10 +3762,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4044,9 +4046,9 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "unicode-normalization"
-version = "0.1.25"
+version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
 dependencies = [
  "tinyvec",
 ]
@@ -4570,7 +4572,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -11,10 +11,11 @@ categories = ["command-line-utilities", "gui"]
 
 [dependencies]
 # The Git declarations are the published baseline for the local family candidate.
-jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 libc = "0.2"
-jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
+jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
+jterm_protocol = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -31,7 +32,6 @@ bytemuck = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
 fontdue = "0.9.4"
 unicode-width = "0.2"
-unicode-normalization = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.24", features = ["v4", "serde"] }
 regex = "1.13"
@@ -53,11 +53,13 @@ mundy = { version = "=0.2.3", default-features = false, features = ["async-io", 
 harfrust = "0.14.0"
 
 [dev-dependencies]
+# Frozen pre-migration NFC bodies stay independent of shared screen composition.
+unicode-normalization = "=0.1.26"
 # Test-only integrity check for losslessly sharded original-production evidence.
 sha2 = "0.10"
 # Test-only lossless original-production oracle transport.
 flate2 = "=1.1.9"
-jterm_core = { version = "0.2.0", features = ["session-parity-tests", "terminal-session-actor-test-hooks"], git = "https://github.com/beamiter/jterm_core.git", rev = "53974b89f87086c3f0d7429c4de67d33e2fe6bcd" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests", "terminal-session-actor-test-hooks"], git = "https://github.com/beamiter/jterm_core.git", rev = "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e" }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]

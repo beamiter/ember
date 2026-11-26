@@ -1,12 +1,12 @@
 {
-  "published_core_commit": "80195416ed2a16e4d3f13418b5c05493076839f5",
-  "published_core_tree": "23183f3a181f554aa329b189c8f47b1ee0cdb161",
-  "archive_sha256": "7d827c7b45f77112d1ce49df8a7c96528958a18731ef88b550e3ce8f70cc9527",
-  "archive_members": 338,
-  "archive_files": 307,
-  "omitted_paths": 63,
+  "published_core_commit": "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e",
+  "published_core_tree": "1708165ed4d4a77962fdab630ea81ef61330003e",
+  "archive_sha256": "1a24c2cd4863a663a8a4f191a7a0590fdbcbe237b126b60335a9cee4901dcd7c",
+  "archive_members": 531,
+  "archive_files": 480,
+  "omitted_paths": 65,
   "scope": "Cargo files, README.md, src/, runtime/, scripts/, tests/, assets/ and crates/ (including the independent engine) from the exact pinned Git commit. Other repository files are excluded.",
   "verification": "Every exported blob hash and executable bit was checked against the exact pinned Git tree. Archive timestamps and owner IDs are normalized. The generator exports Git objects, not working-tree files.",
-  "publication_boundary": "The published_core_* keys identify the Cargo-pinned release commit/tree. This local exporter does not verify remote availability or perform application builds.",
+  "publication_boundary": "The published GitHub commit points to the validated source tree. This normalized archive is an audit export of that tree.",
   "source_nar_verification": "No NAR hash is asserted. This subset archive is not a complete Git export; its SHA-256 is not a recursive NAR hash."
 }

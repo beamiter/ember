@@ -1987,7 +1987,13 @@ impl TerminalRenderer {
             || self.native_vim9_identity.is_some()
             || !terminal.kitty_graphics.get_placements().is_empty()
         {
-            canvas.reset();
+            if policy.chat_mode()
+                && (terminal.is_alt_buffer_active() || terminal.chat_native_takeover())
+            {
+                canvas.suspend();
+            } else {
+                canvas.reset();
+            }
             if self.canvas_geometry.translation != 0.0 {
                 self.scroll_pixel_offset = 0.0;
             }
@@ -2711,8 +2717,10 @@ impl TerminalRenderer {
         let outer_height = (available.y - self.padding * 2.0).max(self.line_height);
         let reserved_scrollbar_width = (Self::SCROLLBAR_WIDTH + Self::SCROLLBAR_GAP)
             .min((outer_width - self.char_width).max(0.0));
-        let reserved_block_gutter = self
-            .block_gutter_width()
+        // Native grid admission follows the saved mode, not the current
+        // prompt's transient dock/fallback presentation. The painter may omit
+        // its stripe, but that must not add a PTY column on restore.
+        let reserved_block_gutter = if self.block_mode { BLOCK_GUTTER_WIDTH } else { 0.0 }
             .min((outer_width - reserved_scrollbar_width - self.char_width).max(0.0));
 
         Vec2::new(
@@ -2794,7 +2802,7 @@ impl TerminalRenderer {
         if records.is_empty() {
             return None;
         }
-        let cols = terminal.screen.grid.row_len();
+        let cols = terminal.vt.screen.grid.row_len();
         let viewport_top = terminal.viewport_top_line_id();
         let viewport_bottom = viewport_top.saturating_add(rows.saturating_sub(1) as u64);
         // Record anchors are monotonic. Binary-search to the one block that can
@@ -3068,7 +3076,7 @@ impl TerminalRenderer {
         if records.is_empty() {
             return None;
         }
-        let cols = terminal.screen.grid.row_len();
+        let cols = terminal.vt.screen.grid.row_len();
         // Only visible blocks need per-frame chrome. A full-record vector made
         // idle rendering grow with retained command history even when only a
         // handful of rows were on screen.
@@ -3545,7 +3553,7 @@ impl TerminalRenderer {
         if terminal.projection_unavailable().is_some() {
             return false;
         }
-        self.pointer_app_mouse_eligible_for_rows(terminal, None, pos, terminal.screen.grid.rows())
+        self.pointer_app_mouse_eligible_for_rows(terminal, None, pos, terminal.vt.screen.grid.rows())
     }
 
     pub fn pointer_app_mouse_eligible_projected(
@@ -3587,7 +3595,7 @@ impl TerminalRenderer {
             if record.complete {
                 return false;
             }
-            let cols = terminal.screen.grid.row_len();
+            let cols = terminal.vt.screen.grid.row_len();
             let start = crate::block_mode::prompt_row_line_id(
                 record.prompt_start.line_id,
                 record.prompt_start.column,
@@ -3609,7 +3617,7 @@ impl TerminalRenderer {
                 start,
                 extent,
                 terminal.total_lines_scrolled,
-                terminal.screen.grid.rows(),
+                terminal.vt.screen.grid.rows(),
             ) else {
                 return false;
             };
@@ -3669,7 +3677,7 @@ impl TerminalRenderer {
         if terminal.projection_unavailable().is_some() {
             return false;
         }
-        self.pointer_link_eligible_for_rows(terminal, None, pos, terminal.screen.grid.rows())
+        self.pointer_link_eligible_for_rows(terminal, None, pos, terminal.vt.screen.grid.rows())
     }
 
     pub fn pointer_link_eligible_projected(
@@ -3757,7 +3765,7 @@ impl TerminalRenderer {
         let Some(content_rect) = self.last_content_rect else {
             return false;
         };
-        let rows = terminal.screen.grid.rows();
+        let rows = terminal.vt.screen.grid.rows();
         self.compute_block_chrome(terminal, rows)
             .as_deref()
             .and_then(|entries| {
@@ -4047,7 +4055,7 @@ impl TerminalRenderer {
         let clicked_start = crate::block_mode::prompt_row_line_id(
             clicked.prompt_start.line_id,
             clicked.prompt_start.column,
-            terminal.screen.grid.row_len(),
+            terminal.vt.screen.grid.row_len(),
         );
         let clicked_end = records
             .get(clicked_index + 1)
@@ -4055,14 +4063,14 @@ impl TerminalRenderer {
                 crate::block_mode::prompt_row_line_id(
                     next.prompt_start.line_id,
                     next.prompt_start.column,
-                    terminal.screen.grid.row_len(),
+                    terminal.vt.screen.grid.row_len(),
                 )
                 .saturating_sub(1)
             })
             .or_else(|| clicked.end.map(|end| end.line_id))
             .unwrap_or(clicked_start);
         let long_block = clicked_end.saturating_sub(clicked_start)
-            >= terminal.screen.grid.rows().saturating_sub(1) as u64;
+            >= terminal.vt.screen.grid.rows().saturating_sub(1) as u64;
         let bookmarked = self.bookmarked_block_sequences.contains(&clicked.sequence);
         let collapse_requested = self
             .requested_collapsed_zone_ids
@@ -4450,7 +4458,7 @@ impl TerminalRenderer {
                 egui::pos2(content.right(), top + height),
             );
             let Some(geometry) =
-                self.card_geometry(entry, content, line_height, terminal.screen.grid.rows())
+                self.card_geometry(entry, content, line_height, terminal.vt.screen.grid.rows())
             else {
                 continue;
             };
@@ -4715,13 +4723,13 @@ impl TerminalRenderer {
         let Some(newest) = records.len().checked_sub(1) else {
             return Vec::new();
         };
-        let cols = terminal.screen.grid.row_len();
+        let cols = terminal.vt.screen.grid.row_len();
         let oldest_line_id = terminal
             .total_lines_scrolled
             .saturating_sub(terminal.scrollback.len() as u64);
         let newest_line_id = terminal
             .total_lines_scrolled
-            .saturating_add(terminal.screen.grid.rows().saturating_sub(1) as u64);
+            .saturating_add(terminal.vt.screen.grid.rows().saturating_sub(1) as u64);
         records
             .iter()
             .enumerate()
@@ -4787,8 +4795,8 @@ impl TerminalRenderer {
         hovered_link: &Option<crate::link::Link>,
         target_rect: egui::Rect,
     ) -> Response {
-        let rows = terminal.screen.grid.rows();
-        let cols = terminal.screen.grid.row_len();
+        let rows = terminal.vt.screen.grid.rows();
+        let cols = terminal.vt.screen.grid.row_len();
 
         let line_height = self.line_height;
         let char_width = self.char_width;
@@ -4839,8 +4847,8 @@ impl TerminalRenderer {
         links: &[crate::link::Link],
         hovered_link: &Option<crate::link::Link>,
     ) -> Response {
-        let rows = terminal.screen.grid.rows();
-        let cols = terminal.screen.grid.row_len();
+        let rows = terminal.vt.screen.grid.rows();
+        let cols = terminal.vt.screen.grid.row_len();
 
         // Get available space
         let available = ui.available_size();
@@ -5857,6 +5865,9 @@ impl TerminalRenderer {
             let selected = terminal.finish_inline_text_selection(
                 selection_enabled && local_selection_enabled && !response.clicked(),
             );
+            if selected && interaction_enabled && viewport.scroll_offset() > 0 {
+                terminal.normalize_link_selection(&viewport, links);
+            }
             self.retained_selection_released = retained && selected;
             ctx.request_repaint();
         }
@@ -6101,7 +6112,7 @@ impl TerminalRenderer {
                     .colors
                     .cursor_override()
                     .map(|(r, g, b)| Color32::from_rgb(r, g, b));
-                match &terminal.screen.cursor_shape {
+                match &terminal.vt.screen.cursor_shape {
                     crate::terminal::CursorShape::Block => {
                         let cursor_c = dynamic_cursor.unwrap_or_else(|| self.theme.cursor_color());
                         let [r, g, b, _] = cursor_c.to_srgba_unmultiplied();
@@ -8027,8 +8038,8 @@ mod tests {
         }
         let mut terminal = TerminalState::new(80, 12);
         terminal.process_input(b"\x1b]8;;https://example.com\x07 \x1b]8;;\x07");
-        assert!(!terminal.screen.grid.get(0, 0).hyperlink_id.is_none());
-        assert!(!companion_cell_is_empty(terminal.screen.grid.get(0, 0)));
+        assert!(!terminal.vt.screen.grid.get(0, 0).hyperlink_id.is_none());
+        assert!(!companion_cell_is_empty(terminal.vt.screen.grid.get(0, 0)));
     }
 
     #[test]
@@ -8036,7 +8047,7 @@ mod tests {
         let mut terminal = TerminalState::new(80, 24);
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         use crate::terminal::{ProjectionPolicy, ProjectionViewState};
-        let before = format!("{:?}", terminal.screen.grid.iter().collect::<Vec<_>>());
+        let before = format!("{:?}", terminal.vt.screen.grid.iter().collect::<Vec<_>>());
         let mut policy = ProjectionPolicy::new();
         policy.set_chat_mode(true);
         policy.set_block_chrome(true, 0);
@@ -8069,7 +8080,7 @@ mod tests {
         }
         assert_eq!(
             before,
-            format!("{:?}", terminal.screen.grid.iter().collect::<Vec<_>>()),
+            format!("{:?}", terminal.vt.screen.grid.iter().collect::<Vec<_>>()),
             "decoration must not edit any PTY cell"
         );
         assert!(
@@ -8309,7 +8320,7 @@ mod tests {
             crate::theme::Theme::default(),
         );
         renderer.block_mode = true;
-        let rows = terminal.screen.grid.rows();
+        let rows = terminal.vt.screen.grid.rows();
         let live_span = |entries: &[BlockChromeEntry]| {
             entries
                 .iter()
@@ -8481,7 +8492,7 @@ mod tests {
                     viewport.application_cell(DisplayPoint::new(row, column))
                 {
                     assert!(
-                        grid_row < terminal.screen.grid.rows(),
+                        grid_row < terminal.vt.screen.grid.rows(),
                         "row {row} col {column} produced grid row {grid_row}"
                     );
                 }
@@ -8612,7 +8623,7 @@ mod tests {
         };
         let raw = live_of(
             &renderer
-                .compute_block_chrome(&terminal, terminal.screen.grid.rows())
+                .compute_block_chrome(&terminal, terminal.vt.screen.grid.rows())
                 .expect("raw chrome"),
         );
         assert!(!raw.starts_in_viewport, "the fixture must clip the top");
@@ -8640,7 +8651,7 @@ mod tests {
         small.process_input(b"\x1b]133;A\x07$ run\r\n\x1b]133;C\x07r0\r\nr1\r\nr2\r\n");
         let small_raw = live_of(
             &renderer
-                .compute_block_chrome(&small, small.screen.grid.rows())
+                .compute_block_chrome(&small, small.vt.screen.grid.rows())
                 .expect("raw chrome"),
         );
         let small_viewport =
@@ -8884,7 +8895,7 @@ mod tests {
             crate::theme::Theme::default(),
         );
         renderer.block_mode = true;
-        let rows = terminal.screen.grid.rows();
+        let rows = terminal.vt.screen.grid.rows();
         // Ownership only. `ends_in_viewport` is a decorative bottom-edge cap
         // that the projected path deliberately withholds for a mid-row next
         // prompt (see `projected_span_edge_flags`); it never decides which
@@ -8961,7 +8972,7 @@ mod tests {
             crate::theme::Theme::default(),
         );
         renderer.block_mode = true;
-        let rows = terminal.screen.grid.rows();
+        let rows = terminal.vt.screen.grid.rows();
 
         // Unscrolled, the raw path is exact and still owns the frame.
         assert!(terminal.viewport_buffer_mapping_is_exact());
@@ -9057,7 +9068,7 @@ mod tests {
         );
         assert!(!renderer.pointer_link_eligible_projected(&terminal, &viewport, header_pos,));
 
-        let raw_grid_row = (0..terminal.screen.grid.rows())
+        let raw_grid_row = (0..terminal.vt.screen.grid.rows())
             .find(|row| {
                 let absolute = terminal.scrollback.len() + row;
                 terminal
@@ -10872,6 +10883,34 @@ mod tests {
     }
 
     #[test]
+    fn native_columns_do_not_follow_prompt_presentation_fallback() {
+        let mut renderer = TerminalRenderer::new(14.0, 2.0, 1.0,
+            crate::config::ScrollbarVisibility::Auto, crate::theme::Theme::default());
+        renderer.char_width = 8.0;
+        renderer.line_height = 20.0;
+        renderer.block_mode = true;
+        let available = egui::vec2(102.0, 104.0);
+        let native = renderer.grid_dimensions(available);
+        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, available);
+        for chat in [false, true] {
+            renderer.glass_chat_requested = chat;
+            for fallback in [false, true] {
+                renderer.continuous_block = fallback;
+                assert_eq!(renderer.grid_dimensions(available), native,
+                    "same saved mode/font/bounds must keep native columns");
+            }
+        }
+        renderer.glass_chat_requested = false;
+        renderer.continuous_block = false;
+        let docked = renderer.layout_rects(pane).0;
+        renderer.continuous_block = true;
+        let fallback = renderer.layout_rects(pane).0;
+        assert!(fallback.left() < docked.left(), "paint-only fallback remains unchanged");
+        assert_eq!(renderer.grid_dimensions(egui::vec2(118.0, 104.0)).0, native.0 + 2,
+            "an explicit owner resize still changes native columns");
+    }
+
+    #[test]
     fn block_gutter_moves_column_zero_and_grid_size_together() {
         let mut renderer = TerminalRenderer::new(
             14.0,
@@ -10936,7 +10975,7 @@ mod tests {
                         assert_eq!(pane.right() - content.right(), 10.0);
                         let mut terminal = TerminalState::new(cols, rows);
                         terminal.on_resize(cols, rows);
-                        assert_eq!(terminal.screen.grid.row_len(), cols);
+                        assert_eq!(terminal.vt.screen.grid.row_len(), cols);
                         for col in [0, cols / 2, cols - 1] {
                             let cell = cursor_rect(content, 0, col, char_width, 20.0);
                             assert_eq!(
@@ -11022,7 +11061,7 @@ mod tests {
                             .block_chrome_snapshot(
                                 &terminal,
                                 &viewport,
-                                terminal.screen.grid.rows(),
+                                terminal.vt.screen.grid.rows(),
                             )
                             .unwrap();
                         let entry = entries.iter().find(|entry| entry.id == record_id).unwrap();
@@ -12032,7 +12071,7 @@ mod block_spacing_tests {
                 );
             }
             assert_eq!(
-                (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+                (terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows()),
                 (40, 24)
             );
         }
@@ -12116,8 +12155,8 @@ mod block_spacing_tests {
                         >= content.top() + (viewport.cursor().row + 1) as f32 * line_height
                 );
                 assert!(content.contains_rect(region));
-                assert_eq!(terminal.screen.grid.row_len(), 24);
-                assert_eq!(terminal.screen.grid.rows(), 16);
+                assert_eq!(terminal.vt.screen.grid.row_len(), 24);
+                assert_eq!(terminal.vt.screen.grid.rows(), 16);
             }
         }
     }
@@ -12162,8 +12201,8 @@ mod block_spacing_tests {
                         assert!(overflow.right() < collapse.left());
                     }
                 }
-                assert_eq!(terminal.screen.grid.row_len(), 40);
-                assert_eq!(terminal.screen.grid.rows(), 24);
+                assert_eq!(terminal.vt.screen.grid.row_len(), 40);
+                assert_eq!(terminal.vt.screen.grid.rows(), 24);
             }
         }
     }
@@ -12658,7 +12697,7 @@ mod transcript_canvas_tests {
         assert_eq!(renderer.canvas_geometry.translation, translation);
         assert!(!state.follows_bottom());
         assert_eq!(
-            (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+            (terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows()),
             (40, 16)
         );
         terminal.process_input(b"\x1b[?1049h");
@@ -12770,7 +12809,7 @@ mod transcript_canvas_tests {
         }
         assert_eq!(after.max_scroll_offset(), 0);
         assert_eq!(
-            (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+            (terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows()),
             (40, 24)
         );
     }
@@ -12974,7 +13013,7 @@ mod transcript_canvas_tests {
             );
             assert_eq!(renderer.canvas_geometry.translation, 16.75);
             assert_eq!(
-                (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+                (terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows()),
                 (40, 16)
             );
             let content =
@@ -13059,14 +13098,14 @@ mod transcript_canvas_tests {
                     assert!(
                         renderer.chat_mode,
                         "shortening the same real prompt restores docking: pane={:?}, font={font}, line={}, native_rows={:?}, limit={limit}, cursor=({},{}), wrapped={:?}",
-                        outer.size(), renderer.line_height, terminal.native_prompt_input_rows(), terminal.screen.cursor_row, terminal.screen.cursor_col, terminal.screen.grid.row_wrapped
+                        outer.size(), renderer.line_height, terminal.native_prompt_input_rows(), terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col, terminal.vt.screen.grid.row_wrapped
                     );
                     assert_eq!(renderer.grid_dimensions(native.size()), short_size);
-                    assert_eq!((terminal.screen.grid.row_len(), terminal.screen.grid.rows()), size);
+                    assert_eq!((terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows()), size);
                     for _ in 0..lines {
                         terminal.process_input(b"x\r\n");
                     }
-                    let archived_cells = terminal.screen.grid.to_vec()[..lines].to_vec();
+                    let archived_cells = terminal.vt.screen.grid.to_vec()[..lines].to_vec();
                     terminal.process_input(b"\x1b[2J\x1b[H");
                     let actual_archive = terminal.scrollback.iter().map(|row| row.decompress()).collect::<Vec<_>>();
                     assert_native_cells_equal(&actual_archive, &archived_cells);
@@ -13129,8 +13168,8 @@ mod transcript_canvas_tests {
                         reference_terminal_rects_with_height(outer, true, true, tools_height).0;
                     let size = renderer.grid_dimensions(native.size());
                     terminal.on_resize(size.0, size.1);
-                    let cursor = (terminal.screen.cursor_row, terminal.screen.cursor_col);
-                    let cells = terminal.screen.grid.to_vec();
+                    let cursor = (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col);
+                    let cells = terminal.vt.screen.grid.to_vec();
                     let presentation = renderer.resolve_glass_layout(&terminal, outer);
                     let expected = terminal.native_prompt_input_rows().is_some_and(|rows| {
                         rows as f32 * renderer.line_height
@@ -13152,10 +13191,10 @@ mod transcript_canvas_tests {
                     assert_eq!(renderer.foreground_footer_rect.is_none(), expected);
                     assert_eq!(renderer.grid_dimensions(native.size()), size);
                     assert_eq!(
-                        (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                        (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
                         cursor
                     );
-                    assert_native_cells_equal(&terminal.screen.grid.to_vec(), &cells);
+                    assert_native_cells_equal(&terminal.vt.screen.grid.to_vec(), &cells);
                     assert_eq!(terminal.preedit_text, "中文组合");
                     assert_eq!(terminal.preedit_cursor, 2);
                     assert!(terminal.ime_enabled && renderer.ime_enabled);
@@ -13179,8 +13218,8 @@ mod transcript_canvas_tests {
         let ctx = egui::Context::default();
         let (mut renderer, terminal, _) = fixture(true);
         let outer = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 600.0));
-        let cells = terminal.screen.grid.to_vec();
-        let cursor = (terminal.screen.cursor_row, terminal.screen.cursor_col);
+        let cells = terminal.vt.screen.grid.to_vec();
+        let cursor = (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col);
         ctx.run_ui(Default::default(), |_| {
             for chat in [false, true, false] {
                 renderer.sync_glass_presentation(&ctx, chat, &terminal, outer.height());
@@ -13189,9 +13228,9 @@ mod transcript_canvas_tests {
                 assert!(!renderer.continuous_block);
                 assert_eq!(renderer.chat_command_bubbles, chat);
                 assert!(renderer.foreground_footer_rect.is_none());
-                assert_native_cells_equal(&terminal.screen.grid.to_vec(), &cells);
+                assert_native_cells_equal(&terminal.vt.screen.grid.to_vec(), &cells);
                 assert_eq!(
-                    (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                    (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
                     cursor
                 );
             }
@@ -13339,7 +13378,7 @@ mod transcript_canvas_tests {
         assert_eq!(renderer.canvas_geometry.translation, translation);
         assert!(!state.follows_bottom());
         assert_eq!(
-            (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+            (terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows()),
             (40, 16)
         );
         terminal.process_input(b"\x1b[?1049h");
@@ -13407,7 +13446,7 @@ mod transcript_canvas_tests {
                 before_anchor
             );
             assert_eq!(
-                (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+                (terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows()),
                 (40, 16)
             );
         }
@@ -13555,6 +13594,38 @@ mod transcript_canvas_tests {
     }
 
     #[test]
+    fn history_selection_copies_the_original_rows_after_output_and_resize() {
+        let (mut renderer, _, _) = fixture(false);
+        let mut terminal = TerminalState::new(36, 6);
+        for row in 0..16 {
+            terminal.process_input(format!("PAST {row:04} HELLO\r\n").as_bytes());
+        }
+        terminal.scroll(100);
+        let historical = renderer.projected_viewport(&mut terminal);
+        assert!(historical.scroll_offset() > 0);
+        assert!(terminal.inline_text_scope().is_none());
+        assert!(terminal.start_inline_text_selection(
+            &historical,
+            (0, 0),
+            crate::terminal::SelectionMode::Block,
+        ));
+        terminal.update_inline_text_selection((2, 14));
+        assert!(terminal.finish_inline_text_selection(true));
+        let expected = "PAST 0000 HELLO\nPAST 0001 HELLO\nPAST 0002 HELLO";
+        assert_eq!(terminal.copy_selection().as_deref(), Some(expected));
+
+        terminal.process_input(b"\x1b[?2026hnew output\r\nmore output\r\n\x1b[?2026l");
+        renderer.projected_viewport(&mut terminal);
+        assert_eq!(terminal.copy_selection().as_deref(), Some(expected));
+        terminal.on_resize(30, 4);
+        terminal.scroll(-2);
+        renderer.projected_viewport(&mut terminal);
+        assert_eq!(terminal.copy_selection().as_deref(), Some(expected));
+        terminal.clear_text_selection();
+        assert_eq!(terminal.copy_selection(), None);
+    }
+
+    #[test]
     fn inline_cli_selection_remains_copyable_through_a_partially_painted_frame() {
         for press_in_sync in [false, true] {
             let (mut renderer, _, policy) = fixture(false);
@@ -13628,7 +13699,7 @@ mod transcript_canvas_tests {
             if !press_in_sync {
                 terminal.process_input(partial_update);
             }
-            assert!(terminal.sync_output_active);
+            assert!(terminal.vt.sync_output.active);
             assert!(terminal.projection_unavailable().is_none());
             render(
                 &mut renderer,

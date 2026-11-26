@@ -5,11 +5,39 @@ use crossbeam_channel::Receiver;
 use jterm_core::runtime_wake::WakeSink;
 use jterm_core::session_actor::SessionActor;
 
-pub use jterm_core::session_actor::{
-    SessionEvent as ShellEvent, WriteError as ShellWriteError, WriteSender as ShellWriteSender,
-};
+pub use jterm_core::session_actor::{SessionEvent as ShellEvent, WriteError as ShellWriteError};
+
+// A held view-admission fence is transient and accepts zero bytes.
+fn view_busy(bytes: usize) -> ShellWriteError {
+    ShellWriteError::Full {
+        requested_bytes: bytes,
+        queued_bytes: 0,
+        byte_capacity: 0,
+        queued_messages: 0,
+        message_capacity: 0,
+    }
+}
+
+#[derive(Clone)]
+pub struct ShellWriteSender {
+    inner: jterm_core::session_actor::WriteSender,
+    view: std::sync::Arc<parking_lot::Mutex<crate::terminal_attachment::TerminalViewAttachment>>,
+    ticket: jterm_protocol::terminal::Attachment,
+}
+impl ShellWriteSender {
+    pub fn try_send(&self, bytes: Vec<u8>) -> Result<(), ShellWriteError> {
+        let Some(view) = self.view.try_lock() else {
+            return Err(view_busy(bytes.len()));
+        };
+        if !view.attached() || !view.matches(&self.ticket) {
+            return Err(ShellWriteError::Closed);
+        }
+        self.inner.try_send(bytes)
+    }
+}
 
 pub struct ShellSession {
+    view: std::sync::Arc<parking_lot::Mutex<crate::terminal_attachment::TerminalViewAttachment>>,
     actor: SessionActor<Pty>,
     child_pid: i32,
     started_at: std::time::Instant,
@@ -87,7 +115,14 @@ impl ShellSession {
             shell_program.as_deref().map(std::path::Path::new),
         );
         let actor = SessionActor::start(pty, repaint_ctx)?;
+        let runtime_epoch = actor
+            .output_source()
+            .and_then(|epoch| u32::try_from(epoch).ok())
+            .ok_or_else(|| "Terminal runtime epoch unavailable".to_string())?;
         Ok(Self {
+            view: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::terminal_attachment::TerminalViewAttachment::new(runtime_epoch),
+            )),
             actor,
             child_pid,
             started_at: std::time::Instant::now(),
@@ -123,7 +158,35 @@ impl ShellSession {
     }
 
     pub fn write(&self, data: &[u8]) -> Result<(), ShellWriteError> {
+        let Some(view) = self.view.try_lock() else {
+            return Err(view_busy(data.len()));
+        };
+        if !view.attached() {
+            return Err(ShellWriteError::Closed);
+        }
         self.actor.write(data)
+    }
+
+    /// Runtime protocol traffic retains the original FIFO while a GUI view is absent.
+    pub(crate) fn write_protocol(&self, data: &[u8]) -> Result<(), ShellWriteError> {
+        self.actor.write(data)
+    }
+    pub fn view_attached(&self) -> bool {
+        self.view.lock().attached()
+    }
+    pub(crate) fn view_ticket(&self) -> jterm_protocol::terminal::Attachment {
+        self.view.lock().ticket()
+    }
+    pub(crate) fn change_view(
+        &self,
+        ticket: &jterm_protocol::terminal::Attachment,
+        attach: bool,
+    ) -> bool {
+        let mut view = self.view.lock();
+        if !view.can_switch(ticket, attach) || (!attach && self.actor.input_drained() != Ok(true)) {
+            return false;
+        }
+        view.switch(ticket, attach)
     }
 
     pub fn input_drained(&self) -> Result<bool, ShellWriteError> {
@@ -139,11 +202,19 @@ impl ShellSession {
         byte: u8,
         validate: impl FnOnce(i32) -> bool,
     ) -> bool {
-        self.actor.try_write_control_byte(byte, validate)
+        let Some(view) = self.view.try_lock() else {
+            return false;
+        };
+        view.attached() && self.actor.try_write_control_byte(byte, validate)
     }
 
     pub fn write_sender(&self) -> ShellWriteSender {
-        self.actor.write_sender()
+        let view = self.view.lock();
+        ShellWriteSender {
+            inner: self.actor.write_sender(),
+            view: std::sync::Arc::clone(&self.view),
+            ticket: view.ticket(),
+        }
     }
 
     pub(crate) fn freeze_after_exit(&self) {
@@ -151,6 +222,10 @@ impl ShellSession {
     }
 
     pub fn resize(&self, cols: usize, rows: usize) -> Result<(), String> {
+        let view = self.view.lock();
+        if !view.attached() {
+            return Err("Terminal view is detached".into());
+        }
         self.actor.resize(cols, rows)
     }
 
@@ -167,6 +242,93 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn view_detach_retires_cloned_input_without_retiring_protocol_or_actor() {
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty raw -echo; printf READY; cat".into(),
+        ];
+        let shell = ShellSession::new_with_cwd(
+            80,
+            24,
+            None,
+            None,
+            None,
+            Some(&argv),
+            crate::runtime_wake::egui_wake(eframe::egui::Context::default()),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut output = Vec::new();
+        while !output.ends_with(b"READY") {
+            if let Ok(ShellEvent::Output(bytes)) =
+                shell.events().recv_timeout(Duration::from_millis(20))
+            {
+                output.extend_from_slice(bytes.as_bytes());
+            }
+            assert!(Instant::now() < deadline);
+        }
+        let pid = shell.get_child_pid();
+        let epoch = shell.output_source();
+        let first = shell.view_ticket();
+        let retired = shell.write_sender();
+        {
+            let _fence = shell.view.lock();
+            assert!(retired
+                .try_send(b"BUSY".to_vec())
+                .unwrap_err()
+                .is_backpressure());
+            assert!(shell.write(b"BUSY").unwrap_err().is_backpressure());
+            assert!(!shell
+                .try_write_control_byte(3, |_| panic!("busy view must reject without waiting")));
+        }
+
+        assert_eq!(epoch, Some(u64::from(first.epoch)));
+        assert!(shell.change_view(&first, false));
+        assert!(matches!(
+            shell.write(b"RETIRED"),
+            Err(ShellWriteError::Closed)
+        ));
+        assert!(matches!(
+            retired.try_send(b"STALE".to_vec()),
+            Err(ShellWriteError::Closed)
+        ));
+        assert!(shell.resize(20, 10).is_err());
+        let detached = shell.view_ticket();
+        let absent_sender = shell.write_sender();
+        shell.write_protocol(b"PROTO").unwrap();
+        assert!(shell.change_view(&detached, true));
+        assert!(matches!(
+            retired.try_send(b"STALE".to_vec()),
+            Err(ShellWriteError::Closed)
+        ));
+        assert!(matches!(
+            absent_sender.try_send(b"ABSENT".to_vec()),
+            Err(ShellWriteError::Closed)
+        ));
+        shell.write_sender().try_send(b"FRESH".to_vec()).unwrap();
+        let mut received = Vec::new();
+        while received.len() < 10 {
+            if let Ok(ShellEvent::Output(bytes)) =
+                shell.events().recv_timeout(Duration::from_millis(20))
+            {
+                received.extend_from_slice(bytes.as_bytes());
+            }
+            assert!(Instant::now() < deadline);
+        }
+        assert_eq!(received, b"PROTOFRESH");
+        assert_eq!(shell.get_child_pid(), pid);
+        assert_eq!(shell.output_source(), epoch);
+        let current = shell.view_ticket();
+        assert_eq!(
+            (&current.session, current.epoch),
+            (&first.session, first.epoch)
+        );
+        assert_eq!(current.generation, first.generation + 2);
+    }
 
     #[cfg(unix)]
     #[test]

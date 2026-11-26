@@ -9,16 +9,16 @@ pub(super) fn seeded() -> TerminalState {
     let mut t = TerminalState::new(6, 5);
     seed_active(&mut t);
     for row in 0..5 {
-        t.screen.alt_grid[row][0].character = 'H';
+        t.vt.screen.alt_grid[row][0].character = 'H';
     }
     t
 }
 
 fn seed_active(t: &mut TerminalState) {
     for row in 0..5 {
-        t.screen.grid.row_wrapped[row] = row % 2 == 0;
+        t.vt.screen.grid.row_wrapped[row] = row % 2 == 0;
         for col in 0..6 {
-            let c = t.screen.grid.get_mut(row, col);
+            let c = t.vt.screen.grid.get_mut(row, col);
             *c = TerminalCell::default();
             c.character = char::from(b'A' + row as u8);
             c.foreground = Color::Indexed(row as u8);
@@ -27,15 +27,15 @@ fn seed_active(t: &mut TerminalState) {
             c.hyperlink_id = HyperlinkId::from_raw(row as u16 + 1);
         }
     }
-    t.screen.grid[2][1].character = '界';
-    t.screen.grid[2][1].flags.set_wide(true);
-    t.screen.grid[2][2].character = ' ';
-    t.screen.grid[2][2].flags.set_wide_continuation(true);
-    t.screen.current_bg = Color::Blue;
-    t.screen.current_flags.set_protected(true);
-    t.screen.cursor_row = 2;
-    t.screen.cursor_col = 5;
-    t.screen.pending_wrap = true;
+    t.vt.screen.grid[2][1].character = '界';
+    t.vt.screen.grid[2][1].flags.set_wide(true);
+    t.vt.screen.grid[2][2].character = ' ';
+    t.vt.screen.grid[2][2].flags.set_wide_continuation(true);
+    t.vt.screen.current_bg = Color::Blue;
+    t.vt.screen.current_flags.set_protected(true);
+    t.vt.screen.cursor_row = 2;
+    t.vt.screen.cursor_col = 5;
+    t.vt.screen.pending_wrap = true;
 }
 
 pub(super) fn prime(t: &mut TerminalState) {
@@ -71,7 +71,7 @@ pub(super) fn snapshot(t: &TerminalState) -> Snapshot {
         last_synced_primary_screen_snapshot
     );
     macro_rules! screen {
-        ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), format!("{:?}", t.screen.$field));)*};
+        ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), format!("{:?}", t.vt.screen.$field));)*};
     }
     screen!(
         cursor_row,
@@ -85,17 +85,17 @@ pub(super) fn snapshot(t: &TerminalState) -> Snapshot {
         scroll_region_top,
         scroll_region_bottom
     );
-    out.insert("grid".into(), format!("{:?}", t.screen.grid.to_vec()));
-    out.insert("grid_ids".into(), format!("{:?}", t.screen.grid.row_ids()));
-    out.insert("wraps".into(), format!("{:?}", t.screen.grid.row_wrapped));
-    out.insert("hidden".into(), format!("{:?}", t.screen.alt_grid.to_vec()));
+    out.insert("grid".into(), format!("{:?}", t.vt.screen.grid.to_vec()));
+    out.insert("grid_ids".into(), format!("{:?}", t.vt.screen.grid.row_ids()));
+    out.insert("wraps".into(), format!("{:?}", t.vt.screen.grid.row_wrapped));
+    out.insert("hidden".into(), format!("{:?}", t.vt.screen.alt_grid.to_vec()));
     out.insert(
         "hidden_ids".into(),
-        format!("{:?}", t.screen.alt_grid.row_ids()),
+        format!("{:?}", t.vt.screen.alt_grid.row_ids()),
     );
     out.insert(
         "hidden_wraps".into(),
-        format!("{:?}", t.screen.alt_grid.row_wrapped),
+        format!("{:?}", t.vt.screen.alt_grid.row_wrapped),
     );
     out.insert(
         "history".into(),
@@ -161,17 +161,17 @@ fn cases() -> BTreeMap<String, Snapshot> {
         for count in [0, 1, 2, 65535] {
             for cursor in [0, 2, 4] {
                 let mut t = seeded();
-                t.screen.scroll_region_top = 1;
-                t.screen.scroll_region_bottom = 3;
-                t.screen.cursor_row = cursor;
+                t.vt.screen.scroll_region_top = 1;
+                t.vt.screen.scroll_region_bottom = 3;
+                t.vt.screen.cursor_row = cursor;
                 prime(&mut t);
                 t.process_input(format!("\x1b[{count}{}", if up { 'M' } else { 'L' }).as_bytes());
                 all.insert(format!("lines_{up}_{count}_{cursor}"), snapshot(&t));
             }
             for (top, bottom) in [(0, 4), (1, 3)] {
                 let mut t = seeded();
-                t.screen.scroll_region_top = top;
-                t.screen.scroll_region_bottom = bottom;
+                t.vt.screen.scroll_region_top = top;
+                t.vt.screen.scroll_region_bottom = bottom;
                 prime(&mut t);
                 t.process_input(format!("\x1b[{count}{}", if up { 'S' } else { 'T' }).as_bytes());
                 all.insert(format!("count_{up}_{count}_{top}_{bottom}"), snapshot(&t));
@@ -203,7 +203,7 @@ fn cases() -> BTreeMap<String, Snapshot> {
             let mut t = seeded();
             t.set_max_scrollback(2);
             for row in 0..2 {
-                let line = ScrollbackLine::compress(&t.screen.grid[row], false);
+                let line = ScrollbackLine::compress(&t.vt.screen.grid[row], false);
                 t.push_scrollback_compressed(line);
             }
             let (a, b) = ((1, 0), (4, 3));
@@ -227,7 +227,7 @@ fn cases() -> BTreeMap<String, Snapshot> {
     for command in [b"\x1b[2S".as_slice(), b"\x1b[2T", b"\x1b[2L", b"\x1b[2M"] {
         let mut t = seeded();
         t.next_raw_row_id = u64::MAX;
-        t.screen.grid.row_ids_mut()[1] = RawRowId::UNTRACKED;
+        t.vt.screen.grid.row_ids_mut()[1] = RawRowId::UNTRACKED;
         prime(&mut t);
         t.process_input(command);
         all.insert(format!("exhaustion_{command:?}"), snapshot(&t));
@@ -248,7 +248,7 @@ fn cases() -> BTreeMap<String, Snapshot> {
     }
     for command in [b"\n".as_slice(), b"\x1bD", b"\x1bM", b"x"] {
         let mut t = seeded();
-        t.screen.cursor_row = 4;
+        t.vt.screen.cursor_row = 4;
         prime(&mut t);
         t.process_input(command);
         all.insert(format!("advance_{command:?}"), snapshot(&t));

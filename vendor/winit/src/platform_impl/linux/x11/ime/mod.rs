@@ -205,11 +205,18 @@ impl Ime {
             }
         }
 
+        // Input-method users may cache an unchanged caret rectangle. Keep its
+        // last native spot across the disabled/enabled context boundary.
+        let spot = self.inner.contexts.get(&window).and_then(|context| context.as_ref()).map(|context| context.spot());
+
         // Remove context for that window.
         let _ = self.remove_context(window);
 
         // Create new context supporting IME input.
         let _ = self.create_context(window, allowed);
+        if let Some((x, y)) = spot {
+            self.send_xim_spot(window, x, y);
+        }
     }
 
     pub fn is_ime_allowed(&self, window: ffi::Window) -> bool {

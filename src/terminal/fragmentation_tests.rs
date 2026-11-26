@@ -59,15 +59,21 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
     macro_rules! fields {
         ($($field:ident),* $(,)?) => {$(result.insert(stringify!($field), format!("{:?}", t.$field));)*};
     }
+    result.insert(
+        "pending_osc52_clipboard_set",
+        format!("{:?}", t.osc52.pending_set),
+    );
+    result.insert(
+        "pending_osc52_clipboard_queries",
+        format!("{:?}", t.osc52.pending_queries),
+    );
+    result.insert("pending_clipboard_requests", format!("{:?}", t.osc5522.pending_clipboard_requests));
+    result.insert("sync_output_active", format!("{:?}", t.vt.sync_output.active));
     fields!(
         announced_jsh_session_id,
         current_working_dir,
         global_bg,
         output_buffer,
-        sync_output_active,
-        pending_osc52_clipboard_set,
-        pending_osc52_clipboard_queries,
-        pending_clipboard_requests,
         pending_notifications,
         pending_bell,
         command_marks,
@@ -75,7 +81,7 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
         consumed_command_ids,
         total_lines_scrolled,
     );
-    let parser = t.parser.snapshot();
+    let parser = t.vt.parser.snapshot();
     result.insert("pending_escape", format!("{:?}", parser.pending_escape));
     result.insert("pending_apc", format!("{:?}", parser.pending_apc));
     result.insert("pending_osc", format!("{:?}", parser.pending_osc));
@@ -89,7 +95,7 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
         format!("{:?}", parser.discarding_apc_prev_escape),
     );
     macro_rules! screen_fields {
-        ($($field:ident),* $(,)?) => {$(result.insert(stringify!($field), format!("{:?}", t.screen.$field));)*};
+        ($($field:ident),* $(,)?) => {$(result.insert(stringify!($field), format!("{:?}", t.vt.screen.$field));)*};
     }
     screen_fields!(
         cursor_row,
@@ -117,37 +123,37 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
     );
     // Keep protocol lanes separately named, including the inactive screen.
     for (name, value) in [
-        ("modes", format!("{:?}", t.protocol.modes())),
+        ("modes", format!("{:?}", t.vt.protocol.modes())),
         (
             "keyboard_enhancement_flags",
-            format!("{:?}", t.protocol.keyboard_enhancement_flags()),
+            format!("{:?}", t.vt.protocol.keyboard_enhancement_flags()),
         ),
         (
             "keyboard_enhancement_stack",
-            format!("{:?}", t.protocol.keyboard_enhancement_stack()),
+            format!("{:?}", t.vt.protocol.keyboard_enhancement_stack()),
         ),
         (
             "alt_keyboard_enhancement_flags",
-            format!("{:?}", t.protocol.inactive_keyboard_enhancement_flags()),
+            format!("{:?}", t.vt.protocol.inactive_keyboard_enhancement_flags()),
         ),
         (
             "alt_keyboard_enhancement_stack",
-            format!("{:?}", t.protocol.inactive_keyboard_enhancement_stack()),
+            format!("{:?}", t.vt.protocol.inactive_keyboard_enhancement_stack()),
         ),
         (
             "xterm_modify_other_keys",
-            format!("{:?}", t.protocol.xterm_modify_other_keys()),
+            format!("{:?}", t.vt.protocol.xterm_modify_other_keys()),
         ),
         (
             "xterm_format_other_keys",
-            format!("{:?}", t.protocol.xterm_format_other_keys()),
+            format!("{:?}", t.vt.protocol.xterm_format_other_keys()),
         ),
     ] {
         result.insert(name, value);
     }
     for (name, saved) in [
-        ("saved_cursor", &t.screen.saved_state),
-        ("saved_primary", &t.screen.saved_primary_screen_state),
+        ("saved_cursor", &t.vt.screen.saved_state),
+        ("saved_primary", &t.vt.screen.saved_primary_screen_state),
     ] {
         result.insert(
             name,
@@ -160,13 +166,13 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
             ),
         );
     }
-    result.insert("grid", format!("{:?}", t.screen.grid.to_vec()));
-    result.insert("alt_grid", format!("{:?}", t.screen.alt_grid.to_vec()));
+    result.insert("grid", format!("{:?}", t.vt.screen.grid.to_vec()));
+    result.insert("alt_grid", format!("{:?}", t.vt.screen.alt_grid.to_vec()));
     result.insert(
         "wraps",
         format!(
             "{:?}",
-            (&t.screen.grid.row_wrapped, &t.screen.alt_grid.row_wrapped)
+            (&t.vt.screen.grid.row_wrapped, &t.vt.screen.alt_grid.row_wrapped)
         ),
     );
     result.insert(
@@ -183,7 +189,7 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
         "links",
         format!(
             "{:?}",
-            t.screen
+            t.vt.screen
                 .grid
                 .iter()
                 .flatten()
@@ -196,8 +202,8 @@ fn snapshot(t: &TerminalState) -> BTreeMap<&'static str, String> {
         format!(
             "{:?}",
             (
-                &t.parser.snapshot().utf8_buf[..t.parser.snapshot().utf8_len as usize],
-                t.parser.snapshot().utf8_len
+                &t.vt.parser.snapshot().utf8_buf[..t.vt.parser.snapshot().utf8_len as usize],
+                t.vt.parser.snapshot().utf8_len
             )
         ),
     );
@@ -255,10 +261,10 @@ fn run(bytes: &[u8], ends: impl IntoIterator<Item = usize>) -> TerminalState {
         assert!(end >= start && end <= bytes.len());
         terminal.process_input(&bytes[start..end]);
         for pending in [
-            &terminal.parser.snapshot().pending_escape,
-            &terminal.parser.snapshot().pending_apc,
-            &terminal.parser.snapshot().pending_osc,
-            &terminal.parser.snapshot().pending_string,
+            &terminal.vt.parser.snapshot().pending_escape,
+            &terminal.vt.parser.snapshot().pending_apc,
+            &terminal.vt.parser.snapshot().pending_osc,
+            &terminal.vt.parser.snapshot().pending_string,
         ] {
             // Payload cap plus introducer and possible split-ST ESC.
             assert!(pending.len() <= MAX_PENDING_ESCAPE + 3);
@@ -340,8 +346,8 @@ fn osc_non_ascii_hash_colors_preserve_values_and_recover_across_partitions() {
                         (command == "4;1" && index == 1).then_some(expected_color)
                     );
                 }
-                assert_eq!(terminal.screen.grid[0][0].character, 'O');
-                assert_eq!(terminal.screen.grid[0][1].character, 'K');
+                assert_eq!(terminal.vt.screen.grid[0][0].character, 'O');
+                assert_eq!(terminal.vt.screen.grid[0][1].character, 'K');
                 let expected = snapshot(&terminal);
                 for cut in 0..=bytes.len() {
                     assert_partition(&input, bytes, &expected, &[cut, bytes.len()]);
@@ -415,10 +421,10 @@ fn corpus_oracle_negative_controls() {
     );
     let expected = snapshot(&terminal);
     let mut changed = run(bytes, [bytes.len()]);
-    changed.screen.grid[0][0].character = '!';
+    changed.vt.screen.grid[0][0].character = '!';
     assert_ne!(snapshot(&changed)["grid"], expected["grid"]);
     let mut changed = run(bytes, [bytes.len()]);
-    changed.protocol.modes_mut().insert(2004);
+    changed.vt.protocol.modes_mut().insert(2004);
     assert_ne!(snapshot(&changed)["modes"], expected["modes"]);
     let mut changed = run(bytes, [bytes.len()]);
     changed.output_buffer.push(0);
@@ -434,8 +440,8 @@ fn corpus_oracle_negative_controls() {
 #[test]
 fn corpus_known_effects_and_abnormal_reset_recovery() {
     let t = run(CASES[1].1, [CASES[1].1.len()]);
-    assert_eq!(t.pending_osc52_clipboard_set.as_deref(), Some("hello"));
-    assert_eq!(t.pending_osc52_clipboard_queries.len(), 2);
+    assert_eq!(t.osc52.pending_set.as_deref(), Some("hello"));
+    assert_eq!(t.osc52.pending_queries.len(), 2);
     let t = run(CASES[4].1, [CASES[4].1.len()]);
     assert_eq!(
         t.kitty_graphics.get_image(41).unwrap().data,
@@ -443,11 +449,11 @@ fn corpus_known_effects_and_abnormal_reset_recovery() {
     );
     assert!(!t.output_buffer.is_empty());
     let t = run(CASES[8].1, [CASES[8].1.len()]);
-    assert!(!t.screen.use_alt_buffer);
-    assert!(!t.protocol.modes().contains(&2004));
+    assert!(!t.vt.screen.use_alt_buffer);
+    assert!(!t.vt.protocol.modes().contains(&2004));
     assert!(t.command_records.is_empty());
-    assert!(t.parser.snapshot().pending_osc.is_empty());
-    assert_eq!(t.screen.grid[0][0].character, 'R');
+    assert!(t.vt.parser.snapshot().pending_osc.is_empty());
+    assert_eq!(t.vt.screen.grid[0][0].character, 'R');
     assert!(!t.output_buffer.is_empty());
 }
 
@@ -490,10 +496,10 @@ fn oversized_osc_and_dcs_are_partition_invariant_and_recover_after_st() {
         bytes.extend_from_slice(b"\x1b[2JSECRET\x1b\\Z");
         let whole = run(&bytes, [bytes.len()]);
         let split = run(&bytes, [MAX_PENDING_ESCAPE + 3, bytes.len()]);
-        assert_eq!(whole.parser.rejected_count(), 1);
-        assert_eq!(split.parser.rejected_count(), 1);
+        assert_eq!(whole.vt.parser.rejected_count(), 1);
+        assert_eq!(split.vt.parser.rejected_count(), 1);
         assert_eq!(snapshot(&whole), snapshot(&split));
-        assert_eq!(whole.screen.grid[0][0].character, 'Z');
+        assert_eq!(whole.vt.screen.grid[0][0].character, 'Z');
     }
 }
 
@@ -502,9 +508,9 @@ fn minimal_interrupted_utf8_prefix_has_one_replacement() {
     let bytes = b"\xe2\x82X";
     for ends in [vec![3], vec![1, 3], vec![2, 3], vec![1, 2, 3]] {
         let t = run(bytes, ends);
-        assert_eq!(t.screen.cursor_col, 2);
-        assert_eq!(t.screen.grid[0][0].character, '\u{fffd}');
-        assert_eq!(t.screen.grid[0][1].character, 'X');
+        assert_eq!(t.vt.screen.cursor_col, 2);
+        assert_eq!(t.vt.screen.grid[0][0].character, '\u{fffd}');
+        assert_eq!(t.vt.screen.grid[0][1].character, 'X');
     }
 }
 
@@ -552,7 +558,7 @@ fn utf8_replacement_matches_standard_library_for_all_partitions() {
         let expected = String::from_utf8_lossy(&terminated);
         for cut in 0..=terminated.len() {
             let t = run(&terminated, [cut, terminated.len()]);
-            let rendered: String = t.screen.grid[0][..t.screen.cursor_col]
+            let rendered: String = t.vt.screen.grid[0][..t.vt.screen.cursor_col]
                 .iter()
                 .filter(|c| !c.flags.wide_continuation())
                 .map(|c| c.character)
@@ -560,7 +566,7 @@ fn utf8_replacement_matches_standard_library_for_all_partitions() {
             assert_eq!(rendered, expected, "bytes={bytes:?}, cut={cut}");
         }
         let t = run(&terminated, 1..=terminated.len());
-        let rendered: String = t.screen.grid[0][..t.screen.cursor_col]
+        let rendered: String = t.vt.screen.grid[0][..t.vt.screen.cursor_col]
             .iter()
             .filter(|c| !c.flags.wide_continuation())
             .map(|c| c.character)
@@ -574,11 +580,11 @@ fn utf8_replacement_matches_standard_library_for_all_partitions() {
     ] {
         let t = run(bytes, 1..=bytes.len());
         assert_eq!(
-            t.screen.cursor_col, 0,
+            t.vt.screen.cursor_col, 0,
             "unfinished scalar is pending, not EOF"
         );
         assert_eq!(
-            &t.parser.snapshot().utf8_buf[..t.parser.snapshot().utf8_len as usize],
+            &t.vt.parser.snapshot().utf8_buf[..t.vt.parser.snapshot().utf8_len as usize],
             bytes
         );
     }
@@ -615,23 +621,23 @@ fn oversized_kitty_discard_is_bounded_and_does_not_amplify_replies() {
             let mut t = TerminalState::new(24, 6);
             t.process_input(format!("\x1b_Gi=99,q={quiet};").as_bytes());
             t.process_input(&vec![b'A'; MAX_PENDING_ESCAPE]);
-            assert!(t.parser.snapshot().pending_apc.is_empty());
-            assert_eq!(t.parser.rejected_count(), 1);
+            assert!(t.vt.parser.snapshot().pending_apc.is_empty());
+            assert_eq!(t.vt.parser.rejected_count(), 1);
             let reply = t.get_output();
             assert!(reply.is_empty());
             assert!(reply.len() < 256);
             for _ in 0..8 {
                 t.process_input(&[b'A'; 1024]);
-                assert!(t.parser.snapshot().pending_apc.is_empty());
+                assert!(t.vt.parser.snapshot().pending_apc.is_empty());
                 assert!(t.get_output().is_empty(), "one rejection per packet");
             }
             t.process_input(terminator);
             t.process_input(b"RECOVERED");
             assert_eq!(
-                t.parser.pending_kind(),
+                t.vt.parser.pending_kind(),
                 jterm_engine::parser::PendingKind::None
             );
-            assert_eq!(t.screen.grid[0][0].character, 'R');
+            assert_eq!(t.vt.screen.grid[0][0].character, 'R');
             assert!(t.command_records.is_empty());
             assert!(t.pending_completed_command_outputs.is_empty());
         }
@@ -691,7 +697,7 @@ fn historical_legacy_parser_migration_recorded_oracle() {
             // behavior. Keep that scanner explicit, never regenerate the oracle.
             // Production bounded behavior has separate security and ordinary
             // stream differential tests; other host oracles stay production.
-            terminal.parser =
+            terminal.vt.parser =
                 jterm_engine::parser::Parser::new(jterm_engine::parser::ParserLimits {
                     pending_bytes: MAX_PENDING_ESCAPE,
                     kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES + 1,
@@ -730,7 +736,7 @@ fn historical_legacy_parser_migration_recorded_oracle() {
             // behavior. Keep that scanner explicit, never regenerate the oracle.
             // Production bounded behavior has separate security and ordinary
             // stream differential tests; other host oracles stay production.
-            terminal.parser =
+            terminal.vt.parser =
                 jterm_engine::parser::Parser::new(jterm_engine::parser::ParserLimits {
                     pending_bytes: MAX_PENDING_ESCAPE,
                     kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES + 1,

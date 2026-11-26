@@ -169,6 +169,15 @@ pub trait App {
         _ = (ctx, frame);
     }
 
+    /// Called instead of `logic` when the backend runs no UI pass.
+    ///
+    /// Input events remain those of the last shown frame. Applications must not
+    /// replay input or paint here; this hook may advance independent runtimes.
+    /// The default preserves the ordinary `logic` contract.
+    fn logic_only(&mut self, ctx: &egui::Context, frame: &mut Frame) {
+        self.logic(ctx, frame);
+    }
+
     /// Called each time the UI needs repainting, which may be many times per second.
     ///
     /// The given [`egui::Ui`] has no margin or background color.

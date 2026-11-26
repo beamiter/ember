@@ -1,9 +1,9 @@
 {
   "adapter_source_core_base": "10120c3aa690ff5e1a66ae15f2418b753e2053f1",
   "bundle": "withdrawal-resume-v1",
-  "core_pin_verification": "The application's locked Cargo graph uses the published jterm_core revision in public_core_base. The bundled adapter files have separately recorded source identities and checksums.",
+  "core_pin_verification": "The current locked frontend and packaged core use frontend_core_revision. Bundled adapter origins and file checksums record the historical export.",
   "files_sha256": {
-    "tools/check-host-bundle.py": "2e7aabaa31915190dc4422f4558ab7b6a49e436ab5cf9cab1b6cfce582827486",
+    "tools/check-host-bundle.py": "ec58bf0f9708a2f18262a5e243a288b05d7c38b8696f873c34a95480113882ea",
     "vendor/companion-client/Cargo.toml": "ff89400987a917d5d7d9d8bc5ba5f1c52ebee44f10848476815f67caa8a701a8",
     "vendor/companion-client/LICENSE": "df864a86870c22b4a37004850372cd147b82495362f64676fecbe28f27f58d42",
     "vendor/companion-client/src/lib.rs": "7197122c55a45c5a9bd50695f3347a60b0a572bd47e64caf3d411e529114bcdf",
@@ -17,7 +17,7 @@
     "vendor/companion-host/src/lib.rs": "cc01e41c9e2d40083e4d9d4aeea032e4985f43505ede1637ba37b4502aedec7d",
     "vendor/companion-host/src/notice.rs": "a3e9ff16ecbc3d0c804796f00bab504c2625cf088001f67ac5ed10c7bac596d3",
     "vendor/companion-host/src/proposal.rs": "b9fa93d32cc960a710401e68e61cdf3cc6dc84943f77e95021b145e656fce5c4",
-    "vendor/companion-host/src/pty_session.rs": "935dd113b6de8038b3f11913cbd9613cbf416932d6bceabec9c01853140f9aee",
+    "vendor/companion-host/src/pty_session.rs": "a9abd5ecd968e0196f6dfe02c727d29c6996936cad0e67e927b65f364a98d0ee",
     "vendor/companion-host/src/shell_identity.rs": "19c9d4aaba33215546398bd8b3319bc3c625bdd896cffd444928b5d3fe85e116",
     "vendor/companion-host/src/voice_text.rs": "d20266a40437aeab448a915e4d974bc2bab5d3c2ace272608e3b0dee0e2e84cf",
     "vendor/companion-host/upstream-Cargo.toml": "0b8bdf1195c69bc1caa16a1d415f0a130529f3b95a5dfc4e9836473f300d2be7",
@@ -28,6 +28,7 @@
     "vendor/companion-protocol/src/strict_json.rs": "164ee7f85ea1922492afb845f2ec56311511a8950985546ed2785be8f98504a1",
     "vendor/companion-protocol/upstream-Cargo.toml": "89c06787e200d75685facc835f0bb000186549b1b35eb62768d876e10eea6428"
   },
+  "frontend_core_revision": "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e",
   "public_companion_base": "9aa569540091524d637a7115b64c587b9177a55b",
   "public_core_base": "c4bcdb73b27e21deaf4d7d4a608384e20e8963d7",
   "schema": 1,

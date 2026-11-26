@@ -650,6 +650,7 @@ impl Swapchain for NativeSwapchain {
                 }
             })?
         };
+        crate::vulkan::publication::submitted();
         if publication_id != 0 {
             let wait = khr::present_wait::Device::new(&self.device.instance.raw, &self.device.raw);
             // The swapchain remains locked/live throughout the wait. Timeout,

@@ -5,13 +5,13 @@ use jterm_engine::screen::SavedCursorState;
 impl TerminalState {
     /// 擦除屏幕并把光标归位到左上角。供切换备用缓冲区等场景使用。
     fn reference_clear_screen(&mut self) {
-        let bg_color = self.screen.current_bg;
-        let cols = self.screen.grid.row_len();
-        let spans: Vec<_> = (0..self.screen.grid.rows())
+        let bg_color = self.vt.screen.current_bg;
+        let cols = self.vt.screen.grid.row_len();
+        let spans: Vec<_> = (0..self.vt.screen.grid.rows())
             .map(|row| (row, 0, cols))
             .collect();
         self.invalidate_grid_mutation_spans(&spans);
-        for row in self.screen.grid.iter_mut() {
+        for row in self.vt.screen.grid.iter_mut() {
             for cell in row.iter_mut() {
                 *cell = TerminalCell {
                     character: ' ',
@@ -22,17 +22,17 @@ impl TerminalState {
                 };
             }
         }
-        self.dirty_region.mark_all(self.screen.grid.rows());
-        self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
+        self.dirty_region.mark_all(self.vt.screen.grid.rows());
+        self.mark_rows_dirty(0, self.vt.screen.grid.rows().saturating_sub(1));
         self.kitty_graphics.clear_placements();
-        self.screen.cursor_row = 0;
-        self.screen.cursor_col = 0;
+        self.vt.screen.cursor_row = 0;
+        self.vt.screen.cursor_col = 0;
     }
 
     /// 切入备用屏幕缓冲。`save_cursor` 控制是否保存主屏光标(1049/1048 语义),
     /// `clear` 控制切入后是否清屏(1047/1049 语义)。已在备用屏则无操作。
     fn reference_enter_alt_screen(&mut self, save_cursor: bool, clear: bool) {
-        if self.screen.use_alt_buffer {
+        if self.vt.screen.use_alt_buffer {
             return;
         }
         // A selection belongs to the screen on which it was made. Keeping its
@@ -40,45 +40,45 @@ impl TerminalState {
         // rectangle at the same viewport position in Vim/less.
         self.selection = None;
         if save_cursor {
-            self.screen.saved_cursor_row = self.screen.cursor_row;
-            self.screen.saved_cursor_col = self.screen.cursor_col;
+            self.vt.screen.saved_cursor_row = self.vt.screen.cursor_row;
+            self.vt.screen.saved_cursor_col = self.vt.screen.cursor_col;
             // Snapshot the whole drawing state, not just the cursor: exiting
             // restores it instead of zeroing SGR.
-            self.screen.saved_primary_screen_state = Some(SavedCursorState {
-                row: self.screen.cursor_row,
-                col: self.screen.cursor_col,
-                fg: self.screen.current_fg,
-                bg: self.screen.current_bg,
-                flags: self.screen.current_flags,
-                g0: self.screen.g0_charset,
-                g1: self.screen.g1_charset,
-                active: self.screen.active_charset,
-                origin_mode: self.screen.origin_mode,
-                autowrap: self.protocol.modes().contains(&7),
-                pending_wrap: self.screen.pending_wrap,
+            self.vt.screen.saved_primary_screen_state = Some(SavedCursorState {
+                row: self.vt.screen.cursor_row,
+                col: self.vt.screen.cursor_col,
+                fg: self.vt.screen.current_fg,
+                bg: self.vt.screen.current_bg,
+                flags: self.vt.screen.current_flags,
+                g0: self.vt.screen.g0_charset,
+                g1: self.vt.screen.g1_charset,
+                active: self.vt.screen.active_charset,
+                origin_mode: self.vt.screen.origin_mode,
+                autowrap: self.vt.protocol.modes().contains(&7),
+                pending_wrap: self.vt.screen.pending_wrap,
             });
         }
-        self.screen.saved_primary_cursor_shape = Some(self.screen.cursor_shape);
+        self.vt.screen.saved_primary_cursor_shape = Some(self.vt.screen.cursor_shape);
         // 备用屏不显示 scrollback
         self.scroll_offset = 0;
-        std::mem::swap(&mut self.screen.grid, &mut self.screen.alt_grid);
+        std::mem::swap(&mut self.vt.screen.grid, &mut self.vt.screen.alt_grid);
         self.mark_row_identity_changed();
         self.kitty_graphics.switch_screen();
-        self.screen.alt_cursor_row = self.screen.cursor_row;
-        self.screen.alt_cursor_col = self.screen.cursor_col;
-        self.protocol.switch_screen();
+        self.vt.screen.alt_cursor_row = self.vt.screen.cursor_row;
+        self.vt.screen.alt_cursor_col = self.vt.screen.cursor_col;
+        self.vt.protocol.switch_screen();
         self.watch.boundary();
         self.invalidate_search_scrollback_seals();
-        self.screen.use_alt_buffer = true;
+        self.vt.screen.use_alt_buffer = true;
         self.organism_working_dir = None;
         // Retained cells keep their own keys, but an unterminated primary-screen
         // OSC 8 link must not arm alternate-screen text.
-        self.screen.current_hyperlink = HyperlinkId::NONE;
+        self.vt.screen.current_hyperlink = HyperlinkId::NONE;
         // DECSTBM is per-buffer. Carrying the primary screen's partial scroll
         // region into the alternate buffer makes a TUI that never issues its
         // own DECSTBM draw inside somebody else's region.
-        self.screen.scroll_region_top = 0;
-        self.screen.scroll_region_bottom = self.screen.grid.rows().saturating_sub(1);
+        self.vt.screen.scroll_region_top = 0;
+        self.vt.screen.scroll_region_bottom = self.vt.screen.grid.rows().saturating_sub(1);
         if clear {
             self.reference_clear_screen();
             // ED2 only removes placements intersecting the visible viewport so
@@ -92,64 +92,64 @@ impl TerminalState {
     /// 切回主屏幕缓冲。`restore_cursor` 控制是否恢复进入备用屏前保存的光标(1049 语义)。
     /// 不在备用屏则无操作。
     fn reference_exit_alt_screen(&mut self, restore_cursor: bool) {
-        if !self.screen.use_alt_buffer {
+        if !self.vt.screen.use_alt_buffer {
             return;
         }
         self.selection = None;
-        self.screen.alt_cursor_row = self.screen.cursor_row;
-        self.screen.alt_cursor_col = self.screen.cursor_col;
-        std::mem::swap(&mut self.screen.grid, &mut self.screen.alt_grid);
+        self.vt.screen.alt_cursor_row = self.vt.screen.cursor_row;
+        self.vt.screen.alt_cursor_col = self.vt.screen.cursor_col;
+        std::mem::swap(&mut self.vt.screen.grid, &mut self.vt.screen.alt_grid);
         self.mark_row_identity_changed();
         self.kitty_graphics.switch_screen();
         if restore_cursor {
-            self.screen.cursor_row = self.screen.saved_cursor_row;
-            self.screen.cursor_col = self.screen.saved_cursor_col;
+            self.vt.screen.cursor_row = self.vt.screen.saved_cursor_row;
+            self.vt.screen.cursor_col = self.vt.screen.saved_cursor_col;
         }
-        self.protocol.switch_screen();
+        self.vt.protocol.switch_screen();
         self.watch.boundary();
         self.invalidate_search_scrollback_seals();
-        self.screen.use_alt_buffer = false;
+        self.vt.screen.use_alt_buffer = false;
         // A TUI's DECSCUSR (vim's insert-mode beam) belongs to its screen.
-        if let Some(shape) = self.screen.saved_primary_cursor_shape.take() {
-            self.screen.cursor_shape = shape;
+        if let Some(shape) = self.vt.screen.saved_primary_cursor_shape.take() {
+            self.vt.screen.cursor_shape = shape;
         }
         // Alt-screen OSC 8 state never leaks back onto newly printed
         // primary-screen cells, and the alt buffer's scroll region does not
         // carry back into the main one.
-        self.screen.current_hyperlink = HyperlinkId::NONE;
-        self.screen.scroll_region_top = 0;
-        self.screen.scroll_region_bottom = self.screen.grid.rows().saturating_sub(1);
+        self.vt.screen.current_hyperlink = HyperlinkId::NONE;
+        self.vt.screen.scroll_region_top = 0;
+        self.vt.screen.scroll_region_bottom = self.vt.screen.grid.rows().saturating_sub(1);
 
         // Restore the primary screen's drawing state rather than zeroing it:
         // the shell's own SGR, charsets and modes were in force before the
         // fullscreen app started and must be in force again after it exits.
         // Falling back to Default keeps 1047-style entries (no save) safe.
-        if let Some(saved) = self.screen.saved_primary_screen_state.take() {
-            self.screen.current_fg = saved.fg;
-            self.screen.current_bg = saved.bg;
+        if let Some(saved) = self.vt.screen.saved_primary_screen_state.take() {
+            self.vt.screen.current_fg = saved.fg;
+            self.vt.screen.current_bg = saved.bg;
             self.global_bg = saved.bg;
-            self.screen.current_flags = saved.flags;
-            self.screen.g0_charset = saved.g0;
-            self.screen.g1_charset = saved.g1;
-            self.screen.active_charset = saved.active;
-            self.screen.origin_mode = saved.origin_mode;
+            self.vt.screen.current_flags = saved.flags;
+            self.vt.screen.g0_charset = saved.g0;
+            self.vt.screen.g1_charset = saved.g1;
+            self.vt.screen.active_charset = saved.active;
+            self.vt.screen.origin_mode = saved.origin_mode;
             if saved.autowrap {
-                self.protocol.modes_mut().insert(7);
+                self.vt.protocol.modes_mut().insert(7);
             } else {
-                self.protocol.modes_mut().remove(&7);
+                self.vt.protocol.modes_mut().remove(&7);
             }
         } else {
-            self.screen.current_fg = Color::Default;
-            self.screen.current_bg = Color::Default;
+            self.vt.screen.current_fg = Color::Default;
+            self.vt.screen.current_bg = Color::Default;
             self.global_bg = Color::Default;
-            self.screen.current_flags = StyleFlags::default();
+            self.vt.screen.current_flags = StyleFlags::default();
         }
-        self.screen.pending_wrap = false;
+        self.vt.screen.pending_wrap = false;
 
         // 交换缓冲后强制整屏重绘(+rows+1 触发 ui.rs 的 grid_version_jumped)
-        self.grid_version += self.screen.grid.rows() as u64 + 1;
+        self.grid_version += self.vt.screen.grid.rows() as u64 + 1;
         self.row_versions.fill(self.grid_version);
-        self.dirty_region.mark_all(self.screen.grid.rows());
+        self.dirty_region.mark_all(self.vt.screen.grid.rows());
     }
 }
 
@@ -158,9 +158,10 @@ pub(super) fn snapshot(t: &TerminalState) -> std::collections::BTreeMap<String, 
     macro_rules! host {
         ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), format!("{:?}", t.$field));)*};
     }
-    host!(protocol, watch, global_bg, organism_working_dir);
+    out.insert("protocol".into(), format!("{:?}", t.vt.protocol));
+    host!(watch, global_bg, organism_working_dir);
     macro_rules! screen {
-        ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), format!("{:?}", t.screen.$field));)*};
+        ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), format!("{:?}", t.vt.screen.$field));)*};
     }
     screen!(
         saved_cursor_row,
@@ -195,24 +196,24 @@ pub(super) fn seeded(seed: usize) -> TerminalState {
         active: (2, 3),
         mode: SelectionMode::Normal,
     });
-    t.screen.cursor_row = seed % 5;
-    t.screen.cursor_col = seed % 6;
-    t.screen.saved_cursor_row = (seed + 1) % 5;
-    t.screen.saved_cursor_col = (seed + 1) % 6;
-    t.screen.pending_wrap = seed & 1 != 0;
-    t.screen.origin_mode = seed & 2 != 0;
-    t.screen.g0_charset = Charset::DecSpecialGraphics;
-    t.screen.current_hyperlink = HyperlinkId::from_raw(17);
-    t.screen.scroll_region_top = 1;
-    t.screen.scroll_region_bottom = 3;
-    t.screen.current_fg = Color::Indexed(seed as u8);
-    t.screen.current_flags.set_bold(true);
-    t.screen.current_flags.set_protected(true);
+    t.vt.screen.cursor_row = seed % 5;
+    t.vt.screen.cursor_col = seed % 6;
+    t.vt.screen.saved_cursor_row = (seed + 1) % 5;
+    t.vt.screen.saved_cursor_col = (seed + 1) % 6;
+    t.vt.screen.pending_wrap = seed & 1 != 0;
+    t.vt.screen.origin_mode = seed & 2 != 0;
+    t.vt.screen.g0_charset = Charset::DecSpecialGraphics;
+    t.vt.screen.current_hyperlink = HyperlinkId::from_raw(17);
+    t.vt.screen.scroll_region_top = 1;
+    t.vt.screen.scroll_region_bottom = 3;
+    t.vt.screen.current_fg = Color::Indexed(seed as u8);
+    t.vt.screen.current_flags.set_bold(true);
+    t.vt.screen.current_flags.set_protected(true);
     t.scroll_offset = seed % 3;
     t.organism_working_dir = Some("/alternate-parity".into());
-    t.protocol.push_keyboard_enhancement_flags(seed as u16);
+    t.vt.protocol.push_keyboard_enhancement_flags(seed as u16);
     if seed & 4 != 0 {
-        t.protocol.modes_mut().remove(&7);
+        t.vt.protocol.modes_mut().remove(&7);
     }
     t.watch.start(1);
     super::structural_parity_tests::prime(&mut t);

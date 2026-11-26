@@ -44,6 +44,35 @@ fn dense_scroll_history_evicts_old_rows_at_the_shared_byte_limit() {
     assert_eq!(terminal.scrollback.back().unwrap().decompress(), cells);
 }
 
+#[test]
+fn process_history_pressure_expires_ember_selection_and_raw_projection_anchor() {
+    use jterm_engine::retained_history::{HistoryBudget, RetainedHistory, RetainedRow};
+    use std::sync::Arc;
+
+    let mut terminal = TerminalState::new(8, 4);
+    let make_row = |character| ScrollbackLine::compress(&[TerminalCell { character, ..Default::default() }; 8], false);
+    let initial = make_row('a');
+    let charge = initial.retained_bytes();
+    let budget = Arc::new(HistoryBudget::new(charge * 2));
+    terminal.scrollback = RetainedHistory::with_process_budget(charge * 4, Arc::clone(&budget));
+    let mut peer = terminal.scrollback.empty_sibling();
+    assert!(peer.push_back(make_row('p')));
+    terminal.push_scrollback_compressed(initial);
+    let old = terminal.raw_row_id_at_absolute(0).unwrap();
+    terminal.scroll_offset = 1;
+    terminal.start_selection((0, 0));
+    terminal.update_selection((0, 2));
+    assert!(terminal.selection.is_some());
+
+    terminal.push_scrollback_compressed(make_row('b'));
+    assert!(terminal.selection.is_none());
+    assert_ne!(terminal.raw_row_id_at_absolute(0), Some(old));
+    assert_eq!(terminal.identity_projection_plan(8).raw_cell_document_row(RawCellAnchor { row_id: old, column: 0 }), None);
+    assert_eq!(terminal.scrollback[0].decompress()[0].character, 'b');
+    assert_eq!(peer[0].decompress()[0].character, 'p');
+    assert_eq!(budget.usage().retained_bytes, charge * 2);
+}
+
 fn emit_completed_block(terminal: &mut TerminalState, index: usize) -> u64 {
     terminal.process_input(
         format!(
@@ -63,12 +92,12 @@ fn collapsed_projection_changes_document_without_mutating_raw_terminal() {
     let zone_id = record.sequence;
     let range = terminal.finished_output_range(zone_id).unwrap();
     let raw_grid: Vec<_> = terminal
-        .screen
+        .vt.screen
         .grid
         .iter()
         .map(|row| row.to_vec())
         .collect();
-    let raw_grid_ids = terminal.screen.grid.row_ids().to_vec();
+    let raw_grid_ids = terminal.vt.screen.grid.row_ids().to_vec();
     let raw_scrollback_ids: Vec<_> = terminal
         .scrollback
         .iter()
@@ -109,13 +138,13 @@ fn collapsed_projection_changes_document_without_mutating_raw_terminal() {
         None
     );
     let current_grid: Vec<_> = terminal
-        .screen
+        .vt.screen
         .grid
         .iter()
         .map(|row| row.to_vec())
         .collect();
     assert_cell_grids_equal(&current_grid, &raw_grid, "collapse raw grid");
-    assert_eq!(terminal.screen.grid.row_ids(), raw_grid_ids);
+    assert_eq!(terminal.vt.screen.grid.row_ids(), raw_grid_ids);
     let current_scrollback: Vec<_> = terminal
         .scrollback
         .iter()
@@ -849,8 +878,8 @@ fn transformed_plan_and_viewport_caches_have_independent_exact_keys() {
         &std::collections::BTreeSet::from([zone_ids[3]])
     );
 
-    let last = terminal.screen.grid.rows() - 1;
-    terminal.screen.grid.row_wrapped[last] = !terminal.screen.grid.row_wrapped[last];
+    let last = terminal.vt.screen.grid.rows() - 1;
+    terminal.vt.screen.grid.row_wrapped[last] = !terminal.vt.screen.grid.row_wrapped[last];
     let _rewrapped = terminal.projected_viewport_with_state(
         HistoryProjection::identity(),
         true,
@@ -1112,7 +1141,7 @@ fn collapsed_plan_advances_across_capped_front_trim_with_exact_origins() {
                     .scrollback
                     .iter()
                     .any(|line| line.raw_row_id() == raw.row_id)
-                    || terminal.screen.grid.row_ids().contains(&raw.row_id)
+                    || terminal.vt.screen.grid.row_ids().contains(&raw.row_id)
             );
         }
     }
@@ -1373,10 +1402,10 @@ fn identity_full_document_plan_matches_eager_history_and_grid_across_widths() {
         let mut archived = terminal.scrollback[3].clone();
         archived.set_raw_row_id(RawRowId::UNTRACKED);
         terminal.scrollback.replace(3, archived).unwrap();
-        terminal.screen.grid.get_mut(0, 0).character = 'G';
-        terminal.screen.grid.get_mut(1, 0).character = 'H';
-        terminal.screen.grid.row_wrapped[0] = true;
-        terminal.screen.grid.row_ids_mut()[1] = RawRowId::UNTRACKED;
+        terminal.vt.screen.grid.get_mut(0, 0).character = 'G';
+        terminal.vt.screen.grid.get_mut(1, 0).character = 'H';
+        terminal.vt.screen.grid.row_wrapped[0] = true;
+        terminal.vt.screen.grid.row_ids_mut()[1] = RawRowId::UNTRACKED;
 
         let plan = terminal.identity_projection_plan(cols);
         let (actual, actual_wrapped) = terminal.materialize_identity_projection_plan(&plan);
@@ -1389,8 +1418,8 @@ fn identity_full_document_plan_matches_eager_history_and_grid_across_widths() {
         let mut expected_wrapped: Vec<_> =
             eager_history.iter().map(|line| line.is_wrapped).collect();
         let grid_start = expected.len();
-        expected.extend(terminal.screen.grid.iter().map(|row| row.to_vec()));
-        expected_wrapped.extend(terminal.screen.grid.row_wrapped.iter().copied());
+        expected.extend(terminal.vt.screen.grid.iter().map(|row| row.to_vec()));
+        expected_wrapped.extend(terminal.vt.screen.grid.row_wrapped.iter().copied());
 
         assert_cell_grids_equal(&actual, &expected, &format!("identity plan width {cols}"));
         assert_eq!(actual_wrapped, expected_wrapped, "wrapped width {cols}");
@@ -1423,7 +1452,7 @@ fn identity_full_document_plan_materializes_a_narrow_wide_body() {
     let mut archived = terminal.scrollback[0].clone();
     archived.set_raw_row_id(RawRowId::UNTRACKED);
     terminal.scrollback.replace(0, archived).unwrap();
-    terminal.screen.grid.get_mut(0, 0).character = 'G';
+    terminal.vt.screen.grid.get_mut(0, 0).character = 'G';
 
     let plan = terminal.identity_projection_plan(1);
     let (actual, wrapped) = terminal.materialize_identity_projection_plan(&plan);
@@ -1461,15 +1490,15 @@ fn osc8_hyperlink_survives_every_input_batch_boundary() {
         terminal.process_input(LABEL.as_bytes());
         terminal.process_input(b"\x1b]8;;\x1b\\X");
 
-        let id = terminal.screen.grid[0][0].hyperlink_id;
+        let id = terminal.vt.screen.grid[0][0].hyperlink_id;
         assert!(!id.is_none(), "OSC 8 was lost at input split {split_at}");
         assert_eq!(terminal.hyperlink_uri(id), Some(TARGET));
-        assert!(terminal.screen.grid[0][..LABEL.len()]
+        assert!(terminal.vt.screen.grid[0][..LABEL.len()]
             .iter()
             .all(|cell| cell.hyperlink_id == id));
-        assert_eq!(terminal.screen.grid[0][LABEL.len()].character, 'X');
+        assert_eq!(terminal.vt.screen.grid[0][LABEL.len()].character, 'X');
         assert_eq!(
-            terminal.screen.grid[0][LABEL.len()].hyperlink_id,
+            terminal.vt.screen.grid[0][LABEL.len()].hyperlink_id,
             HyperlinkId::NONE
         );
     }
@@ -1481,7 +1510,7 @@ fn osc8_rejects_oversized_control_and_unsafe_targets() {
         let mut terminal = TerminalState::new(4, 1);
         let sequence = format!("\x1b]8;{params};{target}\x1b\\X");
         terminal.process_input(sequence.as_bytes());
-        terminal.screen.grid[0][0].hyperlink_id
+        terminal.vt.screen.grid[0][0].hyperlink_id
     }
 
     assert!(rendered_id(&"p".repeat(MAX_OSC8_PARAMS_BYTES + 1), "https://safe.test").is_none());
@@ -1499,8 +1528,8 @@ fn osc8_rejects_oversized_control_and_unsafe_targets() {
     // A rejected opening must not leave the preceding safe target active.
     let mut terminal = TerminalState::new(4, 1);
     terminal.process_input(b"\x1b]8;;https://safe.test\x1b\\A\x1b]8;;javascript:alert(1)\x1b\\B");
-    assert!(!terminal.screen.grid[0][0].hyperlink_id.is_none());
-    assert!(terminal.screen.grid[0][1].hyperlink_id.is_none());
+    assert!(!terminal.vt.screen.grid[0][0].hyperlink_id.is_none());
+    assert!(terminal.vt.screen.grid[0][1].hyperlink_id.is_none());
 }
 
 #[test]
@@ -1535,9 +1564,9 @@ fn osc8_link_ids_survive_scrollback_reflow_and_selection() {
     terminal.scroll(-1);
     terminal.start_selection((0, 0));
     terminal.update_selection((0, 2));
-    let before = terminal.screen.grid[0][0].hyperlink_id;
+    let before = terminal.vt.screen.grid[0][0].hyperlink_id;
     assert_eq!(terminal.copy_selection().as_deref(), Some("fgh"));
-    assert_eq!(terminal.screen.grid[0][0].hyperlink_id, before);
+    assert_eq!(terminal.vt.screen.grid[0][0].hyperlink_id, before);
     assert_eq!(terminal.hyperlink_uri(before), Some(TARGET));
 }
 
@@ -1546,10 +1575,10 @@ fn osc8_marks_both_cells_of_a_wide_masked_label() {
     let mut terminal = TerminalState::new(4, 1);
     terminal.process_input("\x1b]8;;https://example.test/wide\x1b\\点\x1b]8;;\x1b\\".as_bytes());
 
-    let id = terminal.screen.grid[0][0].hyperlink_id;
+    let id = terminal.vt.screen.grid[0][0].hyperlink_id;
     assert!(!id.is_none());
-    assert_eq!(terminal.screen.grid[0][1].hyperlink_id, id);
-    assert!(terminal.screen.grid[0][1].flags.wide_continuation());
+    assert_eq!(terminal.vt.screen.grid[0][1].hyperlink_id, id);
+    assert!(terminal.vt.screen.grid[0][1].flags.wide_continuation());
 }
 
 #[test]
@@ -1590,9 +1619,9 @@ fn fragmented_kitty_apc_advances_its_scan_cursor_and_stays_bounded() {
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b_Gi=52,f=32,s=1,v=1;");
     assert_eq!(
-        terminal.parser.snapshot().pending_apc_scan_from,
+        terminal.vt.parser.snapshot().pending_apc_scan_from,
         terminal
-            .parser
+            .vt.parser
             .snapshot()
             .pending_apc
             .len()
@@ -1605,16 +1634,16 @@ fn fragmented_kitty_apc_advances_its_scan_cursor_and_stays_bounded() {
         b"BA".as_slice(),
         b"==".as_slice(),
     ] {
-        let old_len = terminal.parser.snapshot().pending_apc.len();
+        let old_len = terminal.vt.parser.snapshot().pending_apc.len();
         terminal.process_input(fragment);
         assert_eq!(
-            terminal.parser.snapshot().pending_apc.len(),
+            terminal.vt.parser.snapshot().pending_apc.len(),
             old_len + fragment.len()
         );
         assert_eq!(
-            terminal.parser.snapshot().pending_apc_scan_from,
+            terminal.vt.parser.snapshot().pending_apc_scan_from,
             terminal
-                .parser
+                .vt.parser
                 .snapshot()
                 .pending_apc
                 .len()
@@ -1623,15 +1652,15 @@ fn fragmented_kitty_apc_advances_its_scan_cursor_and_stays_bounded() {
         );
     }
     terminal.process_input(b"\x1b\\");
-    assert!(terminal.parser.snapshot().pending_apc.is_empty());
+    assert!(terminal.vt.parser.snapshot().pending_apc.is_empty());
     assert!(terminal.kitty_graphics.get_image(52).is_some());
     std::mem::take(&mut terminal.output_buffer);
 
     let mut oversized = b"\x1b_Ga=p,i=53,q=0;".to_vec();
     oversized.resize(MAX_PENDING_ESCAPE + 3, b'A');
     terminal.process_input(&oversized);
-    assert!(terminal.parser.snapshot().pending_apc.is_empty());
-    assert_eq!(terminal.parser.rejected_count(), 1);
+    assert!(terminal.vt.parser.snapshot().pending_apc.is_empty());
+    assert_eq!(terminal.vt.parser.rejected_count(), 1);
     let response = std::mem::take(&mut terminal.output_buffer);
     // Resource rejection is opaque: no reflected Kitty recovery reply.
     assert!(response.is_empty());
@@ -1640,10 +1669,10 @@ fn fragmented_kitty_apc_advances_its_scan_cursor_and_stays_bounded() {
     // ordinary terminal parsing on the same input batch.
     terminal.process_input(b"\x1b\\Z");
     assert_eq!(
-        terminal.parser.pending_kind(),
+        terminal.vt.parser.pending_kind(),
         jterm_engine::parser::PendingKind::None
     );
-    assert_eq!(terminal.screen.grid[0][0].character, 'Z');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'Z');
 
     // The bytes after ST belong to the normal stream, not the APC. Even when
     // they make the whole read exceed the cap, a packet whose terminator is
@@ -1653,11 +1682,11 @@ fn fragmented_kitty_apc_advances_its_scan_cursor_and_stays_bounded() {
     terminal.process_input(&near_limit);
     terminal.process_input(b"\x1b\\Y");
     assert_eq!(
-        terminal.parser.pending_kind(),
+        terminal.vt.parser.pending_kind(),
         jterm_engine::parser::PendingKind::None
     );
-    assert!(terminal.parser.snapshot().pending_apc.is_empty());
-    assert_eq!(terminal.screen.grid[0][1].character, 'Y');
+    assert!(terminal.vt.parser.snapshot().pending_apc.is_empty());
+    assert_eq!(terminal.vt.screen.grid[0][1].character, 'Y');
 }
 
 #[test]
@@ -1693,7 +1722,7 @@ fn osc_window_title_survives_every_input_batch_boundary() {
                 terminal.titles.window_title, "fragmented title",
                 "OSC was lost at input split {split_at}"
             );
-            assert!(terminal.parser.snapshot().pending_osc.is_empty());
+            assert!(terminal.vt.parser.snapshot().pending_osc.is_empty());
         }
     }
 }
@@ -1703,9 +1732,9 @@ fn fragmented_osc_advances_its_scan_cursor_and_stays_bounded() {
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b]0;stream");
     assert_eq!(
-        terminal.parser.snapshot().pending_osc_scan_from,
+        terminal.vt.parser.snapshot().pending_osc_scan_from,
         terminal
-            .parser
+            .vt.parser
             .snapshot()
             .pending_osc
             .len()
@@ -1713,16 +1742,16 @@ fn fragmented_osc_advances_its_scan_cursor_and_stays_bounded() {
     );
 
     for fragment in [b"ed-".as_slice(), b"ti".as_slice(), b"tle".as_slice()] {
-        let old_len = terminal.parser.snapshot().pending_osc.len();
+        let old_len = terminal.vt.parser.snapshot().pending_osc.len();
         terminal.process_input(fragment);
         assert_eq!(
-            terminal.parser.snapshot().pending_osc.len(),
+            terminal.vt.parser.snapshot().pending_osc.len(),
             old_len + fragment.len()
         );
         assert_eq!(
-            terminal.parser.snapshot().pending_osc_scan_from,
+            terminal.vt.parser.snapshot().pending_osc_scan_from,
             terminal
-                .parser
+                .vt.parser
                 .snapshot()
                 .pending_osc
                 .len()
@@ -1733,9 +1762,9 @@ fn fragmented_osc_advances_its_scan_cursor_and_stays_bounded() {
     // The BEL terminator and the byte after it arrive in the same batch; the
     // trailing byte is ordinary terminal input, not OSC payload.
     terminal.process_input(b"\x07Z");
-    assert!(terminal.parser.snapshot().pending_osc.is_empty());
+    assert!(terminal.vt.parser.snapshot().pending_osc.is_empty());
     assert_eq!(terminal.titles.window_title, "streamed-title");
-    assert_eq!(terminal.screen.grid[0][0].character, 'Z');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'Z');
 }
 
 #[test]
@@ -1744,11 +1773,11 @@ fn osc_terminators_straddling_chunks_complete_the_sequence() {
     // batch opens with `\`.
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b]0;straddle\x1b");
-    assert!(!terminal.parser.snapshot().pending_osc.is_empty());
+    assert!(!terminal.vt.parser.snapshot().pending_osc.is_empty());
     terminal.process_input(b"\\Y");
-    assert!(terminal.parser.snapshot().pending_osc.is_empty());
+    assert!(terminal.vt.parser.snapshot().pending_osc.is_empty());
     assert_eq!(terminal.titles.window_title, "straddle");
-    assert_eq!(terminal.screen.grid[0][0].character, 'Y');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'Y');
 
     // A non-ST ESC abandons OSC and starts the next escape. Here ESC c
     // resets the terminal, then the ordinary suffix is displayed.
@@ -1756,7 +1785,7 @@ fn osc_terminators_straddling_chunks_complete_the_sequence() {
     terminal.process_input(b"\x1b]0;ab\x1b");
     terminal.process_input(b"cd\x07");
     assert!(terminal.titles.window_title.is_empty());
-    assert_eq!(terminal.screen.grid[0][0].character, 'd');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'd');
 
     // ESC ESC \: the first non-ST escape abandons OSC; ST cannot revive it.
     let mut terminal = TerminalState::new(8, 2);
@@ -1771,14 +1800,14 @@ fn oversized_osc_discards_until_terminator_without_payload_side_effects() {
     let mut oversized = b"\x1b]0;".to_vec();
     oversized.resize(MAX_PENDING_ESCAPE + 3, b'A');
     terminal.process_input(&oversized);
-    assert_eq!(terminal.parser.rejected_count(), 1);
-    assert_eq!(terminal.parser.retained_bytes(), 0);
+    assert_eq!(terminal.vt.parser.rejected_count(), 1);
+    assert_eq!(terminal.vt.parser.retained_bytes(), 0);
     terminal.process_input(b"SECRET\x1b]52;c;aGVsbG8=\x1b[2J");
-    assert!(terminal.pending_osc52_clipboard_set.is_none());
-    assert_eq!(terminal.screen.grid[0][0].character, ' ');
+    assert!(terminal.osc52.pending_set.is_none());
+    assert_eq!(terminal.vt.screen.grid[0][0].character, ' ');
     terminal.process_input(b"\x07ok\x1b]0;new\x07");
-    assert_eq!(terminal.screen.grid[0][0].character, 'o');
-    assert_eq!(terminal.screen.grid[0][1].character, 'k');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'o');
+    assert_eq!(terminal.vt.screen.grid[0][1].character, 'k');
     assert_eq!(terminal.titles.window_title, "new");
 }
 
@@ -1790,14 +1819,14 @@ fn dcs_stays_opaque_across_every_input_batch_boundary() {
         terminal.process_input(&sequence[..split_at]);
         terminal.process_input(&sequence[split_at..]);
         assert_eq!(
-            terminal.screen.grid[0][0].character, 'Z',
+            terminal.vt.screen.grid[0][0].character, 'Z',
             "byte after ST was lost at input split {split_at}"
         );
         assert_eq!(
-            terminal.screen.grid[0][1].character, ' ',
+            terminal.vt.screen.grid[0][1].character, ' ',
             "opaque DCS payload leaked at input split {split_at}"
         );
-        assert!(terminal.parser.snapshot().pending_string.is_empty());
+        assert!(terminal.vt.parser.snapshot().pending_string.is_empty());
     }
 }
 
@@ -1806,9 +1835,9 @@ fn fragmented_dcs_advances_its_scan_cursor_and_stays_bounded() {
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1bP1;2|");
     assert_eq!(
-        terminal.parser.snapshot().pending_string_scan_from,
+        terminal.vt.parser.snapshot().pending_string_scan_from,
         terminal
-            .parser
+            .vt.parser
             .snapshot()
             .pending_string
             .len()
@@ -1816,16 +1845,16 @@ fn fragmented_dcs_advances_its_scan_cursor_and_stays_bounded() {
     );
 
     for fragment in [b"ab".as_slice(), b"cd".as_slice()] {
-        let old_len = terminal.parser.snapshot().pending_string.len();
+        let old_len = terminal.vt.parser.snapshot().pending_string.len();
         terminal.process_input(fragment);
         assert_eq!(
-            terminal.parser.snapshot().pending_string.len(),
+            terminal.vt.parser.snapshot().pending_string.len(),
             old_len + fragment.len()
         );
         assert_eq!(
-            terminal.parser.snapshot().pending_string_scan_from,
+            terminal.vt.parser.snapshot().pending_string_scan_from,
             terminal
-                .parser
+                .vt.parser
                 .snapshot()
                 .pending_string
                 .len()
@@ -1834,19 +1863,19 @@ fn fragmented_dcs_advances_its_scan_cursor_and_stays_bounded() {
         );
     }
     terminal.process_input(b"\x1b\\Z");
-    assert!(terminal.parser.snapshot().pending_string.is_empty());
-    assert_eq!(terminal.screen.grid[0][0].character, 'Z');
+    assert!(terminal.vt.parser.snapshot().pending_string.is_empty());
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'Z');
 
     // Oversized DCS remains opaque until its ST terminator.
     let mut oversized = b"\x1bP".to_vec();
     oversized.resize(MAX_PENDING_ESCAPE + 3, b'A');
     terminal.process_input(&oversized);
-    assert!(terminal.parser.snapshot().pending_string.is_empty());
-    assert_eq!(terminal.parser.snapshot().pending_string_scan_from, 0);
+    assert!(terminal.vt.parser.snapshot().pending_string.is_empty());
+    assert_eq!(terminal.vt.parser.snapshot().pending_string_scan_from, 0);
     terminal.process_input(b"\x1b\\no");
     // ST ends the discard; only the following ordinary suffix is displayed.
-    assert_eq!(terminal.screen.grid[0][1].character, 'n');
-    assert_eq!(terminal.screen.grid[0][2].character, 'o');
+    assert_eq!(terminal.vt.screen.grid[0][1].character, 'n');
+    assert_eq!(terminal.vt.screen.grid[0][2].character, 'o');
 }
 
 #[test]
@@ -1863,17 +1892,17 @@ fn ris_resets_graphics_and_parser_state_without_printing_the_final_byte() {
 
     assert!(terminal.kitty_graphics.get_image(41).is_none());
     assert!(terminal.kitty_graphics.get_placements().is_empty());
-    assert_eq!(terminal.screen.grid[0][0].character, 'Z');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'Z');
     assert_eq!(
-        (terminal.screen.cursor_col, terminal.screen.cursor_row),
+        (terminal.vt.screen.cursor_col, terminal.vt.screen.cursor_row),
         (1, 0)
     );
     assert!(terminal.is_cursor_visible());
-    assert_eq!(terminal.screen.current_fg, Color::Default);
+    assert_eq!(terminal.vt.screen.current_fg, Color::Default);
     assert_eq!(terminal.max_scrollback(), 17);
     assert_eq!(terminal.kitty_graphics.cell_size_pixels(), (9, 18));
-    assert!(terminal.parser.snapshot().pending_escape.is_empty());
-    assert!(terminal.parser.snapshot().pending_apc.is_empty());
+    assert!(terminal.vt.parser.snapshot().pending_escape.is_empty());
+    assert!(terminal.vt.parser.snapshot().pending_apc.is_empty());
 }
 
 #[test]
@@ -1920,7 +1949,7 @@ fn kitty_placement_applies_explicit_cursor_policy_and_cell_offsets() {
     terminal.process_input(b"\x1b_Ga=p,i=50,X=3,Y=4,c=2,r=3\x1b\\");
 
     assert_eq!(
-        (terminal.screen.cursor_col, terminal.screen.cursor_row),
+        (terminal.vt.screen.cursor_col, terminal.vt.screen.cursor_row),
         (2, 3)
     );
     let placement = terminal.kitty_graphics.get_placements().last().unwrap();
@@ -1929,7 +1958,7 @@ fn kitty_placement_applies_explicit_cursor_policy_and_cell_offsets() {
     terminal.process_input(b"\x1b[2;2H");
     terminal.process_input(b"\x1b_Ga=p,i=50,c=4,r=2,C=1\x1b\\");
     assert_eq!(
-        (terminal.screen.cursor_col, terminal.screen.cursor_row),
+        (terminal.vt.screen.cursor_col, terminal.vt.screen.cursor_row),
         (1, 1)
     );
 }
@@ -1988,8 +2017,8 @@ fn resize_preserves_full_screen_scroll_region() {
 
     terminal.on_resize(4, 6);
 
-    assert_eq!(terminal.screen.scroll_region_top, 0);
-    assert_eq!(terminal.screen.scroll_region_bottom, 5);
+    assert_eq!(terminal.vt.screen.scroll_region_top, 0);
+    assert_eq!(terminal.vt.screen.scroll_region_bottom, 5);
 }
 
 #[test]
@@ -2001,15 +2030,15 @@ fn alt_screen_resize_does_not_leak_background_into_primary_screen() {
     // background is active. The visible alternate screen should inherit it,
     // but the saved primary screen must remain independent.
     terminal.on_resize(8, 3);
-    assert_eq!(terminal.screen.grid[0][4].background, Color::Blue);
-    assert_eq!(terminal.screen.grid[2][0].background, Color::Blue);
+    assert_eq!(terminal.vt.screen.grid[0][4].background, Color::Blue);
+    assert_eq!(terminal.vt.screen.grid[2][0].background, Color::Blue);
 
     terminal.process_input(b"\x1b[?1049l");
 
     assert!(!terminal.is_alt_buffer_active());
-    assert_eq!(terminal.screen.grid[0][0].character, 'm');
-    assert_eq!(terminal.screen.grid[0][4].background, Color::Default);
-    assert_eq!(terminal.screen.grid[2][0].background, Color::Default);
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'm');
+    assert_eq!(terminal.vt.screen.grid[0][4].background, Color::Default);
+    assert_eq!(terminal.vt.screen.grid[2][0].background, Color::Default);
 }
 
 #[test]
@@ -2101,8 +2130,8 @@ fn decstbm_zero_bottom_defaults_to_full_screen() {
 
     terminal.process_input(b"\x1b[1;0r");
 
-    assert_eq!(terminal.screen.scroll_region_top, 0);
-    assert_eq!(terminal.screen.scroll_region_bottom, 3);
+    assert_eq!(terminal.vt.screen.scroll_region_top, 0);
+    assert_eq!(terminal.vt.screen.scroll_region_bottom, 3);
 }
 
 #[test]
@@ -2178,8 +2207,8 @@ fn top_margin_scroll_region_pushes_scrolled_lines_to_scrollback() {
         "expected lines scrolled off a top-anchored region to remain scrollable"
     );
 
-    assert_eq!(terminal.screen.grid[4][0].character, 'p');
-    assert_eq!(terminal.screen.grid[5][0].character, 's');
+    assert_eq!(terminal.vt.screen.grid[4][0].character, 'p');
+    assert_eq!(terminal.vt.screen.grid[5][0].character, 's');
 }
 
 #[test]
@@ -2271,22 +2300,22 @@ fn synchronized_alt_screen_redraw_rebases_live_selection() {
 #[test]
 fn linefeed_at_bottom_pushes_to_scrollback_for_full_screen_region() {
     let mut terminal = TerminalState::new(4, 2);
-    terminal.screen.grid[0][0].character = 'A';
-    terminal.screen.grid[1][0].character = 'B';
-    terminal.screen.cursor_row = 1;
-    terminal.screen.cursor_col = 0;
+    terminal.vt.screen.grid[0][0].character = 'A';
+    terminal.vt.screen.grid[1][0].character = 'B';
+    terminal.vt.screen.cursor_row = 1;
+    terminal.vt.screen.cursor_col = 0;
 
     terminal.process_input(b"\n");
 
     assert_eq!(terminal.scrollback.len(), 1);
     assert_eq!(terminal.scrollback[0].decompress()[0].character, 'A');
-    assert_eq!(terminal.screen.grid[0][0].character, 'B');
-    assert_eq!(terminal.screen.grid[1][0].character, ' ');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'B');
+    assert_eq!(terminal.vt.screen.grid[1][0].character, ' ');
 }
 
 fn legacy_reflowed_visible_cells(terminal: &TerminalState) -> Vec<Vec<TerminalCell>> {
-    let rows = terminal.screen.grid.rows();
-    let cols = terminal.screen.grid.row_len();
+    let rows = terminal.vt.screen.grid.rows();
+    let cols = terminal.vt.screen.grid.row_len();
     let blank_cell = terminal.create_blank_cell();
     let mut start_idx = terminal
         .scrollback
@@ -2311,7 +2340,7 @@ fn legacy_reflowed_visible_cells(terminal: &TerminalState) -> Vec<Vec<TerminalCe
         .collect();
     result.truncate(rows);
 
-    for row in terminal.screen.grid.iter() {
+    for row in terminal.vt.screen.grid.iter() {
         if result.len() >= rows {
             break;
         }
@@ -2468,7 +2497,7 @@ fn stale_identity_projection_cache_releases_cells_before_visible_rebuild() {
 fn identity_projection_live_origins_round_trip_each_physical_wide_cell() {
     let mut terminal = TerminalState::new(4, 2);
     terminal.process_input("点x".as_bytes());
-    let row_id = terminal.screen.grid.row_id(0);
+    let row_id = terminal.vt.screen.grid.row_id(0);
     let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
 
     for column in 0..3 {
@@ -2501,7 +2530,7 @@ fn identity_projection_reflow_preserves_raw_origins_and_rejects_padding() {
     terminal.push_scrollback_compressed(line("de", 4, false));
     let first_id = terminal.scrollback[0].raw_row_id();
     let second_id = terminal.scrollback[1].raw_row_id();
-    let live_id = terminal.screen.grid.row_id(0);
+    let live_id = terminal.vt.screen.grid.row_id(0);
     terminal.scroll_offset = 2;
 
     let legacy = terminal.get_visible_cells();
@@ -2608,9 +2637,9 @@ fn identity_projection_matches_legacy_and_round_trips_across_widths_and_offsets(
 fn identity_projection_alt_screen_bypasses_semantics_and_maps_only_active_origins() {
     let mut terminal = TerminalState::new(4, 2);
     terminal.process_input(b"primary");
-    let primary_id = terminal.screen.grid.row_id(0);
+    let primary_id = terminal.vt.screen.grid.row_id(0);
     terminal.process_input(b"\x1b[?1049hALT");
-    let alt_id = terminal.screen.grid.row_id(0);
+    let alt_id = terminal.vt.screen.grid.row_id(0);
 
     let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
     assert!(viewport.key().is_bypass());
@@ -2741,13 +2770,13 @@ fn projected_legacy_metrics_preserve_mouse_scrollbar_cursor_and_kitty_coordinate
 #[test]
 fn raw_row_identity_follows_local_scroll_moves_and_drops_removed_rows() {
     let mut terminal = TerminalState::new(4, 4);
-    let original: Vec<_> = (0..4).map(|row| terminal.screen.grid.row_id(row)).collect();
+    let original: Vec<_> = (0..4).map(|row| terminal.vt.screen.grid.row_id(row)).collect();
 
     terminal.scroll_region_up(1, 3);
-    assert_eq!(terminal.screen.grid.row_id(0), original[0]);
-    assert_eq!(terminal.screen.grid.row_id(1), original[2]);
-    assert_eq!(terminal.screen.grid.row_id(2), original[3]);
-    let fresh_bottom = terminal.screen.grid.row_id(3);
+    assert_eq!(terminal.vt.screen.grid.row_id(0), original[0]);
+    assert_eq!(terminal.vt.screen.grid.row_id(1), original[2]);
+    assert_eq!(terminal.vt.screen.grid.row_id(2), original[3]);
+    let fresh_bottom = terminal.vt.screen.grid.row_id(3);
     assert!(!original.contains(&fresh_bottom));
 
     let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
@@ -2767,9 +2796,9 @@ fn raw_row_identity_follows_local_scroll_moves_and_drops_removed_rows() {
     );
 
     terminal.scroll_region_down(1, 3);
-    assert_eq!(terminal.screen.grid.row_id(2), original[2]);
-    assert_eq!(terminal.screen.grid.row_id(3), original[3]);
-    let fresh_top = terminal.screen.grid.row_id(1);
+    assert_eq!(terminal.vt.screen.grid.row_id(2), original[2]);
+    assert_eq!(terminal.vt.screen.grid.row_id(3), original[3]);
+    let fresh_top = terminal.vt.screen.grid.row_id(1);
     assert!(!original.contains(&fresh_top));
     assert_ne!(fresh_top, fresh_bottom);
 
@@ -2791,65 +2820,65 @@ fn raw_row_identity_follows_local_scroll_moves_and_drops_removed_rows() {
 #[test]
 fn raw_row_identity_tracks_csi_insert_and_delete_lines() {
     let mut insert = TerminalState::new(4, 4);
-    let original: Vec<_> = (0..4).map(|row| insert.screen.grid.row_id(row)).collect();
+    let original: Vec<_> = (0..4).map(|row| insert.vt.screen.grid.row_id(row)).collect();
     insert.process_input(b"\x1b[2;1H\x1b[2L");
-    assert_eq!(insert.screen.grid.row_id(0), original[0]);
-    assert_eq!(insert.screen.grid.row_id(3), original[1]);
-    assert!(!original.contains(&insert.screen.grid.row_id(1)));
-    assert!(!original.contains(&insert.screen.grid.row_id(2)));
-    assert_ne!(insert.screen.grid.row_id(1), insert.screen.grid.row_id(2));
+    assert_eq!(insert.vt.screen.grid.row_id(0), original[0]);
+    assert_eq!(insert.vt.screen.grid.row_id(3), original[1]);
+    assert!(!original.contains(&insert.vt.screen.grid.row_id(1)));
+    assert!(!original.contains(&insert.vt.screen.grid.row_id(2)));
+    assert_ne!(insert.vt.screen.grid.row_id(1), insert.vt.screen.grid.row_id(2));
 
     let mut delete = TerminalState::new(4, 4);
-    let original: Vec<_> = (0..4).map(|row| delete.screen.grid.row_id(row)).collect();
+    let original: Vec<_> = (0..4).map(|row| delete.vt.screen.grid.row_id(row)).collect();
     delete.process_input(b"\x1b[2;1H\x1b[2M");
-    assert_eq!(delete.screen.grid.row_id(0), original[0]);
-    assert_eq!(delete.screen.grid.row_id(1), original[3]);
-    assert!(!original.contains(&delete.screen.grid.row_id(2)));
-    assert!(!original.contains(&delete.screen.grid.row_id(3)));
-    assert_ne!(delete.screen.grid.row_id(2), delete.screen.grid.row_id(3));
+    assert_eq!(delete.vt.screen.grid.row_id(0), original[0]);
+    assert_eq!(delete.vt.screen.grid.row_id(1), original[3]);
+    assert!(!original.contains(&delete.vt.screen.grid.row_id(2)));
+    assert!(!original.contains(&delete.vt.screen.grid.row_id(3)));
+    assert_ne!(delete.vt.screen.grid.row_id(2), delete.vt.screen.grid.row_id(3));
 }
 
 #[test]
 fn full_scroll_transfers_identity_but_archive_snapshot_duplicates_it() {
     let mut terminal = TerminalState::new(6, 3);
-    terminal.screen.grid[0][0].character = 'A';
-    terminal.screen.grid[1][0].character = 'B';
-    let first = terminal.screen.grid.row_id(0);
-    let second = terminal.screen.grid.row_id(1);
-    terminal.screen.cursor_row = 2;
+    terminal.vt.screen.grid[0][0].character = 'A';
+    terminal.vt.screen.grid[1][0].character = 'B';
+    let first = terminal.vt.screen.grid.row_id(0);
+    let second = terminal.vt.screen.grid.row_id(1);
+    terminal.vt.screen.cursor_row = 2;
     terminal.scroll_region_up(0, 2);
 
     assert_eq!(terminal.scrollback.back().unwrap().raw_row_id(), first);
-    assert_eq!(terminal.screen.grid.row_id(0), second);
+    assert_eq!(terminal.vt.screen.grid.row_id(0), second);
     assert!(
-        !terminal.screen.grid.row_id(2).is_tracked() || terminal.screen.grid.row_id(2) != first
+        !terminal.vt.screen.grid.row_id(2).is_tracked() || terminal.vt.screen.grid.row_id(2) != first
     );
 
-    let live_source = terminal.screen.grid.row_id(0);
+    let live_source = terminal.vt.screen.grid.row_id(0);
     terminal.archive_visible_screen_to_scrollback_with_options(false, false);
     let snapshot = terminal.scrollback.back().unwrap().raw_row_id();
     assert!(snapshot.is_tracked());
     assert_ne!(snapshot, live_source);
-    assert_eq!(terminal.screen.grid.row_id(0), live_source);
+    assert_eq!(terminal.vt.screen.grid.row_id(0), live_source);
 }
 
 #[test]
 fn resize_retains_surviving_row_ids_and_allocates_only_new_rows() {
     let mut terminal = TerminalState::new(4, 2);
-    let retained: Vec<_> = (0..2).map(|row| terminal.screen.grid.row_id(row)).collect();
+    let retained: Vec<_> = (0..2).map(|row| terminal.vt.screen.grid.row_id(row)).collect();
     terminal.on_resize(7, 4);
 
-    assert_eq!(terminal.screen.grid.row_id(0), retained[0]);
-    assert_eq!(terminal.screen.grid.row_id(1), retained[1]);
-    assert!(!retained.contains(&terminal.screen.grid.row_id(2)));
-    assert!(!retained.contains(&terminal.screen.grid.row_id(3)));
+    assert_eq!(terminal.vt.screen.grid.row_id(0), retained[0]);
+    assert_eq!(terminal.vt.screen.grid.row_id(1), retained[1]);
+    assert!(!retained.contains(&terminal.vt.screen.grid.row_id(2)));
+    assert!(!retained.contains(&terminal.vt.screen.grid.row_id(3)));
     assert_ne!(
-        terminal.screen.grid.row_id(2),
-        terminal.screen.grid.row_id(3)
+        terminal.vt.screen.grid.row_id(2),
+        terminal.vt.screen.grid.row_id(3)
     );
 
-    let dropped = terminal.screen.grid.row_id(3);
-    terminal.screen.cursor_row = 0;
+    let dropped = terminal.vt.screen.grid.row_id(3);
+    terminal.vt.screen.cursor_row = 0;
     terminal.on_resize(7, 3);
     let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
     assert_eq!(
@@ -2864,15 +2893,15 @@ fn resize_retains_surviving_row_ids_and_allocates_only_new_rows() {
 #[test]
 fn alternate_screen_swap_preserves_each_grids_row_identity() {
     let mut terminal = TerminalState::new(4, 2);
-    let primary: Vec<_> = (0..2).map(|row| terminal.screen.grid.row_id(row)).collect();
+    let primary: Vec<_> = (0..2).map(|row| terminal.vt.screen.grid.row_id(row)).collect();
     let hidden_alt: Vec<_> = (0..2)
-        .map(|row| terminal.screen.alt_grid.row_id(row))
+        .map(|row| terminal.vt.screen.alt_grid.row_id(row))
         .collect();
 
     terminal.process_input(b"\x1b[?1049h");
-    assert_eq!(terminal.screen.grid.row_ids(), hidden_alt);
+    assert_eq!(terminal.vt.screen.grid.row_ids(), hidden_alt);
     terminal.process_input(b"\x1b[?1049l");
-    assert_eq!(terminal.screen.grid.row_ids(), primary);
+    assert_eq!(terminal.vt.screen.grid.row_ids(), primary);
 }
 
 #[test]
@@ -2916,11 +2945,11 @@ fn raw_row_allocator_exhaustion_never_reuses_zero_or_a_prior_id() {
 #[test]
 fn hard_reset_does_not_retarget_origins_into_replacement_rows() {
     let mut terminal = TerminalState::new(3, 2);
-    let stale = terminal.screen.grid.row_id(0);
+    let stale = terminal.vt.screen.grid.row_id(0);
     terminal.hard_reset();
     let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
 
-    assert_ne!(terminal.screen.grid.row_id(0), stale);
+    assert_ne!(terminal.vt.screen.grid.row_id(0), stale);
     assert_eq!(
         viewport.display_point_for(RawCellAnchor {
             row_id: stale,
@@ -2971,8 +3000,8 @@ fn alt_screen_does_not_inherit_or_export_the_scroll_region() {
     terminal.process_input(b"\x1b[3;7r");
     assert_eq!(
         (
-            terminal.screen.scroll_region_top,
-            terminal.screen.scroll_region_bottom
+            terminal.vt.screen.scroll_region_top,
+            terminal.vt.screen.scroll_region_bottom
         ),
         (2, 6)
     );
@@ -2980,8 +3009,8 @@ fn alt_screen_does_not_inherit_or_export_the_scroll_region() {
     terminal.process_input(b"\x1b[?1049h");
     assert_eq!(
         (
-            terminal.screen.scroll_region_top,
-            terminal.screen.scroll_region_bottom
+            terminal.vt.screen.scroll_region_top,
+            terminal.vt.screen.scroll_region_bottom
         ),
         (0, 9)
     );
@@ -2990,8 +3019,8 @@ fn alt_screen_does_not_inherit_or_export_the_scroll_region() {
     terminal.process_input(b"\x1b[?1049l");
     assert_eq!(
         (
-            terminal.screen.scroll_region_top,
-            terminal.screen.scroll_region_bottom
+            terminal.vt.screen.scroll_region_top,
+            terminal.vt.screen.scroll_region_bottom
         ),
         (0, 9)
     );
@@ -3002,14 +3031,14 @@ fn leaving_the_alt_screen_restores_the_shells_sgr_rather_than_clearing_it() {
     let mut terminal = TerminalState::new(20, 4);
     // The shell sets red before launching a fullscreen app.
     terminal.process_input(b"\x1b[31m");
-    let shell_fg = terminal.screen.current_fg;
+    let shell_fg = terminal.vt.screen.current_fg;
 
     terminal.process_input(b"\x1b[?1049h\x1b[44m\x1b[1m");
     terminal.process_input(b"\x1b[?1049l");
 
-    assert_eq!(terminal.screen.current_fg, shell_fg);
-    assert_eq!(terminal.screen.current_bg, Color::Default);
-    assert_eq!(terminal.screen.current_flags, StyleFlags::default());
+    assert_eq!(terminal.vt.screen.current_fg, shell_fg);
+    assert_eq!(terminal.vt.screen.current_bg, Color::Default);
+    assert_eq!(terminal.vt.screen.current_flags, StyleFlags::default());
 }
 
 /// A resize is a window drag, a pane split or a font change — never a request
@@ -3058,6 +3087,25 @@ fn xtwinops_reports_window_state_and_position() {
     terminal.process_input(b"\x1b[11t\x1b[13t");
 
     assert_eq!(terminal.output_buffer.as_slice(), b"\x1b[1t\x1b[3;0;0t");
+}
+
+#[test]
+fn xtwinops_matches_frozen_ember_reply_order_at_every_split() {
+    let input = b"\x1b]0;before\x07\x1b[22;1t\x1b[11t\x1b[?14t\x1b[14$t\
+                  \x1b[8;40;120t\x1b[13t\x1b[14;999t\x1b[5n\x1b[16t\
+                  \x1b]0;after\x07\x1b[23t\x1b[20t\x1b[18t\x1b[21t\x1b[19t";
+    let expected = b"\x1b[1t\x1b[3;0;0t\x1b[4;65;72t\x1b[0n\x1b[6;13;9t\
+                     \x1b]Lbefore\x1b\\\x1b[8;5;8t\x1b]lafter\x1b\\\x1b[9;5;8t";
+    for split in 0..=input.len() {
+        let mut terminal = TerminalState::new(8, 5);
+        terminal.kitty_graphics.set_cell_size_pixels(9, 13);
+        terminal.process_input(&input[..split]);
+        terminal.process_input(&input[split..]);
+        assert_eq!(terminal.output_buffer.as_slice(), expected, "split {split}");
+        assert_eq!(terminal.titles.icon_title, "before");
+        assert_eq!(terminal.titles.window_title, "after");
+        assert!(terminal.titles.title_stack.is_empty());
+    }
 }
 
 #[test]
@@ -3184,7 +3232,7 @@ fn rep_without_a_preceding_glyph_is_ignored() {
 
     terminal.process_input(b"\x1b[4b");
 
-    assert_eq!(terminal.screen.cursor_col, 0);
+    assert_eq!(terminal.vt.screen.cursor_col, 0);
     assert_eq!(terminal.get_visible_cells()[0][0].character, ' ');
 }
 
@@ -3194,14 +3242,14 @@ fn cht_and_cbt_walk_the_tab_stops() {
 
     // Default stops every 8 columns.
     terminal.process_input(b"\x1b[3I");
-    assert_eq!(terminal.screen.cursor_col, 24);
+    assert_eq!(terminal.vt.screen.cursor_col, 24);
 
     terminal.process_input(b"\x1b[2Z");
-    assert_eq!(terminal.screen.cursor_col, 8);
+    assert_eq!(terminal.vt.screen.cursor_col, 8);
 
     // Back-tab saturates at column 0 rather than wrapping.
     terminal.process_input(b"\x1b[9Z");
-    assert_eq!(terminal.screen.cursor_col, 0);
+    assert_eq!(terminal.vt.screen.cursor_col, 0);
 }
 
 /// While the user reads history, streaming output must not walk the viewport
@@ -3282,9 +3330,9 @@ fn shrinking_scrollback_invalidates_both_historical_view_caches() {
 #[test]
 fn visible_cells_keep_rectangular_shape_after_resize_with_scrollback() {
     let mut terminal = TerminalState::new(4, 2);
-    terminal.screen.grid.get_mut(0, 0).character = 'A';
-    terminal.screen.grid.get_mut(1, 0).character = 'B';
-    terminal.screen.cursor_row = 1;
+    terminal.vt.screen.grid.get_mut(0, 0).character = 'A';
+    terminal.vt.screen.grid.get_mut(1, 0).character = 'B';
+    terminal.vt.screen.cursor_row = 1;
 
     terminal.process_input(b"\n");
     terminal.on_resize(5, 2);
@@ -3337,9 +3385,9 @@ fn viewport_mapping_exactness_is_recomputed_when_height_changes() {
 #[test]
 fn cursor_is_hidden_while_viewing_scrollback() {
     let mut terminal = TerminalState::new(4, 2);
-    terminal.screen.grid.get_mut(0, 0).character = 'A';
-    terminal.screen.grid.get_mut(1, 0).character = 'B';
-    terminal.screen.cursor_row = 1;
+    terminal.vt.screen.grid.get_mut(0, 0).character = 'A';
+    terminal.vt.screen.grid.get_mut(1, 0).character = 'B';
+    terminal.vt.screen.cursor_row = 1;
 
     terminal.process_input(b"\n");
 
@@ -3353,9 +3401,9 @@ fn cursor_is_hidden_while_viewing_scrollback() {
 #[test]
 fn scroll_to_bottom_restores_live_cursor_visibility() {
     let mut terminal = TerminalState::new(4, 2);
-    terminal.screen.grid.get_mut(0, 0).character = 'A';
-    terminal.screen.grid.get_mut(1, 0).character = 'B';
-    terminal.screen.cursor_row = 1;
+    terminal.vt.screen.grid.get_mut(0, 0).character = 'A';
+    terminal.vt.screen.grid.get_mut(1, 0).character = 'B';
+    terminal.vt.screen.cursor_row = 1;
 
     terminal.process_input(b"\n");
     terminal.scroll(1);
@@ -3371,8 +3419,8 @@ fn sgr_39_and_49_restore_default_colors() {
 
     terminal.process_input(b"\x1b[36;44mA\x1b[39;49mB");
 
-    let first = &terminal.screen.grid[0][0];
-    let second = &terminal.screen.grid[0][1];
+    let first = &terminal.vt.screen.grid[0][0];
+    let second = &terminal.vt.screen.grid[0][1];
 
     assert_eq!(first.foreground, Color::Cyan);
     assert_eq!(first.background, Color::Blue);
@@ -3386,8 +3434,8 @@ fn cleared_cells_keep_active_background() {
 
     terminal.process_input(b"\x1b[44mAB\x1b[1;1H\x1b[K");
 
-    assert_eq!(terminal.screen.grid[0][0].background, Color::Blue);
-    assert_eq!(terminal.screen.grid[0][1].background, Color::Blue);
+    assert_eq!(terminal.vt.screen.grid[0][0].background, Color::Blue);
+    assert_eq!(terminal.vt.screen.grid[0][1].background, Color::Blue);
 }
 
 #[test]
@@ -3396,8 +3444,8 @@ fn empty_sgr_sequence_resets_attributes() {
 
     terminal.process_input(b"\x1b[7;36;44mA\x1b[mB");
 
-    let first = &terminal.screen.grid[0][0];
-    let second = &terminal.screen.grid[0][1];
+    let first = &terminal.vt.screen.grid[0][0];
+    let second = &terminal.vt.screen.grid[0][1];
 
     assert!(first.flags.inverse());
     assert_eq!(first.foreground, Color::Cyan);
@@ -3415,11 +3463,11 @@ fn split_truecolor_sequence_does_not_leak_text() {
     terminal.process_input(b"\x1b[38");
     terminal.process_input(b";2;81;175;239msrc");
 
-    assert_eq!(terminal.screen.grid[0][0].character, 's');
-    assert_eq!(terminal.screen.grid[0][1].character, 'r');
-    assert_eq!(terminal.screen.grid[0][2].character, 'c');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 's');
+    assert_eq!(terminal.vt.screen.grid[0][1].character, 'r');
+    assert_eq!(terminal.vt.screen.grid[0][2].character, 'c');
     assert_eq!(
-        terminal.screen.grid[0][0].foreground,
+        terminal.vt.screen.grid[0][0].foreground,
         Color::Rgb(81, 175, 239)
     );
 }
@@ -3429,7 +3477,7 @@ fn sgr_underline_with_semicolon_keeps_following_attr() {
     // `4;1` 是两个独立 SGR(下划线 + 粗体),分号不得被吞。
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b[4;1mA");
-    let cell = &terminal.screen.grid[0][0];
+    let cell = &terminal.vt.screen.grid[0][0];
     assert_eq!(cell.flags.underline(), UnderlineStyle::Single);
     assert!(cell.flags.bold(), "粗体不应被下划线吞掉");
 }
@@ -3439,7 +3487,7 @@ fn sgr_underline_colon_substyle_is_extended() {
     // `4:3` 冒号子参数 = curly 下划线,且不应附带粗体。
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b[4:3mA");
-    let cell = &terminal.screen.grid[0][0];
+    let cell = &terminal.vt.screen.grid[0][0];
     assert_eq!(cell.flags.underline(), UnderlineStyle::Curly);
     assert!(!cell.flags.bold());
 }
@@ -3449,7 +3497,7 @@ fn csi_empty_leading_param_defaults() {
     // `\x1b[;3H` 应定位到第 1 行第 3 列(空字段默认 1)。
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b[;3HX");
-    assert_eq!(terminal.screen.grid[0][2].character, 'X');
+    assert_eq!(terminal.vt.screen.grid[0][2].character, 'X');
 }
 
 #[test]
@@ -3459,7 +3507,7 @@ fn ed_clear_screen_does_not_move_cursor() {
     terminal.process_input(b"\x1b[2;3H"); // row2,col3
     terminal.process_input(b"\x1b[2J");
     terminal.process_input(b"X");
-    assert_eq!(terminal.screen.grid[1][2].character, 'X');
+    assert_eq!(terminal.vt.screen.grid[1][2].character, 'X');
 }
 
 #[test]
@@ -3468,7 +3516,7 @@ fn vpa_and_hpa_position_cursor() {
     terminal.process_input(b"\x1b[3d"); // VPA -> row 3
     terminal.process_input(b"\x1b[5`"); // HPA -> col 5
     terminal.process_input(b"Z");
-    assert_eq!(terminal.screen.grid[2][4].character, 'Z');
+    assert_eq!(terminal.vt.screen.grid[2][4].character, 'Z');
 }
 
 #[test]
@@ -3479,21 +3527,21 @@ fn cuu_does_not_scroll_at_top_margin() {
     terminal.process_input(b"\x1b[2;1HABC"); // 在区顶写入
     terminal.process_input(b"\x1b[2;1H\x1b[A"); // 回到区顶再 CUU
                                                 // 内容应原地保留,不被向下滚动
-    assert_eq!(terminal.screen.grid[1][0].character, 'A');
-    assert_eq!(terminal.screen.grid[1][1].character, 'B');
+    assert_eq!(terminal.vt.screen.grid[1][0].character, 'A');
+    assert_eq!(terminal.vt.screen.grid[1][1].character, 'B');
 }
 
 #[test]
 fn hpr_and_vpr_are_the_relative_cursor_moves() {
     let mut terminal = TerminalState::new(8, 6);
     terminal.process_input(b"\x1b[2;3H\x1b[2a\x1b[3eX");
-    assert_eq!(terminal.screen.cursor_row, 4);
-    assert_eq!(terminal.screen.cursor_col, 5);
-    assert_eq!(terminal.screen.grid[4][4].character, 'X');
+    assert_eq!(terminal.vt.screen.cursor_row, 4);
+    assert_eq!(terminal.vt.screen.cursor_col, 5);
+    assert_eq!(terminal.vt.screen.grid[4][4].character, 'X');
 
     terminal.process_input(b"\x1b[3;5r\x1b[3;1H\x1b[20e");
     assert_eq!(
-        terminal.screen.cursor_row, 4,
+        terminal.vt.screen.cursor_row, 4,
         "VPR stops at the bottom margin the same way CUD does"
     );
 }
@@ -3502,13 +3550,13 @@ fn hpr_and_vpr_are_the_relative_cursor_moves() {
 fn hpb_and_vpb_are_the_relative_cursor_backs() {
     let mut terminal = TerminalState::new(8, 6);
     terminal.process_input(b"\x1b[4;5H\x1b[2j\x1b[2kX");
-    assert_eq!(terminal.screen.cursor_row, 1);
-    assert_eq!(terminal.screen.cursor_col, 3);
-    assert_eq!(terminal.screen.grid[1][2].character, 'X');
+    assert_eq!(terminal.vt.screen.cursor_row, 1);
+    assert_eq!(terminal.vt.screen.cursor_col, 3);
+    assert_eq!(terminal.vt.screen.grid[1][2].character, 'X');
 
     terminal.process_input(b"\x1b[3;5r\x1b[3;1H\x1b[20k");
     assert_eq!(
-        terminal.screen.cursor_row, 2,
+        terminal.vt.screen.cursor_row, 2,
         "VPB stops at the top margin the same way CUU does"
     );
 }
@@ -3524,7 +3572,7 @@ fn protected_erase_fixture() -> TerminalState {
 }
 
 fn assert_erase_rows(terminal: &TerminalState, expected: [&str; 3], sequence: &str) {
-    for (row, text) in terminal.screen.grid.iter().zip(expected) {
+    for (row, text) in terminal.vt.screen.grid.iter().zip(expected) {
         assert_eq!(
             row.iter().map(|cell| cell.character).collect::<String>(),
             text,
@@ -3537,10 +3585,10 @@ fn assert_erase_rows(terminal: &TerminalState, expected: [&str; 3], sequence: &s
         }
     }
     assert_eq!(
-        (terminal.screen.cursor_row, terminal.screen.cursor_col),
+        (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
         (1, 2)
     );
-    assert!(terminal.screen.current_flags.protected());
+    assert!(terminal.vt.screen.current_flags.protected());
 }
 
 #[test]
@@ -3586,13 +3634,13 @@ fn decsca_survives_sgr_reset_but_resets_on_decstr() {
         terminal.process_input(b"\x1b[1\"q\x1b[1;44m");
         terminal.process_input(sgr.as_bytes());
         terminal.process_input(b"A\x1bP$q\"q\x1b\\");
-        assert!(terminal.screen.grid[0][0].flags.protected(), "{sgr:?}");
-        assert!(!terminal.screen.grid[0][0].flags.bold());
-        assert_eq!(terminal.screen.grid[0][0].background, Color::Default);
+        assert!(terminal.vt.screen.grid[0][0].flags.protected(), "{sgr:?}");
+        assert!(!terminal.vt.screen.grid[0][0].flags.bold());
+        assert_eq!(terminal.vt.screen.grid[0][0].background, Color::Default);
         assert_eq!(terminal.get_output(), b"\x1bP1$r1\"q\x1b\\");
         terminal.process_input(b"\x1b[!pB");
-        assert!(!terminal.screen.grid[0][1].flags.protected());
-        assert!(!terminal.screen.current_flags.protected());
+        assert!(!terminal.vt.screen.grid[0][1].flags.protected());
+        assert!(!terminal.vt.screen.current_flags.protected());
     }
 }
 
@@ -3601,23 +3649,23 @@ fn decsca_valid_parameters_and_saved_cursor_control_protection() {
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b[1\"q\x1b[99\"qA\x1b7\x1b[2\"qB\x1b8C");
     assert!(
-        terminal.screen.grid[0][0].flags.protected(),
+        terminal.vt.screen.grid[0][0].flags.protected(),
         "unknown Ps must be ignored"
     );
     assert!(
-        terminal.screen.grid[0][1].flags.protected(),
+        terminal.vt.screen.grid[0][1].flags.protected(),
         "DECRC restores DECSCA"
     );
     terminal.process_input(b"\x1b[0\"qD\x1b[1\"qE\x1b[\"qF\x1b[1\"qG\x1b[2\"qH");
     for col in [2, 4, 6] {
-        assert!(!terminal.screen.grid[0][col].flags.protected());
+        assert!(!terminal.vt.screen.grid[0][col].flags.protected());
     }
     for col in [3, 5] {
-        assert!(terminal.screen.grid[0][col].flags.protected());
+        assert!(terminal.vt.screen.grid[0][col].flags.protected());
     }
     terminal.process_input(b"\x1b[1\"q\x1bc");
     assert!(
-        !terminal.screen.current_flags.protected(),
+        !terminal.vt.screen.current_flags.protected(),
         "RIS resets DECSCA"
     );
 }
@@ -3627,23 +3675,23 @@ fn selective_erase_keeps_protected_wide_pairs_at_both_boundaries() {
     for sequence in ["\x1b[1;2H\x1b[?K", "\x1b[1;1H\x1b[?1K", "\x1b[?2J"] {
         let mut terminal = TerminalState::new(8, 2);
         terminal.process_input("\x1b[1\"q界\x1b[0\"q文Z".as_bytes());
-        assert!(terminal.screen.grid[0][1].flags.protected());
+        assert!(terminal.vt.screen.grid[0][1].flags.protected());
         terminal.process_input(sequence.as_bytes());
-        assert_eq!(terminal.screen.grid[0][0].character, '界', "{sequence:?}");
-        assert!(terminal.screen.grid[0][0].flags.wide());
-        assert!(terminal.screen.grid[0][1].flags.wide_continuation());
+        assert_eq!(terminal.vt.screen.grid[0][0].character, '界', "{sequence:?}");
+        assert!(terminal.vt.screen.grid[0][0].flags.wide());
+        assert!(terminal.vt.screen.grid[0][1].flags.wide_continuation());
         if sequence != "\x1b[1;1H\x1b[?1K" {
-            for cell in &terminal.screen.grid[0][2..=4] {
+            for cell in &terminal.vt.screen.grid[0][2..=4] {
                 assert_eq!(cell.character, ' ');
                 assert!(!cell.flags.wide());
                 assert!(!cell.flags.wide_continuation());
             }
         }
         terminal.process_input(b"\x1b[1;2H\x1b[X");
-        assert_eq!(terminal.screen.grid[0][0].character, ' ');
-        assert_eq!(terminal.screen.grid[0][1].character, ' ');
-        assert!(!terminal.screen.grid[0][0].flags.wide());
-        assert!(!terminal.screen.grid[0][1].flags.wide_continuation());
+        assert_eq!(terminal.vt.screen.grid[0][0].character, ' ');
+        assert_eq!(terminal.vt.screen.grid[0][1].character, ' ');
+        assert!(!terminal.vt.screen.grid[0][0].flags.wide());
+        assert!(!terminal.vt.screen.grid[0][1].flags.wide_continuation());
     }
 }
 
@@ -3682,8 +3730,8 @@ fn selective_erase_does_not_archive_screens_or_remove_graphics() {
         assert!(terminal.scrollback.is_empty());
         assert_eq!(terminal.total_lines_scrolled, 0);
         assert_eq!(terminal.kitty_graphics.get_placements().len(), placements);
-        assert_eq!(terminal.screen.grid[0][0].character, 'A');
-        assert_eq!(terminal.screen.grid[0][3].character, ' ');
+        assert_eq!(terminal.vt.screen.grid[0][0].character, 'A');
+        assert_eq!(terminal.vt.screen.grid[0][3].character, ' ');
     }
 }
 
@@ -3694,9 +3742,9 @@ fn erase_ignores_unknown_prefixes_intermediates_and_parameters() {
         "\x1b[?9K",
     ] {
         let mut terminal = protected_erase_fixture();
-        let before = terminal.screen.grid.to_vec();
+        let before = terminal.vt.screen.grid.to_vec();
         terminal.process_input(sequence.as_bytes());
-        assert_cell_grids_equal(&terminal.screen.grid.to_vec(), &before, sequence);
+        assert_cell_grids_equal(&terminal.vt.screen.grid.to_vec(), &before, sequence);
         assert!(terminal.scrollback.is_empty());
     }
 }
@@ -3711,14 +3759,14 @@ fn selective_erase_is_invariant_under_pty_fragmentation() {
         fragmented.process_input(&data[..boundary]);
         fragmented.process_input(&data[boundary..]);
         assert_cell_grids_equal(
-            &fragmented.screen.grid.to_vec(),
-            &whole.screen.grid.to_vec(),
+            &fragmented.vt.screen.grid.to_vec(),
+            &whole.vt.screen.grid.to_vec(),
             &format!("PTY split at {boundary}"),
         );
-        assert_eq!(fragmented.screen.current_flags, whole.screen.current_flags);
+        assert_eq!(fragmented.vt.screen.current_flags, whole.vt.screen.current_flags);
         assert_eq!(
-            (fragmented.screen.cursor_row, fragmented.screen.cursor_col),
-            (whole.screen.cursor_row, whole.screen.cursor_col)
+            (fragmented.vt.screen.cursor_row, fragmented.vt.screen.cursor_col),
+            (whole.vt.screen.cursor_row, whole.vt.screen.cursor_col)
         );
         assert!(fragmented.scrollback.is_empty());
     }
@@ -3731,8 +3779,8 @@ fn trailing_escape_is_buffered_until_next_chunk() {
     terminal.process_input(b"\x1b");
     terminal.process_input(b"[31mX");
 
-    assert_eq!(terminal.screen.grid[0][0].character, 'X');
-    assert_eq!(terminal.screen.grid[0][0].foreground, Color::Red);
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'X');
+    assert_eq!(terminal.vt.screen.grid[0][0].foreground, Color::Red);
 }
 
 #[test]
@@ -3743,12 +3791,12 @@ fn csi_executes_embedded_crlf_and_continues_parsing() {
     // parameter, producing this exact ESC [ 3 CR LF 3 m shape.
     terminal.process_input(b"A\x1b[3\r\n3mB\x1b[mC");
 
-    assert!(terminal.parser.snapshot().pending_escape.is_empty());
-    assert_eq!(terminal.screen.cursor_row, 1);
-    assert_eq!(terminal.screen.grid[1][0].character, 'B');
-    assert_eq!(terminal.screen.grid[1][0].foreground, Color::Yellow);
-    assert_eq!(terminal.screen.grid[1][1].character, 'C');
-    assert_eq!(terminal.screen.grid[1][1].foreground, Color::Default);
+    assert!(terminal.vt.parser.snapshot().pending_escape.is_empty());
+    assert_eq!(terminal.vt.screen.cursor_row, 1);
+    assert_eq!(terminal.vt.screen.grid[1][0].character, 'B');
+    assert_eq!(terminal.vt.screen.grid[1][0].foreground, Color::Yellow);
+    assert_eq!(terminal.vt.screen.grid[1][1].character, 'C');
+    assert_eq!(terminal.vt.screen.grid[1][1].foreground, Color::Default);
 }
 
 #[test]
@@ -3756,15 +3804,15 @@ fn partial_csi_does_not_replay_embedded_linefeed_on_next_chunk() {
     let mut terminal = TerminalState::new(16, 4);
 
     terminal.process_input(b"\x1b[3\r\n");
-    assert_eq!(terminal.screen.cursor_row, 1);
-    assert_eq!(terminal.parser.snapshot().pending_escape, b"\x1b[3");
+    assert_eq!(terminal.vt.screen.cursor_row, 1);
+    assert_eq!(terminal.vt.parser.snapshot().pending_escape, b"\x1b[3");
 
     terminal.process_input(b"3mX");
 
-    assert!(terminal.parser.snapshot().pending_escape.is_empty());
-    assert_eq!(terminal.screen.cursor_row, 1);
-    assert_eq!(terminal.screen.grid[1][0].character, 'X');
-    assert_eq!(terminal.screen.grid[1][0].foreground, Color::Yellow);
+    assert!(terminal.vt.parser.snapshot().pending_escape.is_empty());
+    assert_eq!(terminal.vt.screen.cursor_row, 1);
+    assert_eq!(terminal.vt.screen.grid[1][0].character, 'X');
+    assert_eq!(terminal.vt.screen.grid[1][0].foreground, Color::Yellow);
 }
 
 #[test]
@@ -3773,9 +3821,9 @@ fn dec_special_graphics_charset_maps_line_drawing() {
 
     terminal.process_input(b"\x1b(0qx\x0fA");
 
-    assert_eq!(terminal.screen.grid[0][0].character, '─');
-    assert_eq!(terminal.screen.grid[0][1].character, '│');
-    assert_eq!(terminal.screen.grid[0][2].character, 'A');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, '─');
+    assert_eq!(terminal.vt.screen.grid[0][1].character, '│');
+    assert_eq!(terminal.vt.screen.grid[0][2].character, 'A');
 }
 
 #[test]
@@ -3784,7 +3832,7 @@ fn decscusr_with_intermediate_space_does_not_leak_text() {
 
     terminal.process_input(b"\x1b[0 qX");
 
-    assert_eq!(terminal.screen.grid[0][0].character, 'X');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'X');
 }
 
 #[test]
@@ -3794,9 +3842,9 @@ fn private_csi_u_sequence_does_not_restore_cursor_or_leak() {
     terminal.process_input(b"AB");
     terminal.process_input(b"\x1b[?4uC");
 
-    assert_eq!(terminal.screen.grid[0][0].character, 'A');
-    assert_eq!(terminal.screen.grid[0][1].character, 'B');
-    assert_eq!(terminal.screen.grid[0][2].character, 'C');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'A');
+    assert_eq!(terminal.vt.screen.grid[0][1].character, 'B');
+    assert_eq!(terminal.vt.screen.grid[0][2].character, 'C');
 }
 
 #[test]
@@ -3805,8 +3853,8 @@ fn csi_with_gt_prefix_is_consumed_without_printing_parameters() {
 
     terminal.process_input(b"\x1b[>4;1mZ");
 
-    assert_eq!(terminal.screen.grid[0][0].character, 'Z');
-    assert_eq!(terminal.screen.grid[0][1].character, ' ');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'Z');
+    assert_eq!(terminal.vt.screen.grid[0][1].character, ' ');
 }
 
 #[test]
@@ -3815,8 +3863,8 @@ fn dcs_sequence_is_consumed_without_leaking_text() {
 
     terminal.process_input(b"\x1bP$q q\x1b\\X");
 
-    assert_eq!(terminal.screen.grid[0][0].character, 'X');
-    assert_eq!(terminal.screen.grid[0][1].character, ' ');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'X');
+    assert_eq!(terminal.vt.screen.grid[0][1].character, ' ');
 }
 
 #[test]
@@ -4271,7 +4319,7 @@ fn osc_5522_mime_list_request_without_user_paste_is_denied() {
     terminal.process_input(b"\x1b]5522;type=read;Lg==\x1b\\");
 
     assert!(terminal.take_clipboard_read_requests().is_empty());
-    assert!(terminal.pending_paste_grant.is_none());
+    assert!(terminal.osc5522.pending_paste_grant.is_none());
     assert_eq!(
         String::from_utf8(terminal.get_output()).unwrap(),
         "\x1b]5522;type=read:status=EPERM\x1b\\"
@@ -4344,7 +4392,7 @@ fn osc_5522_paste_grant_rejects_wrong_name_and_unoffered_mime() {
         "Paste event",
     ));
     assert!(terminal.take_clipboard_read_requests().is_empty());
-    assert!(terminal.pending_paste_grant.is_none());
+    assert!(terminal.osc5522.pending_paste_grant.is_none());
 
     terminal.process_input(&osc_5522_mime_read("text/plain", &token, "Paste event"));
     assert!(terminal.take_clipboard_read_requests().is_empty());
@@ -4356,19 +4404,19 @@ fn osc_5522_paste_grant_expires_and_is_revoked_with_mode() {
     terminal.process_input(b"\x1b[?5522h");
     let event = terminal.build_paste_event(&["text/plain".to_string()]);
     let token = paste_token_from_event(&event);
-    terminal.pending_paste_grant.as_mut().unwrap().expires_at =
+    terminal.osc5522.pending_paste_grant.as_mut().unwrap().expires_at =
         std::time::Instant::now() - std::time::Duration::from_millis(1);
 
     terminal.process_input(&osc_5522_mime_read("text/plain", &token, "Paste event"));
     assert!(terminal.take_clipboard_read_requests().is_empty());
-    assert!(terminal.pending_paste_grant.is_none());
+    assert!(terminal.osc5522.pending_paste_grant.is_none());
 
     let event = terminal.build_paste_event(&["text/plain".to_string()]);
     let token = paste_token_from_event(&event);
     terminal.process_input(b"\x1b[?5522l");
     terminal.process_input(&osc_5522_mime_read("text/plain", &token, "Paste event"));
     assert!(terminal.take_clipboard_read_requests().is_empty());
-    assert!(terminal.pending_paste_grant.is_none());
+    assert!(terminal.osc5522.pending_paste_grant.is_none());
 }
 
 #[test]
@@ -4412,11 +4460,11 @@ fn combining_mark_composes_onto_previous_cell() {
     // 'e' followed by U+0301 (combining acute) should compose to 'é'.
     terminal.process_input("e\u{0301}".as_bytes());
 
-    assert_eq!(terminal.screen.grid[0][0].character, 'é');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'é');
     // The mark consumes no column; cursor stays just past the base glyph.
-    assert_eq!(terminal.screen.cursor_col, 1);
+    assert_eq!(terminal.vt.screen.cursor_col, 1);
     // The second column is untouched.
-    assert_eq!(terminal.screen.grid[0][1].character, ' ');
+    assert_eq!(terminal.vt.screen.grid[0][1].character, ' ');
 }
 
 #[test]
@@ -4426,8 +4474,8 @@ fn combining_mark_at_line_start_is_dropped() {
     // A combining mark with no base character is ignored.
     terminal.process_input("\u{0301}".as_bytes());
 
-    assert_eq!(terminal.screen.grid[0][0].character, ' ');
-    assert_eq!(terminal.screen.cursor_col, 0);
+    assert_eq!(terminal.vt.screen.grid[0][0].character, ' ');
+    assert_eq!(terminal.vt.screen.cursor_col, 0);
 }
 
 #[test]
@@ -4436,15 +4484,15 @@ fn pending_wrap_defers_line_break_until_next_char() {
 
     // Fill the row exactly; cursor latches at the last column (no wrap yet).
     terminal.process_input(b"abc");
-    assert_eq!(terminal.screen.cursor_row, 0);
-    assert_eq!(terminal.screen.cursor_col, 2);
-    assert_eq!(terminal.screen.grid[0][2].character, 'c');
+    assert_eq!(terminal.vt.screen.cursor_row, 0);
+    assert_eq!(terminal.vt.screen.cursor_col, 2);
+    assert_eq!(terminal.vt.screen.grid[0][2].character, 'c');
 
     // The next printable char triggers the deferred wrap.
     terminal.process_input(b"d");
-    assert_eq!(terminal.screen.cursor_row, 1);
-    assert_eq!(terminal.screen.cursor_col, 1);
-    assert_eq!(terminal.screen.grid[1][0].character, 'd');
+    assert_eq!(terminal.vt.screen.cursor_row, 1);
+    assert_eq!(terminal.vt.screen.cursor_col, 1);
+    assert_eq!(terminal.vt.screen.grid[1][0].character, 'd');
 }
 
 #[test]
@@ -4455,9 +4503,9 @@ fn carriage_return_cancels_pending_wrap() {
     // CR cancels the latched wrap; the next char overwrites column 0.
     terminal.process_input(b"\rd");
 
-    assert_eq!(terminal.screen.cursor_row, 0);
-    assert_eq!(terminal.screen.cursor_col, 1);
-    assert_eq!(terminal.screen.grid[0][0].character, 'd');
+    assert_eq!(terminal.vt.screen.cursor_row, 0);
+    assert_eq!(terminal.vt.screen.cursor_col, 1);
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'd');
 }
 
 #[test]
@@ -4487,12 +4535,12 @@ fn right_margin_edits_cancel_pending_wrap_without_moving_the_cursor() {
                 }
                 terminal.process_input(b"\x1b[3;1H");
                 terminal.process_input(text.as_bytes());
-                assert!(terminal.screen.pending_wrap);
-                let cursor = (terminal.screen.cursor_row, terminal.screen.cursor_col);
+                assert!(terminal.vt.screen.pending_wrap);
+                let cursor = (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col);
                 terminal.process_input(sequence.as_bytes());
-                assert!(!terminal.screen.pending_wrap, "{sequence:?} after {text:?}");
+                assert!(!terminal.vt.screen.pending_wrap, "{sequence:?} after {text:?}");
                 assert_eq!(
-                    (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                    (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
                     cursor
                 );
                 terminal.process_input(b"\x1b[6n");
@@ -4504,8 +4552,8 @@ fn right_margin_edits_cancel_pending_wrap_without_moving_the_cursor() {
                 let scrolled = terminal.total_lines_scrolled;
                 let history = terminal.scrollback.len();
                 terminal.process_input(b"x");
-                assert_eq!(terminal.screen.grid[cursor.0][cursor.1].character, 'x');
-                assert_eq!(terminal.screen.cursor_row, cursor.0);
+                assert_eq!(terminal.vt.screen.grid[cursor.0][cursor.1].character, 'x');
+                assert_eq!(terminal.vt.screen.cursor_row, cursor.0);
                 assert_eq!(terminal.total_lines_scrolled, scrolled);
                 assert_eq!(terminal.scrollback.len(), history);
             }
@@ -4521,21 +4569,21 @@ fn cursor_back_aliases_cancel_pending_wrap_like_cub_and_cuu() {
             let mut actual = TerminalState::new(8, 5);
             for terminal in [&mut expected, &mut actual] {
                 terminal.process_input(b"\x1b[2;4r\x1b[2;1HABCDEFGH");
-                assert!(terminal.screen.pending_wrap);
+                assert!(terminal.vt.screen.pending_wrap);
             }
             expected.process_input(format!("\x1b[{count}{canonical}").as_bytes());
             actual.process_input(format!("\x1b[{count}{alias}").as_bytes());
-            assert!(!actual.screen.pending_wrap, "{count}{alias}");
+            assert!(!actual.vt.screen.pending_wrap, "{count}{alias}");
             expected.process_input(b"x");
             actual.process_input(b"x");
             assert_cell_grids_equal(
-                &actual.screen.grid.to_vec(),
-                &expected.screen.grid.to_vec(),
+                &actual.vt.screen.grid.to_vec(),
+                &expected.vt.screen.grid.to_vec(),
                 "cursor back",
             );
             assert_eq!(
-                (actual.screen.cursor_row, actual.screen.cursor_col),
-                (expected.screen.cursor_row, expected.screen.cursor_col)
+                (actual.vt.screen.cursor_row, actual.vt.screen.cursor_col),
+                (expected.vt.screen.cursor_row, expected.vt.screen.cursor_col)
             );
         }
     }
@@ -4561,15 +4609,15 @@ fn selective_erase_pending_wrap_depends_on_the_erased_runs() {
                 terminal.process_input(b"\x1b[0\"q");
             }
             terminal.process_input(b"ABCDEFGH");
-            assert!(terminal.screen.pending_wrap);
+            assert!(terminal.vt.screen.pending_wrap);
             terminal.process_input(sequence.as_bytes());
             assert_eq!(
-                terminal.screen.pending_wrap,
+                terminal.vt.screen.pending_wrap,
                 fully_protected && !cancels_protected_only,
                 "{sequence:?}, protected={fully_protected}"
             );
             assert_eq!(
-                (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
                 (1, 7)
             );
             assert!(terminal.scrollback.is_empty());
@@ -4588,12 +4636,12 @@ fn ignored_edits_and_scrollback_clear_preserve_pending_wrap() {
     ] {
         let mut terminal = TerminalState::new(8, 3);
         terminal.process_input(b"ABCDEFGH");
-        let before = terminal.screen.grid.to_vec();
+        let before = terminal.vt.screen.grid.to_vec();
         terminal.process_input(sequence.as_bytes());
-        assert!(terminal.screen.pending_wrap, "{sequence:?}");
-        assert_cell_grids_equal(&terminal.screen.grid.to_vec(), &before, sequence);
+        assert!(terminal.vt.screen.pending_wrap, "{sequence:?}");
+        assert_cell_grids_equal(&terminal.vt.screen.grid.to_vec(), &before, sequence);
         terminal.process_input(b"x");
-        assert_eq!(terminal.screen.grid[1][0].character, 'x', "{sequence:?}");
+        assert_eq!(terminal.vt.screen.grid[1][0].character, 'x', "{sequence:?}");
     }
 }
 
@@ -4601,12 +4649,12 @@ fn ignored_edits_and_scrollback_clear_preserve_pending_wrap() {
 fn saved_pending_wrap_is_independent_of_live_erase_state() {
     let mut before_erase = TerminalState::new(8, 3);
     before_erase.process_input(b"ABCDEFGH\x1b7\x1b[K\x1b8x");
-    assert_eq!(before_erase.screen.grid[1][0].character, 'x');
+    assert_eq!(before_erase.vt.screen.grid[1][0].character, 'x');
 
     let mut after_erase = TerminalState::new(8, 3);
     after_erase.process_input(b"ABCDEFGH\x1b[K\x1b7\r12345678\x1b8x");
-    assert_eq!(after_erase.screen.grid[0][7].character, 'x');
-    assert_eq!(after_erase.screen.cursor_row, 0);
+    assert_eq!(after_erase.vt.screen.grid[0][7].character, 'x');
+    assert_eq!(after_erase.vt.screen.cursor_row, 0);
     assert_eq!(row_text(&after_erase, 1), "");
 }
 
@@ -4615,7 +4663,7 @@ fn pending_wrap_edits_are_invariant_under_pty_fragmentation() {
     let data = b"\x1b[3;1HABCDEFGH\x1b[2Kx\x1b[6n";
     let mut whole = TerminalState::new(8, 3);
     whole.process_input(data);
-    assert_eq!(whole.screen.grid[2][7].character, 'x');
+    assert_eq!(whole.vt.screen.grid[2][7].character, 'x');
     assert_eq!(whole.total_lines_scrolled, 0);
     let reply = whole.get_output();
     for boundary in 0..=data.len() {
@@ -4623,11 +4671,11 @@ fn pending_wrap_edits_are_invariant_under_pty_fragmentation() {
         fragmented.process_input(&data[..boundary]);
         fragmented.process_input(&data[boundary..]);
         assert_cell_grids_equal(
-            &fragmented.screen.grid.to_vec(),
-            &whole.screen.grid.to_vec(),
+            &fragmented.vt.screen.grid.to_vec(),
+            &whole.vt.screen.grid.to_vec(),
             &format!("PTY split at {boundary}"),
         );
-        assert_eq!(fragmented.screen.pending_wrap, whole.screen.pending_wrap);
+        assert_eq!(fragmented.vt.screen.pending_wrap, whole.vt.screen.pending_wrap);
         assert_eq!(fragmented.total_lines_scrolled, whole.total_lines_scrolled);
         assert_eq!(fragmented.get_output(), reply);
     }
@@ -4776,8 +4824,8 @@ fn finished_output_range_is_exact_on_a_shared_raw_row() {
         .expect("exact retained output range");
     assert_eq!(range.start.row, range.end.row);
     assert_eq!((range.start.col, range.end.col), (3, 6));
-    assert_eq!(terminal.screen.grid[0][range.start.col].character, 'O');
-    assert_eq!(terminal.screen.grid[0][range.end.col].character, 's');
+    assert_eq!(terminal.vt.screen.grid[0][range.start.col].character, 'O');
+    assert_eq!(terminal.vt.screen.grid[0][range.end.col].character, 's');
 }
 
 #[test]
@@ -4792,7 +4840,7 @@ fn finished_output_range_survives_suffix_filling_and_wrapping_outside_it() {
     // Fill every remaining cell on the shared row. This sets DEC pending-wrap
     // but does not touch the protected [0, 3) output interval.
     terminal.process_input(b"abcde");
-    assert!(terminal.screen.pending_wrap);
+    assert!(terminal.vt.screen.pending_wrap);
     assert_eq!(terminal.finished_output_range(sequence), Some(exact));
 
     // Resolving that pending wrap changes topology and writes on the next raw
@@ -4863,7 +4911,7 @@ fn finished_output_shift_and_wide_mutations_fail_closed() {
         .process_input(b"\x1b]133;A\x07\x1b]133;C;id=combining\x07e\x1b]133;D;0;id=combining\x07");
     let sequence = combining.command_record("combining").unwrap().sequence;
     combining.process_input("\u{301}".as_bytes());
-    assert_eq!(combining.screen.grid[0][0].character, 'é');
+    assert_eq!(combining.vt.screen.grid[0][0].character, 'é');
     assert_eq!(combining.finished_output_range(sequence), None);
 }
 
@@ -4889,7 +4937,7 @@ fn partial_region_scroll_drops_only_discarded_raw_row_provenance() {
     let mut down = TerminalState::new(8, 4);
     down.process_input(b"\x1b[3;1H\x1b]133;A\x07\x1b]133;C;id=down\x07x\x1b]133;D;0;id=down\x07");
     let sequence = down.command_record("down").unwrap().sequence;
-    let dropped = down.screen.grid.row_id(2);
+    let dropped = down.vt.screen.grid.row_id(2);
     assert!(down.finished_output_owners.contains_key(&dropped));
     down.scroll_region_down(1, 2);
     assert_eq!(down.finished_output_range(sequence), None);
@@ -4898,7 +4946,7 @@ fn partial_region_scroll_drops_only_discarded_raw_row_provenance() {
     let mut up = TerminalState::new(8, 4);
     up.process_input(b"\x1b[2;1H\x1b]133;A\x07\x1b]133;C;id=up\x07x\x1b]133;D;0;id=up\x07");
     let sequence = up.command_record("up").unwrap().sequence;
-    let dropped = up.screen.grid.row_id(1);
+    let dropped = up.vt.screen.grid.row_id(1);
     assert!(up.finished_output_owners.contains_key(&dropped));
     up.scroll_region_up(1, 2);
     assert_eq!(up.finished_output_range(sequence), None);
@@ -4917,7 +4965,7 @@ fn finished_output_range_follows_identity_preserving_partial_line_moves() {
     terminal.process_input(b"\x1b[1;1H\x1b[L");
 
     assert_eq!(terminal.finished_output_range(sequence), Some(exact));
-    assert_eq!(terminal.screen.grid[2][0].character, 'O');
+    assert_eq!(terminal.vt.screen.grid[2][0].character, 'O');
 }
 
 /// A zero count means one (xterm), so `CSI 0 M` must leave exactly the grid
@@ -5006,7 +5054,7 @@ fn pending_wrap_at_output_start_rebases_to_the_first_real_output_row() {
 
     let record = terminal.command_record("start-wrap").unwrap();
     let range = terminal.finished_output_range(record.sequence).unwrap();
-    assert_ne!(range.start.row, terminal.screen.grid.row_id(0));
+    assert_ne!(range.start.row, terminal.vt.screen.grid.row_id(0));
     assert_eq!((range.start.col, range.end.col), (0, 1));
     assert_eq!(
         terminal
@@ -5134,7 +5182,7 @@ fn finished_output_range_shrinks_start_after_a_real_leftward_write() {
         .expect("a real write after CR expands output ownership leftward");
 
     assert_eq!((range.start.col, range.end.col), (0, 6));
-    assert_eq!(terminal.screen.grid[0][0].character, 'Z');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'Z');
     assert_eq!(
         terminal
             .command_output_text("left-write", 1024)
@@ -5236,8 +5284,8 @@ fn alternate_screen_writes_do_not_contaminate_primary_output_provenance() {
     let record = terminal.command_record("alt-safe").unwrap();
     let range = terminal.finished_output_range(record.sequence).unwrap();
     assert_eq!((range.start.col, range.end.col), (0, 2));
-    assert_eq!(terminal.screen.grid[0][0].character, 'P');
-    assert_eq!(terminal.screen.grid[0][1].character, 'Q');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'P');
+    assert_eq!(terminal.vt.screen.grid[0][1].character, 'Q');
 }
 
 #[test]
@@ -6178,9 +6226,9 @@ fn pending_wrap_not_set_when_autowrap_disabled() {
     terminal.process_input(b"abcd");
 
     // Without autowrap the last column is overwritten in place.
-    assert_eq!(terminal.screen.cursor_row, 0);
-    assert_eq!(terminal.screen.cursor_col, 2);
-    assert_eq!(terminal.screen.grid[0][2].character, 'd');
+    assert_eq!(terminal.vt.screen.cursor_row, 0);
+    assert_eq!(terminal.vt.screen.cursor_col, 2);
+    assert_eq!(terminal.vt.screen.grid[0][2].character, 'd');
 }
 
 #[test]
@@ -6195,30 +6243,30 @@ fn decrc_restores_pending_wrap_so_right_prompt_does_not_drop_cursor() {
     // 左 prompt 写到第 0 行第 2 列,保存光标(pending_wrap=false)
     terminal.process_input(b"P>");
     terminal.process_input(b"\x1b7");
-    assert_eq!(terminal.screen.cursor_row, 0);
-    assert_eq!(terminal.screen.cursor_col, 2);
-    assert!(!terminal.screen.pending_wrap);
+    assert_eq!(terminal.vt.screen.cursor_row, 0);
+    assert_eq!(terminal.vt.screen.cursor_col, 2);
+    assert!(!terminal.vt.screen.pending_wrap);
 
     // 移到末列写入,触发 pending_wrap(末列延迟换行)
     terminal.process_input(b"\x1b[6GR");
-    assert_eq!(terminal.screen.cursor_row, 0);
-    assert_eq!(terminal.screen.cursor_col, 5);
-    assert!(terminal.screen.pending_wrap);
+    assert_eq!(terminal.vt.screen.cursor_row, 0);
+    assert_eq!(terminal.vt.screen.cursor_col, 5);
+    assert!(terminal.vt.screen.pending_wrap);
 
     // 恢复光标:应同时恢复 pending_wrap=false
     terminal.process_input(b"\x1b8");
-    assert_eq!(terminal.screen.cursor_row, 0);
-    assert_eq!(terminal.screen.cursor_col, 2);
+    assert_eq!(terminal.vt.screen.cursor_row, 0);
+    assert_eq!(terminal.vt.screen.cursor_col, 2);
     assert!(
-        !terminal.screen.pending_wrap,
+        !terminal.vt.screen.pending_wrap,
         "DECRC must restore the Last Column Flag"
     );
 
     // 下一字符不应再触发换行
     terminal.process_input(b"x");
-    assert_eq!(terminal.screen.cursor_row, 0);
-    assert_eq!(terminal.screen.cursor_col, 3);
-    assert_eq!(terminal.screen.grid[0][2].character, 'x');
+    assert_eq!(terminal.vt.screen.cursor_row, 0);
+    assert_eq!(terminal.vt.screen.cursor_col, 3);
+    assert_eq!(terminal.vt.screen.grid[0][2].character, 'x');
 }
 
 #[test]
@@ -6550,7 +6598,7 @@ fn a_terminal_inside_its_mutex_is_not_at_the_mutex_address() {
 /// skips continuation cells, so they show as bare background regardless of
 /// what the cell holds.
 fn rendered_row(terminal: &TerminalState, row: usize) -> String {
-    terminal.screen.grid[row]
+    terminal.vt.screen.grid[row]
         .iter()
         .map(|cell| {
             if cell.flags.wide_continuation() {
@@ -6570,13 +6618,13 @@ fn rendered_row(terminal: &TerminalState, row: usize) -> String {
 /// neighbouring one — and the next write there blanks a good cell while
 /// repairing the pair.
 fn wide_pairing_violation(terminal: &TerminalState) -> Option<String> {
-    let (rows, cols) = (terminal.screen.grid.rows(), terminal.screen.grid.row_len());
+    let (rows, cols) = (terminal.vt.screen.grid.rows(), terminal.vt.screen.grid.row_len());
     for row in 0..rows {
         for col in 0..cols {
-            let cell = terminal.screen.grid[row][col];
+            let cell = terminal.vt.screen.grid[row][col];
             if cell.flags.wide()
                 && (col + 1 >= cols
-                    || !terminal.screen.grid[row][col + 1].flags.wide_continuation())
+                    || !terminal.vt.screen.grid[row][col + 1].flags.wide_continuation())
             {
                 return Some(format!(
                     "row {row} col {col}: wide {:?} alone",
@@ -6584,7 +6632,7 @@ fn wide_pairing_violation(terminal: &TerminalState) -> Option<String> {
                 ));
             }
             if cell.flags.wide_continuation()
-                && (col == 0 || !terminal.screen.grid[row][col - 1].flags.wide())
+                && (col == 0 || !terminal.vt.screen.grid[row][col - 1].flags.wide())
             {
                 return Some(format!(
                     "row {row} col {col}: continuation alone, holding {:?}",
@@ -6620,7 +6668,7 @@ fn ascii_typed_over_a_continuation_cell_clears_the_stranded_lead() {
     terminal.process_input("好".as_bytes());
     terminal.process_input(b"\x1b[2Gab");
 
-    assert!(!terminal.screen.grid[0][0].flags.wide());
+    assert!(!terminal.vt.screen.grid[0][0].flags.wide());
     assert_eq!(rendered_row(&terminal, 0), " ab");
     assert_eq!(wide_pairing_violation(&terminal), None);
 }
@@ -6636,7 +6684,7 @@ fn a_wide_character_landing_on_a_wide_lead_clears_the_stranded_continuation() {
     terminal.process_input(b"\x1b[3G");
     terminal.process_input("的".as_bytes());
 
-    assert!(!terminal.screen.grid[0][4].flags.wide_continuation());
+    assert!(!terminal.vt.screen.grid[0][4].flags.wide_continuation());
     assert_eq!(wide_pairing_violation(&terminal), None);
 }
 
@@ -6661,7 +6709,7 @@ fn inserting_inside_a_wide_character_clears_both_halves() {
     terminal.process_input("a好b".as_bytes());
     terminal.process_input(b"\x1b[3G\x1b[1@");
 
-    assert!(!terminal.screen.grid[0][1].flags.wide());
+    assert!(!terminal.vt.screen.grid[0][1].flags.wide());
     assert_eq!(rendered_row(&terminal, 0), "a   b");
     assert_eq!(wide_pairing_violation(&terminal), None);
 }
@@ -6670,11 +6718,11 @@ fn inserting_inside_a_wide_character_clears_both_halves() {
 fn narrowing_past_a_wide_character_clears_its_lead_half() {
     let mut terminal = TerminalState::new(6, 1);
     terminal.process_input("a好".as_bytes());
-    assert!(terminal.screen.grid[0][1].flags.wide());
+    assert!(terminal.vt.screen.grid[0][1].flags.wide());
 
     terminal.on_resize(2, 1);
 
-    assert!(!terminal.screen.grid[0][1].flags.wide());
+    assert!(!terminal.vt.screen.grid[0][1].flags.wide());
     assert_eq!(wide_pairing_violation(&terminal), None);
 }
 
@@ -7219,7 +7267,7 @@ fn osc_titles_drop_controls_and_replace_visual_spoofing() {
 }
 
 fn row_text(terminal: &TerminalState, row: usize) -> String {
-    terminal.screen.grid[row]
+    terminal.vt.screen.grid[row]
         .iter()
         .map(|cell| cell.character)
         .collect::<String>()
@@ -7243,7 +7291,7 @@ fn decscusr_uses_the_xterm_shape_numbering() {
         (6, "Beam"),
     ] {
         terminal.process_input(format!("\x1b[{param} q").as_bytes());
-        let shape = match terminal.screen.cursor_shape {
+        let shape = match terminal.vt.screen.cursor_shape {
             CursorShape::Block => "Block",
             CursorShape::Underline => "Underline",
             CursorShape::Beam => "Beam",
@@ -7307,13 +7355,13 @@ fn esc_sequences_swallow_their_bytes_and_nel_decaln_work() {
         assert_eq!(row_text(&terminal, row), "EEEEEE");
     }
     assert_eq!(
-        (terminal.screen.cursor_row, terminal.screen.cursor_col),
+        (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
         (0, 0)
     );
     assert_eq!(
         (
-            terminal.screen.scroll_region_top,
-            terminal.screen.scroll_region_bottom
+            terminal.vt.screen.scroll_region_top,
+            terminal.vt.screen.scroll_region_bottom
         ),
         (0, 2)
     );
@@ -7360,24 +7408,24 @@ fn decstr_soft_reset_restores_the_defined_state() {
 
     assert_eq!(
         (
-            terminal.screen.scroll_region_top,
-            terminal.screen.scroll_region_bottom
+            terminal.vt.screen.scroll_region_top,
+            terminal.vt.screen.scroll_region_bottom
         ),
         (0, 5)
     );
-    assert!(!terminal.screen.origin_mode);
-    assert!(!terminal.screen.insert_mode);
-    assert!(terminal.protocol.modes().contains(&7));
-    assert!(terminal.protocol.modes().contains(&25));
+    assert!(!terminal.vt.screen.origin_mode);
+    assert!(!terminal.vt.screen.insert_mode);
+    assert!(terminal.vt.protocol.modes().contains(&7));
+    assert!(terminal.vt.protocol.modes().contains(&25));
     assert!(!terminal.is_application_cursor_keys());
-    assert_eq!(terminal.screen.current_fg, Color::Default);
-    assert!(terminal.screen.saved_state.is_none());
+    assert_eq!(terminal.vt.screen.current_fg, Color::Default);
+    assert!(terminal.vt.screen.saved_state.is_none());
     assert_eq!(
-        (terminal.screen.cursor_row, terminal.screen.cursor_col),
+        (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
         (2, 3)
     );
     terminal.process_input(b"q");
-    assert_eq!(terminal.screen.grid[2][3].character, 'q');
+    assert_eq!(terminal.vt.screen.grid[2][3].character, 'q');
     assert!(
         !terminal.is_application_keypad(),
         "DECSTR returns the keypad to numeric mode"
@@ -7392,7 +7440,7 @@ fn zero_count_parameters_mean_one() {
 
     terminal.process_input(b"ABCD\x1b[3;3H\x1b[0A\x1b[0C");
     assert_eq!(
-        (terminal.screen.cursor_row, terminal.screen.cursor_col),
+        (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
         (1, 3)
     );
 
@@ -7411,13 +7459,13 @@ fn deccara_is_not_executed_as_decstbm() {
 
     assert_eq!(
         (
-            terminal.screen.scroll_region_top,
-            terminal.screen.scroll_region_bottom
+            terminal.vt.screen.scroll_region_top,
+            terminal.vt.screen.scroll_region_bottom
         ),
         (0, 5)
     );
     assert_eq!(
-        (terminal.screen.cursor_row, terminal.screen.cursor_col),
+        (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
         (3, 4)
     );
 }
@@ -7435,13 +7483,13 @@ fn index_and_tab_controls_clear_pending_wrap() {
     ] {
         let mut terminal = TerminalState::new(5, 4);
         terminal.process_input(b"\r\nABCDE");
-        assert!(terminal.screen.pending_wrap);
+        assert!(terminal.vt.screen.pending_wrap);
 
         terminal.process_input(sequence);
         terminal.process_input(b"x");
 
         assert_eq!(
-            terminal.screen.grid[row][col].character, 'x',
+            terminal.vt.screen.grid[row][col].character, 'x',
             "after {sequence:?}"
         );
     }
@@ -7453,14 +7501,14 @@ fn mode_1048_does_not_share_the_1049_cursor_slot() {
     let mut terminal = TerminalState::new(10, 8);
     terminal.process_input(b"\x1b[2;2H\x1b[?1049h\x1b[5;5H\x1b[?1048h\x1b[6;6H\x1b[?1048l");
     assert_eq!(
-        (terminal.screen.cursor_row, terminal.screen.cursor_col),
+        (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
         (4, 4)
     );
 
     terminal.process_input(b"\x1b[?1049l");
 
     assert_eq!(
-        (terminal.screen.cursor_row, terminal.screen.cursor_col),
+        (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
         (1, 1)
     );
 }
@@ -7582,12 +7630,12 @@ fn xtwinops_reports_the_cell_size_in_pixels() {
 fn leaving_the_alternate_screen_restores_the_cursor_shape() {
     let mut terminal = TerminalState::new(8, 4);
     terminal.process_input(b"\x1b[4 q\x1b[?1049h\x1b[6 q");
-    assert!(matches!(terminal.screen.cursor_shape, CursorShape::Beam));
+    assert!(matches!(terminal.vt.screen.cursor_shape, CursorShape::Beam));
 
     terminal.process_input(b"\x1b[?1049l");
 
     assert!(matches!(
-        terminal.screen.cursor_shape,
+        terminal.vt.screen.cursor_shape,
         CursorShape::Underline
     ));
 }
@@ -7605,7 +7653,7 @@ fn shrinking_drops_blank_rows_below_the_cursor_first() {
     assert_eq!(row_text(&terminal, 1), "line two");
     assert_eq!(row_text(&terminal, 2), "line three");
     assert_eq!(row_text(&terminal, 3), "$");
-    assert_eq!(terminal.screen.cursor_row, 3);
+    assert_eq!(terminal.vt.screen.cursor_row, 3);
     assert_eq!(terminal.scrollback_len(), 0);
 }
 
@@ -7620,7 +7668,7 @@ fn shrinking_a_full_screen_still_evicts_from_the_top() {
     assert_eq!(terminal.scrollback_len(), before + 2);
     assert_eq!(row_text(&terminal, 0), "l4");
     assert_eq!(row_text(&terminal, 1), "l5");
-    assert_eq!(terminal.screen.cursor_row, 1);
+    assert_eq!(terminal.vt.screen.cursor_row, 1);
 }
 
 /// Claude Code and neovim enable private mode 2031 for theme-change
@@ -7711,10 +7759,10 @@ fn cancelled_control_strings_resume_visible_text_at_every_split() {
                 terminal.process_input(&bytes[..split]);
                 terminal.process_input(&bytes[split..]);
                 assert_eq!(
-                    terminal.screen.grid[0][0].character, 'o',
+                    terminal.vt.screen.grid[0][0].character, 'o',
                     "prefix={prefix:?}, cancel={cancel}, split={split}"
                 );
-                assert_eq!(terminal.screen.grid[0][1].character, 'k');
+                assert_eq!(terminal.vt.screen.grid[0][1].character, 'k');
                 assert!(terminal.titles.window_title.is_empty());
             }
         }
@@ -7739,14 +7787,14 @@ fn a_real_reset_interrupts_control_strings_at_every_split() {
             terminal.process_input(&bytes[..split]);
             terminal.process_input(&bytes[split..]);
             assert_eq!(
-                terminal.screen.grid[0][0].character, 'o',
+                terminal.vt.screen.grid[0][0].character, 'o',
                 "prefix={prefix:?}, split={split}"
             );
             assert_eq!(
-                terminal.screen.grid[0][1].character, 'k',
+                terminal.vt.screen.grid[0][1].character, 'k',
                 "prefix={prefix:?}, split={split}"
             );
-            assert!(!terminal.protocol.modes().contains(&2004));
+            assert!(!terminal.vt.protocol.modes().contains(&2004));
             assert!(terminal.titles.window_title.is_empty());
         }
     }
@@ -7759,16 +7807,16 @@ fn discarded_oversized_apc_obeys_cancel_but_does_not_execute_embedded_reset() {
         let mut oversized = b"\x1b_Gi=1;".to_vec();
         oversized.resize(MAX_PENDING_ESCAPE + 3, b'A');
         terminal.process_input(&oversized);
-        assert_eq!(terminal.parser.rejected_count(), 1);
+        assert_eq!(terminal.vt.parser.rejected_count(), 1);
         for byte in suffix {
             terminal.process_input(&[*byte]);
         }
         assert_eq!(
-            terminal.parser.pending_kind(),
+            terminal.vt.parser.pending_kind(),
             jterm_engine::parser::PendingKind::None
         );
-        assert_eq!(terminal.screen.grid[0][0].character, 'o');
-        assert_eq!(terminal.screen.grid[0][1].character, 'k');
+        assert_eq!(terminal.vt.screen.grid[0][0].character, 'o');
+        assert_eq!(terminal.vt.screen.grid[0][1].character, 'k');
     }
 }
 
@@ -8013,12 +8061,12 @@ fn block_spacing_inserts_real_origin_free_rows_and_preserves_terminal_and_cursor
     emit_completed_block(&mut terminal, 0);
     terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
     let raw: Vec<_> = terminal
-        .screen
+        .vt.screen
         .grid
         .iter()
         .map(|row| row.to_vec())
         .collect();
-    let ids = terminal.screen.grid.row_ids().to_vec();
+    let ids = terminal.vt.screen.grid.row_ids().to_vec();
     let version = terminal.grid_version;
     let cursor = terminal.get_cursor_pos();
     let mut policy = ProjectionPolicy::new();
@@ -8053,14 +8101,14 @@ fn block_spacing_inserts_real_origin_free_rows_and_preserves_terminal_and_cursor
     assert_cell_grids_equal(
         &raw,
         &terminal
-            .screen
+            .vt.screen
             .grid
             .iter()
             .map(|row| row.to_vec())
             .collect::<Vec<_>>(),
         "spaced raw grid",
     );
-    assert_eq!(terminal.screen.grid.row_ids(), ids);
+    assert_eq!(terminal.vt.screen.grid.row_ids(), ids);
     assert_eq!(terminal.grid_version, version);
     terminal.start_selection_projected(&viewport, (spacer, 0));
     assert!(!terminal.has_text_selection());
@@ -8427,7 +8475,7 @@ fn native_block_chrome_first_prompt_keeps_status_and_six_row_input_visible() {
         .application_cell(DisplayPoint::new(row, 0))
         .is_some()));
     assert_eq!(
-        (terminal.screen.grid.row_len(), terminal.screen.grid.rows()),
+        (terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows()),
         (40, 20)
     );
     assert_cell_grids_equal(
@@ -8599,7 +8647,7 @@ fn native_block_chrome_never_trims_rendition_or_hyperlink_blank_tail() {
         let mut terminal = TerminalState::new(24, 20);
         terminal.process_input(b"\x1b]133;A\x07$ ");
         terminal.process_input(format!("\x1b[20;1H{rendition} \x1b[1;3H").as_bytes());
-        let tail = terminal.screen.grid[19].to_vec();
+        let tail = terminal.vt.screen.grid[19].to_vec();
         let mut policy = ProjectionPolicy::new();
         policy.set_block_chrome(true, 4);
         let viewport = spaced_view(&mut terminal, &policy, &mut ProjectionViewState::new());
@@ -8723,10 +8771,10 @@ fn native_block_chrome_never_trims_wrapped_default_spaces_or_their_continuation(
     terminal.process_input(b"\x1b]133;A\x07$ \x1b[19;1H");
     terminal.process_input(&[b' '; 25]);
     terminal.process_input(b"\x1b[1;3H");
-    assert!(terminal.screen.grid.row_wrapped[18]);
-    assert!(terminal.screen.grid[18]
+    assert!(terminal.vt.screen.grid.row_wrapped[18]);
+    assert!(terminal.vt.screen.grid[18]
         .iter()
-        .chain(terminal.screen.grid[19].iter())
+        .chain(terminal.vt.screen.grid[19].iter())
         .all(|cell| cell.character == ' ' && cell.background == Color::Default));
     let mut policy = ProjectionPolicy::new();
     policy.set_block_chrome(true, 4);
@@ -8861,7 +8909,7 @@ fn chat_history_redraw_and_mode_switch_preserve_draft_and_command_identity() {
         terminal.process_input(format!("\r\x1b[2K$ {input}").as_bytes());
         let raw_cursor = terminal.get_cursor_pos();
         let raw_rows: Vec<String> = terminal
-            .screen
+            .vt.screen
             .grid
             .iter()
             .map(|row| row.iter().map(|cell| cell.character).collect())
@@ -8887,7 +8935,7 @@ fn chat_history_redraw_and_mode_switch_preserve_draft_and_command_identity() {
             }
             .is_current(&terminal));
             for (row, expected) in raw_rows.iter().enumerate() {
-                let actual: String = terminal.screen.grid[row]
+                let actual: String = terminal.vt.screen.grid[row]
                     .iter()
                     .map(|cell| cell.character)
                     .collect();
@@ -8907,7 +8955,7 @@ fn chat_projection_pins_real_prompt_and_left_aligns_command_without_fake_cells()
     let mut terminal = TerminalState::new(80, 24);
     chat_pair(&mut terminal, "printf hello", "hello");
     chat_prompt(&mut terminal, "draft");
-    let raw_before = terminal.screen.grid.clone();
+    let raw_before = terminal.vt.screen.grid.clone();
     let raw_cursor = terminal.get_cursor_pos();
     let viewport = spaced_view(
         &mut terminal,
@@ -8934,11 +8982,11 @@ fn chat_projection_pins_real_prompt_and_left_aligns_command_without_fake_cells()
     let mapped = viewport.application_cell(viewport.cursor()).unwrap();
     assert_eq!(mapped, raw_cursor);
     assert!(composer.contains(&viewport.cursor().row));
-    assert_eq!(terminal.screen.grid.rows(), raw_before.rows());
-    assert_eq!(terminal.screen.grid.row_len(), raw_before.row_len());
+    assert_eq!(terminal.vt.screen.grid.rows(), raw_before.rows());
+    assert_eq!(terminal.vt.screen.grid.row_len(), raw_before.row_len());
     for row in 0..raw_before.rows() {
         assert_eq!(
-            terminal.screen.grid[row]
+            terminal.vt.screen.grid[row]
                 .iter()
                 .map(|cell| cell.character)
                 .collect::<String>(),
@@ -9546,7 +9594,7 @@ fn replay_shared_session_parity_corpus(
                     .filter(|record| !record.complete && record.state == CommandState::Running)
                     .map(|record| record.id.clone());
                 let draft_text = step.expected.draft_text.as_ref().map(|draft| {
-                    let row: String = terminal.screen.grid[terminal.get_cursor_pos().0]
+                    let row: String = terminal.vt.screen.grid[terminal.get_cursor_pos().0]
                         .iter()
                         .filter(|cell| !cell.flags.wide_continuation())
                         .map(|cell| cell.character)
@@ -9605,7 +9653,7 @@ fn replay_shared_session_parity_corpus(
                 }
                 // Real presentation switches must not edit shell-owned draft cells,
                 // completion records, cursor, or local command identity.
-                let grid = format!("{:?}", terminal.screen.grid.to_vec());
+                let grid = format!("{:?}", terminal.vt.screen.grid.to_vec());
                 let cursor = terminal.get_cursor_pos();
                 let records = format!("{:?}", terminal.command_records());
                 for mode in [2, 0, 1, 2] {
@@ -9620,7 +9668,7 @@ fn replay_shared_session_parity_corpus(
                         &mut view_state,
                     );
                     assert_eq!(
-                        format!("{:?}", terminal.screen.grid.to_vec()),
+                        format!("{:?}", terminal.vt.screen.grid.to_vec()),
                         grid,
                         "{context}: mode {mode} changed cells"
                     );
@@ -9793,7 +9841,7 @@ fn chat_presentation_rows_do_not_resize_native_cells_or_duplicate_prompt_origins
     );
     assert!(expanded.is_transformed());
     assert_eq!(expanded.visible_rows(), 18);
-    assert_eq!(terminal.screen.grid.rows(), 12);
+    assert_eq!(terminal.vt.screen.grid.rows(), 12);
     assert_eq!(terminal.grid_version, native_version);
     let cursor_anchor = expanded.raw_anchor_at(expanded.cursor()).unwrap();
     let again = terminal.projected_viewport_with_rows(
@@ -9816,7 +9864,7 @@ fn chat_presentation_rows_do_not_resize_native_cells_or_duplicate_prompt_origins
     );
     assert_eq!(reduced.visible_rows(), 12);
     assert_eq!(reduced.raw_anchor_at(reduced.cursor()), Some(cursor_anchor));
-    assert_eq!(terminal.screen.grid.rows(), 12);
+    assert_eq!(terminal.vt.screen.grid.rows(), 12);
     assert_eq!(terminal.grid_version, native_version);
     assert_eq!(format!("{:?}", terminal.command_records()), records);
     terminal.process_input(b"\x1b[?1049h");
@@ -9878,7 +9926,7 @@ fn chat_presentation_row_changes_preserve_history_anchor_and_follow_intent() {
         );
         assert_eq!(first_raw(&changed), Some(anchor));
         assert!(!state.follows_bottom(), "reading intent must not be stolen");
-        assert_eq!(terminal.screen.grid.rows(), 12);
+        assert_eq!(terminal.vt.screen.grid.rows(), 12);
     }
     state.scroll_to_bottom();
     let latest = terminal.projected_viewport_with_rows(
@@ -9992,15 +10040,15 @@ fn sync_watchdog_strict_boundary_and_idle_checks() {
     terminal.dirty_region.clear();
     *now.lock().unwrap() += std::time::Duration::from_secs(1);
     terminal.check_sync_output_timeout();
-    assert!(terminal.sync_output_active);
-    assert!(terminal.protocol.modes().contains(&2026));
+    assert!(terminal.vt.sync_output.active);
+    assert!(terminal.vt.protocol.modes().contains(&2026));
     assert!(terminal.dirty_region.rows.is_empty());
     assert!(terminal.last_synced_primary_screen_snapshot.is_empty());
     *now.lock().unwrap() += std::time::Duration::from_nanos(1);
     terminal.check_sync_output_timeout();
-    assert!(!terminal.sync_output_active);
-    assert!(!terminal.protocol.modes().contains(&2026));
-    assert!(terminal.sync_output_start.is_none());
+    assert!(!terminal.vt.sync_output.active);
+    assert!(!terminal.vt.protocol.modes().contains(&2026));
+    assert!(terminal.vt.sync_output.started.is_none());
     assert_eq!(terminal.dirty_region.rows, vec![(0, 2)]);
     assert!(terminal
         .row_versions
@@ -10023,14 +10071,14 @@ fn sync_watchdog_repeated_set_restarts_and_explicit_reset_cancels() {
     *now.lock().unwrap() += std::time::Duration::from_millis(900);
     terminal.process_input(b"\x1b[?2026h");
     let restarted = *now.lock().unwrap();
-    assert_eq!(terminal.sync_output_start, Some(restarted));
+    assert_eq!(terminal.vt.sync_output.started, Some(restarted));
     *now.lock().unwrap() += std::time::Duration::from_millis(200);
     terminal.check_sync_output_timeout();
-    assert!(terminal.sync_output_active);
+    assert!(terminal.vt.sync_output.active);
     terminal.process_input(b"\x1b[?2026l");
-    assert!(!terminal.sync_output_active);
-    assert!(!terminal.protocol.modes().contains(&2026));
-    assert!(terminal.sync_output_start.is_none());
+    assert!(!terminal.vt.sync_output.active);
+    assert!(!terminal.vt.protocol.modes().contains(&2026));
+    assert!(terminal.vt.sync_output.started.is_none());
     terminal.dirty_region.clear();
     *now.lock().unwrap() += std::time::Duration::from_secs(2);
     terminal.check_sync_output_timeout();
@@ -10041,26 +10089,26 @@ fn sync_watchdog_repeated_set_restarts_and_explicit_reset_cancels() {
 fn sync_watchdog_resize_soft_reset_and_ris_lifecycle() {
     let (mut terminal, now) = watchdog_test_terminal();
     terminal.process_input(b"\x1b[?2026h");
-    let start = terminal.sync_output_start;
+    let start = terminal.vt.sync_output.started;
     *now.lock().unwrap() += std::time::Duration::from_secs(1);
     terminal.on_resize(14, 4);
     terminal.process_input(b"\x1b[!p");
-    assert!(terminal.sync_output_active);
-    assert!(terminal.protocol.modes().contains(&2026));
-    assert_eq!(terminal.sync_output_start, start);
+    assert!(terminal.vt.sync_output.active);
+    assert!(terminal.vt.protocol.modes().contains(&2026));
+    assert_eq!(terminal.vt.sync_output.started, start);
     *now.lock().unwrap() += std::time::Duration::from_nanos(1);
     terminal.check_sync_output_timeout();
-    assert!(!terminal.sync_output_active);
+    assert!(!terminal.vt.sync_output.active);
     terminal.process_input(b"\x1b[?2026h\x1bc");
-    assert!(!terminal.sync_output_active);
-    assert!(!terminal.protocol.modes().contains(&2026));
-    assert!(terminal.sync_output_start.is_none());
+    assert!(!terminal.vt.sync_output.active);
+    assert!(!terminal.vt.protocol.modes().contains(&2026));
+    assert!(terminal.vt.sync_output.started.is_none());
     *now.lock().unwrap() += std::time::Duration::from_secs(50);
     terminal.process_input(b"\x1b[?2026h");
-    assert_eq!(terminal.sync_output_start, Some(*now.lock().unwrap()));
+    assert_eq!(terminal.vt.sync_output.started, Some(*now.lock().unwrap()));
     *now.lock().unwrap() += std::time::Duration::from_secs(2);
     terminal.check_sync_output_timeout();
-    assert!(!terminal.sync_output_active);
+    assert!(!terminal.vt.sync_output.active);
 }
 
 #[test]
@@ -10070,20 +10118,20 @@ fn sync_watchdog_fragmented_sequences_and_independent_instances() {
     first.process_input(b"\x1b[?202");
     *now.lock().unwrap() += std::time::Duration::from_secs(5);
     first.check_sync_output_timeout();
-    assert!(!first.sync_output_active);
+    assert!(!first.vt.sync_output.active);
     first.process_input(b"6h");
-    assert_eq!(first.sync_output_start, Some(*now.lock().unwrap()));
+    assert_eq!(first.vt.sync_output.started, Some(*now.lock().unwrap()));
     second.process_input(b"\x1b[?2026h");
     *now.lock().unwrap() += std::time::Duration::from_secs(2);
     first.check_sync_output_timeout();
     second.check_sync_output_timeout();
-    assert!(!first.sync_output_active);
-    assert!(second.sync_output_active);
+    assert!(!first.vt.sync_output.active);
+    assert!(second.vt.sync_output.active);
     second.process_input(b"\x1b[?2026");
-    assert!(second.sync_output_active);
+    assert!(second.vt.sync_output.active);
     second.process_input(b"l");
-    assert!(!second.sync_output_active);
-    assert_eq!(second.sync_output_start, None);
+    assert!(!second.vt.sync_output.active);
+    assert_eq!(second.vt.sync_output.started, None);
     assert_ne!(*now.lock().unwrap(), *other_now.lock().unwrap());
 }
 
@@ -10098,7 +10146,7 @@ fn sync_watchdog_alt_timeout_matches_explicit_end_snapshot_and_dirty_rows() {
     *now.lock().unwrap() += std::time::Duration::from_secs(2);
     timed.check_sync_output_timeout();
     explicit.process_input(b"\x1b[?2026l");
-    assert!(!timed.sync_output_active);
+    assert!(!timed.vt.sync_output.active);
     assert_eq!(timed.dirty_region.rows, vec![(0, 2)]);
     assert!(timed.row_versions.iter().all(|v| *v == timed.grid_version));
     assert_eq!(timed.scrollback_len(), 3);
@@ -10132,15 +10180,15 @@ fn sync_watchdog_clock_cannot_control_clipboard_capability_expiration() {
     *now.lock().unwrap() += std::time::Duration::from_secs(3600);
     let event = terminal.build_paste_event(&["text/plain".to_string()]);
     let token = paste_token_from_event(&event);
-    let expiry = terminal.pending_paste_grant.as_ref().unwrap().expires_at;
+    let expiry = terminal.osc5522.pending_paste_grant.as_ref().unwrap().expires_at;
     assert!(expiry >= real_before + super::OSC_5522_PASTE_GRANT_TTL);
     assert!(expiry <= std::time::Instant::now() + super::OSC_5522_PASTE_GRANT_TTL);
     // An expired grant stays expired even when the VT clock is frozen in the past.
     *now.lock().unwrap() = real_before - std::time::Duration::from_secs(3600);
-    terminal.pending_paste_grant.as_mut().unwrap().expires_at = real_before;
+    terminal.osc5522.pending_paste_grant.as_mut().unwrap().expires_at = real_before;
     terminal.process_input(&osc_5522_mime_read("text/plain", &token, "Paste event"));
     assert!(terminal.take_clipboard_read_requests().is_empty());
-    assert!(terminal.pending_paste_grant.is_none());
+    assert!(terminal.osc5522.pending_paste_grant.is_none());
     assert!(String::from_utf8(terminal.get_output())
         .unwrap()
         .contains("status=EPERM"));
@@ -10152,7 +10200,7 @@ fn engine_protocol_parser_transitions_preserve_screen_stacks_and_global_xterm() 
     terminal.process_input(b"\x1b[=17u\x1b[>31u\x1b[>4;2m\x1b[>4;1f\x1b[?1049h");
     assert_eq!(terminal.keyboard_enhancement_flags(), 0);
     assert_eq!(
-        terminal.protocol.inactive_keyboard_enhancement_stack(),
+        terminal.vt.protocol.inactive_keyboard_enhancement_stack(),
         &[17]
     );
     terminal.process_input(b"\x1b[>8u\x1b[>16u\x1b[?u");
@@ -10161,15 +10209,15 @@ fn engine_protocol_parser_transitions_preserve_screen_stacks_and_global_xterm() 
     assert_eq!(terminal.keyboard_enhancement_flags(), 16);
     terminal.process_input(b"\x1b[?1049l");
     assert_eq!(terminal.keyboard_enhancement_flags(), 31);
-    assert_eq!(terminal.protocol.keyboard_enhancement_stack(), &[17]);
+    assert_eq!(terminal.vt.protocol.keyboard_enhancement_stack(), &[17]);
     assert_eq!(
-        terminal.protocol.inactive_keyboard_enhancement_stack(),
+        terminal.vt.protocol.inactive_keyboard_enhancement_stack(),
         &[0, 8]
     );
     terminal.process_input(b"\x1b]133;A\x1b\\");
     assert_eq!(terminal.keyboard_enhancement_flags(), 0);
-    assert!(terminal.protocol.keyboard_enhancement_stack().is_empty());
-    assert_eq!(terminal.protocol.inactive_keyboard_enhancement_flags(), 16);
+    assert!(terminal.vt.protocol.keyboard_enhancement_stack().is_empty());
+    assert_eq!(terminal.vt.protocol.inactive_keyboard_enhancement_flags(), 16);
     assert_eq!(terminal.xterm_modify_other_keys(), 2);
     assert_eq!(terminal.xterm_format_other_keys(), 1);
     terminal.process_input(b"\x1b[?1049h\x1b[<0u\x1b[?u");
@@ -10185,7 +10233,7 @@ fn engine_protocol_parser_stack_bound_reset_and_input_getters() {
         terminal.process_input(format!("\x1b[>{flags}u").as_bytes());
     }
     assert_eq!(
-        terminal.protocol.keyboard_enhancement_stack(),
+        terminal.vt.protocol.keyboard_enhancement_stack(),
         &(8..40).collect::<Vec<_>>()
     );
     terminal.process_input(b"\x1b[=31u\x1b[=32768;2u\x1b[=4;3u\x1b[=0;9u\x1b[?u");
@@ -10206,10 +10254,10 @@ fn engine_protocol_parser_stack_bound_reset_and_input_getters() {
     assert_eq!(terminal.xterm_format_other_keys(), 1);
     terminal.process_input(b"\x1bc");
     assert_eq!(terminal.keyboard_enhancement_flags(), 0);
-    assert_eq!(terminal.protocol.inactive_keyboard_enhancement_flags(), 0);
-    assert!(terminal.protocol.keyboard_enhancement_stack().is_empty());
+    assert_eq!(terminal.vt.protocol.inactive_keyboard_enhancement_flags(), 0);
+    assert!(terminal.vt.protocol.keyboard_enhancement_stack().is_empty());
     assert!(terminal
-        .protocol
+        .vt.protocol
         .inactive_keyboard_enhancement_stack()
         .is_empty());
     assert_eq!(terminal.xterm_modify_other_keys(), 0);
@@ -10226,15 +10274,15 @@ fn engine_row_effects_invalidate_collateral_without_claiming_it_as_output() {
             "\x1b]133;A\x07\x1b]133;C;id=old-wide\x07界\x1b]133;D;0;id=old-wide\x07".as_bytes(),
         );
         let old = terminal.command_record("old-wide").unwrap().sequence;
-        let row_id = terminal.screen.grid.row_id(0);
+        let row_id = terminal.vt.screen.grid.row_id(0);
         terminal.process_input(b"\x1b[1;2H\x1b]133;A\x07\x1b]133;C;id=new-output\x07");
         let revision = terminal.finished_output_revision();
         terminal.process_input(replacement.as_bytes());
         // Effects are consumed before the next OSC completion arrives.
         assert_eq!(terminal.finished_output_range(old), None);
         assert!(terminal.finished_output_revision() > revision);
-        assert_eq!(terminal.screen.grid[0][0].character, ' ');
-        assert_eq!(terminal.screen.grid.row_id(0), row_id);
+        assert_eq!(terminal.vt.screen.grid[0][0].character, ' ');
+        assert_eq!(terminal.vt.screen.grid.row_id(0), row_id);
         terminal.process_input(b"\x1b]133;D;0;id=new-output\x07");
         let current = terminal.command_record("new-output").unwrap().sequence;
         let range = terminal.finished_output_range(current).unwrap();
@@ -10264,7 +10312,7 @@ fn engine_irm_continuation_effects_keep_preexisting_shift_and_repair_semantics()
         let range = terminal.finished_output_range(current).unwrap();
         assert_eq!(range.start.col, 2);
         assert_eq!(range.end.col, if inserted == "x" { 3 } else { 4 });
-        assert_eq!(terminal.screen.grid[0][1].character, ' ');
+        assert_eq!(terminal.vt.screen.grid[0][1].character, ' ');
     }
 }
 
@@ -10278,7 +10326,7 @@ fn engine_row_edits_dirty_host_versions_before_later_commands() {
         let mut dirty = Vec::new();
         terminal.get_dirty_rows(prior, &mut dirty);
         assert_eq!(dirty, vec![0]);
-        assert!(!terminal.screen.pending_wrap);
+        assert!(!terminal.vt.screen.pending_wrap);
     }
 }
 
@@ -10286,16 +10334,16 @@ fn engine_row_edits_dirty_host_versions_before_later_commands() {
 fn bounded_parser_oversized_osc8_clears_active_link_without_reflecting_payload() {
     let mut terminal = TerminalState::new(16, 2);
     terminal.process_input(b"\x1b]8;;https://safe.test\x1b\\A");
-    assert!(!terminal.screen.grid[0][0].hyperlink_id.is_none());
+    assert!(!terminal.vt.screen.grid[0][0].hyperlink_id.is_none());
     let mut attack = b"\x1b]8;;https://oversized.test/".to_vec();
     attack.resize(MAX_PENDING_ESCAPE + 3, b'x');
     terminal.process_input(&attack);
-    assert_eq!(terminal.parser.rejected_count(), 1);
-    assert!(terminal.screen.current_hyperlink.is_none());
+    assert_eq!(terminal.vt.parser.rejected_count(), 1);
+    assert!(terminal.vt.screen.current_hyperlink.is_none());
     terminal.process_input(b"\x1b\\B");
-    assert_eq!(terminal.screen.grid[0][1].character, 'B');
-    assert!(terminal.screen.grid[0][1].hyperlink_id.is_none());
-    assert!(!terminal.screen.grid[0][0].hyperlink_id.is_none());
+    assert_eq!(terminal.vt.screen.grid[0][1].character, 'B');
+    assert!(terminal.vt.screen.grid[0][1].hyperlink_id.is_none());
+    assert!(!terminal.vt.screen.grid[0][0].hyperlink_id.is_none());
     assert!(terminal.output_buffer.is_empty());
 }
 
@@ -10317,15 +10365,15 @@ fn bounded_parser_all_strings_reject_complete_and_split_oversize_without_effects
             t.process_input(b"A\x1b[31m");
             t.process_input(&bytes[..cut]);
             t.process_input(&bytes[cut..]);
-            assert_eq!(t.parser.rejected_count(), 1, "intro={intro} cut={cut}");
-            assert_eq!(t.parser.retained_bytes(), 0);
-            assert_eq!(t.screen.grid[0][0].character, 'A');
-            assert_eq!(t.screen.grid[0][1].character, 'Z');
-            assert_eq!(t.screen.grid[0][1].foreground, Color::Red);
+            assert_eq!(t.vt.parser.rejected_count(), 1, "intro={intro} cut={cut}");
+            assert_eq!(t.vt.parser.retained_bytes(), 0);
+            assert_eq!(t.vt.screen.grid[0][0].character, 'A');
+            assert_eq!(t.vt.screen.grid[0][1].character, 'Z');
+            assert_eq!(t.vt.screen.grid[0][1].foreground, Color::Red);
             assert!(t.titles.window_title.is_empty());
             assert!(t.output_buffer.is_empty());
-            assert!(t.pending_osc52_clipboard_set.is_none());
-            assert!(!t.screen.use_alt_buffer);
+            assert!(t.osc52.pending_set.is_none());
+            assert!(!t.vt.screen.use_alt_buffer);
         }
     }
 }
@@ -10338,7 +10386,7 @@ fn bounded_parser_normal_stream_matches_legacy_dispatch_at_every_split() {
     for cut in 0..=bytes.len() {
         let mut strict = TerminalState::new(24, 6);
         let mut legacy = TerminalState::new(24, 6);
-        legacy.parser = jterm_engine::parser::Parser::new(jterm_engine::parser::ParserLimits {
+        legacy.vt.parser = jterm_engine::parser::Parser::new(jterm_engine::parser::ParserLimits {
             pending_bytes: MAX_PENDING_ESCAPE,
             kitty_recovery_bytes: jterm_core::kitty_graphics::MAX_CONTROL_BYTES + 1,
         });
@@ -10347,13 +10395,13 @@ fn bounded_parser_normal_stream_matches_legacy_dispatch_at_every_split() {
             legacy.process_input(part);
         }
         for row in 0..6 {
-            assert_eq!(strict.screen.grid[row], legacy.screen.grid[row]);
+            assert_eq!(strict.vt.screen.grid[row], legacy.vt.screen.grid[row]);
         }
-        assert_eq!(strict.screen.cursor_row, legacy.screen.cursor_row);
-        assert_eq!(strict.screen.cursor_col, legacy.screen.cursor_col);
+        assert_eq!(strict.vt.screen.cursor_row, legacy.vt.screen.cursor_row);
+        assert_eq!(strict.vt.screen.cursor_col, legacy.vt.screen.cursor_col);
         assert_eq!(strict.titles.window_title, legacy.titles.window_title);
         assert_eq!(strict.output_buffer, legacy.output_buffer);
-        assert_eq!(strict.parser.rejected_count(), 0);
+        assert_eq!(strict.vt.parser.rejected_count(), 0);
     }
 }
 
@@ -10472,11 +10520,11 @@ fn unicode_023_halfwidth_marks_occupy_independent_cells() {
             terminal.process_input(&bytes[..split]);
             terminal.process_input(&bytes[split..]);
             assert_eq!(
-                (terminal.screen.cursor_row, terminal.screen.cursor_col),
+                (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
                 (0, input.chars().count())
             );
             for (col, ch) in input.chars().enumerate() {
-                let cell = &terminal.screen.grid[0][col];
+                let cell = &terminal.vt.screen.grid[0][col];
                 assert_eq!(cell.character, ch, "split {split} col {col}");
                 assert!(!cell.flags.wide() && !cell.flags.wide_continuation());
             }
@@ -10491,17 +10539,17 @@ fn unicode_023_halfwidth_marks_wrap_and_backspace_by_cell() {
         let mut terminal = TerminalState::new(4, 3);
         terminal.process_input(&input.as_bytes()[..split]);
         terminal.process_input(&input.as_bytes()[split..]);
-        assert_eq!(terminal.screen.grid[0][2].character, '\u{ff9e}');
-        assert_eq!(terminal.screen.grid[0][3].character, '\u{ff9f}');
-        assert_eq!(terminal.screen.grid[1][0].character, 'Z');
+        assert_eq!(terminal.vt.screen.grid[0][2].character, '\u{ff9e}');
+        assert_eq!(terminal.vt.screen.grid[0][3].character, '\u{ff9f}');
+        assert_eq!(terminal.vt.screen.grid[1][0].character, 'Z');
         assert_eq!(
-            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
             (1, 1)
         );
         terminal.process_input(b"\x08Q");
-        assert_eq!(terminal.screen.grid[1][0].character, 'Q');
+        assert_eq!(terminal.vt.screen.grid[1][0].character, 'Q');
         assert_eq!(
-            (terminal.screen.cursor_row, terminal.screen.cursor_col),
+            (terminal.vt.screen.cursor_row, terminal.vt.screen.cursor_col),
             (1, 1)
         );
     }

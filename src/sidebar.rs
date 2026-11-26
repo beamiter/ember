@@ -2102,6 +2102,16 @@ impl Sidebar {
     /// Stamp a menu/dialog intent against the exact tree root and location
     /// visible to the user. A uniquely remapped identical remote profile stays
     /// valid across configuration reorder; every root/location change does not.
+    #[allow(dead_code)] // Consumed by the native binary workspace.
+    pub(crate) fn preview_remote_target(&self) -> Result<(RemoteHostConfig, String, FilesIntentContext), String> {
+        if self.start_dir_pending || self.pending_location_probe.is_some()
+            || self.pending_navigation.as_ref().is_some_and(|pending|pending.endpoint_commit.is_some()) {
+            return Err("Wait for the Files source to finish opening".into());
+        }
+        let host=remote_fs::preview_host(&self.location,&self.remote_hosts,&self.execution_overlay).map_err(|error|error.to_string())?;
+        Ok((host,self.location.label(&self.remote_hosts),self.files_intent_context()))
+    }
+
     pub fn files_intent_context(&self) -> FilesIntentContext {
         FilesIntentContext {
             generation: self.scan_generation,

@@ -1,4 +1,7 @@
 mod completed_history;
+mod native_alternate;
+#[cfg(test)]
+mod composition_oracles;
 mod projection_budget;
 use completed_history::ARCHIVED_COMMAND_ID_PREFIX;
 pub use projection_budget::ProjectionUnavailable;
@@ -11,10 +14,12 @@ use jterm_core::click_cursor;
 use jterm_core::screen_replay::{CapturedExecutionSource, RunningExecutionSource};
 use jterm_engine::archived_text::{ArchiveAnnotationBuilder, ArchiveAnnotations, ArchiveStyle};
 use jterm_engine::command_blocks::{ShellMarkerClock, ShellMarkerPosition};
-use jterm_engine::protocol_state::{ProtocolState, TerminalModes};
+use jterm_engine::protocol_state::ProtocolState;
 use jterm_engine::retained_history::RetainedHistory;
+#[cfg(test)]
+use jterm_engine::screen::Charset;
 use jterm_engine::screen::{
-    Charset, RegionMutation, RowMutation, ScreenState, VerticalDeparture, VerticalMotion,
+    RegionMutation, RowMutation, ScreenState, VerticalDeparture, VerticalMotion,
 };
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -54,28 +59,6 @@ fn char_class(c: char) -> CharClass {
     }
 }
 
-fn is_extended_token_separator(c: char) -> bool {
-    matches!(
-        c,
-        '/' | '\\' | '.' | ':' | '-' | '~' | '?' | '&' | '=' | '#' | '%' | '+' | '@'
-    )
-}
-
-fn is_extended_token_char(c: char) -> bool {
-    is_word_char(c) || is_extended_token_separator(c)
-}
-
-fn is_token_prefix_wrapper(c: char) -> bool {
-    matches!(c, '"' | '\'' | '`' | '(' | '[' | '{' | '<')
-}
-
-fn is_token_suffix_wrapper(c: char) -> bool {
-    matches!(
-        c,
-        '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ';' | '!'
-    )
-}
-
 const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
 pub use jterm_engine::MAX_TERMINAL_COLS;
 pub const MAX_TERMINAL_ROWS: usize = 512;
@@ -90,8 +73,11 @@ pub const MAX_PENDING_ESCAPE: usize = 4 * 1024 * 1024;
 /// general permission to inspect the host clipboard. Keep the capability
 /// short-lived and bound all protocol-controlled collections.
 const OSC_5522_PASTE_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
 const MAX_PENDING_CLIPBOARD_REQUESTS: usize = 8;
+#[cfg(test)]
 const MAX_OSC_5522_MIME_TYPES: usize = 64;
+#[cfg(test)]
 const MAX_OSC_5522_MIME_LEN: usize = 256;
 
 type VisibleCellsCache = (u64, usize, std::sync::Arc<Vec<Vec<TerminalCell>>>);
@@ -241,8 +227,13 @@ pub struct CommandRecord {
 
 impl CommandRecord {
     fn captured_bytes(&self) -> usize {
-        self.captured_output.as_ref().map_or(0, |output| output.text.len())
-            + self.captured_annotations.as_deref().map_or(0, ArchiveAnnotations::retained_bytes)
+        self.captured_output
+            .as_ref()
+            .map_or(0, |output| output.text.len())
+            + self
+                .captured_annotations
+                .as_deref()
+                .map_or(0, ArchiveAnnotations::retained_bytes)
     }
 
     fn retire_capture(&mut self) -> usize {
@@ -526,28 +517,15 @@ struct ProjectedSelectionEndpoint {
     anchor: ProjectedSelectionAnchor,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ClipboardReadKind {
-    MimeData(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClipboardReadRequest {
-    pub kind: ClipboardReadKind,
-}
-
-#[derive(Debug)]
-struct PendingPasteGrant {
-    token: String,
-    offered_mimes: HashSet<String>,
-    expires_at: std::time::Instant,
-}
+pub use jterm_engine::osc5522::{EmberReadKind as ClipboardReadKind, EmberReadRequest as ClipboardReadRequest};
+#[cfg(test)]
+type PendingPasteGrant = jterm_engine::osc5522::PendingPasteGrant<std::time::Instant>;
 
 pub use jterm_engine::colors::{ColorState, DynamicColorPalette, TerminalDefaultColors};
 
 pub struct TerminalState {
     /// Live VT storage and drawing state; history and host effects remain here.
-    pub screen: ScreenState,
+    pub vt: jterm_engine::native_terminal::NativeTerminal,
     host_context: TerminalHostContext,
     #[cfg(test)]
     search_source_epoch: u64,
@@ -586,14 +564,12 @@ pub struct TerminalState {
     // Global background color set by vim (CSI ... m)
     pub global_bg: Color,
 
-    parser: jterm_engine::parser::Parser,
 
     // IME support
     pub ime_enabled: bool,
     pub preedit_text: String,
     pub preedit_cursor: usize,
 
-    protocol: ProtocolState,
     /// Last observed host-window focus. DECSET 1004 reports CSI I/O against
     /// this, and enabling 1004 while focused emits CSI I immediately.
     host_window_focused: bool,
@@ -601,8 +577,7 @@ pub struct TerminalState {
     // Output buffer for DSR/CPR responses to be sent back to PTY
     pub output_buffer: Vec<u8>,
 
-    pending_clipboard_requests: Vec<ClipboardReadRequest>,
-    pending_paste_grant: Option<PendingPasteGrant>,
+    osc5522: jterm_engine::osc5522::EmberOsc5522<std::time::Instant>,
 
     // Kitty graphics protocol support
     pub kitty_graphics: KittyGraphicsState,
@@ -667,18 +642,12 @@ pub struct TerminalState {
     hyperlinks: hyperlink::HyperlinkTable,
 
     // Synchronized output (mode 2026): suppress rendering until mode is cleared
-    pub sync_output_active: bool,
-    sync_output_start: Option<std::time::Instant>,
     sync_output_clock: SyncOutputClock,
     last_archived_screen_snapshot: Vec<String>,
     last_synced_primary_screen_snapshot: Vec<String>,
 
-    // OSC 52 clipboard set requests (selection_param, decoded_text)
-    pub pending_osc52_clipboard_set: Option<String>,
-    // OSC 52 clipboard queries pending (each needs one read/refusal response).
-    // Keep the terminator per request: a PTY batch may contain both BEL- and
-    // ST-terminated queries. Eight matches the extended-clipboard queue cap.
-    pending_osc52_clipboard_queries: VecDeque<&'static [u8]>,
+    // Shared owner of admitted OSC 52 writes and bounded FIFO read effects.
+    pub osc52: jterm_engine::clipboard::Osc52Clipboard,
     /// Terminator of the OSC being dispatched. xterm and VTE end a reply the
     /// way the query ended, and BEL-only parsers never see an ST reply end.
     osc_reply_terminator: &'static [u8],
@@ -757,3 +726,7 @@ struct ClearedBlocksStash {
 
 #[cfg(test)]
 mod alternate_parity_tests;
+
+#[cfg(test)]
+#[path = "osc52_oracles.rs"]
+mod osc52_oracles;

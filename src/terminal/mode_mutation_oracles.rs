@@ -6,77 +6,77 @@ impl TerminalState {
         match mode {
             25 => {
                 // Show cursor (mode 25)
-                self.protocol.modes_mut().insert(25);
+                self.vt.protocol.modes_mut().insert(25);
             }
             1004 => {
                 // Focus event reporting (CSI I / CSI O). If the window is
                 // already focused, report that immediately so a client that
                 // probes then waits for the first I is not stuck until Alt-Tab.
-                let newly = !self.protocol.modes().contains(&1004);
-                self.protocol.modes_mut().insert(1004);
+                let newly = !self.vt.protocol.modes().contains(&1004);
+                self.vt.protocol.modes_mut().insert(1004);
                 if newly && self.host_window_focused {
                     self.output_buffer.extend_from_slice(b"\x1b[I");
                 }
             }
             2004 => {
                 // Bracketed paste mode
-                self.protocol.modes_mut().insert(2004);
+                self.vt.protocol.modes_mut().insert(2004);
             }
             1000..=1003 => {
                 // Mouse reporting modes
-                self.protocol.modes_mut().insert(mode);
+                self.vt.protocol.modes_mut().insert(mode);
             }
             1006 => {
                 // SGR mouse reporting format
-                self.protocol.modes_mut().insert(mode);
+                self.vt.protocol.modes_mut().insert(mode);
             }
             47 => {
                 // 备用屏(无保存光标、无清屏)
                 self.enter_alt_screen(false, false);
-                self.protocol.modes_mut().insert(47);
+                self.vt.protocol.modes_mut().insert(47);
             }
             1047 => {
                 // 备用屏(切入时清屏)
                 self.enter_alt_screen(false, true);
-                self.protocol.modes_mut().insert(1047);
+                self.vt.protocol.modes_mut().insert(1047);
             }
             1048 => {
                 // 仅保存光标(等价 DECSC). It shares DECSC's slot, as in xterm,
                 // not the one 1049 keeps for the primary screen, so a 1048
                 // inside a 1049 session cannot move the cursor 1049l restores.
                 self.save_cursor_state();
-                self.protocol.modes_mut().insert(1048);
+                self.vt.protocol.modes_mut().insert(1048);
             }
             1049 => {
                 // 备用屏:保存光标 + 切入 + 清屏
                 self.enter_alt_screen(true, true);
-                self.protocol.modes_mut().insert(1049);
+                self.vt.protocol.modes_mut().insert(1049);
             }
             2026 => {
                 // Synchronized output: suppress rendering until cleared
-                self.protocol.modes_mut().insert(2026);
-                self.sync_output_active = true;
-                self.sync_output_start = Some(self.sync_output_clock.now());
+                self.vt.protocol.modes_mut().insert(2026);
+                self.vt.sync_output.active = true;
+                self.vt.sync_output.started = Some(self.sync_output_clock.now());
             }
             7 => {
                 // Autowrap mode
-                self.protocol.modes_mut().insert(7);
+                self.vt.protocol.modes_mut().insert(7);
             }
             6 => {
                 // DECOM - 原点模式:寻址相对滚动区域,光标移到区域原点
-                self.screen.origin_mode = true;
-                self.screen.cursor_row = self.screen.scroll_region_top;
-                self.screen.cursor_col = 0;
+                self.vt.screen.origin_mode = true;
+                self.vt.screen.cursor_row = self.vt.screen.scroll_region_top;
+                self.vt.screen.cursor_col = 0;
             }
             66 => {
-                self.protocol.modes_mut().insert(66);
+                self.vt.protocol.modes_mut().insert(66);
             }
             1007 => {
-                self.protocol.modes_mut().insert(1007);
+                self.vt.protocol.modes_mut().insert(1007);
             }
             _ => {
                 // Unknown mode, just store it
-                self.protocol.modes_mut().insert(mode);
+                self.vt.protocol.modes_mut().insert(mode);
             }
         }
     }
@@ -85,13 +85,13 @@ impl TerminalState {
     pub(super) fn frozen_set_ansi_mode(&mut self, mode: u16) {
         if mode == 4 {
             // IRM - 插入替换模式
-            self.screen.insert_mode = true;
+            self.vt.screen.insert_mode = true;
         }
     }
 
     pub(super) fn frozen_reset_ansi_mode(&mut self, mode: u16) {
         if mode == 4 {
-            self.screen.insert_mode = false;
+            self.vt.screen.insert_mode = false;
         }
     }
 
@@ -99,83 +99,83 @@ impl TerminalState {
         match mode {
             25 => {
                 // Hide cursor
-                self.protocol.modes_mut().remove(&25);
+                self.vt.protocol.modes_mut().remove(&25);
             }
             1004 => {
                 // Disable focus event reporting
-                self.protocol.modes_mut().remove(&1004);
+                self.vt.protocol.modes_mut().remove(&1004);
             }
             2004 => {
                 // Disable bracketed paste mode
-                self.protocol.modes_mut().remove(&2004);
+                self.vt.protocol.modes_mut().remove(&2004);
             }
             5522 => {
                 // A paste capability is valid only while the application keeps
                 // paste-event mode enabled. Revocation must be immediate.
-                self.protocol.modes_mut().remove(&5522);
-                self.pending_paste_grant = None;
+                self.vt.protocol.modes_mut().remove(&5522);
+                self.osc5522.pending_paste_grant = None;
             }
             1000..=1003 => {
                 // Disable mouse reporting
-                self.protocol.modes_mut().remove(&mode);
+                self.vt.protocol.modes_mut().remove(&mode);
             }
             1006 => {
                 // Disable SGR mouse reporting format
-                self.protocol.modes_mut().remove(&mode);
+                self.vt.protocol.modes_mut().remove(&mode);
             }
             47 => {
                 // 退出备用屏(不恢复光标)
                 self.exit_alt_screen(false);
-                self.protocol.modes_mut().remove(&47);
+                self.vt.protocol.modes_mut().remove(&47);
             }
             1047 => {
                 // 退出备用屏(不恢复光标)
                 self.exit_alt_screen(false);
-                self.protocol.modes_mut().remove(&1047);
+                self.vt.protocol.modes_mut().remove(&1047);
             }
             1048 => {
                 // 仅恢复光标(等价 DECRC)
                 self.restore_cursor_state();
-                self.protocol.modes_mut().remove(&1048);
+                self.vt.protocol.modes_mut().remove(&1048);
             }
             1049 => {
                 // 退出备用屏并恢复进入前保存的光标
                 self.exit_alt_screen(true);
-                self.protocol.modes_mut().remove(&1049);
+                self.vt.protocol.modes_mut().remove(&1049);
             }
             2026 => {
                 // End synchronized output: force full render
-                if self.screen.use_alt_buffer {
+                if self.vt.screen.use_alt_buffer {
                     self.archive_visible_screen_to_scrollback_with_options(true, true);
                 } else {
                     self.last_synced_primary_screen_snapshot =
                         self.visible_screen_snapshot().unwrap_or_default();
                 }
-                self.protocol.modes_mut().remove(&2026);
-                self.sync_output_active = false;
-                self.sync_output_start = None;
-                self.dirty_region.mark_all(self.screen.grid.rows());
-                self.mark_rows_dirty(0, self.screen.grid.rows().saturating_sub(1));
+                self.vt.protocol.modes_mut().remove(&2026);
+                self.vt.sync_output.active = false;
+                self.vt.sync_output.started = None;
+                self.dirty_region.mark_all(self.vt.screen.grid.rows());
+                self.mark_rows_dirty(0, self.vt.screen.grid.rows().saturating_sub(1));
             }
             7 => {
                 // Disable autowrap
-                self.protocol.modes_mut().remove(&7);
+                self.vt.protocol.modes_mut().remove(&7);
             }
             6 => {
                 // DECOM 关闭:恢复绝对寻址,光标移到屏幕原点
-                self.screen.origin_mode = false;
-                self.screen.cursor_row = 0;
-                self.screen.cursor_col = 0;
+                self.vt.screen.origin_mode = false;
+                self.vt.screen.cursor_row = 0;
+                self.vt.screen.cursor_col = 0;
             }
             66 => {
-                self.protocol.modes_mut().remove(&66);
+                self.vt.protocol.modes_mut().remove(&66);
             }
             1007 => {
-                self.protocol.modes_mut().remove(&1007);
+                self.vt.protocol.modes_mut().remove(&1007);
             }
             _ => {
                 // Unknown mode, just remove it
-                self.protocol.modes_mut().remove(&mode);
+                self.vt.protocol.modes_mut().remove(&mode);
             }
         }
     }
@@ -198,15 +198,21 @@ fn snapshot(t: &TerminalState) -> Snapshot {
     macro_rules! host {
         ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
     }
+    out.insert(
+        "pending_osc52_clipboard_set".into(),
+        format!("{:?}", t.osc52.pending_set),
+    );
+    out.insert(
+        "pending_osc52_clipboard_queries".into(),
+        format!("{:?}", t.osc52.pending_queries),
+    );
+    out.insert("sync_output_active".into(), format!("{:?}", t.vt.sync_output.active));
     host!(
-        sync_output_active,
         current_working_dir,
         ime_enabled,
         preedit_text,
         preedit_cursor,
         host_window_focused,
-        pending_osc52_clipboard_set,
-        pending_osc52_clipboard_queries,
         pending_notifications,
         pending_bell,
         chat_pending_submit,
@@ -217,13 +223,13 @@ fn snapshot(t: &TerminalState) -> Snapshot {
     );
     out.insert(
         "sync_start_present".into(),
-        t.sync_output_start.is_some().to_string(),
+        t.vt.sync_output.started.is_some().to_string(),
     );
     out.insert(
         "sync_age_ms".into(),
         format!(
             "{:?}",
-            t.sync_output_start.map(|start| t
+            t.vt.sync_output.started.map(|start| t
                 .sync_output_clock
                 .now()
                 .saturating_duration_since(start)
@@ -234,13 +240,13 @@ fn snapshot(t: &TerminalState) -> Snapshot {
         "paste_expiry_ms".into(),
         format!(
             "{:?}",
-            t.pending_paste_grant.as_ref().map(|grant| grant
+            t.osc5522.pending_paste_grant.as_ref().map(|grant| grant
                 .expires_at
                 .saturating_duration_since(t.sync_output_clock.now())
                 .as_millis())
         ),
     );
-    out.insert("parser".into(), format!("{:?}", t.parser.snapshot()));
+    out.insert("parser".into(), format!("{:?}", t.vt.parser.snapshot()));
     out.insert(
         "kitty_image_count".into(),
         t.kitty_graphics.image_count().to_string(),
@@ -249,7 +255,7 @@ fn snapshot(t: &TerminalState) -> Snapshot {
         "paste_grant".into(),
         format!(
             "{:?}",
-            t.pending_paste_grant.as_ref().map(|g| (
+            t.osc5522.pending_paste_grant.as_ref().map(|g| (
                 &g.token,
                 g.offered_mimes
                     .iter()
@@ -272,24 +278,24 @@ fn seeded(seed: usize) -> TerminalState {
     t.process_input(
         b"\x1b[?1;66;1000;1004;2004h\x1b[?7;25;1007l\x1b[4h\x1b[?6h\x1b[2;4r\x1b[2;3H\x1b7",
     );
-    t.screen.cursor_shape = match seed % 3 {
+    t.vt.screen.cursor_shape = match seed % 3 {
         0 => CursorShape::Block,
         1 => CursorShape::Beam,
         _ => CursorShape::Underline,
     };
-    t.screen.current_flags.set_protected(seed & 1 != 0);
-    t.screen.g1_charset = Charset::DecSpecialGraphics;
-    t.screen.active_charset = Charset::DecSpecialGraphics;
-    t.screen.current_fg = Color::Rgb(1, 2, 3);
-    t.screen.current_bg = Color::Indexed(201);
+    t.vt.screen.current_flags.set_protected(seed & 1 != 0);
+    t.vt.screen.g1_charset = Charset::DecSpecialGraphics;
+    t.vt.screen.active_charset = Charset::DecSpecialGraphics;
+    t.vt.screen.current_fg = Color::Rgb(1, 2, 3);
+    t.vt.screen.current_bg = Color::Indexed(201);
     t.global_bg = Color::Blue;
-    t.screen.current_flags.set_underline(UnderlineStyle::Curly);
-    t.screen.pending_wrap = true;
+    t.vt.screen.current_flags.set_underline(UnderlineStyle::Curly);
+    t.vt.screen.pending_wrap = true;
     t.output_buffer = b"existing-reply".to_vec();
     // Modes 4/6/1016 have no TerminalModes storage slots. Use the real
     // authoritative booleans; true values detect mistaken protocol reads.
-    t.screen.origin_mode = seed & 1 == 0;
-    t.screen.insert_mode = seed & 2 == 0;
+    t.vt.screen.origin_mode = seed & 1 == 0;
+    t.vt.screen.insert_mode = seed & 2 == 0;
     super::super::structural_parity_tests::prime(&mut t);
     assert!(t.command_records.back().is_some_and(
         |record| !record.complete && record.state == super::super::CommandState::Running
@@ -301,14 +307,14 @@ fn seeded(seed: usize) -> TerminalState {
     t.current_working_dir = Some("/baseline/mode-mutation".into());
     t.preedit_text = "输入中".into();
     t.preedit_cursor = 1;
-    t.pending_osc52_clipboard_set = Some("clipboard sentinel".into());
-    t.pending_osc52_clipboard_queries.push_back(b"\x07");
+    t.osc52.pending_set = Some("clipboard sentinel".into());
+    t.osc52.pending_queries.push_back(b"\x07");
     t.pending_notifications = vec![("title sentinel".into(), "body sentinel".into())];
     t.colors.dynamic_fg = Some((1, 2, 3));
     t.colors.dynamic_bg = Some((4, 5, 6));
     t.colors.dynamic_cursor_color = Some((7, 8, 9));
     t.pending_bell = true;
-    t.pending_paste_grant = Some(super::super::PendingPasteGrant {
+    t.osc5522.pending_paste_grant = Some(super::super::PendingPasteGrant {
         token: "mode-mutation-grant".into(),
         offered_mimes: ["text/plain".to_owned()].into_iter().collect(),
         expires_at: now + std::time::Duration::from_secs(600),
@@ -316,7 +322,7 @@ fn seeded(seed: usize) -> TerminalState {
     // Make the query's observer call visible even without other VT mutations.
     t.chat_native_takeover_sequence = None;
     t.host_window_focused = seed & 2 == 0;
-    t.protocol.modes_mut().remove(&1004);
+    t.vt.protocol.modes_mut().remove(&1004);
     t.sync_output_clock =
         super::super::SyncOutputClock::new(move || now + std::time::Duration::from_millis(5));
     t

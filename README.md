@@ -321,6 +321,17 @@ sudo apt-get install --no-install-recommends \
   libegl1-mesa-dev libgl1-mesa-dev
 ```
 
+On a minimal Ubuntu 24.04 or 26.04 X11 installation, ember loads
+`libxkbcommon-x11-0` at startup. The prebuilt binary needs this runtime package
+as well as a graphics driver. This software-rendering configuration was tested
+on both releases.
+
+```bash
+sudo apt-get install --no-install-recommends \
+  libxkbcommon-x11-0 libegl1 libegl-mesa0 libgl1 libglx-mesa0 \
+  libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers
+```
+
 Clipboard integration uses the first available backend:
 
 - Wayland: `wl-copy` / `wl-paste` from `wl-clipboard`

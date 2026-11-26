@@ -6,7 +6,7 @@ use jterm_engine::semantics::{dispatch_local, Dispatch};
 impl TerminalState {
     fn reset_query_test_dispatch(&mut self, event: Event<'_>) {
         let Dispatch::Handled(effects) =
-            dispatch_local(&mut self.screen, &mut self.protocol, &event)
+            dispatch_local(&mut self.vt.screen, &mut self.vt.protocol, &event)
         else {
             panic!("engine did not handle reset/query event");
         };
@@ -34,9 +34,9 @@ impl TerminalState {
 
     pub(super) fn decrqss_sgr_payload(&self) -> String {
         let mut probe = TerminalState::new(1, 1);
-        probe.screen.current_flags = self.screen.current_flags;
-        probe.screen.current_fg = self.screen.current_fg;
-        probe.screen.current_bg = self.screen.current_bg;
+        probe.vt.screen.current_flags = self.vt.screen.current_flags;
+        probe.vt.screen.current_fg = self.vt.screen.current_fg;
+        probe.vt.screen.current_bg = self.vt.screen.current_bg;
         probe.handle_decrqss(b"m");
         let reply = probe.output_buffer;
         let payload = reply
@@ -50,9 +50,9 @@ impl TerminalState {
     pub(super) fn sgr_color_params(color: Color, foreground: bool) -> Vec<String> {
         let mut probe = TerminalState::new(1, 1);
         if foreground {
-            probe.screen.current_fg = color;
+            probe.vt.screen.current_fg = color;
         } else {
-            probe.screen.current_bg = color;
+            probe.vt.screen.current_bg = color;
         }
         let payload = probe.decrqss_sgr_payload();
         // Decode the framing of a color-only SGR reply; no color mapping here.

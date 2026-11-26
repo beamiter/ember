@@ -194,7 +194,7 @@ fn bounded_discard_cross_batch_cannot_create_a_trusted_watch_start() {
     assert!(updates
         .iter()
         .all(|u| !u.trusted_start && u.command.is_none()));
-    assert_eq!(terminal.parser.rejected_count(), 1);
+    assert_eq!(terminal.vt.parser.rejected_count(), 1);
     // Separate source batches inside rejected DCS remain opaque. BEL ends
     // OSC markers, but cannot end this enclosing DCS discard.
     for payload in [b"\x1b]133;A\x07".as_slice(), b"\x1b]133;C\x07forged"] {

@@ -53,3 +53,8 @@ mod vim9_buffer;
 pub mod watch_adapter;
 pub mod windows_compat;
 pub mod workflows;
+
+#[allow(dead_code)] // Publication is consumed by the native binary workspace.
+pub(crate) mod terminal_attachment;
+#[allow(dead_code)] // Publication is consumed by the native binary workspace.
+pub(crate) mod observer;

@@ -80,12 +80,12 @@ impl TerminalState {
             ],
             dimensions: [
                 self.scrollback.len(),
-                self.screen.grid.rows(),
-                self.screen.grid.row_len(),
+                self.vt.screen.grid.rows(),
+                self.vt.screen.grid.row_len(),
                 self.scroll_offset,
                 self.command_records.len(),
             ],
-            alternate: self.screen.use_alt_buffer,
+            alternate: self.vt.screen.use_alt_buffer,
         }
     }
     pub fn projection_unavailable(&self) -> Option<ProjectionUnavailable> {
@@ -112,7 +112,7 @@ impl TerminalState {
             .set(self.projection_query_evaluations.get() + 1);
         let result = match &self.projection_last_policy {
             Some(policy) => self
-                .plan_budget(self.screen.grid.row_len().max(1), policy)
+                .plan_budget(self.vt.screen.grid.row_len().max(1), policy)
                 .err(),
             None => self.raw_budget().err(),
         };
@@ -180,9 +180,9 @@ impl TerminalState {
             self.row_identity_revision,
             self.scrollback.len(),
             self.scroll_offset,
-            self.screen.grid.rows(),
-            self.screen.grid.row_len(),
-            self.screen.use_alt_buffer,
+            self.vt.screen.grid.rows(),
+            self.vt.screen.grid.row_len(),
+            self.vt.screen.use_alt_buffer,
             projection::ProjectionMode::Bypass,
         );
         ProjectedViewport::unavailable(key, self.projection_failure.expect("rejection recorded"))
@@ -193,7 +193,7 @@ impl TerminalState {
     ) -> Result<(), ProjectionUnavailable> {
         let b = self.projection_limits();
         limited(
-            add(self.scrollback.len(), self.screen.grid.rows())?,
+            add(self.scrollback.len(), self.vt.screen.grid.rows())?,
             b.source_rows,
             ProjectionUnavailable::SourceRows,
         )?;
@@ -235,7 +235,7 @@ impl TerminalState {
         policy: &ProjectionPolicy,
     ) -> Result<(), ProjectionUnavailable> {
         let b = self.projection_limits();
-        let mut rows = self.screen.grid.rows();
+        let mut rows = self.vt.screen.grid.rows();
         let mut logical = 0usize;
         let mut wide = 0usize;
         let mut open = false;
@@ -279,7 +279,7 @@ impl TerminalState {
         if policy.chat_mode() {
             extra = add(
                 extra,
-                add(policy.chat_footer_rows(), self.screen.grid.rows())?,
+                add(policy.chat_footer_rows(), self.vt.screen.grid.rows())?,
             )?;
         }
         limited(
@@ -287,7 +287,7 @@ impl TerminalState {
             b.view_rows,
             ProjectionUnavailable::ViewRows,
         )?;
-        let slices = add(add(rows, self.scrollback.len())?, self.screen.grid.rows())?;
+        let slices = add(add(rows, self.scrollback.len())?, self.vt.screen.grid.rows())?;
         limited(
             add(
                 slices,
@@ -364,13 +364,13 @@ impl TerminalState {
         self.projection_raw_evaluations
             .set(self.projection_raw_evaluations.get() + 1);
         let b = self.projection_limits();
-        let rows = self.screen.grid.rows();
-        let cols = self.screen.grid.row_len().max(1);
+        let rows = self.vt.screen.grid.rows();
+        let cols = self.vt.screen.grid.row_len().max(1);
         let mut cells = rows
             .checked_mul(cols)
             .ok_or(ProjectionUnavailable::ArithmeticOverflow)?;
         limited(cells, b.raw_cells, ProjectionUnavailable::RawCells)?;
-        if self.screen.use_alt_buffer || self.scroll_offset == 0 {
+        if self.vt.screen.use_alt_buffer || self.scroll_offset == 0 {
             return Ok(());
         }
         self.source_budget(None)?;
@@ -618,7 +618,7 @@ mod tests {
     fn budget_source_and_slice_exact_limits_and_plus_one_fail_before_plan() {
         let mut t = history();
         let p = policy();
-        let source = t.scrollback.len() + t.screen.grid.rows();
+        let source = t.scrollback.len() + t.vt.screen.grid.rows();
         t.projection_test_budget = Some(ProjectionBudget {
             source_rows: source,
             ..ProjectionBudget::default()
@@ -680,7 +680,7 @@ mod tests {
         let _ = frame(&mut t, &p);
         let old_count = t.scrollback.len();
         t.projection_test_budget = Some(ProjectionBudget {
-            source_rows: old_count + t.screen.grid.rows(),
+            source_rows: old_count + t.vt.screen.grid.rows(),
             ..ProjectionBudget::default()
         });
         t.process_input(&[b'y'; 32]);
@@ -709,7 +709,7 @@ mod tests {
         assert_eq!(t.source_budget(Some(&p)), Ok(()));
         assert_eq!(t.plan_budget(160, &p), Ok(()));
         let cap = t.projection_limits().source_rows;
-        while t.scrollback.len() + t.screen.grid.rows() < cap {
+        while t.scrollback.len() + t.vt.screen.grid.rows() < cap {
             t.scrollback
                 .push_back(ScrollbackLine::compress(&[cell; 96], false));
         }

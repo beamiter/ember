@@ -541,7 +541,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=fa9d85efd8560639ff7a6f4a7377a4a2836b7b77#fa9d85efd8560639ff7a6f4a7377a4a2836b7b77"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -576,9 +576,10 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=fa9d85efd8560639ff7a6f4a7377a4a2836b7b77#fa9d85efd8560639ff7a6f4a7377a4a2836b7b77"
 dependencies = [
  "smallvec",
+ "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -586,7 +587,7 @@ dependencies = [
 [[package]]
 name = "jterm_protocol"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=fa9d85efd8560639ff7a6f4a7377a4a2836b7b77#fa9d85efd8560639ff7a6f4a7377a4a2836b7b77"
 dependencies = [
  "jterm_engine",
  "serde",
@@ -595,7 +596,7 @@ dependencies = [
 [[package]]
 name = "jterm_remote_client"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=fa9d85efd8560639ff7a6f4a7377a4a2836b7b77#fa9d85efd8560639ff7a6f4a7377a4a2836b7b77"
 dependencies = [
  "serde",
  "serde_json",
@@ -604,7 +605,7 @@ dependencies = [
 [[package]]
 name = "jterm_runtime"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=53974b89f87086c3f0d7429c4de67d33e2fe6bcd#53974b89f87086c3f0d7429c4de67d33e2fe6bcd"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=fa9d85efd8560639ff7a6f4a7377a4a2836b7b77#fa9d85efd8560639ff7a6f4a7377a4a2836b7b77"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -1074,6 +1075,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "toml"
 version = "1.1.4+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1129,6 +1136,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

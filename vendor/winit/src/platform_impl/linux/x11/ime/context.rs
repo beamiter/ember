@@ -341,17 +341,26 @@ impl ImeContext {
         self.allowed
     }
 
+    pub(crate) fn spot(&self) -> (c_short, c_short) {
+        (self.ic_spot.x, self.ic_spot.y)
+    }
+
     // Set the spot for preedit text. Setting spot isn't working with libX11 when preedit callbacks
     // are being used. Certain IMEs do show selection window, but it's placed in bottom left of the
     // window and couldn't be changed.
     //
     // For me see: https://bugs.freedesktop.org/show_bug.cgi?id=1580.
     pub(crate) fn set_spot(&mut self, xconn: &Arc<XConnection>, x: c_short, y: c_short) {
-        if !self.is_allowed() || self.ic_spot.x == x && self.ic_spot.y == y {
+        if self.ic_spot.x == x && self.ic_spot.y == y {
             return;
         }
 
         self.ic_spot = ffi::XPoint { x, y };
+        // Retain geometry through a disabled context without sending invalid
+        // preedit attributes to a style that does not support composition.
+        if !self.is_allowed() {
+            return;
+        }
 
         unsafe {
             let preedit_attr = util::memory::XSmartPointer::new(

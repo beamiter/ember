@@ -128,6 +128,7 @@ const REPAINT_LIMIT: Duration = Duration::from_secs(1);
 
 #[allow(dead_code)] // Paint state belongs to the binary workspace.
 pub(crate) struct PublishedTerminalFrame {
+    pub observer: Arc<crate::observer::Frame>,
     pub viewport: ProjectedViewport,
     pub canvas: crate::transcript_canvas::CanvasGeometry,
     pub inline_text_scope: Option<(u64, Option<u64>)>,
@@ -203,7 +204,7 @@ impl TerminalPresentation {
 
     #[allow(dead_code)] // Called by the binary renderer.
     pub(crate) fn holding_frame(&self, terminal: &TerminalState, now: Instant) -> bool {
-        terminal.sync_output_active
+        terminal.vt.sync_output.active
             || self
                 .repaint
                 .as_ref()
@@ -216,7 +217,7 @@ impl TerminalPresentation {
         if self
             .repaint
             .as_ref()
-            .is_some_and(|repaint| repaint.finished(now, terminal.sync_output_active))
+            .is_some_and(|repaint| repaint.finished(now, terminal.vt.sync_output.active))
         {
             self.repaint = None;
         }
@@ -285,7 +286,8 @@ impl Session {
         force: bool,
         ctx: &eframe::egui::Context,
     ) {
-        let previous = (terminal.screen.grid.row_len(), terminal.screen.grid.rows());
+        if !self.shell.view_attached(){return;}
+        let previous = (terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows());
         let changed = target != previous;
         if !changed && !force {
             self.terminal_presentation.resize_target = None;
@@ -308,10 +310,17 @@ impl Session {
         }
     }
 
+    pub(crate) fn change_view(&mut self,ticket:&jterm_protocol::terminal::Attachment,attach:bool)->bool {
+        if !self.pending_input.is_empty() || !self.shell.change_view(ticket,attach){return false;}
+        self.terminal_presentation.resize_target=None;
+        let mut terminal=self.terminal.lock();terminal.preedit_text.clear();terminal.preedit_cursor=0;
+        true
+    }
+
     /// Append bytes to this session's strict input FIFO without crossing its
     /// memory cap. `false` guarantees that no byte was appended.
     pub fn queue_input(&mut self, input: &[u8]) -> bool {
-        if self.purpose == SessionPurpose::RetainedCommand {
+        if self.purpose == SessionPurpose::RetainedCommand || !self.shell.view_attached() {
             return false;
         }
         let queued = append_bounded_input(&mut self.pending_input, input, PENDING_INPUT_BYTE_CAP);
@@ -319,6 +328,15 @@ impl Session {
             self.terminal.lock().note_user_input(input);
         }
         queued
+    }
+
+    /// Chat keeps its own transcript position while the dock or a fullscreen
+    /// child receives input. The native grid still follows the live cursor.
+    pub(crate) fn scroll_after_input(&mut self) {
+        self.terminal.lock().scroll_to_bottom();
+        if !self.projection_policy.chat_mode() {
+            self.projection_view_state.scroll_to_bottom();
+        }
     }
 
     /// Attempt a lifecycle-bound control immediately, never through either
@@ -377,7 +395,7 @@ impl Session {
     /// Queue an already-armed Agent command without marking it as unrelated
     /// local input. Callers must arm the terminal generation first.
     pub fn queue_agent_input(&mut self, input: &[u8]) -> bool {
-        if self.purpose == SessionPurpose::RetainedCommand {
+        if self.purpose == SessionPurpose::RetainedCommand || !self.shell.view_attached() {
             return false;
         }
         append_bounded_input(&mut self.pending_input, input, PENDING_INPUT_BYTE_CAP)

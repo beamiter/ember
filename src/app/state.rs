@@ -194,6 +194,8 @@ impl Default for ReferenceInspectorState {
 
 /// Main application state.
 pub struct TerminalApp {
+    pub(crate) observers: Vec<crate::observer_window::View>,
+    pub(crate) observer_serial: u64,
     pub session_manager: SessionManager,
     pub(crate) vim9_editors: std::collections::HashMap<String, crate::vim9_ide::Workbench>,
     pub(crate) vim9_window_close_pending: bool,

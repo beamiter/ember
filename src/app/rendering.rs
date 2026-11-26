@@ -1628,6 +1628,10 @@ fn prepare_terminal_projection(
     retained_selection_enabled: bool,
     focused: bool,
 ) -> crate::terminal::ProjectedViewport {
+    let attached=session.shell.view_attached();
+    let interaction_enabled=interaction_enabled && attached;
+    let retained_selection_enabled=retained_selection_enabled && attached;
+    let focused=focused && attached;
     let held = session.terminal_presentation.settle(terminal, ctx);
     let scope = terminal.inline_text_scope();
     let terminal_size = terminal.get_dimensions();
@@ -1641,7 +1645,7 @@ fn prepare_terminal_projection(
             .as_ref()
             .is_some_and(|frame| {
                 frame.inline_text_scope == scope
-                    && scope.is_some()
+                    && (scope.is_some() || frame.viewport.scroll_offset() > 0)
                     && frame.terminal_size == terminal_size
                     && frame.pane_rect == content_rect
                     && frame.cell_size == cell_size
@@ -1691,6 +1695,7 @@ fn prepare_terminal_projection(
         viewport
             .is_available()
             .then(|| crate::session::PublishedTerminalFrame {
+                observer: crate::observer::Frame::capture(viewport.clone(), renderer, terminal),
                 viewport: viewport.clone(),
                 canvas: renderer.canvas_geometry,
                 inline_text_scope: scope,
@@ -2067,8 +2072,8 @@ impl TerminalApp {
                     let records = terminal.command_records();
                     let last = records.iter().rev().find(|record| record.complete);
                     (
-                        terminal.screen.grid.row_len() as u16,
-                        terminal.screen.grid.rows() as u16,
+                        terminal.vt.screen.grid.row_len() as u16,
+                        terminal.vt.screen.grid.rows() as u16,
                         last.and_then(|record| record.exit_code),
                         last.and_then(|record| record.duration_ms),
                         records.back().is_some_and(|record| {
@@ -2844,6 +2849,7 @@ impl TerminalApp {
         let mut pending_block_menu: Option<(String, crate::block_mode::BlockMenuRequest)> = None;
 
         // 多窗格支持：如果有多于一个窗格，则进行分屏渲染
+        let mut reattach_views=Vec::new();
         if self.layout().panes().len() > 1 {
             // 获取所有窗格信息
             let panes = self.layout().panes().to_vec();
@@ -2963,6 +2969,11 @@ impl TerminalApp {
                         retained_selection_enabled,
                         terminal_interaction_enabled && pane.focused,
                     );
+                    if !session.shell.view_attached() {
+                        let ticket=session.shell.view_ticket();
+                        if crate::terminal_views::placeholder(ui,pane_outer_rect,session.get_shell_pid(),&ticket){reattach_views.push(ticket);}
+                        continue;
+                    }
                     let projection_view_state = &mut session.projection_view_state;
                     let projection_key = viewport.key();
                     if renderer.cached_links_projection_key != Some(projection_key)
@@ -3192,7 +3203,7 @@ impl TerminalApp {
 
             // 点击某个窗格 → 切换输入焦点到该窗格(忽略落在分隔线上的点击,
             // 那是用于拖拽调整比例的)。
-            if terminal_interaction_enabled
+            if (terminal_interaction_enabled || (!self.session_manager.sessions()[self.session_manager.active_index()].shell.view_attached() && !self.terminal_input_blocked(ctx)))
                 && self.dragging_divider.is_none()
                 && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
             {
@@ -3255,6 +3266,11 @@ impl TerminalApp {
                     retained_selection_enabled,
                     terminal_interaction_enabled,
                 );
+                if !session.shell.view_attached() {
+                    let ticket=session.shell.view_ticket();let pid=session.get_shell_pid();drop(terminal_guard);
+                    if crate::terminal_views::placeholder(ui,available_rect,pid,&ticket){self.change_terminal_view(ctx,ticket,true);}
+                    return;
+                }
                 let projection_view_state = &mut session.projection_view_state;
                 let projection_key = viewport.key();
 
@@ -3392,6 +3408,7 @@ impl TerminalApp {
             }
         }
 
+        for ticket in reattach_views {self.change_terminal_view(ctx,ticket,true);}
         if let Some((session_id, click)) = pending_block_click {
             match click {
                 crate::block_mode::BlockClick::Select { record_id, gesture } => {
@@ -4745,8 +4762,8 @@ impl TerminalApp {
         if self.debug_panel.is_open {
             let session = self.session_manager.get_active_session_mut();
             let terminal = session.terminal.lock();
-            let grid_cols = terminal.screen.grid.cols();
-            let grid_rows = terminal.screen.grid.rows();
+            let grid_cols = terminal.vt.screen.grid.cols();
+            let grid_rows = terminal.vt.screen.grid.rows();
             let scrollback_used = terminal.scrollback.len();
             let kitty_images_count = terminal.kitty_graphics.image_count();
             let kitty_memory_mb = terminal.kitty_graphics.image_memory_mb();
@@ -7998,7 +8015,7 @@ mod tests {
                             }
                             terminal
                         });
-                        let raw_grid = format!("{:?}", terminal.screen.grid.to_vec());
+                        let raw_grid = format!("{:?}", terminal.vt.screen.grid.to_vec());
                         let raw_cursor = terminal.get_cursor_pos();
                         let mut policy = crate::terminal::ProjectionPolicy::default();
                         policy.set_block_spacing(spacing);
@@ -8012,9 +8029,9 @@ mod tests {
                         }
                         renderer.set_projection_frame(terminal, viewport, &policy);
                         renderer.render(ui, terminal, true, true, &crate::search::SearchState::default(), &[], &None);
-                        assert_eq!(format!("{:?}", terminal.screen.grid.to_vec()), raw_grid);
+                        assert_eq!(format!("{:?}", terminal.vt.screen.grid.to_vec()), raw_grid);
                         assert_eq!(terminal.get_cursor_pos(), raw_cursor);
-                        assert_eq!((terminal.screen.grid.row_len(), terminal.screen.grid.rows()), (cols, rows));
+                        assert_eq!((terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows()), (cols, rows));
                     });
                     if let Some(path) = &destination {
                         capture.save(

@@ -302,7 +302,7 @@ impl ProtocolResponseSender {
                 return Ok(flushed);
             };
 
-            match shell.write(response) {
+            match shell.write_protocol(response) {
                 Ok(()) => {
                     let response = state.pending.pop_front().expect("front response existed");
                     state.accounted_bytes = state.accounted_bytes.saturating_sub(response.len());
@@ -686,11 +686,34 @@ impl SessionManager {
         protocol_input_barriers: &SessionInputBarriers,
         window_focused: bool,
     ) -> BackgroundPumpResult {
+        self.pump_sessions(total_budget, visible_session_indices, mouse_barrier_session_id,
+            protocol_input_barriers, window_focused, false)
+    }
+
+    /// Advance every owner while no root UI pass runs. Uses the same bounded
+    /// response queues and fair parse budget as visible/background processing.
+    pub fn pump_all_sessions(
+        &mut self,
+        total_budget: usize,
+        mouse_barrier_session_id: Option<&str>,
+        protocol_input_barriers: &SessionInputBarriers,
+    ) -> BackgroundPumpResult {
+        self.pump_sessions(total_budget, &[], mouse_barrier_session_id,
+            protocol_input_barriers, false, true)
+    }
+
+    fn pump_sessions(
+        &mut self,
+        total_budget: usize,
+        visible_session_indices: &[usize],
+        mouse_barrier_session_id: Option<&str>,
+        protocol_input_barriers: &SessionInputBarriers,
+        window_focused: bool,
+        include_active: bool,
+    ) -> BackgroundPumpResult {
         let order = background_pump_order(
-            self.active_index,
-            self.sessions.len(),
-            visible_session_indices,
-            self.background_pump_cursor,
+            if include_active { usize::MAX } else { self.active_index },
+            self.sessions.len(), visible_session_indices, self.background_pump_cursor,
         );
         if self.sessions.len() > 1 {
             self.background_pump_cursor = (self.background_pump_cursor + 1) % self.sessions.len();
@@ -1051,6 +1074,14 @@ impl SessionManager {
         }
         self.freeze_exited_terminal(index);
         true
+    }
+
+    /// Preserve the last startup failure without retrying its retired actor.
+    #[allow(dead_code)] // Called by the binary app.
+    pub(crate) fn retain_failed_startup(&mut self, session_id: &str) {
+        if let Some(index) = self.index_of(session_id) {
+            self.freeze_exited_terminal(index);
+        }
     }
 
     fn freeze_exited_terminal(&mut self, index: usize) {
@@ -1441,7 +1472,7 @@ fn background_pump_order(
         }
     }
 
-    if session_count > 1 {
+    if session_count > 0 {
         let start = cursor % session_count;
         for offset in 0..session_count {
             let idx = (start + offset) % session_count;
@@ -1672,6 +1703,46 @@ mod tests {
             std::fs::canonicalize(actual).unwrap(),
             std::fs::canonicalize(requested).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logic_only_pump_services_real_active_pty_protocol_and_exit() {
+        let repaint = egui::Context::default();
+        let argv = vec!["/usr/bin/python3".into(), "-c".into(),
+            "import os,tty; tty.setraw(0); os.write(1,b'\x1b[5n'); reply=os.read(0,4); os.write(1,b'REPLY='+reply.hex().encode()); raise SystemExit(0 if reply==b'\x1b[0n' else 9)".into()];
+        let shell = ShellSession::new_with_cwd(80,24,Some("/tmp"),None,None,Some(&argv),
+            crate::runtime_wake::egui_wake(repaint.clone())).unwrap();
+        let session = Session::new("logic-only".into(),Vec::new(),
+            Arc::new(ParkingMutex::new(TerminalState::new(80,24))),shell);
+        let id = session.metadata.session_id.clone();
+        let mut manager = SessionManager::new(session,repaint,None);
+        let deadline = std::time::Instant::now()+Duration::from_secs(5);
+        let barriers = SessionInputBarriers::default();
+        let mut bytes = 0;
+        loop {
+            let pump = manager.pump_all_sessions(7,None,&barriers);
+            assert!(pump.bytes_processed <= 7);
+            assert!(pump.errors.is_empty(), "{:?}",pump.errors);
+            bytes += pump.bytes_processed;
+            if let Some(exit) = pump.exited_sessions.first() {
+                assert_eq!(exit.session_id,id);
+                assert_eq!(exit.exit_code,Some(0));
+                assert!(exit.exit_output_notice.is_none(), "{:?}", exit.exit_output_notice);
+                break;
+            }
+            assert!(std::time::Instant::now()<deadline,"active PTY protocol stalled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(bytes, 18, "query and full exit tail must both be parsed");
+    }
+
+    #[test]
+    fn logic_only_pump_includes_single_owner_and_rotates_all_owners() {
+        assert_eq!(background_pump_order(usize::MAX, 0, &[], 0), Vec::<usize>::new());
+        assert_eq!(background_pump_order(usize::MAX, 1, &[], 0), vec![0]);
+        assert_eq!(background_pump_order(usize::MAX, 3, &[], 1), vec![1, 2, 0]);
+        assert_eq!(background_pump_order(usize::MAX, 3, &[], 2), vec![2, 0, 1]);
     }
 
     #[test]

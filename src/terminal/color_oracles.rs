@@ -33,15 +33,21 @@ fn snapshot(t: &TerminalState, previous_epoch: Option<u64>) -> Snapshot {
     macro_rules! host {
         ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
     }
+    out.insert(
+        "pending_osc52_clipboard_set".into(),
+        format!("{:?}", t.osc52.pending_set),
+    );
+    out.insert(
+        "pending_osc52_clipboard_queries".into(),
+        format!("{:?}", t.osc52.pending_queries),
+    );
+    out.insert("sync_output_active".into(), format!("{:?}", t.vt.sync_output.active));
     host!(
-        sync_output_active,
         current_working_dir,
         ime_enabled,
         preedit_text,
         preedit_cursor,
         host_window_focused,
-        pending_osc52_clipboard_set,
-        pending_osc52_clipboard_queries,
         pending_notifications,
         pending_bell,
         osc_reply_terminator,
@@ -53,9 +59,9 @@ fn snapshot(t: &TerminalState, previous_epoch: Option<u64>) -> Snapshot {
     );
     out.insert(
         "sync_start_present".into(),
-        t.sync_output_start.is_some().to_string(),
+        t.vt.sync_output.started.is_some().to_string(),
     );
-    out.insert("parser".into(), format!("{:?}", t.parser.snapshot()));
+    out.insert("parser".into(), format!("{:?}", t.vt.parser.snapshot()));
     out.insert(
         "kitty_image_count".into(),
         t.kitty_graphics.image_count().to_string(),
@@ -64,7 +70,7 @@ fn snapshot(t: &TerminalState, previous_epoch: Option<u64>) -> Snapshot {
         "paste_grant".into(),
         format!(
             "{:?}",
-            t.pending_paste_grant.as_ref().map(|g| (
+            t.osc5522.pending_paste_grant.as_ref().map(|g| (
                 &g.token,
                 g.offered_mimes
                     .iter()
@@ -146,8 +152,8 @@ fn seeded(seed: usize) -> TerminalState {
     });
     t.preedit_text = "输入中".into();
     t.preedit_cursor = 1;
-    t.pending_osc52_clipboard_set = Some("clipboard sentinel".into());
-    t.pending_osc52_clipboard_queries.push_back(b"\x07");
+    t.osc52.pending_set = Some("clipboard sentinel".into());
+    t.osc52.pending_queries.push_back(b"\x07");
     t.pending_notifications = vec![("title sentinel".into(), "body sentinel".into())];
     t.output_buffer = b"existing-reply".to_vec();
     t

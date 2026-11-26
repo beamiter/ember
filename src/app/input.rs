@@ -1045,6 +1045,47 @@ impl TerminalApp {
         }
     }
 
+    /// Reset the real window input context after retiring a composition owner.
+    /// Local quarantine remains in force until native Closed/Opened/Commit
+    /// events retire it. Observers never reach this ROOT-only service.
+    pub(crate) fn service_terminal_ime_reset(&mut self, ctx: &egui::Context) {
+        if ctx.viewport_id() != egui::ViewportId::ROOT
+            || !self.terminal_ime.take_native_reset()
+        {
+            return;
+        }
+        self.renderer.reset_ime_state();
+        for renderer in &mut self.pane_renderers {
+            renderer.reset_ime_state();
+        }
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::IMEAllowed(false));
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn finish_terminal_ime_reset(&mut self, ctx: &egui::Context) {
+        self.service_terminal_ime_reset(ctx);
+        if ctx.viewport_id() != egui::ViewportId::ROOT
+            || !self.terminal_ime.take_native_restore()
+        {
+            return;
+        }
+        // Resolve the NEW input owner after pointer/modal/pane dispatch and
+        // actual rendering. Pre-pass state can still name the old terminal.
+        let text_editor = ctx.output(|output| output.ime.is_some());
+        let terminal = !self.active_projection_unavailable()
+            && !self.active_terminal_is_read_only()
+            && !self.terminal_input_blocked(ctx)
+            && !self.block_chrome_owns_keyboard(ctx);
+        // Native IME capability and keyboard focus are separate. Keep an
+        // eligible context ready while blurred so its first returning key is
+        // filtered by IME; winit focuses it only for the active native window.
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::IMEAllowed(text_editor || terminal),
+        );
+        ctx.request_repaint();
+    }
+
     /// Predict egui's interaction position for this batch, independently of
     /// the drag/drop hover tracker. egui starts from previous latest_pos,
     /// updates on moves AND button edges, and retains interact_pos on Gone.
@@ -1280,7 +1321,7 @@ impl TerminalApp {
             .sessions()
             .get(self.session_manager.active_index())
             .is_some_and(|session| {
-                session.purpose == crate::session::SessionPurpose::RetainedCommand
+                session.purpose == crate::session::SessionPurpose::RetainedCommand || !session.shell.view_attached()
             })
     }
 
@@ -2205,7 +2246,7 @@ impl TerminalApp {
         }
         .map(|anchor| anchor.line_id)
         .unwrap_or(terminal.total_lines_scrolled);
-        let cols = terminal.screen.grid.row_len();
+        let cols = terminal.vt.screen.grid.row_len();
         let target = if next {
             terminal.command_records().iter().find(|record| {
                 crate::block_mode::prompt_row_line_id(
@@ -2661,7 +2702,11 @@ impl TerminalApp {
         true
     }
 
-    fn command_belongs_to_open_modal(&self, command: &keybindings::Command) -> bool {
+    fn command_belongs_to_open_modal(
+        &self,
+        command: &keybindings::Command,
+        modifiers: egui::Modifiers,
+    ) -> bool {
         match command {
             keybindings::Command::SearchClose
             | keybindings::Command::SearchNext
@@ -2677,6 +2722,19 @@ impl TerminalApp {
             keybindings::Command::HistoryPickerToggle => self.history_picker.is_some(),
             keybindings::Command::WorkflowPickerToggle => {
                 self.workflow_picker.is_some() || self.workflow_args.is_some()
+            }
+            keybindings::Command::SessionNext
+            | keybindings::Command::SessionPrev
+            | keybindings::Command::PaneFocusNext
+            | keybindings::Command::PaneFocusPrev
+            | keybindings::Command::PaneFocusLeft
+            | keybindings::Command::PaneFocusRight
+            | keybindings::Command::PaneFocusUp
+            | keybindings::Command::PaneFocusDown => {
+                // Explicit terminal navigation is safe while filling a
+                // workflow. Ordinary Tab, text, Enter and IME remain owned by
+                // the form, even when a user rebinds an app shortcut.
+                self.workflow_args.is_some() && (modifiers.ctrl || modifiers.alt || modifiers.command)
             }
             keybindings::Command::SearchReplaceToggle => self.search_replace_panel.is_open,
             _ => false,
@@ -2833,7 +2891,9 @@ impl TerminalApp {
                     build_keybinding_string(press.key, press.modifiers).unwrap_or_default(),
                     command
                 );
-                if ui_input_blocked && !self.command_belongs_to_open_modal(&command) {
+                if ui_input_blocked
+                    && !self.command_belongs_to_open_modal(&command, press.modifiers)
+                {
                     return OrderedPressOutcome::Ignored;
                 }
                 if crate::vim9_ide::is_editor_command(&command)

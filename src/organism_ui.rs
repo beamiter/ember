@@ -95,6 +95,40 @@ fn terminal_has_running_command(terminal: &crate::terminal::TerminalState) -> bo
     })
 }
 
+/// Prompt redraws (for example after a peer closes and the PTY is resized) do
+/// not replace the last observed execution. Search only this pane's bounded
+/// record deque, crossing empty unstarted prompts, never an unknown execution.
+fn companion_task_record(
+    terminal: &crate::terminal::TerminalState,
+) -> Option<&crate::terminal::CommandRecord> {
+    use crate::block_mode::CompletionProvenance;
+    use crate::terminal::CommandState;
+    for record in terminal.command_records().iter().rev() {
+        if record.start_mark_seen {
+            return Some(record);
+        }
+        let prompt = if record.complete {
+            record.state == CommandState::Complete
+                && record.completion_provenance == CompletionProvenance::BoundaryInferred
+        } else {
+            matches!(record.state, CommandState::Prompt | CommandState::Editing)
+                && record.output_end.is_none()
+                && record.end.is_none()
+        };
+        let empty = record.command.is_none()
+            && !record.command_exact
+            && !record.command_truncated
+            && record.output_start.is_none()
+            && record.exit_code.is_none()
+            && record.duration_ms.is_none()
+            && record.started_at.is_none();
+        if !prompt || !empty {
+            return None;
+        }
+    }
+    None
+}
+
 /// Native pointer observation only; all dwell, hold, cooldown and source policy
 /// lives in jterm_core. Layout changes synchronize position without an entry.
 fn observe_live_attention(
@@ -2695,11 +2729,7 @@ impl crate::TerminalApp {
                     .get(self.session_manager.active_index())
                 {
                     if let Some(terminal) = session.terminal.try_lock() {
-                        if let Some(record) = terminal
-                            .command_records()
-                            .back()
-                            .filter(|r| r.start_mark_seen)
-                        {
+                        if let Some(record) = companion_task_record(&terminal) {
                             use jterm_core::companion_host::TaskStatus;
                             let status = if record.complete {
                                 match record.exit_code {
@@ -2809,19 +2839,16 @@ impl crate::TerminalApp {
                 .get(self.session_manager.active_index())
             {
                 let task = session.terminal.try_lock().and_then(|t| {
-                    t.command_records()
-                        .back()
-                        .filter(|r| r.start_mark_seen)
-                        .map(|r| {
-                            (
-                                jterm_core::companion_host::host_scoped_task_id(
-                                    &host_id,
-                                    &session.metadata.session_id,
-                                    r.sequence,
-                                ),
-                                r.sequence.max(1),
-                            )
-                        })
+                    companion_task_record(&t).map(|r| {
+                        (
+                            jterm_core::companion_host::host_scoped_task_id(
+                                &host_id,
+                                &session.metadata.session_id,
+                                r.sequence,
+                            ),
+                            r.sequence.max(1),
+                        )
+                    })
                 });
                 self.organism.eva.observe_context(
                     ui.ctx(),
@@ -3616,6 +3643,53 @@ mod tests {
 
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn companion_fast_completion_survives_only_its_empty_next_prompt() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 24);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07done\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        let completed = companion_task_record(&terminal).expect("fast completed task");
+        assert!(completed.complete && completed.start_mark_seen);
+        assert_eq!(completed.exit_code, Some(0));
+        let sequence = completed.sequence;
+        assert!(!terminal_has_running_command(&terminal));
+        terminal.process_input(b"false\r\n\x1b]133;C\x07");
+        let running = companion_task_record(&terminal).expect("new task replaces old task");
+        assert!(running.sequence > sequence && !running.complete);
+        terminal.process_input(b"\x1b]133;D;1\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(companion_task_record(&terminal).unwrap().exit_code, Some(1));
+        terminal.process_input(b"untrusted\r\n\x1b]133;D;0\x07");
+        assert!(
+            companion_task_record(&terminal).is_none(),
+            "unstarted completion cannot replay prior success"
+        );
+    }
+
+    #[test]
+    fn companion_task_survives_peer_resize_prompt_redraw_without_cross_pane_replay() {
+        let mut pane_a = crate::terminal::TerminalState::new(80, 24);
+        let mut pane_b = crate::terminal::TerminalState::new(80, 24);
+        pane_a.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07A\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        pane_b.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07false\r\n\x1b]133;C\x07B\r\n\x1b]133;D;1\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        let sequence_b = companion_task_record(&pane_b).unwrap().sequence;
+        assert_eq!(companion_task_record(&pane_a).unwrap().exit_code, Some(0));
+        drop(pane_a);
+        // Actual Bash SIGWINCH redraw emits a new A/B with no C/D. The
+        // previous provisional prompt becomes an unstarted inferred boundary.
+        for (cols, rows) in [(120, 30), (100, 28), (140, 32)] {
+            pane_b.on_resize(cols, rows);
+            pane_b.process_input(b"\r\x1b]133;A\x07$ \x1b]133;B\x07");
+            let observed = companion_task_record(&pane_b).unwrap();
+            assert_eq!(observed.sequence, sequence_b);
+            assert_eq!(observed.exit_code, Some(1));
+        }
+        let fresh_peer = crate::terminal::TerminalState::new(80, 24);
+        assert!(companion_task_record(&fresh_peer).is_none());
+        // An untrusted shell completion is not an empty prompt redraw and
+        // must stop the search rather than replay either pane's known result.
+        pane_b.process_input(b"unknown\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(companion_task_record(&pane_b).is_none());
+    }
 
     #[test]
     fn window_running_snapshot_tracks_non_owner_start_finish_close_and_switch() {

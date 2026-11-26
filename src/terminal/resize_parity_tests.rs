@@ -6,7 +6,7 @@ type Snapshot = BTreeMap<String, String>;
 
 fn seeded(cols: usize, rows: usize, variant: usize) -> TerminalState {
     let mut t = TerminalState::new(cols, rows);
-    for (buffer, grid) in [&mut t.screen.grid, &mut t.screen.alt_grid]
+    for (buffer, grid) in [&mut t.vt.screen.grid, &mut t.vt.screen.alt_grid]
         .into_iter()
         .enumerate()
     {
@@ -32,40 +32,40 @@ fn seeded(cols: usize, rows: usize, variant: usize) -> TerminalState {
             }
         }
     }
-    t.screen.current_fg = Color::Magenta;
-    t.screen.current_bg = Color::Blue;
-    t.screen.current_flags.set_protected(true);
-    t.screen.current_hyperlink = HyperlinkId::from_raw(99);
-    t.screen.cursor_row = variant % rows;
-    t.screen.cursor_col = cols - 1;
-    t.screen.saved_cursor_row = rows + 1;
-    t.screen.saved_cursor_col = cols + 1;
-    t.screen.alt_cursor_row = rows + 2;
-    t.screen.alt_cursor_col = cols + 2;
-    t.screen.pending_wrap = true;
-    t.screen.g1_charset = Charset::DecSpecialGraphics;
-    t.screen.active_charset = Charset::DecSpecialGraphics;
-    t.screen.origin_mode = true;
-    t.screen.insert_mode = true;
-    t.screen.last_printed_char = Some('界');
-    t.screen.tab_stops.fill(false);
-    t.screen.tab_stops[cols - 1] = true;
-    t.screen.save_cursor_state(&t.protocol);
-    t.screen.saved_state.as_mut().unwrap().row = rows + 3;
-    t.screen.saved_state.as_mut().unwrap().col = cols + 3;
-    t.screen.saved_primary_screen_state = t.screen.saved_state.clone();
+    t.vt.screen.current_fg = Color::Magenta;
+    t.vt.screen.current_bg = Color::Blue;
+    t.vt.screen.current_flags.set_protected(true);
+    t.vt.screen.current_hyperlink = HyperlinkId::from_raw(99);
+    t.vt.screen.cursor_row = variant % rows;
+    t.vt.screen.cursor_col = cols - 1;
+    t.vt.screen.saved_cursor_row = rows + 1;
+    t.vt.screen.saved_cursor_col = cols + 1;
+    t.vt.screen.alt_cursor_row = rows + 2;
+    t.vt.screen.alt_cursor_col = cols + 2;
+    t.vt.screen.pending_wrap = true;
+    t.vt.screen.g1_charset = Charset::DecSpecialGraphics;
+    t.vt.screen.active_charset = Charset::DecSpecialGraphics;
+    t.vt.screen.origin_mode = true;
+    t.vt.screen.insert_mode = true;
+    t.vt.screen.last_printed_char = Some('界');
+    t.vt.screen.tab_stops.fill(false);
+    t.vt.screen.tab_stops[cols - 1] = true;
+    t.vt.screen.save_cursor_state(&t.vt.protocol);
+    t.vt.screen.saved_state.as_mut().unwrap().row = rows + 3;
+    t.vt.screen.saved_state.as_mut().unwrap().col = cols + 3;
+    t.vt.screen.saved_primary_screen_state = t.vt.screen.saved_state.clone();
     match variant % 4 {
         1 => {
-            t.screen.scroll_region_top = 1.min(rows - 1);
-            t.screen.scroll_region_bottom = rows - 1;
+            t.vt.screen.scroll_region_top = 1.min(rows - 1);
+            t.vt.screen.scroll_region_bottom = rows - 1;
         }
         2 => {
-            t.screen.scroll_region_top = rows + 2;
-            t.screen.scroll_region_bottom = 0;
+            t.vt.screen.scroll_region_top = rows + 2;
+            t.vt.screen.scroll_region_bottom = 0;
         }
         3 => {
-            t.screen.scroll_region_top = 0;
-            t.screen.scroll_region_bottom = rows + 2;
+            t.vt.screen.scroll_region_top = 0;
+            t.vt.screen.scroll_region_bottom = rows + 2;
         }
         _ => {}
     }
@@ -124,7 +124,7 @@ fn snapshot(t: &mut TerminalState) -> Snapshot {
         last_synced_primary_screen_snapshot
     );
     macro_rules! screen {
-        ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), format!("{:?}", t.screen.$field));)*};
+        ($($field:ident),* $(,)?) => {$(out.insert(stringify!($field).into(), format!("{:?}", t.vt.screen.$field));)*};
     }
     screen!(
         cursor_row,
@@ -153,17 +153,17 @@ fn snapshot(t: &mut TerminalState) -> Snapshot {
         insert_mode,
         last_printed_char
     );
-    out.insert("grid".into(), exact_rows(t.screen.grid.iter()));
-    out.insert("grid_ids".into(), format!("{:?}", t.screen.grid.row_ids()));
-    out.insert("wraps".into(), format!("{:?}", t.screen.grid.row_wrapped));
-    out.insert("hidden".into(), exact_rows(t.screen.alt_grid.iter()));
+    out.insert("grid".into(), exact_rows(t.vt.screen.grid.iter()));
+    out.insert("grid_ids".into(), format!("{:?}", t.vt.screen.grid.row_ids()));
+    out.insert("wraps".into(), format!("{:?}", t.vt.screen.grid.row_wrapped));
+    out.insert("hidden".into(), exact_rows(t.vt.screen.alt_grid.iter()));
     out.insert(
         "hidden_ids".into(),
-        format!("{:?}", t.screen.alt_grid.row_ids()),
+        format!("{:?}", t.vt.screen.alt_grid.row_ids()),
     );
     out.insert(
         "hidden_wraps".into(),
-        format!("{:?}", t.screen.alt_grid.row_wrapped),
+        format!("{:?}", t.vt.screen.alt_grid.row_wrapped),
     );
     out.insert(
         "history".into(),
@@ -244,9 +244,9 @@ fn cases() -> BTreeMap<String, Snapshot> {
         for blanks in 0..5 {
             for cursor in [0, 2, 4] {
                 let mut t = seeded(6, 5, cursor);
-                t.screen.use_alt_buffer = alt;
+                t.vt.screen.use_alt_buffer = alt;
                 for row in 5 - blanks..5 {
-                    t.screen.grid[row].fill(TerminalCell::default());
+                    t.vt.screen.grid[row].fill(TerminalCell::default());
                 }
                 prime(&mut t);
                 t.on_resize(4, 2);
@@ -261,8 +261,8 @@ fn cases() -> BTreeMap<String, Snapshot> {
     for style in ["bg", "fg", "link", "protected", "wrapped"] {
         let mut t = seeded(6, 5, 1);
         for row in 2..5 {
-            t.screen.grid[row].fill(TerminalCell::default());
-            for cell in &mut t.screen.grid[row] {
+            t.vt.screen.grid[row].fill(TerminalCell::default());
+            for cell in &mut t.vt.screen.grid[row] {
                 match style {
                     "bg" => cell.background = Color::Red,
                     "fg" => cell.foreground = Color::Red,
@@ -271,7 +271,7 @@ fn cases() -> BTreeMap<String, Snapshot> {
                     _ => {}
                 }
             }
-            t.screen.grid.row_wrapped[row] = true;
+            t.vt.screen.grid.row_wrapped[row] = true;
         }
         prime(&mut t);
         t.on_resize(6, 2);
@@ -281,7 +281,7 @@ fn cases() -> BTreeMap<String, Snapshot> {
         for sync in [false, true] {
             for cli in [false, true] {
                 let mut t = seeded(6, 5, 4);
-                t.screen.use_alt_buffer = alt;
+                t.vt.screen.use_alt_buffer = alt;
                 if sync {
                     t.process_input(b"\x1b[?2026h");
                 }
@@ -301,7 +301,7 @@ fn cases() -> BTreeMap<String, Snapshot> {
             t.set_max_scrollback(cap);
             for row in 0..3 {
                 t.push_scrollback_compressed(ScrollbackLine::compress(
-                    &t.screen.grid[row],
+                    &t.vt.screen.grid[row],
                     row % 2 == 0,
                 ));
             }
@@ -321,8 +321,8 @@ fn cases() -> BTreeMap<String, Snapshot> {
         for (cols, rows) in [(4, 2), (9, 7), (6, 5)] {
             let mut t = seeded(6, 5, 4);
             t.next_raw_row_id = next;
-            t.screen.grid.row_ids_mut()[1] = RawRowId::UNTRACKED;
-            t.screen.alt_grid.row_ids_mut()[0] = RawRowId::UNTRACKED;
+            t.vt.screen.grid.row_ids_mut()[1] = RawRowId::UNTRACKED;
+            t.vt.screen.alt_grid.row_ids_mut()[0] = RawRowId::UNTRACKED;
             prime(&mut t);
             t.on_resize(cols, rows);
             all.insert(format!("identity_{next}_{cols}_{rows}"), snapshot(&mut t));
@@ -342,7 +342,7 @@ fn cases() -> BTreeMap<String, Snapshot> {
             if alt {
                 t.process_input(b"\x1b[?1049h");
             }
-            t.screen.cursor_row = 4;
+            t.vt.screen.cursor_row = 4;
             prime(&mut t);
             t.on_resize(cols, rows);
             all.insert(format!("kitty_{alt}_{cols}_{rows}"), snapshot(&mut t));
@@ -415,9 +415,9 @@ fn height_shrink_keeps_the_saved_prompt_origin_on_its_live_row() {
     assert_eq!(terminal.scrollback.len(), 2);
 
     terminal.process_input(b"\x1b8\x1b[Jrepaint");
-    assert_eq!(terminal.screen.grid[0][0].character, 'o');
-    assert_eq!(terminal.screen.grid[1][0].character, 'r');
-    assert_eq!(terminal.screen.grid[2][0].character, ' ');
+    assert_eq!(terminal.vt.screen.grid[0][0].character, 'o');
+    assert_eq!(terminal.vt.screen.grid[1][0].character, 'r');
+    assert_eq!(terminal.vt.screen.grid[2][0].character, ' ');
 }
 
 #[test]

@@ -1,4 +1,9 @@
-pub mod agent;
+pub(crate) mod terminal_attachment;
+mod terminal_views;
+mod observer;
+mod observer_window;
+mod observer_identity;
+mod agent;
 mod agent_cli;
 mod agent_panel;
 mod ai_chat_panel;
@@ -1119,9 +1124,8 @@ fn write_paste_to_session(
         .map_err(PasteWriteError::Write)?;
     let mut terminal = session.terminal.lock();
     terminal.note_user_input(&paste.bytes);
-    terminal.scroll_to_bottom();
     drop(terminal);
-    session.projection_view_state.scroll_to_bottom();
+    session.scroll_after_input();
     Ok(true)
 }
 
@@ -2580,6 +2584,212 @@ struct FsDeleteDialog {
 }
 
 impl TerminalApp {
+    /// Apply owner effects identically with or without a painted root frame.
+    fn dispatch_runtime_effects(
+        &mut self, ctx: &egui::Context,
+        background_pump: &mut session_manager::BackgroundPumpResult,
+        visible_sessions: &[usize], window_focused: bool, hidden: bool,
+    ) -> bool {
+        for (session_idx, completed) in background_pump.completed_command_events.drain(..) {
+            if let Some(session) = self.session_manager.sessions().get(session_idx) {
+                self.agent_panel
+                    .handle_completed(&session.metadata.session_id, &completed);
+                self.command_correction.handle_completed(
+                    &self.config,
+                    self.agent_panel.session_active(),
+                    &session.metadata.session_id,
+                    &completed,
+                );
+                self.git_strip_cache
+                    .mark_command_finished(&session.metadata.session_id);
+            }
+            // A visible split pane is watched exactly when the window itself
+            // has focus; a hidden tab is never watched.
+            maybe_notify_long_command(
+                &self.config,
+                &mut self.notification_window_started,
+                &mut self.notifications_in_window,
+                &completed,
+                window_focused && visible_sessions.contains(&session_idx),
+            );
+            record_command_history(&self.config, &completed);
+            if let Err(error) = execution_journal::submit(completed) {
+                log::warn!("jsh execution output journal queue rejected an event: {error:?}");
+            }
+        }
+        for (session_idx, error) in background_pump.errors.drain(..) {
+            log::warn!("background session {}: {}", session_idx + 1, error);
+        }
+        if self.config.osc52_clipboard_read {
+            for (session_idx, requests) in background_pump.clipboard_requests.drain(..) {
+                let response_tx = self.session_manager.protocol_response_sender(session_idx);
+                if let Some(session) = self.session_manager.get_session_mut(session_idx) {
+                    if let Some(response_tx) = response_tx {
+                        service_osc5522_clipboard_requests(
+                            self.clipboard.is_some(),
+                            &self.osc52_read_allowed,
+                            &self.clipboard_request_in_flight,
+                            Arc::clone(&session.terminal),
+                            response_tx,
+                            requests,
+                        );
+                    }
+                }
+            }
+        } else {
+            for (session_idx, requests) in background_pump.clipboard_requests.drain(..) {
+                let response_tx = self.session_manager.protocol_response_sender(session_idx);
+                if let Some(session) = self.session_manager.get_session_mut(session_idx) {
+                    if let Some(response_tx) = response_tx {
+                        for _ in &requests {
+                            enqueue_terminal_protocol_response(
+                                &response_tx,
+                                &session.terminal,
+                                osc_5522_packet("type=read:status=EPERM", None),
+                                "OSC 5522 read-disabled response",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if self.config.osc52_clipboard_write {
+            for (_session_idx, text) in background_pump.osc52_writes.drain(..) {
+                enqueue_osc52_clipboard_write(
+                    self.osc52_clipboard_write_tx.as_ref(),
+                    &mut self.osc52_write_window_started,
+                    &mut self.osc52_writes_in_window,
+                    text,
+                );
+            }
+        }
+        for (session_idx, terminator) in background_pump.osc52_queries.drain(..) {
+            let response_route = self
+                .session_manager
+                .protocol_response_sender(session_idx)
+                .zip(
+                    self.session_manager
+                        .sessions()
+                        .get(session_idx)
+                        .map(|session| Arc::clone(&session.terminal)),
+                );
+            if let Some((response_tx, terminal)) = response_route {
+                if self.config.osc52_clipboard_read {
+                    service_osc52_clipboard_query(
+                        self.clipboard.is_some(),
+                        &self.osc52_read_allowed,
+                        &self.clipboard_request_in_flight,
+                        terminal,
+                        response_tx,
+                        terminator,
+                        &mut self.osc52_read_rate_limit,
+                    );
+                } else {
+                    enqueue_terminal_protocol_response(
+                        &response_tx,
+                        &terminal,
+                        osc52_clipboard_response_with_limit(
+                            "",
+                            MAX_OSC52_CLIPBOARD_RESPONSE_BYTES,
+                            terminator,
+                        ),
+                        "OSC 52 read-disabled response",
+                    );
+                }
+            }
+        }
+        for (_session_idx, title, body) in background_pump.notifications.drain(..) {
+            show_desktop_notification(
+                self.notification_tx.as_ref(),
+                &mut self.notification_window_started,
+                &mut self.notifications_in_window,
+                title,
+                body,
+            );
+        }
+        for session_idx in background_pump.bells.drain(..) {
+            if let Some(session) = self.session_manager.get_session_mut(session_idx) {
+                let title = session.metadata.name.clone();
+                maybe_notify_bell(window_focused, &mut session.last_bell_toast, &title);
+            }
+        }
+        // 按稳定 ID 而不是索引关闭:关掉一个会话会让它之后的索引整体左移,
+        // 而关掉一个只剩一个窗格的 tab 还会连带关掉该 tab 的其他会话,索引
+        // 可能往任意方向漂移。ID 查不到就说明它已经被前一次关闭带走了。
+        // 在关闭 tab 前先把真实 child wait status 交给 TaskManager，否则
+        // opaque Agent PTY 只能得到一个无意义的“消失了”状态。
+        let mut background_exit_notice = None;
+        for exited in std::mem::take(&mut background_pump.exited_sessions) {
+            let had_exit_notice = exited.exit_output_notice.is_some();
+            let session_id = exited.session_id;
+            let exit_code = exited.exit_code;
+            if exited.exit_output_notice.is_some() {
+                background_exit_notice = exited.exit_output_notice;
+            }
+            if let Some(editor) = self.vim9_editors.remove(&session_id) {
+                editor.session.revoke();
+            }
+            if self.finish_shell_vim_exit(&session_id, exit_code, ctx) {
+                if let Some(notice) = background_exit_notice {
+                    self.set_status_for(notice, Duration::from_secs(8));
+                    ctx.request_repaint();
+                }
+                return true;
+            }
+            if self.handle_agent_session_terminal_exit(&session_id) {
+                continue;
+            }
+            let terminal_role = self.task_manager.terminal_role_for_session(&session_id);
+            let task_terminal = self.handle_task_terminal_exit(&session_id, exit_code);
+            let Some(session_idx) = self.session_manager.index_of(&session_id) else {
+                continue;
+            };
+            if terminal_role == Some(crate::agent::TaskTerminalRole::Agent) {
+                self.session_manager.retain_exited_command(&session_id);
+                continue;
+            }
+            if task_terminal && self.session_manager.retain_exited_command(&session_id) {
+                continue;
+            }
+            if hidden && session_idx == self.session_manager.active_index() {
+                if self.session_manager.len() == 1 && exit_code.is_some_and(|code| code != 0)
+                    && self.session_manager.sessions()[session_idx].shell.uptime() < SHELL_STARTUP_GRACE {
+                    self.status_message = format!(
+                        "Shell failed to start (exit code {}). Check the `shell` setting in the config panel.", exit_code.unwrap());
+                    if let Some(notice) = background_exit_notice.take() {
+                        self.status_message.push(' ');
+                        self.status_message.push_str(&notice);
+                    }
+                    self.status_expires_at = None;
+                    self.session_manager.retain_failed_startup(&session_id);
+                    continue;
+                }
+                if had_exit_notice && self.session_manager.len() == 1
+                    && self.session_manager.retain_incomplete_exit(&session_id) {
+                    continue;
+                }
+                if self.session_manager.len() == 1 {
+                    if self.organism.eva.can_close_now() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        ctx.request_repaint();
+                    }
+                    continue;
+                }
+            }
+            if self.session_manager.len() > 1
+                && (hidden || session_idx != self.session_manager.active_index())
+            {
+                self.close_session_or_owning_tab(session_idx);
+                self.schedule_session_save();
+            }
+        }
+        if let Some(notice) = background_exit_notice {
+            self.set_status_for(notice, Duration::from_secs(8));
+        }
+        false
+    }
+
     /// Route click-to-cursor arrows produced by the previous render before
     /// collecting any input from this frame. The terminal pointer is a stable
     /// identity tag while the session owns its `Arc`; stale/unroutable bytes
@@ -2893,6 +3103,8 @@ impl TerminalApp {
 
         Ok(TerminalApp {
             session_manager,
+            observers: Vec::new(),
+            observer_serial: 0,
             vim9_editors,
             vim9_window_close_pending: false,
             window_close_confirmation: None,
@@ -5224,7 +5436,7 @@ impl TerminalApp {
         crate::theme::configure_popup_text(ui, font_size);
         let multi = targets.len() > 1;
         if let Some((path, false)) = entry {
-            if files_are_local && !multi && ui.button("Preview file").clicked() {
+            if !multi && ui.button("Preview file").clicked() {
                 *menu = Some(FsMenuAction::Preview(path.to_path_buf()));
                 ui.close();
             }
@@ -5416,14 +5628,14 @@ impl TerminalApp {
             }
             FsMenuAction::Open(path) => self.open_workspace_file(path, false),
             FsMenuAction::Preview(path) => {
-                if !self.sidebar.location().is_remote() {
-                    let session_id = self
-                        .session_manager
-                        .get_active_session_mut()
-                        .metadata
-                        .session_id
-                        .clone();
-                    self.local_preview_panel.open_tree_file(session_id, path);
+                let session_id=self.session_manager.get_active_session_mut().metadata.session_id.clone();
+                if self.sidebar.location().is_remote() {
+                    match self.sidebar.preview_remote_target() {
+                        Ok((host,label,context))=>self.local_preview_panel.open_remote_tree_file(session_id,path,host,label,context),
+                        Err(error)=>self.set_status(error),
+                    }
+                } else {
+                    self.local_preview_panel.open_tree_file(session_id,path);
                 }
             }
             FsMenuAction::Refresh(dir) => {
@@ -5884,6 +6096,7 @@ impl TerminalApp {
         self.render_reference_optional_controls(root_ui);
         self.render_reference_rail(root_ui);
         self.render_reference_navigation_scrim(root_ui);
+        self.local_preview_panel.validate_files_source(&self.sidebar);
         self.local_preview_panel.poll(root_ui.ctx());
         let preview_was_open = self.active_file_preview_is_open();
         self.render_reference_inspector(root_ui);
@@ -5932,6 +6145,9 @@ impl TerminalApp {
             ctx.data_mut(|data| data.remove_temp::<String>(egui::Id::new("reference-tool-request")))
         {
             match intent.as_str() {
+                "observer" => {
+                    if let Some(index)=ctx.data_mut(|data|data.remove_temp::<usize>(egui::Id::new("read-only-observer-request"))) { self.open_read_only_observer(index); }
+                }
                 "terminal" => self.return_focus_to_terminal(ctx),
                 "search" => self.search_state.open(),
                 "files" => {
@@ -5983,6 +6199,14 @@ impl eframe::App for TerminalApp {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if raw_input.viewport_id != egui::ViewportId::ROOT {
+            // Child viewers have no keyboard, drop, scroll or global zoom authority.
+            // Keep only pointer events for their own Close observer button.
+            raw_input.events.retain(|event|matches!(event,egui::Event::PointerMoved(_) | egui::Event::PointerButton{..} | egui::Event::PointerGone));
+            raw_input.dropped_files.clear();
+            raw_input.hovered_files.clear();
+            return;
+        }
         // Remove Ctrl+wheel before egui creates global zoom or scroll velocity.
         self.font_zoom
             .collect(&mut raw_input.events, raw_input.focused);
@@ -6077,15 +6301,61 @@ impl eframe::App for TerminalApp {
             ui_owns_clipboard,
         );
         self.prepare_terminal_ime_input(ctx, raw_input);
+        self.service_terminal_ime_reset(ctx);
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.viewport_id()!=egui::ViewportId::ROOT {return;}
         self.poll_shell_vim(ctx);
         self.guard_window_close(ctx);
         self.observe_organism_visibility(ctx);
+        self.service_terminal_ime_reset(ctx);
+    }
+
+    fn logic_only(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.logic(ctx, frame);
+        if ctx.viewport_id() != egui::ViewportId::ROOT { return; }
+        // No UI pass runs: never replay the last frame's keyboard/IME events,
+        // resize the PTY, publish a fake presentation, or touch observer input.
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            if self.organism.eva.can_close_now() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else { ctx.request_repaint(); }
+            return;
+        }
+        // Complete already-admitted mouse controls in order, without deriving
+        // new controls from the stale last UI frame.
+        let pending_mouse_result = self.terminal_mouse_capture.as_mut()
+            .filter(|capture| capture.reported_to_app && !capture.pending_controls.is_empty())
+            .map(|capture| flush_mouse_controls(capture, &self.osc_paste_input_barriers));
+        let retire_mouse = pending_mouse_result.as_ref().is_some_and(|result|
+            result.as_ref().err().is_some_and(|error| !error.is_backpressure()))
+            || self.terminal_mouse_capture.as_ref().is_some_and(mouse_capture_is_complete);
+        if let Some(Err(error)) = pending_mouse_result {
+            log::warn!("hidden terminal mouse report: {error}");
+        }
+        if retire_mouse {
+            self.terminal_mouse_capture = None;
+            self.last_terminal_mouse_motion = None;
+        }
+        let barrier = self.terminal_mouse_capture.as_ref()
+            .filter(|capture| capture.reported_to_app && !capture.pending_controls.is_empty())
+            .map(|capture| capture.session_id.clone());
+        for session in self.session_manager.sessions() {
+            session.terminal.lock().set_host_window_focused(false);
+        }
+        let mut pump = self.session_manager.pump_all_sessions(
+            self.adaptive_frame_budget, barrier.as_deref(), &self.osc_paste_input_barriers,
+        );
+        self.dispatch_runtime_effects(ctx, &mut pump, &[], false, true);
+        // PTY wakeups normally schedule us. A bounded timer also services silent
+        // protocol timeouts and writer completion races without busy polling.
+        if pump.has_more { ctx.request_repaint(); }
+        else { ctx.request_repaint_after(Duration::from_millis(100)); }
     }
 
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if root_ui.ctx().viewport_id()!=egui::ViewportId::ROOT {return;}
         // eframe 0.35 起将原来的 App::update 拆成了 `logic` 和 `ui` 两段:
         // 这里把整个 update 的逻辑迁到 ui 中。许多下游代码(viewport 命令、输入查询、重绘请求)
         // 仍需要 &Context,从 root_ui 上 clone 一份(Arc 引用计数,几乎零成本)即可,
@@ -6202,174 +6472,8 @@ impl eframe::App for TerminalApp {
                 .lock()
                 .set_host_window_focused(window_focused);
         }
-        for (session_idx, completed) in background_pump.completed_command_events.drain(..) {
-            if let Some(session) = self.session_manager.sessions().get(session_idx) {
-                self.agent_panel
-                    .handle_completed(&session.metadata.session_id, &completed);
-                self.command_correction.handle_completed(
-                    &self.config,
-                    self.agent_panel.session_active(),
-                    &session.metadata.session_id,
-                    &completed,
-                );
-                self.git_strip_cache
-                    .mark_command_finished(&session.metadata.session_id);
-            }
-            // A visible split pane is watched exactly when the window itself
-            // has focus; a hidden tab is never watched.
-            maybe_notify_long_command(
-                &self.config,
-                &mut self.notification_window_started,
-                &mut self.notifications_in_window,
-                &completed,
-                window_focused && visible_sessions.contains(&session_idx),
-            );
-            record_command_history(&self.config, &completed);
-            if let Err(error) = execution_journal::submit(completed) {
-                log::warn!("jsh execution output journal queue rejected an event: {error:?}");
-            }
-        }
-        for (session_idx, error) in background_pump.errors.drain(..) {
-            log::warn!("background session {}: {}", session_idx + 1, error);
-        }
-        if self.config.osc52_clipboard_read {
-            for (session_idx, requests) in background_pump.clipboard_requests.drain(..) {
-                let response_tx = self.session_manager.protocol_response_sender(session_idx);
-                if let Some(session) = self.session_manager.get_session_mut(session_idx) {
-                    if let Some(response_tx) = response_tx {
-                        service_osc5522_clipboard_requests(
-                            self.clipboard.is_some(),
-                            &self.osc52_read_allowed,
-                            &self.clipboard_request_in_flight,
-                            Arc::clone(&session.terminal),
-                            response_tx,
-                            requests,
-                        );
-                    }
-                }
-            }
-        } else {
-            for (session_idx, requests) in background_pump.clipboard_requests.drain(..) {
-                let response_tx = self.session_manager.protocol_response_sender(session_idx);
-                if let Some(session) = self.session_manager.get_session_mut(session_idx) {
-                    if let Some(response_tx) = response_tx {
-                        for _ in &requests {
-                            enqueue_terminal_protocol_response(
-                                &response_tx,
-                                &session.terminal,
-                                osc_5522_packet("type=read:status=EPERM", None),
-                                "OSC 5522 read-disabled response",
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        if self.config.osc52_clipboard_write {
-            for (_session_idx, text) in background_pump.osc52_writes.drain(..) {
-                enqueue_osc52_clipboard_write(
-                    self.osc52_clipboard_write_tx.as_ref(),
-                    &mut self.osc52_write_window_started,
-                    &mut self.osc52_writes_in_window,
-                    text,
-                );
-            }
-        }
-        for (session_idx, terminator) in background_pump.osc52_queries.drain(..) {
-            let response_route = self
-                .session_manager
-                .protocol_response_sender(session_idx)
-                .zip(
-                    self.session_manager
-                        .sessions()
-                        .get(session_idx)
-                        .map(|session| Arc::clone(&session.terminal)),
-                );
-            if let Some((response_tx, terminal)) = response_route {
-                if self.config.osc52_clipboard_read {
-                    service_osc52_clipboard_query(
-                        self.clipboard.is_some(),
-                        &self.osc52_read_allowed,
-                        &self.clipboard_request_in_flight,
-                        terminal,
-                        response_tx,
-                        terminator,
-                        &mut self.osc52_read_rate_limit,
-                    );
-                } else {
-                    enqueue_terminal_protocol_response(
-                        &response_tx,
-                        &terminal,
-                        osc52_clipboard_response_with_limit(
-                            "",
-                            MAX_OSC52_CLIPBOARD_RESPONSE_BYTES,
-                            terminator,
-                        ),
-                        "OSC 52 read-disabled response",
-                    );
-                }
-            }
-        }
-        for (_session_idx, title, body) in background_pump.notifications.drain(..) {
-            show_desktop_notification(
-                self.notification_tx.as_ref(),
-                &mut self.notification_window_started,
-                &mut self.notifications_in_window,
-                title,
-                body,
-            );
-        }
-        for session_idx in background_pump.bells.drain(..) {
-            if let Some(session) = self.session_manager.get_session_mut(session_idx) {
-                let title = session.metadata.name.clone();
-                maybe_notify_bell(window_focused, &mut session.last_bell_toast, &title);
-            }
-        }
-        // 按稳定 ID 而不是索引关闭:关掉一个会话会让它之后的索引整体左移,
-        // 而关掉一个只剩一个窗格的 tab 还会连带关掉该 tab 的其他会话,索引
-        // 可能往任意方向漂移。ID 查不到就说明它已经被前一次关闭带走了。
-        // 在关闭 tab 前先把真实 child wait status 交给 TaskManager，否则
-        // opaque Agent PTY 只能得到一个无意义的“消失了”状态。
-        let mut background_exit_notice = None;
-        for exited in std::mem::take(&mut background_pump.exited_sessions) {
-            let session_id = exited.session_id;
-            let exit_code = exited.exit_code;
-            if exited.exit_output_notice.is_some() {
-                background_exit_notice = exited.exit_output_notice;
-            }
-            if let Some(editor) = self.vim9_editors.remove(&session_id) {
-                editor.session.revoke();
-            }
-            if self.finish_shell_vim_exit(&session_id, exit_code, ctx) {
-                if let Some(notice) = background_exit_notice {
-                    self.set_status_for(notice, Duration::from_secs(8));
-                    ctx.request_repaint();
-                }
-                return;
-            }
-            if self.handle_agent_session_terminal_exit(&session_id) {
-                continue;
-            }
-            let terminal_role = self.task_manager.terminal_role_for_session(&session_id);
-            let task_terminal = self.handle_task_terminal_exit(&session_id, exit_code);
-            let Some(session_idx) = self.session_manager.index_of(&session_id) else {
-                continue;
-            };
-            if terminal_role == Some(crate::agent::TaskTerminalRole::Agent) {
-                self.session_manager.retain_exited_command(&session_id);
-                continue;
-            }
-            if task_terminal && self.session_manager.retain_exited_command(&session_id) {
-                continue;
-            }
-            if self.session_manager.len() > 1 && session_idx != self.session_manager.active_index()
-            {
-                self.close_session_or_owning_tab(session_idx);
-                self.schedule_session_save();
-            }
-        }
-        if let Some(notice) = background_exit_notice {
-            self.set_status_for(notice, Duration::from_secs(8));
+        if self.dispatch_runtime_effects(ctx, &mut background_pump, &visible_sessions, window_focused, false) {
+            return;
         }
         let background_processed_bytes = background_pump.bytes_processed;
         let active_output_budget = self
@@ -6994,8 +7098,7 @@ impl eframe::App for TerminalApp {
             )
             .is_some();
             if !user_input_flush_blocked && !session.pending_input.is_empty() {
-                session.terminal.lock().scroll_to_bottom();
-                session.projection_view_state.scroll_to_bottom();
+                session.scroll_after_input();
                 match session.shell.write(&session.pending_input) {
                     Ok(()) => session.pending_input.clear(),
                     Err(error) => {
@@ -8837,6 +8940,9 @@ impl eframe::App for TerminalApp {
         if active_session_is_live_for_follow {
             self.update_ssh_files_follow(ctx, frame_start_files_user_intent);
         }
+        self.render_read_only_observers(ctx);
+        self.retire_terminal_view_focus(ctx);
+        self.finish_terminal_ime_reset(ctx);
     }
 }
 
@@ -8845,9 +8951,9 @@ impl Drop for TerminalApp {
         // 保存 agent 会话（取消/清空会话时会删除快照文件）
         self.agent_panel.persist();
 
-        // 取消聊天面板在途请求并落盘聊天库（仅在面板曾成功加载、且本窗口是
-        // 持锁主实例时写入；加载失败的旧文件绝不覆盖）。
-        self.ai_chat_panel.cancel_all();
+        // Closing this window releases its views. The shared host continues
+        // running admitted API work and keeps its durable drafts and results.
+        self.ai_chat_panel.detach_hosted_views();
         self.ai_chat_panel.persist();
 
         // 保存配置

@@ -28,6 +28,8 @@ pub(crate) struct Ownership {
     owner: Option<Owner>,
     composition: Composition,
     enter_claimed: bool,
+    native_reset_pending: bool,
+    native_restore_pending: bool,
 }
 impl Ownership {
     /// Epoch catches A -> B -> A; instance is a live terminal allocation, not an index.
@@ -38,10 +40,27 @@ impl Ownership {
         self.owner = owner;
         if matches!(self.composition, Composition::Active { .. }) {
             self.composition = Composition::Cancelled { closed: false };
+            // The system engine still owns its composition until its native
+            // input context is reset; clearing our painted overlay is not enough.
+            self.native_reset_pending = true;
             return true;
         }
         false
     }
+    /// Retire the native context once per cancelled composition. Taking the
+    /// request never admits its old Commit; the ownership tombstone remains.
+    pub fn take_native_reset(&mut self) -> bool {
+        let pending = std::mem::take(&mut self.native_reset_pending);
+        self.native_restore_pending |= pending;
+        pending
+    }
+
+    /// Restore the actual current UI's IME policy only after its pass. A
+    /// logic-only update leaves native input disabled until the UI returns.
+    pub fn take_native_restore(&mut self) -> bool {
+        std::mem::take(&mut self.native_restore_pending)
+    }
+
     /// Filter cancelled terminal events before modal routing. Idle overlay IME
     /// stays untouched; an old Commit there retires exactly the old tombstone.
     pub fn admit(&mut self, event: Event) -> bool {
@@ -95,6 +114,7 @@ impl Ownership {
             Composition::Idle | Composition::Cancelled { closed: true }
         ) {
             self.composition = Composition::Cancelled { closed: false };
+            self.native_reset_pending = true;
             self.enter_claimed = false;
         }
     }
@@ -124,6 +144,39 @@ mod tests {
         Some(Owner { epoch, instance })
     }
     const PREEDIT: Event = Event::Preedit { empty: false };
+    #[test]
+    fn unowned_late_preedit_resets_native_context_without_admitting_its_commit() {
+        let mut state = Ownership::default();
+        state.sync(owner(1, 10));
+        state.reject_unowned_preedit();
+        assert!(state.take_native_reset());
+        assert!(!state.take_native_reset());
+        assert!(state.take_native_restore());
+        assert!(!state.take_native_restore());
+        assert!(!state.admit(Event::Commit));
+        assert!(state.admit(Event::Opened));
+        assert!(state.admit(PREEDIT));
+        assert!(state.admit(Event::Commit));
+    }
+
+    #[test]
+    fn native_reset_preserves_late_commit_quarantine_and_is_bounded() {
+        let mut state = Ownership::default();
+        state.sync(owner(1, 10));
+        state.sync(owner(2, 20));
+        assert!(!state.take_native_reset(), "idle pane changes do not reset native input");
+        assert!(state.admit(PREEDIT));
+        state.sync(owner(3, 30));
+        assert!(state.take_native_reset());
+        assert!(!state.take_native_reset(), "only one native request per cancellation");
+        state.sync(owner(4, 40));
+        assert!(!state.take_native_reset());
+        assert!(!state.admit(Event::Commit), "taking reset cannot expose the old owner's text");
+        assert!(state.admit(Event::Opened));
+        assert!(state.admit(PREEDIT));
+        assert!(state.admit(Event::Commit), "a genuinely new native cycle remains usable");
+    }
+
     #[test]
     fn empty_without_commit_recovers_enter_while_retaining_commit_owner() {
         let mut s = Ownership::default();

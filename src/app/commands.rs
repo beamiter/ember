@@ -2672,7 +2672,7 @@ impl TerminalApp {
                             .finished_at
                             .and_then(crate::block_mode::epoch_secs)
                             .map(|seconds| seconds.saturating_mul(1_000)),
-                        terminal.screen.grid.row_len(),
+                        terminal.vt.screen.grid.row_len(),
                         record.start_mark_seen,
                         record.completion_provenance,
                     )
@@ -3139,6 +3139,15 @@ impl TerminalApp {
             return;
         };
         if !state.submit_with(|target, command| {
+            // The form belongs to the pane that opened it, even if the user
+            // changed tabs or focused another split while entering arguments.
+            let original = self
+                .session_manager
+                .index_of(target)
+                .ok_or_else(|| "The workflow's original terminal is unavailable".to_owned())?;
+            if original != self.session_manager.active_index() && !self.activate_session(original) {
+                return Err("The workflow's original terminal is unavailable".to_owned());
+            }
             self.try_fill_prompt_with_history_command(command, Some(target))
         }) {
             self.workflow_args = Some(state);

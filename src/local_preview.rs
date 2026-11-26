@@ -111,6 +111,18 @@ pub fn load(path: &Path) -> Result<PreviewContent, String> {
     if bytes.len() as u64 > limit {
         return Err("Preview file grew beyond its byte budget".into());
     }
+    decode_bytes(bytes)
+}
+
+/// One decoder and byte/unsafe-text policy for local and authenticated remote bytes.
+pub(crate) fn decode_bytes(bytes: Vec<u8>) -> Result<PreviewContent, String> {
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err("Preview exceeds its byte budget".into());
+    }
+    let format = raster_format(&bytes[..bytes.len().min(12)]);
+    if format.is_none() && bytes.len() as u64 > MAX_TEXT_BYTES {
+        return Err("Text preview exceeds the 1 MiB limit".into());
+    }
     if let Some(format) = format {
         decode_raster(bytes, format).map(PreviewContent::Image)
     } else {

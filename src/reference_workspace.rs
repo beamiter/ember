@@ -1713,8 +1713,8 @@ impl TerminalApp {
                 .find(|record| record.start_mark_seen || record.complete);
             (
                 terminal.current_working_dir.clone(),
-                terminal.screen.grid.row_len(),
-                terminal.screen.grid.rows(),
+                terminal.vt.screen.grid.row_len(),
+                terminal.vt.screen.grid.rows(),
                 latest.map(|record| {
                     (
                         inspector_context_text(
@@ -2231,6 +2231,17 @@ impl TerminalApp {
                             let more = header_action(ui, Icon::More, "Session tools");
                             let visible = egui::Popup::menu(&more)
                                 .show(|ui| {
+                                    let session=&self.session_manager.sessions()[self.session_manager.active_index()];
+                                    let ticket=session.shell.view_ticket();let attached=session.shell.view_attached();
+                                    if ui.button(if attached{"Detach terminal view"}else{"Reattach terminal view"}).clicked(){
+                                        self.change_terminal_view(ui.ctx(),ticket,!attached);ui.close();
+                                    }
+                                    if ui.button("Open read-only observer").clicked() {
+                                        // This header belongs to the currently selected pane.
+                                        // Capture its generation now; no deferred active-pane lookup.
+                                        self.open_read_only_observer(self.session_manager.active_index());
+                                        ui.close();
+                                    }
                                     if ui.button("Command launcher").clicked() {
                                         self.command_palette.open();
                                         ui.close();

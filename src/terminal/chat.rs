@@ -16,7 +16,7 @@ impl super::TerminalState {
             prompt_ready: self.shell_is_prompt_ready(),
             command_running: current
                 .is_some_and(|record| !record.complete && record.state == CommandState::Running),
-            alternate_screen: self.screen.use_alt_buffer,
+            alternate_screen: self.vt.screen.use_alt_buffer,
         })
     }
 
@@ -144,11 +144,11 @@ impl super::TerminalState {
             let start = source
                 .start
                 .saturating_sub(grid_base)
-                .min(self.screen.grid.rows());
+                .min(self.vt.screen.grid.rows());
             let end = source
                 .end
                 .saturating_sub(grid_base)
-                .min(self.screen.grid.rows());
+                .min(self.vt.screen.grid.rows());
             self.row_versions[start..end].hash(&mut hash);
         }
         hash.finish()
@@ -162,11 +162,11 @@ impl super::TerminalState {
             return self.scrollback[absolute].reflow_content_len();
         }
         let row = absolute - self.scrollback.len();
-        if self.screen.grid.row_wrapped[row] {
-            return self.screen.grid.row_len();
+        if self.vt.screen.grid.row_wrapped[row] {
+            return self.vt.screen.grid.row_len();
         }
         let blank = TerminalCell::default();
-        self.screen.grid[row]
+        self.vt.screen.grid[row]
             .iter()
             .rposition(|cell| {
                 cell.character != blank.character
@@ -326,7 +326,7 @@ impl super::TerminalState {
                     .document_rows()
                     .saturating_sub(start)
                     .saturating_add(decorated_rows)
-                    < self.screen.grid.rows()
+                    < self.vt.screen.grid.rows()
                 {
                     if let Some(before) = plan.rows[start].raw_slices.first().and_then(|slice| {
                         slice.origin.map(|origin| RawCellAnchor {
@@ -486,11 +486,11 @@ impl super::TerminalState {
             .find_map(|span| {
                 let end = span.raw_start.column.saturating_add(span.len);
                 (span.raw_start.row_id == cursor_row_id
-                    && (span.raw_start.column..end).contains(&self.screen.cursor_col))
+                    && (span.raw_start.column..end).contains(&self.vt.screen.cursor_col))
                 .then(|| {
                     DisplayPoint::new(
                         span.display_start.row,
-                        span.display_start.column + self.screen.cursor_col - span.raw_start.column,
+                        span.display_start.column + self.vt.screen.cursor_col - span.raw_start.column,
                     )
                 })
             })

@@ -793,7 +793,11 @@ impl Painter {
             let start = web_time::Instant::now();
             #[cfg(target_os = "linux")]
             let published = if feedback_pass.is_some() {
-                wgpu_hal::vulkan::publication::observe(|| render_state.queue.present(output_frame)).1
+                if window.native_frame_feedback_is_surface_bound() {
+                    wgpu_hal::vulkan::publication::observe_submission(|| render_state.queue.present(output_frame)).1
+                } else {
+                    wgpu_hal::vulkan::publication::observe(|| render_state.queue.present(output_frame)).1
+                }
             } else {
                 render_state.queue.present(output_frame);
                 false

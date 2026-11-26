@@ -1,4 +1,4 @@
-//! Read-only local previews, with one worker and one current inspector page.
+//! Read-only source-bound previews, with one worker and one current inspector page.
 use crate::local_reference::SourceLocationCandidate;
 use crate::preview_navigation::{match_background, ImageZoom, SourceMatches};
 use std::path::{Path, PathBuf};
@@ -8,6 +8,14 @@ use std::sync::mpsc::{self, Receiver};
 struct ReadTarget {
     path: PathBuf,
     fallback: Option<(PathBuf, SourceLocationCandidate)>,
+    remote: Option<RemoteRead>,
+}
+
+#[derive(Clone)]
+struct RemoteRead {
+    host: jterm_core::jsh_remote::RemoteHostConfig,
+    label: String,
+    context: crate::sidebar::FilesIntentContext,
 }
 
 impl ReadTarget {
@@ -15,6 +23,7 @@ impl ReadTarget {
         Self {
             path,
             fallback: None,
+            remote: None,
         }
     }
 
@@ -40,10 +49,17 @@ impl ReadTarget {
             .source_location
             .map(|location| join(&location.path).map(|path| (path, location)))
             .transpose()?;
-        Ok(Self { path, fallback })
+        Ok(Self {
+            path,
+            fallback,
+            remote: None,
+        })
     }
 
     fn resolve(self) -> Result<(PathBuf, Option<SourceLocationCandidate>), String> {
+        if self.remote.is_some() {
+            return Ok((self.path, None));
+        }
         match std::fs::symlink_metadata(&self.path) {
             Ok(_) => Ok((self.path, None)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => self
@@ -62,6 +78,7 @@ struct LoadedPreview {
     path: PathBuf,
     location: Option<SourceLocationCandidate>,
     content: crate::local_preview::PreviewContent,
+    remote: Option<RemoteRead>,
 }
 
 struct PreviewText {
@@ -130,6 +147,41 @@ impl LocalPreviewPanel {
         self.start_read();
     }
 
+    pub(crate) fn open_remote_tree_file(
+        &mut self,
+        session_id: String,
+        path: PathBuf,
+        host: jterm_core::jsh_remote::RemoteHostConfig,
+        label: String,
+        context: crate::sidebar::FilesIntentContext,
+    ) {
+        if !path.is_absolute() {
+            return;
+        }
+        self.present(session_id, &path);
+        self.last_request = Some(ReadTarget {
+            path,
+            fallback: None,
+            remote: Some(RemoteRead {
+                host,
+                label,
+                context,
+            }),
+        });
+        self.start_read();
+    }
+
+    pub(crate) fn validate_files_source(&mut self, sidebar: &crate::sidebar::Sidebar) {
+        let stale = self
+            .last_request
+            .as_ref()
+            .and_then(|target| target.remote.as_ref())
+            .is_some_and(|remote| !sidebar.files_intent_is_current(&remote.context));
+        if stale {
+            self.close();
+        }
+    }
+
     fn present(&mut self, session_id: String, path: &Path) {
         self.close();
         self.session_id = session_id;
@@ -155,13 +207,32 @@ impl LocalPreviewPanel {
         if std::thread::Builder::new()
             .name("local-file-preview".into())
             .spawn(move || {
-                let _ = tx.send(worker_target.resolve().and_then(|(path, location)| {
-                    crate::local_preview::load(&path).map(|content| LoadedPreview {
+                let result = if let Some(remote) = worker_target.remote.clone() {
+                    let path = worker_target.path;
+                    crate::remote_fs::read_preview(
+                        &remote.host,
+                        &path,
+                        crate::local_preview::MAX_IMAGE_BYTES,
+                    )
+                    .map_err(|error| error.to_string())
+                    .and_then(crate::local_preview::decode_bytes)
+                    .map(|content| LoadedPreview {
                         path,
-                        location,
+                        location: None,
                         content,
+                        remote: Some(remote),
                     })
-                }));
+                } else {
+                    worker_target.resolve().and_then(|(path, location)| {
+                        crate::local_preview::load(&path).map(|content| LoadedPreview {
+                            path,
+                            location,
+                            content,
+                            remote: None,
+                        })
+                    })
+                };
+                let _ = tx.send(result);
             })
             .is_err()
         {
@@ -220,7 +291,11 @@ impl LocalPreviewPanel {
         match result {
             Ok(loaded) => {
                 self.path = loaded.path;
-                self.last_request = Some(ReadTarget::exact(self.path.clone()));
+                self.last_request = Some(ReadTarget {
+                    path: self.path.clone(),
+                    fallback: None,
+                    remote: loaded.remote,
+                });
                 if let Some(location) = loaded.location {
                     self.selected_line = Some(location.line.get() as usize);
                     self.location = Some(location);
@@ -268,7 +343,15 @@ impl LocalPreviewPanel {
     pub fn show(&mut self, ui: &mut egui::Ui) -> bool {
         let close = ui
             .horizontal(|ui| {
-                ui.strong("Local file preview");
+                let remote = self
+                    .last_request
+                    .as_ref()
+                    .and_then(|target| target.remote.as_ref());
+                ui.strong(if remote.is_some() {
+                    "Remote file preview"
+                } else {
+                    "Local file preview"
+                });
                 let close = ui.button("Close");
                 crate::ui::remember_inspector_control(ui, &close);
                 close.clicked()
@@ -277,6 +360,20 @@ impl LocalPreviewPanel {
         if close {
             self.close();
             return true;
+        }
+        if let Some(remote) = self
+            .last_request
+            .as_ref()
+            .and_then(|target| target.remote.as_ref())
+        {
+            ui.add(
+                egui::Label::new(format!(
+                    "Source: {}",
+                    crate::review_text::visible_bounded(&remote.label, 100)
+                ))
+                .truncate(),
+            )
+            .on_hover_text(&remote.label);
         }
         let path = display_path(&self.path);
         if self.candidate.is_none() {
@@ -355,9 +452,9 @@ impl LocalPreviewPanel {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(if self.text.is_some() || self.texture.is_some() {
-                    "Reloading local file…"
+                    "Reloading file…"
                 } else {
-                    "Reading local file…"
+                    "Reading file…"
                 });
             });
         }
@@ -788,6 +885,59 @@ mod tests {
     }
 
     #[test]
+    fn remote_target_never_uses_local_resolution_or_fallback() {
+        let host = crate::config::default_remote_hosts()[0].clone();
+        let target = ReadTarget {
+            path: PathBuf::from("/remote-only-no-local-copy"),
+            fallback: None,
+            remote: Some(RemoteRead {
+                host,
+                label: "SSH selected".into(),
+                context: crate::sidebar::Sidebar::test_files_intent_context(99),
+            }),
+        };
+        assert_eq!(
+            target.resolve().unwrap().0,
+            PathBuf::from("/remote-only-no-local-copy")
+        );
+    }
+
+    #[test]
+    fn remote_reload_preserves_authority_and_source_change_retires_it() {
+        let host = crate::config::default_remote_hosts()[0].clone();
+        let remote = RemoteRead {
+            host: host.clone(),
+            label: "SSH selected".into(),
+            context: crate::sidebar::Sidebar::test_files_intent_context(99),
+        };
+        let mut panel = LocalPreviewPanel::default();
+        panel.present("owner".into(), Path::new("/same-name.txt"));
+        let (tx, rx) = mpsc::sync_channel(1);
+        panel.pending = Some((panel.content_revision, rx));
+        tx.send(Ok(LoadedPreview {
+            path: PathBuf::from("/same-name.txt"),
+            location: None,
+            content: crate::local_preview::PreviewContent::Text("remote only".into()),
+            remote: Some(remote),
+        }))
+        .unwrap();
+        panel.poll(&egui::Context::default());
+        assert_eq!(
+            panel
+                .last_request
+                .as_ref()
+                .unwrap()
+                .remote
+                .as_ref()
+                .unwrap()
+                .host,
+            host
+        );
+        panel.validate_files_source(&crate::sidebar::Sidebar::new());
+        assert!(!panel.visible && panel.last_request.is_none() && panel.text.is_none());
+    }
+
+    #[test]
     fn egui_frames_seek_and_virtualize_without_stealing_other_session() {
         let mut panel = LocalPreviewPanel::default();
         panel
@@ -801,6 +951,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(1);
         panel.pending = Some((panel.content_revision, rx));
         tx.send(Ok(LoadedPreview {
+            remote: None,
             path: PathBuf::from("/tmp/view.tsx"),
             location: crate::local_reference::parse_candidate("view.tsx:1500:3")
                 .unwrap()
@@ -884,6 +1035,7 @@ mod tests {
             "busy reader must keep the new confirmation"
         );
         tx.send(Ok(LoadedPreview {
+            remote: None,
             path: PathBuf::from("/tmp/view.md"),
             location: None,
             content: crate::local_preview::PreviewContent::Image(egui::ColorImage::filled(

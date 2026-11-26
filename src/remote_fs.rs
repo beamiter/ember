@@ -404,6 +404,48 @@ case "$op" in
     [ -f "$p" ] && [ -r "$p" ] || exit 3
     cat "$p" || exit 4
     ;;
+  preview)
+    p=${2:-}; limit=${3:-}
+    case "$p" in /*) ;; *) exit 2 ;; esac
+    case "$limit" in ''|0|*[!0-9]*) exit 2 ;; esac
+    python3 -I -c '
+import os
+import stat
+import sys
+
+path, limit = sys.argv[1], int(sys.argv[2])
+parts = path.split("/")[1:]
+if not parts or any(part in ("", ".", "..") for part in parts):
+    sys.exit(2)
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+directory = os.open("/", directory_flags)
+try:
+    for part in parts[:-1]:
+        next_directory = os.open(part, directory_flags, dir_fd=directory)
+        os.close(directory)
+        directory = next_directory
+    handle = os.open(parts[-1], os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        if not stat.S_ISREG(os.fstat(handle).st_mode):
+            print("Preview requires a regular file", file=sys.stderr)
+            sys.exit(4)
+        reader = os.open("/proc/self/fd/" + str(handle), os.O_RDONLY | os.O_NONBLOCK)
+    finally:
+        os.close(handle)
+    with os.fdopen(reader, "rb") as source:
+        info = os.fstat(source.fileno())
+        if info.st_size > limit:
+            print("File exceeds the preview byte limit", file=sys.stderr)
+            sys.exit(4)
+        data = source.read(limit + 1)
+        if len(data) > limit:
+            print("File exceeds the preview byte limit", file=sys.stderr)
+            sys.exit(4)
+        sys.stdout.buffer.write(data)
+finally:
+    os.close(directory)
+' "$p" "$limit" || exit $?
+    ;;
   put)
     p=${2:-}; id=${3:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
@@ -2794,6 +2836,21 @@ fn execution_host_for_location(
     }
     validate_host_for_execution(&host)?;
     Ok(Some(host))
+}
+
+/// Immutable checked endpoint for an explicitly selected remote preview.
+#[allow(dead_code)] // Consumed by the native binary workspace.
+pub(crate) fn preview_host(loc: &FsLocation, hosts: &[RemoteHostConfig], overlay: &SshExecutionOverlay) -> io::Result<RemoteHostConfig> {
+    execution_host_for_location(loc, hosts, overlay)?.ok_or_else(||io::Error::new(io::ErrorKind::InvalidInput,"Remote preview requires a remote Files source"))
+}
+
+/// No local fallback: descriptor-pinned regular file read on the selected host.
+#[allow(dead_code)] // Consumed by the native binary workspace.
+pub(crate) fn read_preview(host: &RemoteHostConfig, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    if limit==0 || limit>crate::local_preview::MAX_IMAGE_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidInput,"Invalid preview byte limit")); }
+    require_absolute(path)?;
+    let capture=run_probe(host,"preview",&[path_str(path)?,&limit.to_string()],PROBE_LIST_TIMEOUT,limit)?;
+    probe_output(capture)
 }
 
 /// Public preflight used by the UI's atomic SSH-follow commit. It performs
@@ -6302,6 +6359,24 @@ docker = true
             MAX_LIST_OUTPUT,
         )
         .expect("spawn sh")
+    }
+
+    #[test]
+    #[cfg(target_os="linux")]
+    fn probe_script_preview_is_bounded_and_descriptor_pinned() {
+        let dir=TestDir::new();let file=dir.join("preview text.txt");
+        std::fs::write(&file,b"remote bytes").unwrap();let name=file.to_str().unwrap();
+        let result=run_probe_locally(&["preview",name,"12"]);
+        assert_eq!(result.status,Some(0),"{:?}",result.stderr);assert_eq!(result.stdout,b"remote bytes");
+        assert_ne!(run_probe_locally(&["preview",name,"4"]).status,Some(0));
+        let link=dir.join("link");std::os::unix::fs::symlink(&file,&link).unwrap();
+        assert_ne!(run_probe_locally(&["preview",link.to_str().unwrap(),"12"]).status,Some(0));
+        let parent=dir.join("parent-link");std::os::unix::fs::symlink(dir.path(),&parent).unwrap();
+        assert_ne!(run_probe_locally(&["preview",parent.join("preview text.txt").to_str().unwrap(),"12"]).status,Some(0));
+        let fifo=dir.join("fifo");assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let start=std::time::Instant::now();
+        assert_ne!(run_probe_locally(&["preview",fifo.to_str().unwrap(),"12"]).status,Some(0));
+        assert!(start.elapsed()<std::time::Duration::from_secs(2),"FIFO must never wait for a writer");
     }
 
     #[test]

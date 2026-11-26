@@ -348,6 +348,7 @@ class Smoke:
                         EMBER_SMOKE_RAW_ROOT=str(out / 'raw-pty'))
         config = home / '.config/ember'
         config.mkdir(parents=True)
+        config.chmod(0o700)
         self.config = config / 'config.toml'
         (home / '.bash_profile').write_text(r"""export HISTFILE=/dev/null
 exec 9>>"$EMBER_SMOKE_SHELL_TRACE"
@@ -857,6 +858,9 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         if getattr(self, 'renderer', None) is not None:
             config += f'app_renderer = "{self.renderer}"\n'
         self.config.write_text(config)
+        # Match the production persistence boundary even on group-writable
+        # developer workspaces, where the inherited umask can produce 0664.
+        self.config.chmod(0o600)
         app = self.app = self.spawn([str(self.binary)], 'ember')
         wait_for(self.app_window, 'Ember window')
         time.sleep(2)

@@ -191,6 +191,26 @@ impl HistorySnapshot {
 mod tests {
     use super::*;
 
+    // Content/schema and restart tests must reach the decoder under any
+    // caller umask; the production reader correctly rejects writable files.
+    fn write_private(path: &std::path::Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(bytes.as_ref())
+    }
+
     struct TestDir(std::path::PathBuf);
 
     impl TestDir {
@@ -242,7 +262,7 @@ mod tests {
         };
 
         let over = root.0.join("over.json");
-        std::fs::write(&over, b"last-good").unwrap();
+        write_private(&over, b"last-good").unwrap();
         assert!(snapshot(MAX_HISTORY_SNAPSHOT_BYTES as usize + 1)
             .save(&over)
             .is_err());
@@ -250,7 +270,7 @@ mod tests {
 
         // A hostile externally-created valid document over the limit is also
         // rejected by the reader.
-        std::fs::write(
+        write_private(
             &over,
             serde_json::to_vec(&snapshot(MAX_HISTORY_SNAPSHOT_BYTES as usize + 1)).unwrap(),
         )
@@ -279,7 +299,7 @@ mod tests {
             ),
         ] {
             let path = root.0.join(name);
-            std::fs::write(&path, bytes).unwrap();
+            write_private(&path, bytes).unwrap();
             let _ = HistorySnapshot::load(&path);
             let error = HistorySnapshot::default().save(&path);
             assert!(error.is_err(), "must refuse to replace {name}");
@@ -291,7 +311,7 @@ mod tests {
     fn future_history_version_is_not_loaded_as_current_state() {
         let root = TestDir::new("future-version");
         let path = root.0.join("ui_history.json");
-        std::fs::write(&path, br#"{"version":2,"search_history":[{"query":"future","is_regex":false,"case_sensitive":false,"timestamp":"later"}]}"#).unwrap();
+        write_private(&path, br#"{"version":2,"search_history":[{"query":"future","is_regex":false,"case_sensitive":false,"timestamp":"later"}]}"#).unwrap();
         let loaded = HistorySnapshot::load(&path);
         assert_eq!(loaded.version, 1);
         assert!(loaded.search_history.is_empty());
@@ -305,7 +325,7 @@ mod tests {
             ("future.json", "{\"version\":2}"),
         ] {
             let path = root.0.join(name);
-            std::fs::write(&path, original).unwrap();
+            write_private(&path, original).unwrap();
             let (snapshot, mut persistence) = UiHistoryPersistence::restore(Ok(path.clone()));
             assert!(snapshot.search_history.is_empty());
             assert!(persistence.is_paused());
@@ -328,13 +348,13 @@ mod tests {
         let path = root.0.join("ui_history.json");
         let (snapshot, mut persistence) = UiHistoryPersistence::restore(Ok(path.clone()));
         assert!(!persistence.is_paused());
-        std::fs::write(&path, "broken input").unwrap();
+        write_private(&path, "broken input").unwrap();
         assert!(persistence.save(&snapshot).is_some());
         assert!(persistence.is_paused());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken input");
         // Simulate the owner repairing the file. Further events in the old
         // window must still perform no writes; a restart is the recovery step.
-        std::fs::write(&path, "{}").unwrap();
+        write_private(&path, "{}").unwrap();
         for _ in 0..3 {
             assert!(persistence.save(&snapshot).is_none());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
@@ -432,7 +452,7 @@ mod tests {
                 timestamp: "1970-01-01".to_string(),
             }],
         };
-        std::fs::write(&target, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        write_private(&target, serde_json::to_vec(&snapshot).unwrap()).unwrap();
         symlink(&target, &link).unwrap();
 
         let loaded = HistorySnapshot::load(&link);

@@ -723,10 +723,17 @@ impl State {
         // }
 
         match ime {
-            // [`winit::event::Ime::Enabled`] means different things in X11 and
-            // Wayland, but it doesn't matter to us.
-            // See <https://github.com/rust-windowing/winit/issues/2498>
-            winit::event::Ime::Enabled | winit::event::Ime::Disabled => {}
+            // Preserve the actual native context boundary. Terminal ownership
+            // quarantine must not be retired optimistically by a UI reset;
+            // it needs the backend's real Closed/Opened lifecycle.
+            #[allow(deprecated)]
+            winit::event::Ime::Enabled => {
+                self.egui_input.events.push(egui::Event::Ime(egui::ImeEvent::Enabled));
+            }
+            #[allow(deprecated)]
+            winit::event::Ime::Disabled => {
+                self.egui_input.events.push(egui::Event::Ime(egui::ImeEvent::Disabled));
+            }
             winit::event::Ime::Preedit(text, active_range_bytes) => {
                 let active_range_chars = match *active_range_bytes {
                     Some((start_bytes, end_bytes)) => {

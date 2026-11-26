@@ -34,6 +34,8 @@ use super::state::WinitState;
 use super::types::xdg_activation::XdgActivationTokenData;
 use super::{ActiveEventLoop, WaylandError, WindowId};
 
+use super::types::wp_presentation::WindowFeedback;
+
 pub(crate) mod state;
 
 pub use state::WindowState;
@@ -48,6 +50,8 @@ pub struct Window {
 
     /// The state of the window.
     window_state: Arc<Mutex<WindowState>>,
+
+    frame_feedback: Option<Arc<WindowFeedback>>,
 
     /// Compositor to handle WlRegion stuff.
     compositor: Arc<CompositorState>,
@@ -196,6 +200,7 @@ impl Window {
 
         // Setup the event sync to insert `WindowEvents` right from the window.
         let window_events_sink = state.window_events_sink.clone();
+        let frame_feedback = state.presentation_state.as_ref().map(|manager| WindowFeedback::new(manager.clone(), window_id, window_requests.clone(), window_events_sink.clone()));
 
         let mut wayland_source = event_loop_window_target.wayland_dispatcher.as_source_mut();
         let event_queue = wayland_source.queue();
@@ -229,6 +234,7 @@ impl Window {
             event_loop_awakener,
             window_requests,
             window_events_sink,
+            frame_feedback,
         })
     }
 
@@ -293,6 +299,17 @@ impl Window {
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
+            self.event_loop_awakener.ping();
+        }
+    }
+
+    pub fn native_frame_feedback_is_surface_bound(&self) -> bool { self.frame_feedback.is_some() }
+    pub fn begin_native_frame_feedback(&self, serial: u64, width: u32, height: u32) -> bool {
+        width != 0 && height != 0 && self.frame_feedback.as_ref().is_some_and(|feedback| feedback.begin(serial, self.window.wl_surface(), &self.queue_handle))
+    }
+    pub fn finish_native_frame_feedback(&self, serial: u64, submitted: bool) {
+        if let Some(feedback) = &self.frame_feedback {
+            feedback.finish(serial, submitted);
             self.event_loop_awakener.ping();
         }
     }
@@ -717,7 +734,8 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        self.window_requests.closed.store(true, Ordering::Relaxed);
+        self.window_requests.closed.store(true, Ordering::Release);
+        if let Some(feedback) = &self.frame_feedback { feedback.invalidate(); }
         self.event_loop_awakener.ping();
     }
 }

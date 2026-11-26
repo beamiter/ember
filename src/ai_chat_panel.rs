@@ -1232,23 +1232,15 @@ impl AiChatPanel {
         }
     }
 
-    /// Cancel all in-flight requests (app shutdown); the store then persists
-    /// pending messages as drafts on the next [`Self::persist`].
-    pub fn cancel_all(&mut self) {
-        let requests = std::mem::take(&mut self.requests);
-        for (token, cancellation) in requests {
-            cancellation.cancel();
-            let _ = self
-                .store
-                .cancel_request(token, "Request cancelled during shutdown.".into());
-        }
+    /// Release this window's observations while the host retains the API jobs.
+    pub(crate) fn detach_hosted_views(&mut self) {
+        self.requests.clear();
     }
 }
 
 impl Drop for AiChatPanel {
     fn drop(&mut self) {
-        // Dropping observations detaches views; the host retains API work.
-        self.requests.clear();
+        self.detach_hosted_views();
         // Let an in-flight save finish its atomic replace rather than leaving
         // its temp file behind when the process goes away.
         if let Some(handle) = self.persist_thread.take() {

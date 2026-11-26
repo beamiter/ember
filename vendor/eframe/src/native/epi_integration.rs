@@ -341,7 +341,7 @@ impl EpiIntegration {
 
         let logic_output = self.egui_ctx.run_logic(&raw_input, |ctx| {
             profiling::scope!("App::logic");
-            app.logic(ctx, &mut self.frame);
+            app.logic_only(ctx, &mut self.frame);
         });
 
         // No pass consumed the input, so save it for the next one:

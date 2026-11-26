@@ -9,9 +9,9 @@ use jterm_engine::{
 impl TerminalState {
     fn decrqm_test_mode_state(&self, mode: u16, private: bool) -> u8 {
         let mut screen = ScreenState::with_grids(TerminalGrid::new(1, 1), TerminalGrid::new(1, 1));
-        screen.origin_mode = self.screen.origin_mode;
-        screen.insert_mode = self.screen.insert_mode;
-        let mut protocol = self.protocol.clone();
+        screen.origin_mode = self.vt.screen.origin_mode;
+        screen.insert_mode = self.vt.screen.insert_mode;
+        let mut protocol = self.vt.protocol.clone();
         let event = Event::Csi {
             raw_params: mode.to_string().into_bytes(),
             params: vec![mode],

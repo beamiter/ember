@@ -95,7 +95,14 @@ impl EventProcessor {
                     ime.send_xim_spot(window_id, x, y);
                 },
                 ImeRequest::Allow(window_id, allowed) => {
+                    let changed = ime.is_ime_allowed(window_id) != allowed;
                     ime.set_ime_allowed(window_id, allowed);
+                    // Recreating an XIC does not generate another XI FocusIn.
+                    // Focus only the context of the already-active native window;
+                    // never activate or steal OS focus for an inactive viewport.
+                    if allowed && changed && self.active_window == Some(window_id as xproto::Window) {
+                        ime.focus(window_id).expect("Failed to focus recreated input context");
+                    }
                 },
             }
         }

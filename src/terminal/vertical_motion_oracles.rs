@@ -19,15 +19,21 @@ fn snapshot(t: &TerminalState) -> Snapshot {
     macro_rules! host {
         ($($f:ident),* $(,)?) => {$(out.insert(stringify!($f).into(), format!("{:?}", t.$f));)*};
     }
+    out.insert(
+        "pending_osc52_clipboard_set".into(),
+        format!("{:?}", t.osc52.pending_set),
+    );
+    out.insert(
+        "pending_osc52_clipboard_queries".into(),
+        format!("{:?}", t.osc52.pending_queries),
+    );
+    out.insert("sync_output_active".into(), format!("{:?}", t.vt.sync_output.active));
     host!(
-        sync_output_active,
         current_working_dir,
         ime_enabled,
         preedit_text,
         preedit_cursor,
         host_window_focused,
-        pending_osc52_clipboard_set,
-        pending_osc52_clipboard_queries,
         pending_notifications,
         pending_bell,
         chat_pending_submit,
@@ -38,13 +44,13 @@ fn snapshot(t: &TerminalState) -> Snapshot {
     );
     out.insert(
         "sync_start_present".into(),
-        t.sync_output_start.is_some().to_string(),
+        t.vt.sync_output.started.is_some().to_string(),
     );
     out.insert(
         "sync_age_ms".into(),
         format!(
             "{:?}",
-            t.sync_output_start.map(|start| t
+            t.vt.sync_output.started.map(|start| t
                 .sync_output_clock
                 .now()
                 .saturating_duration_since(start)
@@ -55,13 +61,13 @@ fn snapshot(t: &TerminalState) -> Snapshot {
         "paste_expiry_ms".into(),
         format!(
             "{:?}",
-            t.pending_paste_grant.as_ref().map(|grant| grant
+            t.osc5522.pending_paste_grant.as_ref().map(|grant| grant
                 .expires_at
                 .saturating_duration_since(t.sync_output_clock.now())
                 .as_millis())
         ),
     );
-    out.insert("parser".into(), format!("{:?}", t.parser.snapshot()));
+    out.insert("parser".into(), format!("{:?}", t.vt.parser.snapshot()));
     out.insert(
         "kitty_image_count".into(),
         t.kitty_graphics.image_count().to_string(),
@@ -70,7 +76,7 @@ fn snapshot(t: &TerminalState) -> Snapshot {
         "paste_grant".into(),
         format!(
             "{:?}",
-            t.pending_paste_grant.as_ref().map(|g| (
+            t.osc5522.pending_paste_grant.as_ref().map(|g| (
                 &g.token,
                 g.offered_mimes
                     .iter()
@@ -97,7 +103,7 @@ pub(in crate::terminal) fn observe(t: &TerminalState, event: &str, detail: Strin
                 detail
             };
             trace.push(format!("{event}:{detail}:cursor={:?}:pending={}:history={:?}:identity={}:dirty={:?}:provenance={:?}",
-                (t.screen.cursor_row,t.screen.cursor_col),t.screen.pending_wrap,
+                (t.vt.screen.cursor_row,t.vt.screen.cursor_col),t.vt.screen.pending_wrap,
                 (t.total_lines_scrolled,t.scrollback.len(),t.scroll_offset),t.row_identity_revision,t.dirty_region,t.active_output_provenance));
         }
     });
@@ -158,13 +164,13 @@ fn seeded(context: usize, geometry: usize, row: usize) -> TerminalState {
     let mut t = super::super::alternate_parity_tests::seeded(0);
     let now = std::time::Instant::now();
     t.sync_output_clock = super::super::SyncOutputClock::new(move || now);
-    t.protocol.modes_mut().insert(7);
-    t.screen.active_charset = Charset::Ascii;
-    t.screen.g0_charset = Charset::Ascii;
-    t.screen.scroll_region_top = 0;
-    t.screen.scroll_region_bottom = 4;
+    t.vt.protocol.modes_mut().insert(7);
+    t.vt.screen.active_charset = Charset::Ascii;
+    t.vt.screen.g0_charset = Charset::Ascii;
+    t.vt.screen.scroll_region_top = 0;
+    t.vt.screen.scroll_region_bottom = 4;
     t.set_max_scrollback(2);
-    t.screen.cursor_row = 4;
+    t.vt.screen.cursor_row = 4;
     t.process_input(b"\n\n\n");
     if context & 1 != 0 {
         t.process_input(b"\x1b[?1049h");
@@ -195,8 +201,8 @@ fn seeded(context: usize, geometry: usize, row: usize) -> TerminalState {
     if geometry == 8 {
         t.on_resize(5, 1);
     }
-    let rows = t.screen.grid.rows();
-    let cols = t.screen.grid.row_len();
+    let rows = t.vt.screen.grid.rows();
+    let cols = t.vt.screen.grid.row_len();
     let (top, bottom) = match geometry {
         0 => (0, 4),
         1 => (0, 2),
@@ -206,19 +212,19 @@ fn seeded(context: usize, geometry: usize, row: usize) -> TerminalState {
         5 => (0, 9),
         _ => (0, rows - 1),
     };
-    t.screen.scroll_region_top = top;
-    t.screen.scroll_region_bottom = bottom;
-    t.screen.cursor_row = row.min(rows - 1);
-    t.screen.cursor_col = cols - 1;
-    t.screen.pending_wrap = true;
-    t.screen.current_bg = Color::Indexed(201);
+    t.vt.screen.scroll_region_top = top;
+    t.vt.screen.scroll_region_bottom = bottom;
+    t.vt.screen.cursor_row = row.min(rows - 1);
+    t.vt.screen.cursor_col = cols - 1;
+    t.vt.screen.pending_wrap = true;
+    t.vt.screen.current_bg = Color::Indexed(201);
     t.scroll_offset = 1;
     t.selection = Some(Selection {
         anchor: (0, 0),
         active: (1, 1),
         mode: SelectionMode::Normal,
     });
-    for (r, wrapped) in t.screen.grid.row_wrapped[..rows].iter_mut().enumerate() {
+    for (r, wrapped) in t.vt.screen.grid.row_wrapped[..rows].iter_mut().enumerate() {
         *wrapped = r % 2 == 0;
     }
     if let Some(a) = t.active_output_provenance.as_mut() {
@@ -323,7 +329,7 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
                 for _ in 0..history_rows {
                     t.process_input(b"\n");
                 }
-                t.screen.pending_wrap = pending;
+                t.vt.screen.pending_wrap = pending;
                 assert_eq!(t.scroll_offset, 0);
                 assert_eq!(t.scrollback.len(), history_rows);
                 start_trace(&t);
@@ -366,8 +372,8 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
                         let sequence = t.command_records.back().unwrap().sequence;
                         t.inline_cli_command_scope = Some((sequence, t.total_lines_scrolled + 9));
                     }
-                    t.screen.pending_wrap = true;
-                    if !t.screen.use_alt_buffer {
+                    t.vt.screen.pending_wrap = true;
+                    if !t.vt.screen.use_alt_buffer {
                         let active = t.active_output_provenance.unwrap();
                         assert!(
                             active.extent.is_none()
@@ -376,7 +382,7 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
                         );
                         assert_eq!(
                             active.start_row_id,
-                            t.screen.grid.row_id(t.screen.cursor_row)
+                            t.vt.screen.grid.row_id(t.vt.screen.cursor_row)
                         );
                     }
                     start_trace(&t);
