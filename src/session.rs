@@ -240,13 +240,6 @@ pub struct Session {
     /// correctness boundary: switching tabs while the writer is backpressured
     /// must never deliver bytes to a different shell.
     pub pending_input: Vec<u8>,
-    /// PTY output that exceeded the per-frame parsing budget.
-    ///
-    /// This must live on the session rather than on `TerminalApp`: a tab switch
-    /// can happen between frames, and feeding the old tab's remaining ANSI
-    /// stream into the newly active terminal corrupts both its screen and its
-    /// terminal modes.
-    pub pending_output: crate::output_batch::OutputBuffer,
     pub(crate) terminal_presentation: TerminalPresentation,
     /// Session-owned view policy. Renderers are reused across tabs/panes and
     /// must never carry collapse state or projected scroll between sessions.
@@ -325,8 +318,8 @@ impl Session {
     ) -> bool {
         if self.purpose != SessionPurpose::Interactive
             || !self.pending_input.is_empty()
-            || !self.pending_output.is_empty()
-            || !self.shell.events().is_empty()
+            || self.shell.has_pending_output()
+            || self.shell.output_finished()
             || bytes.len() != 1
             || expected_foreground <= 0
         {
@@ -408,7 +401,6 @@ impl Session {
             shell,
             purpose: SessionPurpose::Interactive,
             pending_input: Vec::new(),
-            pending_output: crate::output_batch::OutputBuffer::default(),
             terminal_presentation: TerminalPresentation::default(),
             projection_policy: ProjectionPolicy::new(),
             projection_view_state: ProjectionViewState::new(),

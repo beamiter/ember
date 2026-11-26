@@ -2,7 +2,7 @@
 #![cfg(target_os = "linux")]
 
 use ember::session::Session;
-use ember::shell::{ShellEvent, ShellSession};
+use ember::shell::{OutputNotice, ShellSession};
 use ember::terminal::{
     ChatInputAction, HistoryProjection, ProjectionPolicy, ProjectionViewState, TerminalState,
 };
@@ -58,21 +58,23 @@ fn poll_until(session: &mut Session, predicate: impl Fn(&TerminalState, &[u8]) -
             "timed out waiting for real shell; captured {} bytes",
             output.len()
         );
-        match session
-            .shell
-            .events()
-            .recv_timeout(Duration::from_millis(50))
-        {
-            Ok(ShellEvent::Output(bytes)) => {
-                for fragment in bytes.fragments() {
-                    output.extend_from_slice(fragment.bytes);
-                    session.terminal.lock().process_input(fragment.bytes);
-                }
+        let progress = session.shell.poll_output(
+            128 * 1024,
+            || true,
+            |batch, _| {
+                output.extend_from_slice(batch.as_bytes());
+                session.terminal.lock().process_output_buffer(batch, |_| {});
+            },
+        );
+        match progress.notice {
+            Some(OutputNotice::Error(error)) => panic!("PTY failed: {error}"),
+            Some(OutputNotice::Exited { code, .. }) => {
+                panic!("interactive shell exited unexpectedly: {code:?}")
             }
-            Ok(ShellEvent::Error(error)) => panic!("PTY failed: {error}"),
-            Ok(ShellEvent::Exit(code)) => panic!("interactive shell exited unexpectedly: {code}"),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(error) => panic!("PTY event channel ended: {error}"),
+            None => {}
+        }
+        if progress.bytes_applied == 0 {
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 }

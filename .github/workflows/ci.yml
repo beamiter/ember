@@ -438,6 +438,11 @@ jobs:
         if: steps.desktop-install.outcome == 'success'
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend x11 --output native-smoke-artifacts/x11
 
+      - name: Gate X11 active and hidden PTY exit tails
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        timeout-minutes: 3
+        run: python3 scripts/native-ordered-output-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend x11 --output native-smoke-artifacts/pty-tail-x11
+
       - name: Gate native Mission create inspect and candidate freeze
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
         timeout-minutes: 5
@@ -560,6 +565,11 @@ jobs:
         run: |
           python3 scripts/test-native-clipboard-readback.py
           python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend wayland --output native-smoke-artifacts/wayland
+
+      - name: Gate Wayland active and hidden PTY exit tails
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' && steps.desktop-pointer.outcome == 'success' }}
+        timeout-minutes: 3
+        run: python3 scripts/native-ordered-output-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend wayland --output native-smoke-artifacts/pty-tail-wayland
 
       - name: Gate installed session recovery on both desktops
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' && steps.desktop-pointer.outcome == 'success' }}

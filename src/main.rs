@@ -110,7 +110,7 @@ pub(crate) use jterm_core::char_width;
 use parking_lot::Mutex as ParkingMutex;
 use session::Session;
 use session_manager::{ProtocolResponseQueueError, ProtocolResponseSender, SessionManager};
-use shell::{ShellEvent, ShellSession};
+use shell::{OutputNotice, ShellSession};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
@@ -2730,15 +2730,19 @@ impl TerminalApp {
 
         let configured_shell = std::env::var("EMBER_SHELL").ok().or(cfg.shell.clone());
 
-        let shell = match ShellSession::new_with_cwd(
-            cols,
-            rows,
-            first_cwd.as_deref(),
-            Some(&first_session_id),
-            configured_shell.as_deref(),
-            startup_argv.as_deref(),
-            crate::runtime_wake::egui_wake(repaint_ctx.clone()),
-        ) {
+        let launch = |directory| {
+            ShellSession::new_with_pinned_cwd(
+                cols,
+                rows,
+                directory,
+                Some(&first_session_id),
+                configured_shell.as_deref(),
+                startup_argv.as_deref(),
+                None,
+                crate::runtime_wake::egui_wake(repaint_ctx.clone()),
+            )
+        };
+        let shell = match launch(first_cwd.as_deref()) {
             Ok(session) => {
                 eprintln!("✓ Shell session started successfully");
                 session
@@ -2747,19 +2751,14 @@ impl TerminalApp {
                 if startup_editor.is_some() {
                     return Err(format!("Vim9 editor process could not start: {e}"));
                 }
+                if first_cwd.is_none() || !ShellSession::failed_working_directory(&e) {
+                    return Err(format!("Cannot create shell session: {e}"));
+                }
                 eprintln!(
                     "✗ Failed to start shell with saved cwd, falling back: {}",
                     e
                 );
-                match ShellSession::new_with_cwd(
-                    cols,
-                    rows,
-                    None,
-                    Some(&first_session_id),
-                    configured_shell.as_deref(),
-                    None,
-                    crate::runtime_wake::egui_wake(repaint_ctx.clone()),
-                ) {
+                match launch(None) {
                     Ok(session) => session,
                     Err(e2) => {
                         return Err(format!(
@@ -6519,15 +6518,6 @@ impl eframe::App for TerminalApp {
 
         // 获取当前活跃会话（在所有快捷键处理完后）
         let session_count_before = self.session_manager.len();
-        let mut shell_exited = false;
-        let mut shell_exit_observed = false;
-        let mut shell_exit_code = None;
-        let mut retain_exited_task_terminal = false;
-        // A shell that dies before it could ever have shown a prompt is a
-        // startup failure, not the user leaving. Closing the window on it
-        // makes ember look like it "exits as soon as it runs", hiding the
-        // real cause (bad `shell =` config, unusable cwd, wrong binary).
-        let mut shell_startup_failed = false;
 
         // Step 2.5: 搜索面板事件处理
         if self.pending_paste_confirm.is_none() && !self.search_replace_panel.is_open {
@@ -7024,125 +7014,29 @@ impl eframe::App for TerminalApp {
             ctx.request_repaint();
         }
 
-        // Step 6: 处理 shell 事件
-        // 关键：限制每帧处理的总字节数，防止大量 ANSI 数据阻塞 UI 线程导致假死。
-        // 超出限制的数据保存到当前 session 自己的 pending_output，
-        // 下一帧继续处理。绝不能放在 TerminalApp 全局缓冲中：帧间切 tab
-        // 会把旧 session 的 ANSI 字节流喂给新 session，造成串屏和终端模式污染。
-        // 使用自适应帧预算，根据帧时间动态调整
-        let mut has_new_output = false;
-        let max_bytes_per_frame = active_output_budget;
-        let mut has_more_data = false;
-        let mut active_processed_bytes = 0;
-
-        // 先取回上一帧未处理完的数据
-        let mut accumulated_data = std::mem::take(&mut session.pending_output);
-        if !accumulated_data.is_empty() {
-            has_new_output = true;
-        }
-
-        // 从 channel 中收集数据，直到达到字节上限
-        let shell_events_are_live =
-            session.purpose != crate::session::SessionPurpose::RetainedCommand;
-        if shell_events_are_live && accumulated_data.len() < max_bytes_per_frame {
-            loop {
-                match session.shell.events().try_recv() {
-                    Ok(ShellEvent::Output(data)) => {
-                        accumulated_data.extend(data);
-                        has_new_output = true;
-                        if accumulated_data.len() >= max_bytes_per_frame {
-                            has_more_data = true;
-                            break;
-                        }
-                    }
-                    Ok(ShellEvent::Exit(code)) => {
-                        if let Some(editor) = self.vim9_editors.remove(&session.metadata.session_id)
-                        {
-                            editor.session.revoke();
-                        }
-                        crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
-                        shell_exit_observed = true;
-                        shell_exit_code = Some(code);
-                        retain_exited_task_terminal = active_task_terminal.is_some();
-                        let uptime = session.shell.uptime();
-                        if active_task_terminal.is_some() {
-                            // Task feedback is composed after applying the authoritative exit below.
-                        } else if code != 0 && uptime < SHELL_STARTUP_GRACE {
-                            shell_startup_failed = true;
-                            self.status_message = format!(
-                                "Shell failed to start (exit code {code}). Check the `shell` setting in the config panel."
-                            );
-                            self.status_expires_at = None;
-                        } else {
-                            self.status_message = format!("Shell exited with code: {}", code);
-                            self.status_expires_at =
-                                Some(std::time::Instant::now() + Duration::from_secs(6));
-                        }
-                        has_new_output = true;
-                        shell_exited = true;
-                        break;
-                    }
-                    Ok(ShellEvent::Error(e)) => {
-                        self.status_message = format!("Error: {}", e);
-                        self.status_expires_at =
-                            Some(std::time::Instant::now() + Duration::from_secs(6));
-                        has_new_output = true;
-                        break;
-                    }
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        shell_exit_observed = true;
-                        retain_exited_task_terminal = active_task_terminal.is_some();
-                        shell_exited = true;
-                        break;
-                    }
-                }
-            }
-        } else if accumulated_data.len() >= max_bytes_per_frame {
-            has_more_data = true;
-        }
-
-        // 如果累积数据超过帧限制，将多余部分保存到下一帧
-        if accumulated_data.len() > max_bytes_per_frame {
-            session.pending_output = accumulated_data.split_off(max_bytes_per_frame);
-            has_more_data = true;
-        }
-        // 也检查 channel 中是否还有数据
-        if shell_events_are_live && !has_more_data && !session.shell.events().is_empty() {
-            has_more_data = true;
-        }
-
-        // 处理本帧的数据
-        if !accumulated_data.is_empty() {
-            if active_protocol_responses.has_pending() {
-                // Preserve PTY byte order and stop accepting more protocol
-                // requests until their older replies have entered the bounded
-                // shell writer. The current chunk precedes the split-off tail.
-                accumulated_data.append(&mut session.pending_output);
-                accumulated_data.quarantine();
-                self.organism.watch_parked(&active_session_id);
-                session.pending_output = accumulated_data;
-                has_more_data = true;
-            } else {
+        // Step 6: Apply the next ordered PTY batch within this frame's budget.
+        let progress = session.shell.poll_output(
+            active_output_budget,
+            || !active_protocol_responses.has_pending(),
+            |data, backlogged| {
                 let mut terminal = session.terminal.lock();
                 let active_parse_started = std::time::Instant::now();
-                terminal.process_output_buffer(&accumulated_data, |update| {
+                terminal.process_output_buffer(data, |update| {
                     self.organism
-                        .watch_parsed(&active_session_id, update, has_more_data);
+                        .watch_parsed(&active_session_id, update, backlogged);
                 });
                 session
                     .terminal_presentation
                     .note_output(std::time::Instant::now());
                 terminal.check_sync_output_timeout();
                 terminal_parse_time += active_parse_started.elapsed();
-                active_processed_bytes = accumulated_data.len();
                 let completed_outputs = terminal.take_completed_command_events();
                 self.organism.batch(
                     &active_session_id,
                     terminal.command_records(),
                     &completed_outputs,
                     terminal.is_alt_buffer_active(),
-                    has_more_data,
+                    backlogged,
                 );
                 let rang_bell = terminal.take_pending_bell();
                 // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
@@ -7187,8 +7081,49 @@ impl eframe::App for TerminalApp {
                         );
                     }
                 }
-            }
+            },
+        );
+        if progress.parked {
+            self.organism.watch_parked(&active_session_id);
         }
+        let active_processed_bytes = progress.bytes_applied;
+        let has_new_output =
+            active_processed_bytes > 0 || progress.parked || progress.notice.is_some();
+        let mut has_more_data = progress.has_more;
+        let mut shell_startup_failed = false;
+        let shell_exit = match progress.notice {
+            Some(OutputNotice::Exited { code, observed_at }) => {
+                if let Some(editor) = self.vim9_editors.remove(&active_session_id) {
+                    editor.session.revoke();
+                }
+                if let Some(code) = code {
+                    crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
+                    if active_task_terminal.is_none() {
+                        if code != 0 && session.shell.uptime_at(observed_at) < SHELL_STARTUP_GRACE {
+                            // Keep the final window open so the user can read the startup failure.
+                            shell_startup_failed = true;
+                            self.status_message = format!(
+                                "Shell failed to start (exit code {code}). Check the `shell` setting in the config panel."
+                            );
+                            self.status_expires_at = None;
+                        } else {
+                            self.status_message = format!("Shell exited with code: {code}");
+                            self.status_expires_at =
+                                Some(std::time::Instant::now() + Duration::from_secs(6));
+                        }
+                    }
+                }
+                Some(code)
+            }
+            Some(OutputNotice::Error(error)) => {
+                self.status_message = format!("Error: {error}");
+                self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(6));
+                None
+            }
+            None => None,
+        };
+        let shell_exited = shell_exit.is_some();
+        let retain_exited_task_terminal = shell_exited && active_task_terminal.is_some();
 
         let processed_bytes = background_processed_bytes.saturating_add(active_processed_bytes);
         let output_backlogged = background_has_more
@@ -8626,7 +8561,7 @@ impl eframe::App for TerminalApp {
         #[allow(dropping_references)]
         drop(session);
 
-        if shell_exit_observed {
+        if let Some(shell_exit_code) = shell_exit {
             if self.finish_shell_vim_exit(&active_session_id, shell_exit_code, ctx) {
                 return;
             }
@@ -8688,7 +8623,7 @@ impl eframe::App for TerminalApp {
             let has_pending_data = if !has_new_output {
                 let session = self.session_manager.get_active_session_mut();
                 session.purpose != crate::session::SessionPurpose::RetainedCommand
-                    && !session.shell.events().is_empty()
+                    && session.shell.has_pending_output()
             } else {
                 false
             };

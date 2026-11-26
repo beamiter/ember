@@ -1,6 +1,6 @@
 use crate::session::{Session, SessionPurpose};
 use crate::session_persistence;
-use crate::shell::{ShellEvent, ShellSession, ShellWriteError};
+use crate::shell::{OutputNotice, ShellSession, ShellWriteError};
 use crate::terminal::{
     clamp_terminal_dimensions, ClipboardReadRequest, CompletedCommandEvent, CompletedCommandOutput,
     TerminalDefaultColors, TerminalState,
@@ -753,52 +753,21 @@ impl SessionManager {
             if visible_session_indices.contains(&session_idx) && window_focused {
                 session.metadata.unseen_output = false;
             }
-            let mut data = std::mem::take(&mut session.pending_output);
-            let mut exit_code = None;
-            let mut exited = false;
-
-            if share > 0 && data.len() < share {
-                loop {
-                    match session.shell.events().try_recv() {
-                        Ok(ShellEvent::Output(chunk)) => {
-                            data.extend(chunk);
-                            if data.len() >= share {
-                                break;
-                            }
-                        }
-                        Ok(ShellEvent::Exit(code)) => {
-                            exit_code = Some(code);
-                            exited = true;
-                            break;
-                        }
-                        Ok(ShellEvent::Error(error)) => {
-                            result.errors.push((session_idx, error));
-                            break;
-                        }
-                        Err(crossbeam_channel::TryRecvError::Empty) => break,
-                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                            exited = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if share == 0 {
-                data.quarantine();
-                session.pending_output = data;
-                data = crate::output_batch::OutputBuffer::default();
-                if !session.pending_output.is_empty() || !session.shell.events().is_empty() {
-                    result.has_more = true;
-                }
-            } else if data.len() > share {
-                session.pending_output = data.split_off(share);
-            }
-
-            if !data.is_empty() {
+            let mut terminal = session.terminal.lock();
+            let progress = session.shell.poll_output(
+                share,
+                || !protocol_responses.has_pending(),
+                |data, _| {
+                    terminal.process_output_buffer(data, |_| {});
+                    session
+                        .terminal_presentation
+                        .note_output(std::time::Instant::now());
+                },
+            );
+            if progress.bytes_applied > 0 {
                 result.had_output = true;
-                result.bytes_processed += data.len();
-                remaining_budget = remaining_budget.saturating_sub(data.len());
+                result.bytes_processed += progress.bytes_applied;
+                remaining_budget -= progress.bytes_applied;
                 // A split pane is already visible even when it is not the
                 // focused session; only hidden tabs should gain an unread dot.
                 if !visible_session_indices.contains(&session_idx) {
@@ -809,13 +778,6 @@ impl SessionManager {
             // Protocol timers and side effects must progress even in a silent
             // PTY. In particular, synchronized-output mode otherwise remains
             // frozen forever if an application dies after its begin marker.
-            let mut terminal = session.terminal.lock();
-            if !data.is_empty() {
-                terminal.process_output_buffer(&data, |_| {});
-                session
-                    .terminal_presentation
-                    .note_output(std::time::Instant::now());
-            }
             terminal.check_sync_output_timeout();
             let response = terminal.get_output();
             if let Err((error, mut response)) = protocol_responses.try_enqueue(response) {
@@ -869,18 +831,19 @@ impl SessionManager {
                 }
             }
 
-            if exited {
-                result.exited_sessions.push(ExitedSession {
-                    session_id: session.metadata.session_id.clone(),
-                    exit_code,
-                });
+            match progress.notice {
+                Some(OutputNotice::Exited { code, .. }) => {
+                    result.exited_sessions.push(ExitedSession {
+                        session_id: session.metadata.session_id.clone(),
+                        exit_code: code,
+                    });
+                }
+                Some(OutputNotice::Error(error)) => result.errors.push((session_idx, error)),
+                None => {}
             }
-            if protocol_responses.has_pending()
-                || !session.pending_output.is_empty()
-                || !session.shell.events().is_empty()
-            {
-                result.has_more = true;
-            }
+            result.has_more |= progress.has_more
+                || protocol_responses.has_pending()
+                || session.shell.has_pending_output();
         }
 
         result
@@ -1029,15 +992,15 @@ impl SessionManager {
         else {
             return false;
         };
-        match self.sessions[index].purpose {
-            SessionPurpose::Interactive => return false,
-            SessionPurpose::EphemeralCommand => {
-                self.sessions[index].purpose = SessionPurpose::RetainedCommand;
+        let session = &mut self.sessions[index];
+        match session.purpose {
+            SessionPurpose::EphemeralCommand if session.shell.output_finished() => {
+                session.purpose = SessionPurpose::RetainedCommand;
             }
             SessionPurpose::RetainedCommand => {}
+            SessionPurpose::Interactive | SessionPurpose::EphemeralCommand => return false,
         }
-        self.sessions[index].pending_input.clear();
-        self.sessions[index].shell.freeze_after_exit();
+        session.pending_input.clear();
         self.protocol_responses[index].close();
         true
     }
@@ -1112,7 +1075,8 @@ impl SessionManager {
             command_argv.as_deref(),
             pinned_cwd,
             crate::runtime_wake::egui_wake(self.repaint_ctx.clone()),
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         let mut terminal = self.new_terminal_state(cols, rows);
         if let Some(argv) = command_argv.as_deref() {
             terminal.set_inline_cli_launch(crate::agent_cli::is_inline_launch(argv));
@@ -1196,8 +1160,7 @@ impl SessionManager {
             .filter(|index| *index != self.active_index)
     }
 
-    /// 扫描所有后台会话:若其 shell 事件通道有未消费数据,标记 unseen_output。
-    /// 主循环每帧只 drain active session,这里用通道非空作为"后台有产出"的代理。
+    /// Badge hidden sessions that have not delivered all their queued output.
     pub fn refresh_unseen_flags(&mut self, visible_session_indices: &[usize]) {
         let active = self.active_index;
         for (i, s) in self.sessions.iter_mut().enumerate() {
@@ -1205,7 +1168,7 @@ impl SessionManager {
                 s.metadata.unseen_output,
                 i == active,
                 visible_session_indices.contains(&i),
-                !s.shell.events().is_empty(),
+                s.shell.has_pending_output(),
             );
         }
     }
@@ -1347,29 +1310,25 @@ impl SessionManager {
             let session_id = restored_or_fresh_session_id(session_id, &used_session_ids);
             used_session_ids.insert(session_id.clone());
             let cwd_ref = cwd.as_deref();
-            let mut shell_result = ShellSession::new_with_cwd(
-                80,
-                24,
-                cwd_ref,
-                Some(&session_id),
-                self.configured_shell.as_deref(),
-                None,
-                crate::runtime_wake::egui_wake(self.repaint_ctx.clone()),
-            );
+            let launch = |directory| {
+                ShellSession::new_with_pinned_cwd(
+                    80,
+                    24,
+                    directory,
+                    Some(&session_id),
+                    self.configured_shell.as_deref(),
+                    None,
+                    None,
+                    crate::runtime_wake::egui_wake(self.repaint_ctx.clone()),
+                )
+            };
+            let mut shell_result = launch(cwd_ref);
             if let Err(error) = &shell_result {
-                if cwd_ref.is_some() {
+                if cwd_ref.is_some() && ShellSession::failed_working_directory(error) {
                     eprintln!(
                         "Failed to restore session in saved cwd ({error}); retrying in default cwd"
                     );
-                    shell_result = ShellSession::new_with_cwd(
-                        80,
-                        24,
-                        None,
-                        Some(&session_id),
-                        self.configured_shell.as_deref(),
-                        None,
-                        crate::runtime_wake::egui_wake(self.repaint_ctx.clone()),
-                    );
+                    shell_result = launch(None);
                 }
             }
             match shell_result {
@@ -1524,9 +1483,15 @@ mod tests {
             .new_command_session_in_cwd(
                 "Agent".to_string(),
                 vec![
-                    "/bin/sh".to_string(),
+                    "/bin/bash".to_string(),
                     "-c".to_string(),
-                    "exit 0".to_string(),
+                    r#"stty raw -echo || exit 90
+                       printf '\033[3;4H\033[6n'
+                       IFS= read -r -n 6 response
+                       [[ $response == $'\033[3;4R' ]] || exit 91
+                       printf '\033[6;1HFINAL_TAIL\a'
+                       exit 37"#
+                        .to_string(),
                 ],
                 Path::new("/tmp"),
                 80,
@@ -1538,6 +1503,41 @@ mod tests {
             manager.sessions()[created.session_index].purpose,
             SessionPurpose::EphemeralCommand
         );
+        assert!(!manager.retain_exited_command(&created.session_id));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut rang_bell = false;
+        loop {
+            let progress = manager.pump_inactive_sessions(
+                7,
+                &[],
+                None,
+                &SessionInputBarriers::default(),
+                true,
+            );
+            assert!(progress.bytes_processed <= 7);
+            assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+            rang_bell |= progress.bells.contains(&created.session_index);
+            if let Some(exit) = progress.exited_sessions.first() {
+                assert_eq!(progress.exited_sessions.len(), 1);
+                assert_eq!(exit.session_id, created.session_id);
+                assert_eq!(exit.exit_code, Some(37));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hidden terminal did not finish"
+            );
+            if progress.bytes_processed == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(rang_bell);
+        let terminal = manager.sessions()[created.session_index].terminal.lock();
+        let last: String = (0..10)
+            .map(|col| terminal.screen.grid.get(5, col).character)
+            .collect();
+        assert_eq!(last, "FINAL_TAIL");
+        drop(terminal);
         assert!(manager.retain_exited_command(&created.session_id));
         assert_eq!(
             manager.sessions()[created.session_index].purpose,

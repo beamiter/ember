@@ -1,18 +1,20 @@
 //! Product and platform launch policy for Ember's shared session actor.
 use crate::pty::Pty;
 use crate::terminal::clamp_terminal_dimensions;
-use crossbeam_channel::Receiver;
+use jterm_core::native_pty_launch::PtyLaunchError;
+use jterm_core::output_batch::OutputBuffer;
 use jterm_core::runtime_wake::WakeSink;
-use jterm_core::session_actor::SessionActor;
+use jterm_core::session_actor::SessionHandle;
+use std::time::{Duration, Instant};
 
 pub use jterm_core::session_actor::{
-    SessionEvent as ShellEvent, WriteError as ShellWriteError, WriteSender as ShellWriteSender,
+    OutputNotice, OutputProgress, WriteError as ShellWriteError, WriteSender as ShellWriteSender,
 };
 
 pub struct ShellSession {
-    actor: SessionActor<Pty>,
+    actor: SessionHandle<Pty>,
     child_pid: i32,
-    started_at: std::time::Instant,
+    started_at: Instant,
     shell_program: Option<String>,
     shell_identity: companion_host::shell_identity::ShellIdentity,
 }
@@ -51,6 +53,7 @@ impl ShellSession {
             None,
             repaint_ctx,
         )
+        .map_err(|error| error.to_string())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -63,10 +66,10 @@ impl ShellSession {
         command_argv: Option<&[String]>,
         pinned_cwd: Option<crate::pty::PinnedDirectory>,
         repaint_ctx: WakeSink,
-    ) -> std::result::Result<Self, String> {
+    ) -> anyhow::Result<Self> {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
         let shell_program = if command_argv.is_none() {
-            Some(crate::pty::resolved_shell(configured_shell).map_err(|error| error.to_string())?)
+            Some(crate::pty::resolved_shell(configured_shell)?)
         } else {
             None
         };
@@ -80,34 +83,61 @@ impl ShellSession {
             command_argv,
             pinned_cwd,
         )
-        .map_err(|error| format!("Failed to create shell session: {error}"))?;
+        .map_err(|error| {
+            let message = format!("Failed to create shell session: {error}");
+            error.context(message)
+        })?;
         let child_pid = pty.get_child_pid();
         let shell_identity = companion_host::shell_identity::ShellIdentity::capture(
             child_pid,
             shell_program.as_deref().map(std::path::Path::new),
         );
-        let actor = SessionActor::start(pty, repaint_ctx)?;
+        let started_at = Instant::now();
+        let actor = SessionHandle::start_ordered(pty, repaint_ctx)
+            .map_err(|error| PtyLaunchError::ExecConfirmed(std::io::Error::other(error)))?;
         Ok(Self {
             actor,
             child_pid,
-            started_at: std::time::Instant::now(),
+            started_at,
             shell_program,
             shell_identity,
         })
+    }
+
+    pub(crate) fn failed_working_directory(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<PtyLaunchError>()
+            .is_some_and(PtyLaunchError::failed_working_directory)
     }
 
     pub fn output_source(&self) -> Option<u64> {
         self.actor.output_source()
     }
 
-    /// 获取事件接收器（用于读取 shell 事件）
-    pub fn events(&self) -> &Receiver<ShellEvent> {
-        self.actor.events()
+    pub fn poll_output(
+        &mut self,
+        budget: usize,
+        admit: impl FnOnce() -> bool,
+        apply: impl FnOnce(&OutputBuffer, bool),
+    ) -> OutputProgress {
+        self.actor.poll_output(budget, admit, apply)
     }
 
-    /// 子进程启动至今的时长。用于区分"用户主动 exit"与"shell 根本没起来"。
-    pub fn uptime(&self) -> std::time::Duration {
-        self.started_at.elapsed()
+    pub fn has_pending_output(&self) -> bool {
+        self.actor.has_pending_output()
+    }
+
+    pub fn buffered_output_bytes(&self) -> usize {
+        self.actor.buffered_output_bytes()
+    }
+
+    pub fn output_finished(&self) -> bool {
+        self.actor.output_finished()
+    }
+
+    /// Time when the exit was first collected, even if its tail took additional polls.
+    pub fn uptime_at(&self, observed_at: Instant) -> Duration {
+        observed_at.saturating_duration_since(self.started_at)
     }
 
     pub fn shell_program(&self) -> Option<&str> {
@@ -146,10 +176,6 @@ impl ShellSession {
         self.actor.write_sender()
     }
 
-    pub(crate) fn freeze_after_exit(&self) {
-        self.actor.freeze_after_exit();
-    }
-
     pub fn resize(&self, cols: usize, rows: usize) -> Result<(), String> {
         self.actor.resize(cols, rows)
     }
@@ -163,10 +189,50 @@ impl ShellSession {
 mod tests {
     use super::*;
     use parking_lot::Mutex;
-    use std::{
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use std::sync::Arc;
+
+    fn wait_for_output(
+        shell: &mut ShellSession,
+        deadline: Instant,
+        mut apply: impl FnMut(&OutputBuffer),
+    ) -> Option<OutputProgress> {
+        while Instant::now() < deadline {
+            let progress = shell.poll_output(4096, || true, |batch, _| apply(batch));
+            if progress.bytes_applied != 0 || progress.notice.is_some() {
+                return Some(progress);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    fn wait_for_ready(shell: &mut ShellSession, deadline: Instant) {
+        let mut output = Vec::new();
+        while !output.windows(5).any(|word| word == b"READY") {
+            let progress = wait_for_output(shell, deadline, |batch| {
+                output.extend_from_slice(batch.as_bytes());
+            })
+            .expect("timed out waiting for PTY readiness");
+            assert!(progress.notice.is_none(), "{:?}", progress.notice);
+        }
+    }
+
+    fn read_until_exit(shell: &mut ShellSession, deadline: Instant) -> (Vec<u8>, i32) {
+        let mut output = Vec::new();
+        loop {
+            let progress = wait_for_output(shell, deadline, |batch| {
+                output.extend_from_slice(batch.as_bytes());
+            })
+            .expect("timed out waiting for PTY exit");
+            match progress.notice {
+                Some(OutputNotice::Exited {
+                    code: Some(code), ..
+                }) => return (output, code),
+                Some(notice) => panic!("unexpected PTY notice: {notice:?}"),
+                None => {}
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -176,7 +242,7 @@ mod tests {
             "-c".into(),
             "stty raw -echo; printf READY; sleep 30".into(),
         ];
-        let shell = ShellSession::new_with_cwd(
+        let mut shell = ShellSession::new_with_cwd(
             80,
             24,
             None,
@@ -187,16 +253,7 @@ mod tests {
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if let Ok(ShellEvent::Output(bytes)) =
-                shell.events().recv_timeout(Duration::from_millis(20))
-            {
-                if bytes.as_bytes().windows(5).any(|word| word == b"READY") {
-                    break;
-                }
-            }
-            assert!(Instant::now() < deadline);
-        }
+        wait_for_ready(&mut shell, deadline);
         // A real FIFO write becomes in-flight while its PTY lock is held.
         let pty = shell.actor.test_transport();
         shell.write(b"older").unwrap();
@@ -253,7 +310,7 @@ mod tests {
             "-c".into(),
             "stty raw -echo; printf READY; read line; printf DONE".into(),
         ];
-        let shell = ShellSession::new_with_cwd(
+        let mut shell = ShellSession::new_with_cwd(
             80,
             24,
             None,
@@ -264,15 +321,7 @@ mod tests {
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut output = Vec::new();
-        while !output.windows(5).any(|word| word == b"READY") {
-            if let Ok(ShellEvent::Output(bytes)) =
-                shell.events().recv_timeout(Duration::from_millis(20))
-            {
-                output.extend_from_slice(bytes.as_bytes());
-            }
-            assert!(Instant::now() < deadline);
-        }
+        wait_for_ready(&mut shell, deadline);
         let terminal = Arc::new(Mutex::new(crate::terminal::TerminalState::new(80, 24)));
         terminal
             .lock()
@@ -349,7 +398,7 @@ mod tests {
             "-c".into(),
             "stty raw -echo; printf READY; sleep 30".into(),
         ];
-        let shell = ShellSession::new_with_cwd(
+        let mut shell = ShellSession::new_with_cwd(
             80,
             24,
             None,
@@ -360,16 +409,7 @@ mod tests {
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if let Ok(ShellEvent::Output(bytes)) =
-                shell.events().recv_timeout(Duration::from_millis(20))
-            {
-                if bytes.as_bytes().windows(5).any(|word| word == b"READY") {
-                    break;
-                }
-            }
-            assert!(Instant::now() < deadline);
-        }
+        wait_for_ready(&mut shell, deadline);
         // Saturate the real nonblocking kernel PTY while its child is not
         // reading. This fixture holds the same descriptor lock as production.
         for _ in 0..3 {
@@ -399,7 +439,7 @@ mod tests {
             "-c".to_string(),
             "printf 'FINAL_TAIL'; exit 0".to_string(),
         ];
-        let session = ShellSession::new_with_cwd(
+        let mut session = ShellSession::new_with_cwd(
             80,
             24,
             Some("/tmp"),
@@ -420,20 +460,24 @@ mod tests {
             cloned_writer.try_send(b"ignored".to_vec()),
             Err(ShellWriteError::Closed)
         );
-        let mut received = Vec::new();
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "timed out waiting for command exit");
-            match session.events().recv_timeout(remaining).unwrap() {
-                ShellEvent::Exit(0) => break,
-                ShellEvent::Output(output) => received.extend_from_slice(output.as_bytes()),
-                ShellEvent::Exit(code) => panic!("unexpected exit code {code}"),
-                ShellEvent::Error(error) => panic!("unexpected shell error: {error}"),
+            let paused = session.poll_output(64, || false, |_, _| panic!("PTY reply gate held"));
+            assert!(paused.notice.is_none());
+            assert_eq!(paused.bytes_applied, 0);
+            assert!(!session.output_finished());
+            if paused.parked {
+                break;
             }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the parked tail"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
+        let (received, code) = read_until_exit(&mut session, deadline);
         assert_eq!(received, b"FINAL_TAIL");
-
-        session.freeze_after_exit();
+        assert_eq!(code, 0);
+        assert!(session.output_finished());
         assert!(matches!(
             session.write(b"ignored"),
             Err(ShellWriteError::Closed)
@@ -442,7 +486,7 @@ mod tests {
             cloned_writer.try_send(b"ignored".to_vec()),
             Err(ShellWriteError::Closed)
         ));
-        assert!(session.events().is_empty());
+        assert!(!session.has_pending_output());
     }
 
     #[cfg(unix)]
@@ -465,7 +509,7 @@ mod tests {
             "ember-descendant-test".to_string(),
             escaped_marker.to_string_lossy().into_owned(),
         ];
-        let session = ShellSession::new_with_cwd(
+        let mut session = ShellSession::new_with_cwd(
             80,
             24,
             Some("/tmp"),
@@ -477,16 +521,7 @@ mod tests {
         .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "timed out waiting for command exit");
-            match session.events().recv_timeout(remaining).unwrap() {
-                ShellEvent::Exit(0) => break,
-                ShellEvent::Output(_) => {}
-                ShellEvent::Exit(code) => panic!("unexpected exit code {code}"),
-                ShellEvent::Error(error) => panic!("unexpected shell error: {error}"),
-            }
-        }
+        assert_eq!(read_until_exit(&mut session, deadline).1, 0);
 
         // The old reap-first path published Exit while the background child
         // remained alive. Give that child enough time to prove it escaped;
@@ -500,7 +535,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn transient_pty_hangup_waits_for_real_exit_and_recovers_output() {
-        use crossbeam_channel::RecvTimeoutError;
         use std::os::unix::fs::PermissionsExt;
 
         let unique = format!(
@@ -528,7 +562,7 @@ mod tests {
         // until that child execs. The window is a neighbour's timing, not this
         // test's subject, so retry briefly instead of failing the run.
         let spawn_deadline = Instant::now() + Duration::from_secs(5);
-        let session = loop {
+        let mut session = loop {
             match ShellSession::new(
                 80,
                 24,
@@ -547,22 +581,14 @@ mod tests {
 
         // The old implementation emitted Exit(-1) after a 30 ms reap window,
         // causing the live child to be dropped and killed before it could reopen.
-        assert!(matches!(
-            session.events().recv_timeout(Duration::from_millis(100)),
-            Err(RecvTimeoutError::Timeout)
-        ));
-
+        let premature = wait_for_output(
+            &mut session,
+            Instant::now() + Duration::from_millis(100),
+            |_| panic!("output while the slave was closed"),
+        );
+        assert!(premature.is_none());
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut output = Vec::new();
-        let exit_code = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "timed out waiting for the test shell");
-            match session.events().recv_timeout(remaining).unwrap() {
-                ShellEvent::Output(bytes) => output.extend_from_slice(bytes.as_bytes()),
-                ShellEvent::Exit(code) => break code,
-                ShellEvent::Error(error) => panic!("unexpected shell error: {error}"),
-            }
-        };
+        let (output, exit_code) = read_until_exit(&mut session, deadline);
         assert_eq!(output, b"recovered");
         assert_eq!(exit_code, 7);
 

@@ -557,6 +557,11 @@ block_mode = true
 block_compact = false
 ```
 
+Scrollback is bounded by both `scrollback_lines` and compressed storage per
+terminal. The default byte allowance is 8 MiB. Larger configured row limits
+increase the allowance up to 32 MiB. Dense rows can exhaust the byte allowance
+before reaching the configured row limit.
+
 ### Block workspace
 
 Block Mode adds a stable workspace strip for browsing command history. Search,
