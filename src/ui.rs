@@ -12474,6 +12474,45 @@ mod transcript_canvas_tests {
     }
 
     #[test]
+    fn inline_cli_page_up_uses_history_arriving_before_the_next_paint() {
+        let (mut renderer, _, policy) = fixture(true);
+        let mut terminal = TerminalState::new(40, 12);
+        terminal.set_inline_cli_launch(true);
+        let ctx = egui::Context::default();
+        let mut state = ProjectionViewState::new();
+        let mut canvas = TranscriptCanvas::default();
+        let before = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(before.max_scroll_offset(), 0);
+
+        // Codex's standard inline history inserts CR/LF at the end of its
+        // top-anchored region, leaving the composer outside the region.
+        terminal.process_input(b"\x1b[?2026h\x1b[1;8r\x1b[8;1H");
+        for index in 0..36 {
+            terminal.process_input(format!("\r\nSESSION_{index:03}").as_bytes());
+        }
+        terminal.process_input(b"\x1b[r\x1b[12;1HLIVE_COMPOSER\x1b[?2026l");
+        assert!(terminal.scrollback_len() >= 20);
+        let fresh = renderer.projected_viewport_with_state(&mut terminal, &policy, &mut state);
+        let page = fresh.visible_rows() - 2;
+        assert!(fresh.max_scroll_offset() >= page);
+
+        canvas.page_on_present(page as isize);
+        let older = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(older.scroll_offset(), page);
+        assert!(!state.follows_bottom());
+        assert!(older.cells().iter().any(|row| {
+            row.iter()
+                .map(|cell| cell.character)
+                .collect::<String>()
+                .starts_with("SESSION_")
+        }));
+        canvas.page_on_present(-(page as isize));
+        let live = renderer.canvas_viewport(&mut terminal, &policy, &mut state, &mut canvas, &ctx);
+        assert_eq!(live.scroll_offset(), 0);
+        assert!(state.follows_bottom());
+    }
+
+    #[test]
     fn inline_cli_alternate_transcript_never_appends_frames_or_scrolled_rows() {
         for direct in [false, true] {
             let mut terminal = TerminalState::new(40, 8);

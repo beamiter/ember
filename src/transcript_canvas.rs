@@ -11,6 +11,7 @@ pub struct TranscriptCanvas {
     initialized: bool,
     resume_pending: bool,
     resume_input: Vec<ResumeInput>,
+    keyboard_pages: Vec<isize>,
     expected_offset: usize,
     document_rows: usize,
     projection_revision: u64,
@@ -53,6 +54,7 @@ impl TranscriptCanvas {
         // Inputs from a visible frame that never presented must not survive a
         // second hide and replay on a later activation.
         self.resume_input.clear();
+        self.keyboard_pages.clear();
         self.motion.cancel();
         self.last_time = None;
     }
@@ -115,6 +117,13 @@ impl TranscriptCanvas {
         }
         self.scroll(rows as f64 * f64::from(line_height.max(1.0)), false);
         true
+    }
+
+    /// A keyboard Page event is decided against the new projection, not the
+    /// last painted extent. In particular the first retained rows can arrive
+    /// in the same UI frame as PageUp.
+    pub fn page_on_present(&mut self, rows: isize) {
+        self.keyboard_pages.push(rows);
     }
 
     /// Rebase against the terminal's stable reading anchor before advancing.
@@ -220,6 +229,22 @@ impl TranscriptCanvas {
                 ResumeInput::Stop => self.stop(),
             }
         }
+        let pages = std::mem::take(&mut self.keyboard_pages);
+        if !pages.is_empty() {
+            // An easing live tail can still be painting older pixels while
+            // its logical viewport is at zero. Page from the rebased row,
+            // not from that transient paint position.
+            let mut position = if follows_live {
+                0.0
+            } else {
+                offset_rows as f64 * height
+            };
+            for rows in pages {
+                position = (position + rows as f64 * height).clamp(0.0, max);
+            }
+            self.motion.jump_to(position);
+            self.follows_live = position <= 0.0;
+        }
         let dt = self
             .last_time
             .filter(|previous| time.is_finite() && time >= *previous)
@@ -298,6 +323,24 @@ mod tests {
         t: f64,
     ) -> CanvasPresentation {
         canvas.present(offset, rows, rows as u64, 20, 80, follow, 20.0, t, false)
+    }
+
+    #[test]
+    fn keyboard_page_counts_from_latest_bounds_not_a_painted_spring() {
+        let mut canvas = TranscriptCanvas::default();
+        let initial = present(&mut canvas, 0, 20, true, 0.0);
+        assert_eq!(initial.offset_rows, 0);
+        canvas.page_on_present(18);
+        let older = present(&mut canvas, 0, 100, true, 0.016);
+        assert_eq!(older.offset_rows, 18);
+        assert!(!older.follows_live);
+        assert!(!older.animating);
+        assert_eq!(older.translation, 0.0);
+
+        canvas.page_on_present(-18);
+        let live = present(&mut canvas, 18, 100, false, 0.032);
+        assert_eq!(live.offset_rows, 0);
+        assert!(live.follows_live);
     }
 
     #[test]

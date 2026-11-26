@@ -7450,9 +7450,13 @@ impl eframe::App for TerminalApp {
                 else {
                     continue;
                 };
-                let (rows, alt_screen) = {
+                let (rows, alt_screen, inline_reading) = {
                     let terminal = session.terminal.lock();
-                    (terminal.get_dimensions().1, terminal.is_alt_buffer_active())
+                    (
+                        terminal.get_dimensions().1,
+                        terminal.is_alt_buffer_active(),
+                        terminal.inline_cli_scope_floor().is_some(),
+                    )
                 };
                 if !crate::ui::viewport_owns_page_key(*key, *modifiers, alt_screen) {
                     continue;
@@ -7465,7 +7469,12 @@ impl eframe::App for TerminalApp {
                     .unwrap_or(&self.renderer);
                 let viewport = projected_viewport_for_session(session, renderer);
                 if viewport.is_transformed() {
-                    if !session.transcript_canvas.page(amount, renderer.line_height) {
+                    if inline_reading
+                        && session.terminal.lock().kitty_graphics.get_placements().is_empty()
+                        && renderer.native_vim9_identity.is_none()
+                    {
+                        session.transcript_canvas.page_on_present(amount);
+                    } else if !session.transcript_canvas.page(amount, renderer.line_height) {
                         session.projection_view_state.scroll(amount, &viewport);
                     }
                 } else {

@@ -26,6 +26,8 @@ fn classify(command: &str, reading_agent_only: bool) -> bool {
         return false;
     };
     let mut args = words.iter().map(String::as_str).peekable();
+    let mut package_launcher = false;
+    let mut pre_command_separator = false;
     let name = loop {
         let Some(word) = args.next() else {
             return false;
@@ -36,7 +38,12 @@ fn classify(command: &str, reading_agent_only: bool) -> bool {
         let name = match word {
             "@anthropic-ai/claude-code" => "claude",
             "@google/gemini-cli" => "gemini",
-            _ => word.rsplit('/').next().unwrap_or(word),
+            value if package_launcher && codex_npm_package(value) => "codex",
+            value if package_launcher && value.starts_with('@') => return false,
+            _ => match word.rsplit('/').next().unwrap_or(word) {
+                "codex.js" => "codex",
+                basename => basename,
+            },
         };
         match name {
             "command" | "exec" => {
@@ -84,16 +91,43 @@ fn classify(command: &str, reading_agent_only: bool) -> bool {
                 }
             }
             "npx" | "bunx" => {
+                package_launcher = true;
                 if matches!(args.peek(), Some(&"--yes" | &"-y" | &"--no-install")) {
                     args.next();
                 }
-            }
-            "pnpm" => {
-                if !matches!(args.next(), Some("dlx" | "exec")) {
-                    return false;
+                if args.peek() == Some(&"--") {
+                    args.next();
+                    pre_command_separator = true;
                 }
             }
-            _ => break name,
+            "npm" | "pnpm" => {
+                if !matches!(
+                    (name, args.next()),
+                    ("npm", Some("exec" | "x")) | ("pnpm", Some("dlx" | "exec"))
+                ) {
+                    return false;
+                }
+                package_launcher = true;
+                if name == "npm" && matches!(args.peek(), Some(&"--yes" | &"-y")) {
+                    args.next();
+                }
+                if args.peek() == Some(&"--") {
+                    args.next();
+                    pre_command_separator = true;
+                }
+            }
+            _ => {
+                // npm exec accepts the separator after the package spec. It
+                // is not Codex's own positional sentinel in that form.
+                if package_launcher
+                    && !pre_command_separator
+                    && codex_npm_package(word)
+                    && args.peek() == Some(&"--")
+                {
+                    args.next();
+                }
+                break name;
+            }
         }
     };
     let agent = matches!(name, "codex" | "claude" | "gemini" | "opencode" | "aider");
@@ -199,6 +233,20 @@ fn assignment(word: &str) -> bool {
 
 // Parse only simple argv, preserving quoted option values. Compound commands
 // are ambiguous; alternate-screen detection remains authoritative for them.
+fn codex_npm_package(word: &str) -> bool {
+    word == "@openai/codex"
+        || word.strip_prefix("@openai/codex@").is_some_and(|version| {
+            version.len() <= 128
+                && version
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && version.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+')
+                })
+        })
+}
+
 fn shell_words(command: &str) -> Option<Vec<String>> {
     if command.len() > 16 * 1024 {
         return None;
@@ -345,6 +393,11 @@ mod reading_tests {
             "claude",
             "env FOO=bar npx -y @anthropic-ai/claude-code",
             "command /opt/bin/codex resume abc",
+            "/pkg/codex.js --no-alt-screen",
+            "npm exec -- codex --no-alt-screen",
+            "npm exec --yes @openai/codex@latest -- --no-alt-screen",
+            "npx -y @openai/codex@0.121.0 resume abc",
+            "pnpm dlx @openai/codex@latest resume abc",
         ] {
             assert!(reads(command), "{command}");
         }
@@ -356,6 +409,13 @@ mod reading_tests {
             "claude --print test",
             "claude --help",
             "ssh host codex",
+            "npm run codex",
+            "npm exec -- codex exec task",
+            "npm exec @openai/codex@latest -- exec task",
+            "npx @openai/codex@latest --help",
+            "npx @other/codex",
+            "npx @other/codex@latest",
+            "npx @openai/codex@https://example.invalid/pkg",
         ] {
             assert!(!reads(command), "{command}");
         }
