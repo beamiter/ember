@@ -124,13 +124,15 @@ pub struct TerminalMouseCapture {
     /// during a drag, but a paste response for this PTY must remain ahead of
     /// its mouse reports.
     pub protocol_responses: crate::session_manager::ProtocolResponseSender,
-    /// Press-time pane geometry plus the most recent cell. Some window
+    /// Press-time pane geometry plus the most recent position. Some window
     /// systems deliver an outside-window release without a pointer position.
     pub content_rect: egui::Rect,
     pub char_width: f32,
     pub line_height: f32,
-    pub last_col: usize,
-    pub last_row: usize,
+    /// Cleared when the gesture's coordinate space is retired. The capture
+    /// still owns button-up, even if it can no longer report it to the PTY.
+    pub(crate) report_space: Option<super::mouse::MouseReportSpace>,
+    pub last_position: Option<jterm_engine::mouse::MousePosition>,
     /// Press/release are state transitions and cannot be dropped like motion
     /// or wheel reports. Keep them ordered across bounded-writer backpressure.
     pub pending_controls: std::collections::VecDeque<PendingMouseControl>,
@@ -140,6 +142,14 @@ pub struct TerminalMouseCapture {
     /// replaced before button-up. Retain the capture only to absorb that
     /// release without copying a different session's selection to PRIMARY.
     pub local_selection_cancelled: bool,
+}
+
+impl TerminalMouseCapture {
+    pub(crate) fn retire_reporting(&mut self) {
+        self.report_space = None;
+        self.last_position = None;
+        self.pending_controls.clear();
+    }
 }
 
 /// Selection survives moving the same inspector between a dock and drawer.
@@ -488,7 +498,7 @@ pub struct TerminalApp {
     pub alternate_scroll_wheel: crate::alternate_scroll::AlternateScrollWheel,
     /// Stable session identity and routing decision for the current drag.
     pub terminal_mouse_capture: Option<TerminalMouseCapture>,
-    pub last_terminal_mouse_motion: Option<(String, usize, usize)>,
+    pub(crate) last_terminal_mouse_motion: Option<(String, super::mouse::MouseMotion)>,
 
     /// Raw Ctrl+wheel samples routed using the current painted regions.
     pub font_zoom: crate::font_zoom::FontZoom,

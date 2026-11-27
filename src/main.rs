@@ -113,10 +113,12 @@ use app::events::{
     normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
     semantic_paste_modifiers, semantic_shortcut_modifiers, should_restore_terminal_shortcut_event,
 };
+use app::mouse::{MouseMotion, MouseReportSpace};
 use base64::Engine;
 use clipboard::{ClipboardContent, ClipboardManager};
 use eframe::egui;
 pub(crate) use jterm_core::char_width;
+use jterm_engine::mouse::MousePosition;
 use parking_lot::Mutex as ParkingMutex;
 use session::Session;
 use session_manager::{ProtocolResponseQueueError, ProtocolResponseSender, SessionManager};
@@ -1486,6 +1488,38 @@ fn application_cell_at_pointer(
     viewport.application_cell(terminal::DisplayPoint::new(row, col))
 }
 
+fn application_mouse_position(
+    space: MouseReportSpace,
+    pointer: egui::Pos2,
+    renderer: &TerminalRenderer,
+    content_rect: egui::Rect,
+    char_width: f32,
+    line_height: f32,
+    viewport: &terminal::ProjectedViewport,
+) -> Option<MousePosition> {
+    let mapped_pointer = renderer.canvas_pointer_position(pointer);
+    match space {
+        MouseReportSpace::Cells => application_cell_at_pointer(
+            mapped_pointer,
+            renderer.canvas_mapping_rect(content_rect),
+            char_width,
+            line_height,
+            viewport,
+        )
+        .map(|(row, column)| MousePosition::Cell { column, row }),
+        MouseReportSpace::Pixels(Some(pixels)) => {
+            let rect = renderer.last_content_rect.filter(|rect| rect.contains(pointer))?;
+            pixels.position_at(
+                mapped_pointer,
+                renderer.canvas_mapping_rect(rect),
+                egui::vec2(renderer.char_width, renderer.line_height),
+                viewport,
+            )
+        }
+        MouseReportSpace::Pixels(None) => None,
+    }
+}
+
 /// Display-only block chrome cannot inject a PRIMARY/clipboard paste.
 /// Real history rows remain eligible inside the terminal content rectangle.
 fn pointer_is_block_decoration(
@@ -1632,37 +1666,37 @@ fn track_middle_paste_gesture(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AppMouseFrameRoute {
-    /// A pointer cell that may produce press, motion or wheel reports.
-    lossy_cell: Option<(usize, usize)>,
-    /// The last real raw cell is retained solely to pair an accepted press with
+struct AppMouseFrameRoute<P> {
+    /// A pointer position that may produce motion or wheel reports.
+    current: Option<P>,
+    /// The last real position is retained solely to pair an accepted press with
     /// its release when the pointer leaves the app surface or its session.
-    release_cell: Option<(usize, usize)>,
+    release: Option<P>,
 }
 
-fn app_mouse_press_reports_from_snapshot(
+fn app_mouse_press_reports_from_snapshot<P>(
     route_requested: bool,
-    application_cell: Option<(usize, usize)>,
+    application_position: Option<P>,
 ) -> bool {
-    route_requested && application_cell.is_some()
+    route_requested && application_position.is_some()
 }
 
-fn app_mouse_frame_route(
+fn app_mouse_frame_route<P: Copy>(
     uses_active_projection: bool,
-    projected_pointer_cell: Option<Option<(usize, usize)>>,
-    captured_last_cell: Option<(usize, usize)>,
-) -> AppMouseFrameRoute {
+    projected_pointer: Option<Option<P>>,
+    captured_last_position: Option<P>,
+) -> AppMouseFrameRoute<P> {
     if !uses_active_projection {
         return AppMouseFrameRoute {
-            lossy_cell: None,
-            release_cell: captured_last_cell,
+            current: None,
+            release: captured_last_position,
         };
     }
 
-    let lossy_cell = projected_pointer_cell.flatten();
+    let current = projected_pointer.flatten();
     AppMouseFrameRoute {
-        lossy_cell,
-        release_cell: lossy_cell.or(captured_last_cell),
+        current,
+        release: current.or(captured_last_position),
     }
 }
 
@@ -1747,14 +1781,22 @@ fn app_mouse_edge_modifiers(
     pressed: bool,
     fallback: egui::Modifiers,
 ) -> egui::Modifiers {
+    app_mouse_button_edge(events, button, pressed).map_or(fallback, |(_, modifiers)| modifiers)
+}
+
+fn app_mouse_button_edge(
+    events: &[egui::Event],
+    button: u8,
+    pressed: bool,
+) -> Option<(egui::Pos2, egui::Modifiers)> {
     events
         .iter()
         .find_map(|event| match event {
             egui::Event::PointerButton {
+                pos,
                 button: edge,
                 pressed: down,
                 modifiers,
-                ..
             } if *down == pressed
                 && match edge {
                     egui::PointerButton::Primary => button == 0,
@@ -1763,17 +1805,17 @@ fn app_mouse_edge_modifiers(
                     _ => false,
                 } =>
             {
-                Some(*modifiers)
+                Some((*pos, *modifiers))
             }
             _ => None,
         })
-        .unwrap_or(fallback)
 }
 
 fn mouse_capture_accepts_new_press(capture_active: bool) -> bool {
     !capture_active
 }
 
+#[cfg(test)]
 fn mouse_cell_for_current_dimensions(
     pointer: Option<egui::Pos2>,
     fallback: Option<(usize, usize)>,
@@ -2221,6 +2263,15 @@ fn flush_mouse_controls(
     capture: &mut crate::app::state::TerminalMouseCapture,
     protocol_input_barriers: &crate::session_manager::SessionInputBarriers,
 ) -> Result<bool, crate::shell::ShellWriteError> {
+    if capture.pending_controls.is_empty() {
+        return Ok(true);
+    }
+    let terminal = capture.terminal.lock();
+    if capture.report_space != Some(MouseReportSpace::for_terminal(&terminal)) {
+        drop(terminal);
+        capture.retire_reporting();
+        return Ok(true);
+    }
     if mouse_protocol_input_is_blocked(
         &capture.session_id,
         protocol_input_barriers,
@@ -2298,7 +2349,7 @@ fn mouse_capture_allows_lossy(capture: Option<&crate::app::state::TerminalMouseC
     capture.is_none_or(|capture| {
         mouse_sequence_allows_lossy(
             capture.reported_to_app,
-            capture.press_accepted,
+            capture.press_accepted && capture.report_space.is_some(),
             capture.release_observed,
             capture.pending_controls.is_empty(),
         )
@@ -2307,7 +2358,7 @@ fn mouse_capture_allows_lossy(capture: Option<&crate::app::state::TerminalMouseC
 
 fn mouse_capture_is_complete(capture: &crate::app::state::TerminalMouseCapture) -> bool {
     mouse_sequence_is_complete(
-        capture.reported_to_app,
+        capture.report_space.is_some(),
         capture.press_accepted,
         capture.release_observed,
         capture.pending_controls.is_empty(),
@@ -8051,6 +8102,7 @@ impl eframe::App for TerminalApp {
                 )
             })
         });
+        let mut mouse_capture_started = false;
         if let Some(button) = terminal_button_pressed.filter(|button| {
             !mouse_cancelled
                 && mouse_capture_accepts_new_press(self.terminal_mouse_capture.is_some())
@@ -8064,61 +8116,50 @@ impl eframe::App for TerminalApp {
             let content_rect = pointer_renderer
                 .last_content_rect
                 .unwrap_or_else(|| ctx.viewport_rect());
-            let (mouse_cols, mouse_rows) = (
-                mouse_projection_viewport.columns(),
-                mouse_projection_viewport.rows(),
+            let (press_pointer, modifiers) = ctx.input(|input| {
+                app_mouse_button_edge(&input.events, button, true)
+                    .map_or((pointer_pos, input.modifiers), |(pos, modifiers)| {
+                        (Some(pos), modifiers)
+                    })
+            });
+            let route_requested = mouse_press_reports_to_app(
+                mouse_enabled,
+                modifiers.shift,
+                pointer_app_mouse_eligible,
+                link_press_override,
             );
-            let display_cell = mouse_cell_for_current_dimensions(
+            let space = MouseReportSpace::for_terminal(&session.terminal.lock());
+            let press_pointer = if space == MouseReportSpace::Cells {
                 pointer_pos
-                    .or(Some(content_rect.center()))
-                    .map(|point| pointer_renderer.canvas_pointer_position(point)),
-                None,
-                pointer_renderer.canvas_mapping_rect(content_rect),
-                pointer_renderer.char_width,
-                pointer_renderer.line_height,
-                mouse_cols,
-                mouse_rows,
-            );
-            let application_cell = pointer_pos.and_then(|pointer| {
-                application_cell_at_pointer(
-                    pointer_renderer.canvas_pointer_position(pointer),
-                    pointer_renderer.canvas_mapping_rect(content_rect),
+            } else {
+                press_pointer
+            };
+            let last_position = press_pointer.filter(|_| route_requested).and_then(|pointer| {
+                application_mouse_position(
+                    space,
+                    pointer,
+                    pointer_renderer,
+                    content_rect,
                     pointer_renderer.char_width,
                     pointer_renderer.line_height,
                     &mouse_projection_viewport,
                 )
             });
-            let reported_to_app = app_mouse_press_reports_from_snapshot(
-                mouse_press_reports_to_app(
-                    mouse_enabled,
-                    ctx.input(|input| {
-                        app_mouse_edge_modifiers(&input.events, button, true, input.modifiers).shift
-                    }),
-                    pointer_app_mouse_eligible,
-                    link_press_override,
-                ),
-                application_cell,
-            );
-            let (last_row, last_col) = if reported_to_app {
-                application_cell.unwrap_or(display_cell)
-            } else {
-                display_cell
-            };
+            let reported_to_app = app_mouse_press_reports_from_snapshot(route_requested, last_position)
+                || (route_requested && space != MouseReportSpace::Cells);
             self.terminal_mouse_capture = Some(crate::app::state::TerminalMouseCapture {
                 session_id: active_session_id.clone(),
                 reported_to_app,
                 button,
-                last_modifiers: ctx.input(|input| {
-                    app_mouse_edge_modifiers(&input.events, button, true, input.modifiers)
-                }),
+                last_modifiers: modifiers,
                 terminal: Arc::clone(&session.terminal),
                 write_tx: session.shell.write_sender(),
                 protocol_responses: active_protocol_responses.clone(),
                 content_rect,
                 char_width: pointer_renderer.char_width,
                 line_height: pointer_renderer.line_height,
-                last_col,
-                last_row,
+                report_space: last_position.map(|_| space),
+                last_position,
                 pending_controls: std::collections::VecDeque::new(),
                 press_accepted: false,
                 release_observed: false,
@@ -8128,6 +8169,7 @@ impl eframe::App for TerminalApp {
                 // PRIMARY when the link opens.
                 local_selection_cancelled: link_press_override,
             });
+            mouse_capture_started = true;
         }
 
         // Captures can belong to an inactive pane. Never drain queued coordinates
@@ -8212,7 +8254,7 @@ impl eframe::App for TerminalApp {
             content_rect,
             char_width,
             line_height,
-            fallback_cell,
+            fallback_position,
         ) = if let Some(capture) = capture_for_route {
             (
                 Arc::clone(&capture.terminal),
@@ -8222,7 +8264,7 @@ impl eframe::App for TerminalApp {
                 capture.content_rect,
                 capture.char_width,
                 capture.line_height,
-                Some((capture.last_row, capture.last_col)),
+                capture.last_position,
             )
         } else {
             let pointer_renderer = active_pane_renderer_idx
@@ -8244,11 +8286,13 @@ impl eframe::App for TerminalApp {
         let mouse_uses_active_projection = mouse_session_id == active_session_id
             && Arc::ptr_eq(&mouse_terminal, &session.terminal);
         let mut mouse_route_closed = false;
+        let mut lossy_mouse_space = None;
+        let mut pending_motion = None;
         let raw_wheel_frame = self.alternate_scroll_wheel.take_tracking_events();
         let lossy_mouse_reports: Vec<Vec<u8>> = if (!sequence_reports_to_app
             || !pointer_routes_to_terminal
             || (terminal_pointer_input_blocked && reported_capture_release.is_none()))
-            || (pointer_pos.is_none() && fallback_cell.is_none())
+            || (pointer_pos.is_none() && fallback_position.is_none())
         {
             self.mouse_line_wheel.reset();
             self.mouse_point_wheel.reset();
@@ -8258,175 +8302,208 @@ impl eframe::App for TerminalApp {
             Vec::new()
         } else {
             let terminal = mouse_terminal.lock();
-            if !terminal.is_mouse_enabled() {
+            let space = MouseReportSpace::for_terminal(&terminal);
+            let capture_reports = self.terminal_mouse_capture.as_mut().is_none_or(|capture| {
+                if capture.report_space != Some(space) {
+                    capture.retire_reporting();
+                }
+                capture.report_space.is_some()
+            });
+            if !capture_reports || !terminal.is_mouse_enabled() {
                 self.mouse_line_wheel.reset();
                 self.mouse_point_wheel.reset();
                 self.mouse_wheel_alt_screen = None;
-            self.mouse_wheel_alt_modifier = None;
-            self.mouse_wheel_session_id = None;
-                // The application disabled mouse reporting while a sequence was
-                // active. An unaccepted press can be retired, but a release
-                // already encoded behind backpressure must still follow its
-                // accepted press on the original writer route.
-                let queued_release = self.terminal_mouse_capture.as_ref().is_some_and(|capture| {
-                    capture.pending_controls.iter().any(|pending| {
-                        pending.kind == crate::app::state::PendingMouseControlKind::Release
-                    })
-                });
-                mouse_route_closed = self.terminal_mouse_capture.is_some() && !queued_release;
-                drop(terminal);
+                self.mouse_wheel_alt_modifier = None;
+                self.mouse_wheel_session_id = None;
+                // A legacy release already encoded behind backpressure still
+                // follows its press. A retired pixel gesture only absorbs button-up.
+                if capture_reports {
+                    mouse_route_closed = self.terminal_mouse_capture.as_ref().is_some_and(|capture| {
+                        !capture.pending_controls.iter().any(|pending| {
+                            pending.kind == crate::app::state::PendingMouseControlKind::Release
+                        })
+                    });
+                }
                 Vec::new()
             } else {
                 let mut reports = Vec::new();
+                let modes = terminal.vt.protocol.modes();
+                lossy_mouse_space = Some(space);
                 let alt_screen = terminal.is_alt_buffer();
                 if self.mouse_wheel_session_id.as_deref() != Some(mouse_session_id.as_str()) {
-                    self.mouse_line_wheel.reset();self.mouse_point_wheel.reset();self.mouse_wheel_alt_modifier=None;
-                    self.mouse_wheel_session_id=Some(mouse_session_id.clone());
+                    self.mouse_line_wheel.reset();
+                    self.mouse_point_wheel.reset();
+                    self.mouse_wheel_alt_modifier = None;
+                    self.mouse_wheel_session_id = Some(mouse_session_id.clone());
                 }
                 if self.mouse_wheel_alt_screen != Some(alt_screen) {
                     if self.mouse_wheel_alt_screen.is_some() {
                         self.mouse_line_wheel.reset();
                         self.mouse_point_wheel.reset();
-                        self.mouse_wheel_alt_modifier=None;
+                        self.mouse_wheel_alt_modifier = None;
                     }
                     self.mouse_wheel_alt_screen = Some(alt_screen);
                 }
                 let (_, mouse_rows) = terminal.get_dimensions();
-                let projected_pointer_cell = mouse_uses_active_projection.then(|| {
-                    pointer_pos.and_then(|pointer| {
-                        let renderer = active_pane_renderer_idx
-                            .and_then(|index| self.pane_renderers.get(index))
-                            .unwrap_or(&self.renderer);
-                        application_cell_at_pointer(
-                            renderer.canvas_pointer_position(pointer),
-                            renderer.canvas_mapping_rect(content_rect),
-                            char_width,
-                            line_height,
-                            &mouse_projection_viewport,
-                        )
-                    })
-                });
+                let renderer = active_pane_renderer_idx
+                    .and_then(|index| self.pane_renderers.get(index))
+                    .unwrap_or(&self.renderer);
+                let position_at = |point| {
+                    application_mouse_position(
+                        space,
+                        point,
+                        renderer,
+                        content_rect,
+                        char_width,
+                        line_height,
+                        &mouse_projection_viewport,
+                    )
+                };
+                let pixel_mode = space != MouseReportSpace::Cells;
                 let frame_route = app_mouse_frame_route(
                     mouse_uses_active_projection,
-                    projected_pointer_cell,
-                    fallback_cell,
+                    mouse_uses_active_projection.then(|| {
+                        pointer_pos
+                            .filter(|_| !pixel_mode || pointer_app_mouse_eligible)
+                            .and_then(position_at)
+                    }),
+                    fallback_position,
                 );
-                if let Some((row, col)) = frame_route.lossy_cell {
+
+                if !only_release {
                     if let Some(capture) = self.terminal_mouse_capture.as_mut() {
-                        if capture.session_id == mouse_session_id {
-                            capture.last_col = col;
-                            capture.last_row = row;
+                        if mouse_capture_started {
+                            let press = if pixel_mode {
+                                capture.last_position
+                            } else {
+                                frame_route.current
+                            };
+                            if let Some(report) = press.and_then(|position| {
+                                let modifiers = ctx.input(|input| {
+                                    app_mouse_edge_modifiers(
+                                        &input.events,
+                                        capture.button,
+                                        true,
+                                        input.modifiers,
+                                    )
+                                });
+                                modes.get_mouse_report_at(
+                                    app_mouse_button(capture.button, modifiers),
+                                    position,
+                                )
+                            }) {
+                                queue_mouse_control(
+                                    &mut capture.pending_controls,
+                                    crate::app::state::PendingMouseControlKind::Press,
+                                    report,
+                                );
+                            }
+                        } else if !capture.release_observed {
+                            if let Some(position) = frame_route.current {
+                                capture.last_position = Some(position);
+                            }
                         }
                     }
                 }
 
-                if let Some((row, col)) =
-                    (!only_release).then_some(frame_route.lossy_cell).flatten()
-                {
-                    let runs = raw_wheel_frame.as_ref().map(|(_,events)| mouse_wheel_runs(
-                        &mut self.mouse_line_wheel,&mut self.mouse_point_wheel,&mut self.mouse_wheel_alt_modifier,
-                        events,content_rect,line_height.max(1.0),mouse_rows,inline_cli_host_wheel,ctx.input(|input|input.modifiers.alt))).unwrap_or_default();
-                    for (alt,steps) in runs {
-                        let button=(if steps>0 {64} else {65}) | if alt {8} else {0};
-                        for _ in 0..steps.unsigned_abs() {
-                            if let Some(report)=terminal.get_mouse_report(button,col,row) {reports.push(report);}
-                        }
-                    }
-
-                    if let Some(capture) = self.terminal_mouse_capture.as_ref() {
-                        if capture.reported_to_app
-                            && terminal_button_pressed == Some(capture.button)
-                        {
-                            if let Some(report) = terminal.get_mouse_report(
-                                app_mouse_button(
-                                    capture.button,
-                                    ctx.input(|input| {
-                                        app_mouse_edge_modifiers(
-                                            &input.events,
-                                            capture.button,
-                                            true,
-                                            input.modifiers,
-                                        )
-                                    }),
-                                ),
-                                col,
-                                row,
-                            ) {
-                                if let Some(capture) = self.terminal_mouse_capture.as_mut() {
-                                    queue_mouse_control(
-                                        &mut capture.pending_controls,
-                                        crate::app::state::PendingMouseControlKind::Press,
-                                        report,
-                                    );
-                                }
-                            }
+                if let Some(position) = (!only_release).then_some(frame_route.current).flatten() {
+                    let wheel_rect = if pixel_mode {
+                        renderer.last_content_rect.unwrap_or(content_rect)
+                    } else {
+                        content_rect
+                    };
+                    let runs = raw_wheel_frame
+                        .as_ref()
+                        .map(|(_, events)| {
+                            mouse_wheel_runs(
+                                &mut self.mouse_line_wheel,
+                                &mut self.mouse_point_wheel,
+                                &mut self.mouse_wheel_alt_modifier,
+                                events,
+                                wheel_rect,
+                                line_height.max(1.0),
+                                mouse_rows,
+                                inline_cli_host_wheel,
+                                ctx.input(|input| input.modifiers.alt),
+                            )
+                        })
+                        .unwrap_or_default();
+                    for (alt, steps) in runs {
+                        let button = (if steps > 0 { 64 } else { 65 }) | if alt { 8 } else { 0 };
+                        if let Some(report) = modes.get_mouse_report_at(button, position) {
+                            reports.extend(std::iter::repeat_n(report, steps.unsigned_abs()));
                         }
                     }
 
                     let pointer_moved =
                         ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
                     let motion_button = reported_capture_button(capture_route_state);
-                    if pointer_moved
-                        && terminal.should_report_mouse_motion(motion_button.is_some())
-                        && self.last_terminal_mouse_motion.as_ref().is_none_or(
-                            |(session_id, last_col, last_row)| {
-                                session_id != &mouse_session_id
-                                    || *last_col != col
-                                    || *last_row != row
-                            },
-                        )
-                    {
-                        let base_button = motion_button.unwrap_or(3);
-                        if let Some(report) = terminal.get_mouse_report(
-                            app_mouse_button(base_button | 32, ctx.input(|input| input.modifiers)),
-                            col,
-                            row,
-                        ) {
-                            reports.push(report);
-                            self.last_terminal_mouse_motion =
-                                Some((mouse_session_id.clone(), col, row));
+                    if pointer_moved && terminal.should_report_mouse_motion(motion_button.is_some()) {
+                        let button = app_mouse_button(
+                            motion_button.unwrap_or(3) | 32,
+                            ctx.input(|input| input.modifiers),
+                        );
+                        let motion = MouseMotion::new(space, position, button);
+                        let duplicate = self.last_terminal_mouse_motion.as_ref().is_some_and(
+                            |(session_id, last)| session_id == &mouse_session_id && *last == motion,
+                        );
+                        if !duplicate {
+                            if let Some(report) = modes.get_mouse_report_at(button, position) {
+                                reports.push(report);
+                                pending_motion = Some(motion);
+                            }
                         }
                     }
                 } else {
-                    // Synthetic summary/padding rows never become an app
-                    // surface. A capture whose terminal is no longer active is
-                    // release-only as well: never reinterpret the new pane's
-                    // display coordinates as the old PTY's raw grid. Do not
-                    // retain wheel fractions that could fire on re-entry.
+                    // Summary/padding rows and inactive panes have no app
+                    // surface. Discard wheel fractions so they cannot fire on re-entry.
                     self.mouse_line_wheel.reset();
                     self.mouse_point_wheel.reset();
                     self.mouse_wheel_alt_screen = None;
-            self.mouse_wheel_alt_modifier = None;
-            self.mouse_wheel_session_id = None;
+                    self.mouse_wheel_alt_modifier = None;
+                    self.mouse_wheel_session_id = None;
                 }
 
-                // A release is emitted exactly once and only for a press
-                // captured by this terminal. Mode 1002 therefore cannot
-                // see an orphan release after a drag began elsewhere.
-                if let (Some(button), Some((row, col))) =
-                    (reported_capture_release, frame_route.release_cell)
-                {
-                    let modifiers = self
-                        .terminal_mouse_capture
-                        .as_ref()
-                        .map(|capture| capture.last_modifiers)
-                        .unwrap_or_default();
-                    if let Some(report) = terminal.get_mouse_release_report(
-                        app_mouse_button(button, modifiers),
-                        col,
-                        row,
-                    ) {
-                        if let Some(capture) = self.terminal_mouse_capture.as_mut() {
-                            queue_mouse_control(
-                                &mut capture.pending_controls,
-                                crate::app::state::PendingMouseControlKind::Release,
-                                report,
-                            );
+                if let (Some(button), Some(capture)) = (
+                    reported_capture_release,
+                    self.terminal_mouse_capture.as_mut(),
+                ) {
+                    let release = if pixel_mode {
+                        let has_press = capture.press_accepted
+                            || capture.pending_controls.iter().any(|pending| {
+                                pending.kind == crate::app::state::PendingMouseControlKind::Press
+                            });
+                        if !has_press {
+                            capture.retire_reporting();
+                            None
+                        } else {
+                            let edge = (mouse_uses_active_projection && !only_release)
+                                .then(|| {
+                                    ctx.input(|input| {
+                                        app_mouse_button_edge(&input.events, button, false)
+                                    })
+                                })
+                                .flatten();
+                            edge.and_then(|(pos, _)| position_at(pos))
+                                .or(fallback_position)
                         }
+                    } else {
+                        frame_route.release
+                    };
+                    if let Some(report) = release.and_then(|position| {
+                        modes.get_mouse_release_report_at(
+                            app_mouse_button(button, capture.last_modifiers),
+                            position,
+                        )
+                    }) {
+                        queue_mouse_control(
+                            &mut capture.pending_controls,
+                            crate::app::state::PendingMouseControlKind::Release,
+                            report,
+                        );
                     }
                 }
 
-                drop(terminal);
                 reports
             }
         };
@@ -8460,18 +8537,27 @@ impl eframe::App for TerminalApp {
 
         if !mouse_route_closed
             && mouse_write_error.is_none()
+            && !lossy_mouse_reports.is_empty()
             && mouse_lossy_reports_allowed(
                 mouse_protocol_input_blocked,
                 mouse_capture_allows_lossy(self.terminal_mouse_capture.as_ref()),
             )
         {
-            for report in lossy_mouse_reports {
-                if let Err(error) = mouse_write_tx.try_send(report) {
-                    if !error.is_backpressure() && self.terminal_mouse_capture.is_some() {
-                        mouse_route_closed = true;
+            let terminal = mouse_terminal.lock();
+            if lossy_mouse_space == Some(MouseReportSpace::for_terminal(&terminal)) {
+                for report in lossy_mouse_reports {
+                    if let Err(error) = mouse_write_tx.try_send(report) {
+                        if !error.is_backpressure() && self.terminal_mouse_capture.is_some() {
+                            mouse_route_closed = true;
+                        }
+                        mouse_write_error = Some(error);
+                        break;
                     }
-                    mouse_write_error = Some(error);
-                    break;
+                }
+                if mouse_write_error.is_none() {
+                    if let Some(motion) = pending_motion {
+                        self.last_terminal_mouse_motion = Some((mouse_session_id, motion));
+                    }
                 }
             }
         }
@@ -9383,8 +9469,8 @@ mod tests {
             ));
             let last_real = (2, 3);
             let route = app_mouse_frame_route(true, Some(None), Some(last_real));
-            assert_eq!(route.lossy_cell, None);
-            assert_eq!(route.release_cell, Some(last_real));
+            assert_eq!(route.current, None);
+            assert_eq!(route.release, Some(last_real));
         }
         policy.set_block_spacing(false);
         let compact = terminal.projected_viewport_with_state(
@@ -9446,8 +9532,8 @@ mod tests {
                     assert_eq!(cell, None);
                     assert!(!app_mouse_press_reports_from_snapshot(true, cell));
                     let route = app_mouse_frame_route(true, Some(cell), Some((3, 7)));
-                    assert_eq!(route.lossy_cell, None);
-                    assert_eq!(route.release_cell, Some((3, 7)));
+                    assert_eq!(route.current, None);
+                    assert_eq!(route.release, Some((3, 7)));
                 }
             }
         }
@@ -9521,7 +9607,7 @@ mod tests {
                 false
             ));
             let route = app_mouse_frame_route(true, Some(None), Some((4, 9)));
-            assert_eq!(route.release_cell, Some((4, 9)));
+            assert_eq!(route.release, Some((4, 9)));
         }
         assert!(checked >= 4);
         let pos = egui::pos2(5.0, 10.0);
@@ -9826,7 +9912,7 @@ mod tests {
         }
         // Host admission never consumes or cancels the separate PTY release.
         let route = app_mouse_frame_route(true, Some(None), Some((4, 9)));
-        assert_eq!(route.release_cell, Some((4, 9)));
+        assert_eq!(route.release, Some((4, 9)));
     }
 
     #[test]
@@ -9963,8 +10049,8 @@ mod tests {
         ));
 
         let summary_route = app_mouse_frame_route(true, Some(None), Some(raw_cell));
-        assert_eq!(summary_route.lossy_cell, None);
-        assert_eq!(summary_route.release_cell, Some(raw_cell));
+        assert_eq!(summary_route.current, None);
+        assert_eq!(summary_route.release, Some(raw_cell));
     }
 
     #[test]
@@ -9972,8 +10058,8 @@ mod tests {
         let last_raw_cell = (2, 7);
         let route = app_mouse_frame_route(false, Some(Some((99, 101))), Some(last_raw_cell));
 
-        assert_eq!(route.lossy_cell, None);
-        assert_eq!(route.release_cell, Some(last_raw_cell));
+        assert_eq!(route.current, None);
+        assert_eq!(route.release, Some(last_raw_cell));
     }
 
     #[test]
@@ -10928,6 +11014,71 @@ mod tests {
         assert_eq!(admitted, b"pressrelease");
         assert!(press_accepted);
         assert!(controls.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queued_pixel_mouse_edges_retire_behind_protocol_barrier_after_rescale() {
+        use super::{flush_mouse_controls, mouse_capture_is_complete, MouseReportSpace};
+        use crate::app::state::{PendingMouseControlKind, TerminalMouseCapture};
+        use crate::terminal::PtyWindowPixels;
+        let ctx = egui::Context::default();
+        let shell = crate::shell::ShellSession::new_with_cwd(
+            12,
+            8,
+            None,
+            None,
+            None,
+            Some(&["/bin/sh".into(), "-c".into(), "read line".into()]),
+            crate::runtime_wake::egui_wake(ctx.clone()),
+        )
+        .unwrap();
+        let mut terminal = crate::terminal::TerminalState::new(12, 8);
+        terminal.enable_pixel_mouse();
+        terminal.process_input(b"\x1b[?1002;1016h");
+        let geometry = PtyWindowPixels {
+            grid: (12, 8),
+            pixels: (120, 144),
+        };
+        terminal.install_pty_window_pixels(Some(geometry));
+        let mut capture = TerminalMouseCapture {
+            session_id: "mouse-session".into(),
+            reported_to_app: true,
+            button: 0,
+            last_modifiers: egui::Modifiers::NONE,
+            write_tx: shell.write_sender(),
+            protocol_responses: crate::session_manager::ProtocolResponseSender::new(ctx),
+            content_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 144.0)),
+            char_width: 10.0,
+            line_height: 18.0,
+            report_space: Some(MouseReportSpace::for_terminal(&terminal)),
+            last_position: Some(jterm_engine::mouse::MousePosition::Pixel { x: 35, y: 47 }),
+            terminal: std::sync::Arc::new(parking_lot::Mutex::new(terminal)),
+            pending_controls: std::collections::VecDeque::new(),
+            press_accepted: false,
+            release_observed: false,
+            local_selection_cancelled: false,
+        };
+        queue_mouse_control(
+            &mut capture.pending_controls,
+            PendingMouseControlKind::Press,
+            b"\x1b[<0;36;48M".to_vec(),
+        );
+        let barriers = crate::session_manager::SessionInputBarriers::default();
+        let _protocol = barriers.acquire(capture.session_id.clone());
+        assert!(!flush_mouse_controls(&mut capture, &barriers).unwrap());
+        assert_eq!(capture.pending_controls.len(), 1);
+        capture.terminal.lock().install_pty_window_pixels(Some(PtyWindowPixels {
+            pixels: (240, 288),
+            ..geometry
+        }));
+        assert!(flush_mouse_controls(&mut capture, &barriers).unwrap());
+        assert!(capture.pending_controls.is_empty());
+        assert!(!capture.press_accepted);
+        assert!(!mouse_capture_is_complete(&capture));
+        assert!(capture.reported_to_app);
+        capture.release_observed = true;
+        assert!(mouse_capture_is_complete(&capture));
     }
 
     #[test]

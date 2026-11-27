@@ -629,12 +629,15 @@ impl SessionManager {
         // The first session is constructed by the app before this manager;
         // arm configured direct CLIs here just as later tabs are armed in
         // new_terminal_state, before any queued PTY output is ingested.
+        let mut terminal = first_session.terminal.lock();
+        terminal.enable_pixel_mouse();
         if configured_shell
             .as_deref()
             .is_some_and(|program| crate::agent_cli::is_inline_launch(&[program.to_owned()]))
         {
-            first_session.terminal.lock().set_inline_cli_launch(true);
+            terminal.set_inline_cli_launch(true);
         }
+        drop(terminal);
         let protocol_responses = vec![ProtocolResponseSender::new(repaint_ctx.clone())];
         SessionManager {
             sessions: vec![first_session],
@@ -663,6 +666,7 @@ impl SessionManager {
 
     fn new_terminal_state(&self, cols: usize, rows: usize) -> TerminalState {
         let mut terminal = TerminalState::new(cols, rows);
+        terminal.enable_pixel_mouse();
         terminal.set_inline_cli_launch(
             self.configured_shell
                 .as_deref()

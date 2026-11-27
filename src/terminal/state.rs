@@ -1334,6 +1334,9 @@ impl super::TerminalState {
             self.host_context.clone(),
             self.sync_output_clock.clone(),
         );
+        if previous_protocol.modes().supports_pixel_mouse() {
+            self.enable_pixel_mouse();
+        }
         self.vt.protocol.take_rendition_stack_from(&mut previous_protocol);
         self.pty_window_pixels = pty_window_pixels;
         self.host_window_focused = host_window_focused;
@@ -4345,10 +4348,25 @@ impl super::TerminalState {
         }
     }
 
+    #[allow(dead_code)] // Public library API; the app supplies typed coordinates.
     pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
         self.vt.protocol.modes().get_mouse_report(button, col, row)
     }
 
+    pub(crate) fn enable_pixel_mouse(&mut self) {
+        self.vt.protocol.modes_mut().enable_pixel_mouse();
+    }
+
+    pub(crate) fn install_pty_window_pixels(&mut self, pixels: Option<super::PtyWindowPixels>) {
+        // A change in physical size can leave the grid dimensions unchanged.
+        // Retire positions measured before that resize, including after an ABA.
+        if self.pty_window_pixels != pixels && self.vt.protocol.modes().contains(&1016) {
+            self.retire_alternate_scroll();
+        }
+        self.pty_window_pixels = pixels;
+    }
+
+    #[allow(dead_code)] // Public library API; the app supplies typed coordinates.
     pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
         self.vt.protocol
             .modes()

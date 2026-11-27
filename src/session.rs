@@ -311,7 +311,7 @@ impl Session {
             terminal.on_resize(target.0, target.1);
         }
         if self.shell.resize_with_pixels(target.0, target.1, pixels.unwrap_or((0, 0))).is_ok() {
-            terminal.pty_window_pixels = window_pixels;
+            terminal.install_pty_window_pixels(window_pixels);
             if inline_agent {
                 self.terminal_presentation.repaint = Some(ResizeRepaint::new(Instant::now()));
             }

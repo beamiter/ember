@@ -5,6 +5,7 @@ pub(crate) mod block_review;
 pub mod commands;
 pub mod events;
 pub mod input;
+pub(crate) mod mouse;
 pub mod rendering;
 pub mod state;
 pub mod tabs;
