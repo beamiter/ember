@@ -81,6 +81,9 @@ impl Frame {
                 let cell =
                     egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, self.cell.y));
                 painter.rect_filled(cell, 0.0, bg);
+                if c.flags.concealed() {
+                    continue;
+                }
                 if c.character != '\0' && c.character != ' ' {
                     painter.text(
                         cell.center(),
@@ -102,6 +105,13 @@ impl Frame {
                 if c.flags.strikethrough() {
                     painter.line_segment(
                         [cell.left_center(), cell.right_center()],
+                        egui::Stroke::new(1.0, fg),
+                    );
+                }
+                if c.flags.overline() {
+                    let inset = egui::vec2(0.0, 1.0);
+                    painter.line_segment(
+                        [cell.left_top() + inset, cell.right_top() + inset],
                         egui::Stroke::new(1.0, fg),
                     );
                 }

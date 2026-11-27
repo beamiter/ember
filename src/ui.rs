@@ -6951,7 +6951,10 @@ impl TerminalRenderer {
             let row = &grid[row_idx];
             let is_run_char = |cell: &crate::terminal::TerminalCell| {
                 let cp = cell.character as u32;
-                (0x21..=0x7e).contains(&cp) && !cell.flags.wide() && !cell.flags.wide_continuation()
+                (0x21..=0x7e).contains(&cp)
+                    && !cell.flags.wide()
+                    && !cell.flags.wide_continuation()
+                    && !cell.flags.concealed()
             };
             let mut col = 0usize;
             while col < cols {
@@ -7116,11 +7119,11 @@ impl TerminalRenderer {
                 }
                 found
             };
-            let has_strikethrough = cell.flags.strikethrough();
+            let concealed = cell.flags.concealed();
             let is_wide = cell.flags.wide();
 
             let mut flags: u32 = 0;
-            let has_glyph = cell.character != ' ' && cell.character != '\0';
+            let has_glyph = !concealed && cell.character != ' ' && cell.character != '\0';
             if has_glyph {
                 flags |= gpu::instance::CellInstance::FLAG_HAS_GLYPH;
             }
@@ -7129,7 +7132,9 @@ impl TerminalRenderer {
             }
             // Encode underline style in bits 2-4
             let underline_style =
-                if is_link && cell.flags.underline() == crate::terminal::UnderlineStyle::None {
+                if concealed {
+                    crate::terminal::UnderlineStyle::None
+                } else if is_link && cell.flags.underline() == crate::terminal::UnderlineStyle::None {
                     crate::terminal::UnderlineStyle::Single
                 } else {
                     cell.flags.underline()
@@ -7152,8 +7157,11 @@ impl TerminalRenderer {
                     flags |= gpu::instance::CellInstance::UNDERLINE_DASHED
                 }
             }
-            if has_strikethrough {
+            if !concealed && cell.flags.strikethrough() {
                 flags |= gpu::instance::CellInstance::FLAG_STRIKETHROUGH;
+            }
+            if !concealed && cell.flags.overline() {
+                flags |= gpu::instance::CellInstance::FLAG_OVERLINE;
             }
 
             let lig = lig_map.get(col_idx).and_then(|o| o.as_ref());
@@ -7395,7 +7403,10 @@ impl TerminalRenderer {
                     continue;
                 }
                 let cell = &row[col_idx];
-                if cell.flags.wide_continuation() || cell.character == ' ' {
+                if cell.flags.wide_continuation()
+                    || cell.flags.concealed()
+                    || (cell.character == ' ' && !cell.flags.overline())
+                {
                     col_idx += 1;
                     continue;
                 }
@@ -7448,66 +7459,41 @@ impl TerminalRenderer {
                 let has_strikethrough = cell.flags.strikethrough();
                 let is_wide = cell.flags.wide();
 
-                let mut font_id = FontId::monospace(self.font_size);
-                if bold {
-                    font_id.size *= 1.1;
-                }
-
-                let galley =
-                    ui.painter()
-                        .layout_no_wrap(cell.character.to_string(), font_id, fg_color);
                 let (cx, cw) = snapped_span(content_rect.left(), col_idx, char_width);
-                let text_y = y + (snapped_height - galley.size().y) / 2.0;
                 let cell_w = if is_wide {
                     cw + snapped_span(content_rect.left(), col_idx + 1, char_width).1
                 } else {
                     cw
                 };
-                let glyph_x = cx + (cell_w - galley.size().x) / 2.0;
-                painter.galley(egui::pos2(glyph_x, text_y), galley, fg_color);
+                if cell.character != ' ' {
+                    let mut font_id = FontId::monospace(self.font_size);
+                    if bold {
+                        font_id.size *= 1.1;
+                    }
+                    let galley =
+                        ui.painter()
+                            .layout_no_wrap(cell.character.to_string(), font_id, fg_color);
+                    let text_y = y + (snapped_height - galley.size().y) / 2.0;
+                    let glyph_x = cx + (cell_w - galley.size().x) / 2.0;
+                    painter.galley(egui::pos2(glyph_x, text_y), galley, fg_color);
+                }
 
                 col_idx += if is_wide { 2 } else { 1 };
 
-                // Decorations
-                if has_underline {
-                    let (sx, sw) = snapped_span(
-                        content_rect.left(),
-                        col_idx - if is_wide { 2 } else { 1 },
-                        char_width,
-                    );
-                    let ew = if is_wide {
-                        sw + snapped_span(content_rect.left(), col_idx - 1, char_width).1
-                    } else {
-                        sw
-                    };
-                    let underline_y = y + line_height - 1.0;
+                let draw_line = |line_y| {
                     painter.line_segment(
-                        [
-                            egui::pos2(sx, underline_y),
-                            egui::pos2(sx + ew, underline_y),
-                        ],
+                        [egui::pos2(cx, line_y), egui::pos2(cx + cell_w, line_y)],
                         egui::Stroke::new(1.0, fg_color),
                     );
+                };
+                if has_underline {
+                    draw_line(y + line_height - 1.0);
                 }
                 if has_strikethrough {
-                    let (sx, sw) = snapped_span(
-                        content_rect.left(),
-                        col_idx - if is_wide { 2 } else { 1 },
-                        char_width,
-                    );
-                    let ew = if is_wide {
-                        sw + snapped_span(content_rect.left(), col_idx - 1, char_width).1
-                    } else {
-                        sw
-                    };
-                    let strikethrough_y = y + line_height / 2.0;
-                    painter.line_segment(
-                        [
-                            egui::pos2(sx, strikethrough_y),
-                            egui::pos2(sx + ew, strikethrough_y),
-                        ],
-                        egui::Stroke::new(1.0, fg_color),
-                    );
+                    draw_line(y + line_height / 2.0);
+                }
+                if cell.flags.overline() {
+                    draw_line(y + 1.0);
                 }
             }
         }

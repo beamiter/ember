@@ -183,7 +183,8 @@ fn draws_decoration(in: VertexOutput) -> bool {
         underline = band < 0.08 && fract(local.x * 2.0) < 0.6;
     }
     let strikethrough = (in.flags & 32u) != 0u && abs(local.y - 0.5) < 0.04;
-    return underline || strikethrough;
+    let overline = (in.flags & 128u) != 0u && local.y < 0.08;
+    return underline || strikethrough || overline;
 }
 
 // Compute final fragment color (shared by both entry points).

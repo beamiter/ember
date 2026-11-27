@@ -289,6 +289,7 @@ impl super::TerminalState {
     ) -> Self {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
         let (mut screen, protocol) = jterm_engine::native_reset::fresh_ember_state(rows, cols);
+        screen.enable_extended_rendition();
         let mut next_raw_row_id = 1u64;
         for id in screen
             .grid

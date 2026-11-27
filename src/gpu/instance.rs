@@ -26,6 +26,8 @@ pub struct CellInstance {
     ///   bit 1: wide (CJK double-width)
     ///   bits 2-4: underline style (0=none, 1=single, 2=double, 3=curly, 4=dotted, 5=dashed)
     ///   bit 5: strikethrough
+    ///   bit 6: color glyph
+    ///   bit 7: overline
     pub flags: u32,
     /// Horizontal offset within cell for glyph centering (physical pixels)
     pub glyph_offset_x: f32,
@@ -50,6 +52,7 @@ impl CellInstance {
     pub const FLAG_STRIKETHROUGH: u32 = 32; // bit 5
     #[allow(dead_code)]
     pub const FLAG_COLOR_GLYPH: u32 = 64; // bit 6
+    pub const FLAG_OVERLINE: u32 = 128; // bit 7
 
     pub fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
