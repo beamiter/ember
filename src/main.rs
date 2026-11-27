@@ -1,4 +1,5 @@
 mod alternate_scroll;
+mod terminal_focus;
 pub(crate) mod terminal_attachment;
 mod terminal_views;
 mod observer;
@@ -6299,6 +6300,11 @@ impl eframe::App for TerminalApp {
             raw_input.hovered_files.clear();
             return;
         }
+        for event in &raw_input.events {
+            if let egui::Event::WindowFocused(focused) = event {
+                self.sync_terminal_focus(ctx, *focused);
+            }
+        }
         // Preserve only route-relevant ordered events before font zoom removes
         // Ctrl+wheel, together with the real frame-start pointer position.
         self.alternate_scroll_wheel.capture_frame(self.last_pointer_pos, &raw_input.events);
@@ -6457,6 +6463,7 @@ impl eframe::App for TerminalApp {
         // 与 root_ui 的可变借用互不冲突。
         let ctx_owned = root_ui.ctx().clone();
         let ctx = &ctx_owned;
+        (|| {
         // Capture before any command, panel, dialog, or pane interaction in
         // this frame. SSH follow is drained only after rendering, so a first
         // observation must still yield to an explicit Files intent that ran
@@ -6553,6 +6560,7 @@ impl eframe::App for TerminalApp {
         };
         let background_parse_started = std::time::Instant::now();
         let window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        self.sync_terminal_focus(ctx, window_focused);
         let mut background_pump = self.session_manager.pump_inactive_sessions(
             background_budget,
             &visible_sessions,
@@ -6561,12 +6569,6 @@ impl eframe::App for TerminalApp {
             window_focused,
         );
         let mut terminal_parse_time = background_parse_started.elapsed();
-        for session in self.session_manager.sessions() {
-            session
-                .terminal
-                .lock()
-                .set_host_window_focused(window_focused);
-        }
         if self.dispatch_runtime_effects(ctx, &mut background_pump, &visible_sessions, window_focused, false) {
             return;
         }
@@ -6780,6 +6782,10 @@ impl eframe::App for TerminalApp {
         // Snapshot active session index before mutably borrowing session_manager;
         // we use it to tag pending-paste confirmations so they only deliver to
         // the same tab if the user hasn't switched away.
+        // A dismissed modal can still own this input batch. Reacquire focus
+        // at the final reconciliation, after its keys have been consumed.
+        let active_terminal_focus_allowed =
+            self.sync_terminal_focus(ctx, window_focused && !terminal_input_blocked);
         let session = self.session_manager.get_active_session_mut();
         let active_session_id = session.metadata.session_id.clone();
         let active_task_terminal = self
@@ -7259,6 +7265,11 @@ impl eframe::App for TerminalApp {
         }
 
         // The shared output owner keeps any unparsed bytes with this PTY.
+        // A paste confirmation opened during this batch also owns focus before
+        // any following output can re-enable mode 1004.
+        session.terminal.lock().set_host_window_focused(
+            active_terminal_focus_allowed && !terminal_input_blocked,
+        );
         let progress = if session.purpose == crate::session::SessionPurpose::RetainedCommand {
             OutputProgress::default()
         } else {
@@ -8971,6 +8982,8 @@ impl eframe::App for TerminalApp {
         self.render_read_only_observers(ctx);
         self.retire_terminal_view_focus(ctx);
         self.finish_terminal_ime_reset(ctx);
+        })();
+        self.sync_terminal_focus(ctx, ctx.input(|input| input.viewport().focused.unwrap_or(true)));
     }
 }
 

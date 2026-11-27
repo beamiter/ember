@@ -1255,6 +1255,29 @@ impl TerminalApp {
         );
     }
 
+    /// Reconcile the input owner before any PTY may negotiate focus reporting.
+    pub(crate) fn sync_terminal_focus(&self, ctx: &egui::Context, window_focused: bool) -> bool {
+        let active = self.session_manager.active_index();
+        let owner = (window_focused
+            && self.layout().focused_session_idx() == Some(active)
+            && self.layout().session_indices().contains(&active)
+            && !self.terminal_input_blocked(ctx)
+            && !self.block_chrome_owns_keyboard(ctx)
+            && !self.active_terminal_is_read_only()
+            && !self.active_projection_unavailable())
+            .then_some(active);
+        let changed = crate::terminal_focus::reconcile(
+            self.session_manager.sessions().iter().map(|session| session.terminal.as_ref()),
+            owner,
+        );
+        if changed {
+            // Focus replies use the existing ordered response pump, including
+            // transitions discovered after the frame's last PTY drain.
+            ctx.request_repaint();
+        }
+        owner == Some(active)
+    }
+
     pub(crate) fn block_chrome_owns_keyboard(&self, ctx: &egui::Context) -> bool {
         self.vim9_chrome_owns_keyboard(ctx)
             || self.config.command_cards_enabled()

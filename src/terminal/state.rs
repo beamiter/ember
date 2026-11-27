@@ -576,7 +576,11 @@ impl super::TerminalState {
         self.vt.protocol.modes().contains(&1004)
     }
 
-    /// Remember whether the host window is focused and emit CSI I/O when
+    pub(crate) fn host_window_focused(&self) -> bool {
+        self.host_window_focused
+    }
+
+    /// Remember whether this terminal owns host input and emit CSI I/O when
     /// DECSET 1004 is active and the value actually changed.
     pub fn set_host_window_focused(&mut self, focused: bool) {
         if self.host_window_focused == focused {
@@ -1319,6 +1323,7 @@ impl super::TerminalState {
         self.watch.prompt();
         let watch = std::mem::take(&mut self.watch);
         let wheel_generation = self.alternate_scroll_generation.and_then(|value| value.checked_add(1));
+        let host_window_focused = self.host_window_focused;
         let mut previous_protocol = std::mem::take(&mut self.vt.protocol);
         *self = Self::new_with_host_context_and_sync_output_clock(
             cols,
@@ -1327,6 +1332,7 @@ impl super::TerminalState {
             self.sync_output_clock.clone(),
         );
         self.vt.protocol.take_rendition_stack_from(&mut previous_protocol);
+        self.host_window_focused = host_window_focused;
         self.watch = watch;
         self.alternate_scroll_generation = wheel_generation;
         self.pending_completed_command_outputs = pending_completed_command_outputs;
