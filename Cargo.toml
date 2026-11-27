@@ -11,11 +11,11 @@ categories = ["command-line-utilities", "gui"]
 
 [dependencies]
 # The Git declarations are the published baseline for the local family candidate.
-jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "e061ca26f1532b3abb09f57db221d4c2c7e54b07" }
+jterm_engine = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "108097678eb0a9c89b6b8b0ae4e75cd446f24051" }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 libc = "0.2"
-jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "e061ca26f1532b3abb09f57db221d4c2c7e54b07" }
-jterm_protocol = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "e061ca26f1532b3abb09f57db221d4c2c7e54b07" }
+jterm_core = { version = "0.2.0", features = ["terminal-session-actor"], git = "https://github.com/beamiter/jterm_core.git", rev = "108097678eb0a9c89b6b8b0ae4e75cd446f24051" }
+jterm_protocol = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "108097678eb0a9c89b6b8b0ae4e75cd446f24051" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -59,7 +59,7 @@ unicode-normalization = "=0.1.26"
 sha2 = "0.10"
 # Test-only lossless original-production oracle transport.
 flate2 = "=1.1.9"
-jterm_core = { version = "0.2.0", features = ["session-parity-tests", "terminal-session-actor-test-hooks"], git = "https://github.com/beamiter/jterm_core.git", rev = "e061ca26f1532b3abb09f57db221d4c2c7e54b07" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests", "terminal-session-actor-test-hooks"], git = "https://github.com/beamiter/jterm_core.git", rev = "108097678eb0a9c89b6b8b0ae4e75cd446f24051" }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
