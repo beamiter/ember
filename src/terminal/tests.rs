@@ -10554,3 +10554,29 @@ fn unicode_023_halfwidth_marks_wrap_and_backspace_by_cell() {
         );
     }
 }
+
+#[test]
+fn alternate_scroll_generation_tracks_eligible_aba_and_lifecycle_without_output_resets() {
+    let mut terminal = TerminalState::new(12, 4);
+    terminal.process_input(b"\x1b[?1049h");
+    let before = terminal.alternate_scroll_generation();
+    terminal.process_input(b"paint\x1b[?1$p\x1b[?1007h");
+    assert_eq!(terminal.alternate_scroll_generation(), before);
+    for sequence in [b"\x1b[?1h\x1b[?1l".as_slice(), b"\x1b[=8u\x1b[=0u", b"\x1b[?1007l\x1b[?1007h", b"\x1b[?1049l\x1b[?1049h"] {
+        let before = terminal.alternate_scroll_generation();
+        terminal.process_input(sequence);
+        assert_ne!(terminal.alternate_scroll_generation(), before, "{sequence:?}");
+    }
+    terminal.process_input(b"\x1b[?1000h");
+    let before = terminal.alternate_scroll_generation();
+    terminal.process_input(b"\x1b[?1000;1007l");
+    assert_ne!(terminal.alternate_scroll_generation(), before, "same-CSI inactive→eligible→inactive retires");
+    let before = terminal.alternate_scroll_generation();
+    terminal.hard_reset();
+    assert_ne!(terminal.alternate_scroll_generation(), before);
+    let before = terminal.alternate_scroll_generation();
+    terminal.on_resize(12, 4);
+    assert_eq!(terminal.alternate_scroll_generation(), before);
+    terminal.on_resize(13, 4);
+    assert_ne!(terminal.alternate_scroll_generation(), before);
+}

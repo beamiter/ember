@@ -66,7 +66,10 @@ fn snapshot(t: &TerminalState) -> Snapshot {
         "pending_osc52_clipboard_queries".into(),
         format!("{:?}", t.osc52.pending_queries),
     );
-    out.insert("sync_output_active".into(), format!("{:?}", t.vt.sync_output.active));
+    out.insert(
+        "sync_output_active".into(),
+        format!("{:?}", t.vt.sync_output.active),
+    );
     host!(
         current_working_dir,
         ime_enabled,
@@ -128,7 +131,9 @@ fn seeded(seed: usize) -> TerminalState {
     t.vt.screen.current_fg = Color::Rgb(1, 2, 3);
     t.vt.screen.current_bg = Color::Indexed(201);
     t.global_bg = Color::Blue;
-    t.vt.screen.current_flags.set_underline(UnderlineStyle::Curly);
+    t.vt.screen
+        .current_flags
+        .set_underline(UnderlineStyle::Curly);
     t.vt.screen.pending_wrap = true;
     t.output_buffer = b"existing-reply".to_vec();
     // Modes 4/6/1016 have no TerminalModes storage slots. Use the real
@@ -292,9 +297,22 @@ fn decrqm_frozen_lookup_exhaustive() {
                 } else {
                     t.vt.protocol.modes_mut().remove(&mode);
                 }
+                // X10 and reverse-wrap were unsupported in the frozen
+                // extraction baseline. Their current Boolean state is checked
+                // independently; every other private mode keeps that oracle.
+                let private_expected = match mode {
+                    9 | 45 => {
+                        if stored {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    _ => t.frozen_decrqm_private_mode_state(mode),
+                };
                 assert_eq!(
                     t.decrqm_private_mode_state(mode),
-                    t.frozen_decrqm_private_mode_state(mode),
+                    private_expected,
                     "private {mode}/{state}/{stored}"
                 );
                 assert_eq!(
@@ -305,4 +323,19 @@ fn decrqm_frozen_lookup_exhaustive() {
             }
         }
     }
+}
+
+#[test]
+fn supported_x10_and_reverse_wrap_queries_follow_actual_wire_order() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b[?9;45h\x1b[?45$p\x1b[?9$p\x1b[?45$p");
+    assert_eq!(
+        terminal.get_output(),
+        b"\x1b[?45;1$y\x1b[?9;1$y\x1b[?45;1$y"
+    );
+    terminal.process_input(b"\x1b[?9;45l\x1b[?9$p\x1b[?45$p\x1b[?9$p");
+    assert_eq!(terminal.get_output(), b"\x1b[?9;2$y\x1b[?45;2$y\x1b[?9;2$y");
+    // Ember's inherited DECRQM surface answers only the first parameter.
+    terminal.process_input(b"\x1b[?9;45;9$p");
+    assert_eq!(terminal.get_output(), b"\x1b[?9;2$y");
 }

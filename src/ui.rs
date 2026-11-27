@@ -550,6 +550,37 @@ fn key_to_terminal_sequence(
     }
 }
 
+/// Occupancy/copy provenance does not change painted rendition. Keep every
+/// visual or protected/wide flag conservative when exposing raw ASCII rows.
+fn plain_body_cell(cell: &crate::terminal::TerminalCell) -> bool {
+    cell.flags.is_plain_text()
+        && cell.foreground == crate::terminal::Color::Default
+        && cell.background == crate::terminal::Color::Default
+        && cell.hyperlink_id == crate::terminal::HyperlinkId::NONE
+        && cell.character.is_ascii()
+        && !cell.character.is_ascii_control()
+}
+
+/// Unmodified wheel arrows use the same native key encoders as a real key.
+pub(crate) fn alternate_scroll_arrow_bytes(
+    up: bool,
+    flags: u16,
+    report_all: bool,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
+    let key = if up {
+        egui::Key::ArrowUp
+    } else {
+        egui::Key::ArrowDown
+    };
+    let flags = flags | if report_all { 8 } else { 0 };
+    if let Some(bytes) = kitty_encode_key_event(key, egui::Modifiers::NONE, flags) {
+        return Some(bytes.into_bytes());
+    }
+    key_to_terminal_sequence(key, egui::Modifiers::NONE, app_cursor)
+        .map(|bytes| bytes.as_bytes().to_vec())
+}
+
 /// Encode the legacy xterm/terminfo functional-key family: cursor keys, the
 /// editing block, and F1-F12. A held modifier becomes the standard xterm
 /// parameter (`1 + shift + 2*alt + 4*ctrl + 8*meta`) instead of being dropped —
@@ -6334,10 +6365,11 @@ impl TerminalRenderer {
             && terminal.preedit_text.is_empty()
             && terminal.scroll_offset == initial_scroll_offset
             && self.projected_scroll_request.is_none()
-            && !self.chat_mode
+            && !(self.glass_chat_requested || self.chat_mode && self.chat_command_bubbles)
             && !terminal.is_alt_buffer()
             && self.opacity == 1.0
             && terminal.kitty_graphics.get_placements().is_empty()
+            && native_buffer.is_none()
             && !search_state.is_open
         {
             let clip = painter.clip_rect().intersect(content_rect);
@@ -6360,14 +6392,14 @@ impl TerminalRenderer {
                 };
                 // No styled, hidden, wide, hyperlink or control-bearing cell is
                 // reinterpreted as plain text. The fixture uses plain ASCII.
-                if cells.iter().take(cols).any(|cell| {
-                    cell.flags != crate::terminal::StyleFlags::new()
-                        || cell.foreground != crate::terminal::Color::Default
-                        || cell.background != crate::terminal::Color::Default
-                        || cell.hyperlink_id != crate::terminal::HyperlinkId::NONE
-                        || !cell.character.is_ascii()
-                        || cell.character.is_ascii_control()
-                }) {
+                // Shared docking applies trusted theme RGB to an owned paint
+                // copy. Check program rendition before that retint, but emit
+                // the text from the cells actually submitted below.
+                let rendition_cells = if self.chat_mode {
+                    let Some(source) = viewport.cells().get(row_index) else { continue; };
+                    source
+                } else { cells };
+                if rendition_cells.iter().take(cols).any(|cell| !plain_body_cell(cell)) {
                     continue;
                 }
                 let text: String = cells.iter().take(cols).map(|cell| cell.character).collect();
@@ -10667,6 +10699,14 @@ mod tests {
             "popup",
             "find",
             "images",
+            "styled-space",
+            "protected-space",
+            "linked",
+            "foreground",
+            "background",
+            "concealed",
+            "overline",
+            "wide-space", "native-buffer",
         ] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
@@ -10695,6 +10735,29 @@ mod tests {
                 "preedit" => terminal.preedit_text = "composition".to_owned(),
                 "popup" => egui::Popup::open_id(&ctx, egui::Id::new("body-test-popup")),
                 "find" => search.is_open = true,
+                "styled-space" => terminal.process_batch(b"\x1b[1;12H\x1b[1m \x1b[0m"),
+                "protected-space" => terminal.process_batch(b"\x1b[1;12H\x1b[1\"q \x1b[0\"q"),
+                "foreground" => terminal.process_batch(b"\x1b[1;12H\x1b[31m \x1b[0m"),
+                "background" => terminal.process_batch(b"\x1b[1;12H\x1b[44m \x1b[0m"),
+                "concealed" => { terminal.vt.screen.grid[0][11].flags.set_concealed(true); terminal.process_batch(b""); terminal.row_versions[0] = terminal.grid_version; terminal.dirty_region.mark_row(0); },
+                "overline" => { terminal.vt.screen.grid[0][11].flags.set_overline(true); terminal.process_batch(b""); terminal.row_versions[0] = terminal.grid_version; terminal.dirty_region.mark_row(0); },
+                "wide-space" => {
+                    terminal.vt.screen.grid[0][11].flags.set_wide(true);
+                    terminal.process_batch(b""); terminal.row_versions[0] = terminal.grid_version; terminal.dirty_region.mark_row(0);
+                }
+                "linked" => terminal.process_batch(
+                    format!("\x1b[H\x1b]8;;https://example.com/plain\x1b\\{TARGET}\x1b]8;;\x1b\\")
+                        .as_bytes(),
+                ),
+                "native-buffer" => {
+                    let frame = jterm_core::vim9::Vim9RenderFrame {
+                        supported: true, rows: 8, columns: 64,
+                        view: jterm_core::vim9::Vim9RenderRect { row: 0, column: 0, rows: 8, columns: 64 },
+                        ..Default::default()
+                    };
+                    assert!(crate::vim9_buffer::usable(&frame, 8, 64));
+                    renderer.native_vim9_frame = Some(std::sync::Arc::new(frame));
+                }
                 "images" => {
                     terminal
                         .kitty_graphics
@@ -10714,6 +10777,95 @@ mod tests {
                 )),
                 "{mode}: stale or hidden body exposed"
             );
+        }
+    }
+
+    #[test]
+    fn visible_body_ordinary_printed_spaces_match_submitted_ascii_cells() {
+        for (payload, expected) in [("A B", "A B"), ("A  B", "A  B"), ("  A B   ", "  A B")] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut renderer = TerminalRenderer::new(
+                14.0,
+                2.0,
+                1.0,
+                crate::config::ScrollbarVisibility::Auto,
+                crate::theme::Theme::default(),
+            );
+            renderer.gpu_rendering = false;
+            let mut terminal = TerminalState::new(64, 8);
+            terminal.process_batch(format!("{payload}\r\n").as_bytes());
+            assert!(terminal.vt.screen.grid[0]
+                .iter()
+                .any(|cell| cell.character == ' '
+                    && cell.flags != crate::terminal::StyleFlags::new()));
+            renderer.configure_glass_presentation(false, &terminal, 200.0);
+            assert!(renderer.chat_mode && !renderer.glass_chat_requested && !renderer.chat_command_bubbles);
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    renderer.render(
+                        ui,
+                        &mut terminal,
+                        true,
+                        false,
+                        &crate::search::SearchState::default(),
+                        &[],
+                        &None,
+                    );
+                },
+            );
+            out.textures_delta.clear();
+            assert!(
+                out.platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.value() == Some(expected)
+                        && node
+                            .description()
+                            .is_some_and(|description| description
+                                .starts_with("Terminal submitted raw row;"))),
+                "{payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_body_uses_logical_role_not_shared_prompt_docking_flag() {
+        const TARGET: &str = "DOCKED BLOCK ORDINARY SPACES";
+        for (chat, fallback, explicit_rgb, expose) in [(false,false,false,true),(false,true,false,true),(true,false,false,false),(true,true,false,false),(false,false,true,false),(false,true,true,false)] {
+            let ctx=egui::Context::default();ctx.enable_accesskit();
+            let mut renderer=TerminalRenderer::new(14.0,2.0,1.0,crate::config::ScrollbarVisibility::Auto,crate::theme::Theme::default());
+            renderer.gpu_rendering=false;
+            let mut terminal=TerminalState::new(64,40);
+            terminal.process_batch(format!("{TARGET}\r\n").as_bytes());
+            if fallback {
+                terminal.process_batch(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+                for _ in 0..20 { terminal.process_batch(b"input\r\n"); }
+            }
+            if explicit_rgb {
+                let [r,g,b] = jterm_core::reference_shell::color::CHROME_TEXT;
+                terminal.process_batch(format!("\x1b[1;7H\x1b[38;2;{r};{g};{b}m \x1b[0m").as_bytes());
+            }
+            renderer.configure_glass_presentation(chat,&terminal,200.0);
+            assert_eq!(renderer.glass_chat_requested,chat);
+            assert_eq!(renderer.chat_command_bubbles,chat);
+            assert_eq!(renderer.chat_mode,!fallback,"fixturefallback");
+            let mut out=ctx.run_ui(egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(640.0,200.0))),..Default::default()},|ui|{
+                renderer.render(ui,&mut terminal,true,false,&crate::search::SearchState::default(),&[],&None);
+            });
+            out.textures_delta.clear();
+            let found=out.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().any(|(_,node)|node.value()==Some(TARGET)&&node.description().is_some_and(|d|d.starts_with("Terminal submitted raw row;")));
+            assert_eq!(found,expose,"chat={chat} fallback={fallback} explicit_rgb={explicit_rgb}");
         }
     }
 
@@ -13810,5 +13962,58 @@ mod transcript_canvas_tests {
             state.follows_bottom(),
             "explicit live navigation resumes following"
         );
+    }
+}
+
+#[cfg(test)]
+mod alternate_scroll_encoder_tests {
+    use super::*;
+    #[test]
+    fn alternate_scroll_arrow_matches_actual_native_keyboard_renderer() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        for flags in [0, 1, 8, 17, 25] {
+            for app_cursor in [false, true] {
+                for up in [false, true] {
+                    let key = if up {
+                        egui::Key::ArrowUp
+                    } else {
+                        egui::Key::ArrowDown
+                    };
+                    let event = egui::Event::Key {
+                        key,
+                        physical_key: Some(key),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    };
+                    let mut actual = Vec::new();
+                    renderer.handle_keyboard_input(
+                        &egui::Context::default(),
+                        &mut actual,
+                        &std::collections::HashSet::new(),
+                        false,
+                        flags,
+                        flags & 8 != 0,
+                        2,
+                        1,
+                        app_cursor,
+                        true,
+                        true,
+                        false,
+                        &[event],
+                    );
+                    assert_eq!(
+                        alternate_scroll_arrow_bytes(up, flags, flags & 8 != 0, app_cursor),
+                        Some(actual)
+                    );
+                }
+            }
+        }
     }
 }

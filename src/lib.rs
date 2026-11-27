@@ -1,3 +1,4 @@
+mod alternate_scroll;
 // Library export for benchmarks and testing
 
 pub use jterm_core::char_width; // P5：字符宽度缓存（已抽取到 jterm_core）

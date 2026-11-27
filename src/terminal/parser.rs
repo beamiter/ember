@@ -192,11 +192,15 @@ impl super::TerminalState {
     }
 
     pub(super) fn enter_alt_screen(&mut self, save_cursor: bool, clear: bool) {
+        let before = self.vt.screen.use_alt_buffer;
         jterm_engine::native_alternate::enter_ember(self, save_cursor, clear);
+        if before != self.vt.screen.use_alt_buffer { self.retire_alternate_scroll(); }
     }
 
     pub(super) fn exit_alt_screen(&mut self, restore_cursor: bool) {
+        let before = self.vt.screen.use_alt_buffer;
         jterm_engine::native_alternate::leave_ember(self, restore_cursor);
+        if before != self.vt.screen.use_alt_buffer { self.retire_alternate_scroll(); }
     }
 
     /// Titles are rendered in trusted app chrome (tabs, window manager,
@@ -246,7 +250,7 @@ impl super::TerminalState {
             NativeModeEffect::Reply(bytes) => self.output_buffer.extend_from_slice(bytes),
             NativeModeEffect::RevokePasteGrant => self.osc5522.revoke(),
             NativeModeEffect::MouseReportingChanged => {
-                unreachable!("Ember mouse modes have no native scroll lease")
+                self.retire_alternate_scroll();
             }
             NativeModeEffect::AlternateScreen { mode, enabled } => {
                 if enabled {
@@ -380,6 +384,8 @@ pub(super) mod display_erase_dispatch_oracles;
 mod mode_command_oracles;
 
 impl jterm_engine::ember_csi::EmberCsiHost for TerminalState {
+    fn track_alternate_scroll_changes(&self) -> bool { true }
+
     fn csi_state(&mut self) -> (&mut ScreenState, &mut ProtocolState, &mut u64) {
         (
             &mut self.vt.screen,

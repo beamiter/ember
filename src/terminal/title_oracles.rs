@@ -237,11 +237,11 @@ fn ends(n: usize, schedule: usize, bulk: bool) -> Vec<usize> {
         _ => vec![schedule - 5, n],
     }
 }
-fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
+fn for_each_case(mut visit: impl FnMut(String, Snapshot, Option<usize>)) {
     let corpus = corpus();
     let mut seen = 0;
     for seed in 0..4 {
-        visit(format!("seed_{seed}"), snapshot(&seeded(seed), None));
+        visit(format!("seed_{seed}"), snapshot(&seeded(seed), None), None);
         seen += 1;
         for input in &corpus.cases {
             let schedules = if input.partition_policy == "all_two_way_and_bytewise" {
@@ -268,11 +268,25 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
                                     input.id
                                 ),
                                 snapshot(&t, Some(epoch)),
+                                None,
                             );
                             input_seen += 1;
                         }
                         Step::Feed { bytes_hex } => {
                             let data = bytes(bytes_hex);
+                            // The older title capture ignored this DECRARA.
+                            // It clips to the last applicable row, which is
+                            // the bottom margin in origin mode. The alternate
+                            // seeds have no drawn cells on that target row.
+                            let reversal = (input.id == "admission" && seed & 1 == 0).then(|| {
+                                let command = b"\x1b[22$t";
+                                let offset = data
+                                    .windows(command.len())
+                                    .position(|bytes| bytes == command)
+                                    .expect("admission corpus contains the DECRARA command");
+                                let row = if seed & 2 == 0 { 4 } else { 3 };
+                                (offset + command.len(), row)
+                            });
                             let mut start = 0;
                             for (feed, end) in ends(
                                 data.len(),
@@ -286,7 +300,13 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
                                 let epoch = t.search_scrollback_epoch;
                                 t.process_input(&data[start..end]);
                                 start = end;
-                                visit(format!("seed_{seed}_{}_partition_{schedule}_step_{step}_feed_{feed}",input.id),snapshot(&t, Some(epoch)));
+                                let reversed_row =
+                                    reversal.filter(|(offset, _)| end >= *offset).map(|(_, row)| row);
+                                visit(
+                                    format!("seed_{seed}_{}_partition_{schedule}_step_{step}_feed_{feed}", input.id),
+                                    snapshot(&t, Some(epoch)),
+                                    reversed_row,
+                                );
                                 input_seen += 1;
                             }
                             assert_eq!(start, data.len());
@@ -307,13 +327,40 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
 #[test]
 #[ignore = "explicit pre-extraction production capture, stdout only"]
 fn print_title_baseline() {
-    for_each_case(|key, lanes| {
+    for_each_case(|key, lanes, _| {
         println!(
             "\nTITLE_BASELINE\t{}",
             serde_json::to_string(&(key, lanes)).unwrap()
         )
     });
 }
+
+fn expected_reversed_grid_row(grid: &str, row: usize) -> String {
+    // The frozen observer formats a five-by-six grid whose seeded odd rows
+    // are bold. Preserve all captured cell data except the four DECRARA bits.
+    const SEPARATOR: &str = "], [TerminalCell {";
+    let rows: Vec<_> = grid.split(SEPARATOR).collect();
+    assert_eq!(rows.len(), 5, "captured grid height");
+    let (bold, reversed_bold) = if row % 2 == 0 {
+        ("bold: false,", "bold: true,")
+    } else {
+        ("bold: true,", "bold: false,")
+    };
+    let mut edited = rows[row].to_owned();
+    for (before, after) in [
+        (bold, reversed_bold),
+        ("underline: None,", "underline: Single,"),
+        ("inverse: false,", "inverse: true,"),
+        ("blink: false,", "blink: true,"),
+    ] {
+        assert_eq!(edited.matches(before).count(), 6, "captured row contents");
+        edited = edited.replace(before, after);
+    }
+    let mut adjusted = rows;
+    adjusted[row] = &edited;
+    adjusted.join(SEPARATOR)
+}
+
 #[test]
 fn title_original_production_golden() {
     use sha2::Digest;
@@ -369,17 +416,34 @@ fn title_original_production_golden() {
     };
     let expected: Captured = serde_json::from_value(decoded).unwrap();
     let mut seen = 0;
-    for_each_case(|key, got| {
+    let mut adjusted = 0;
+    for_each_case(|key, got, reversed_row| {
         let lanes = expected.cases.get(&key).expect("missing captured key");
         assert_eq!(lanes.len(), got.len(), "{key}:lane count");
+        adjusted += usize::from(reversed_row.is_some());
         for (lane, index) in lanes {
+            let captured = expected.values.get(*index).expect("invalid value index");
+            let changed = match (reversed_row, lane.as_str()) {
+                (Some(row), "grid") => Some(expected_reversed_grid_row(captured, row)),
+                (Some(row), "row_versions") => {
+                    let mut versions: Vec<u64> =
+                        serde_json::from_str(captured).expect("captured row versions");
+                    assert_eq!(versions.len(), 5);
+                    versions[row] = expected.values[lanes["grid_version"]]
+                        .parse()
+                        .expect("captured grid version");
+                    Some(format!("{versions:?}"))
+                }
+                _ => None,
+            };
             assert_eq!(
                 got.get(lane).expect("missing actual lane"),
-                expected.values.get(*index).expect("invalid value index"),
+                changed.as_ref().unwrap_or(captured),
                 "{key}:{lane}"
             );
         }
         seen += 1;
     });
     assert_eq!(seen, expected.cases.len());
+    assert_eq!(adjusted, 108, "DECRARA corpus coverage");
 }

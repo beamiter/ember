@@ -347,6 +347,7 @@ impl super::TerminalState {
             osc5522: Default::default(),
             kitty_graphics,
             dirty_region,
+            alternate_scroll_generation: Some(1),
             grid_version: 1,
             // IMPORTANT: row_versions must match grid.rows(), not the parameter 'rows'
             // This ensures dirty tracking works correctly even with scrollback
@@ -1317,13 +1318,17 @@ impl super::TerminalState {
         let direct_inline_cli = self.inline_cli_launch_floor.is_some();
         self.watch.prompt();
         let watch = std::mem::take(&mut self.watch);
+        let wheel_generation = self.alternate_scroll_generation.and_then(|value| value.checked_add(1));
+        let mut previous_protocol = std::mem::take(&mut self.vt.protocol);
         *self = Self::new_with_host_context_and_sync_output_clock(
             cols,
             rows,
             self.host_context.clone(),
             self.sync_output_clock.clone(),
         );
+        self.vt.protocol.take_rendition_stack_from(&mut previous_protocol);
         self.watch = watch;
+        self.alternate_scroll_generation = wheel_generation;
         self.pending_completed_command_outputs = pending_completed_command_outputs;
         self.consumed_command_ids = consumed_command_ids;
         self.shell_marker_clock = shell_marker_clock;
@@ -4372,6 +4377,11 @@ impl super::TerminalState {
         self.vt.protocol.modes().contains(&66)
     }
 
+    pub fn alternate_scroll_generation(&self) -> Option<u64> { self.alternate_scroll_generation }
+    pub(super) fn retire_alternate_scroll(&mut self) {
+        self.alternate_scroll_generation = self.alternate_scroll_generation.and_then(|value| value.checked_add(1));
+    }
+
     /// DECSET 1007: wheel on the alternate screen becomes cursor keys while
     /// mouse reporting is off. Defaults on, matching xterm `alternateScroll`.
     pub fn is_alternate_scroll(&self) -> bool {
@@ -7382,6 +7392,7 @@ impl super::TerminalState {
             return;
         }
 
+        self.retire_alternate_scroll();
         self.invalidate_search_source();
         self.invalidate_search_scrollback_seals();
 

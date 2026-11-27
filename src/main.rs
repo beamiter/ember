@@ -1,3 +1,4 @@
+mod alternate_scroll;
 pub(crate) mod terminal_attachment;
 mod terminal_views;
 mod observer;
@@ -2060,6 +2061,7 @@ fn should_send_alternate_scroll(
 
 /// Positive steps are wheel-up / toward history → cursor up, matching the
 /// X10 button-64 mapping used by application mouse reports.
+#[cfg(test)]
 fn alternate_scroll_cursor_bytes(steps: isize, application_cursor_keys: bool) -> Vec<u8> {
     if steps == 0 {
         return Vec::new();
@@ -2085,6 +2087,100 @@ fn bounded_wheel_step_accumulate(current: isize, delta: f32, multiplier: usize) 
             -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
             MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
         )
+}
+
+/// Preserve existing signed direction aggregation within one modifier run,
+/// but never combine a fraction or completed run with another Alt binding.
+fn mouse_wheel_runs(
+    line: &mut jterm_core::wheel::WheelAccumulator,
+    point: &mut jterm_core::wheel::WheelAccumulator,
+    previous_alt: &mut Option<bool>,
+    events: &[egui::Event],
+    rect: egui::Rect,
+    line_height: f32,
+    rows: usize,
+    inline_host: bool,
+    frame_alt: bool,
+) -> Vec<(bool, isize)> {
+    fn flush(
+        out: &mut Vec<(bool, isize)>,
+        budget: &mut usize,
+        alt: Option<bool>,
+        steps: &mut isize,
+    ) {
+        if *steps != 0 && *budget != 0 {
+            let count = steps.unsigned_abs().min(*budget);
+            out.push((
+                alt.unwrap_or(false),
+                if *steps > 0 {
+                    count as isize
+                } else {
+                    -(count as isize)
+                },
+            ));
+            *budget -= count;
+        }
+        *steps = 0;
+    }
+    let mut out = Vec::new();
+    let mut budget = MAX_MOUSE_WHEEL_REPORTS_PER_FRAME as usize;
+    let mut run_alt = *previous_alt;
+    let mut steps = 0;
+    for event in events {
+        let boundary = match event {
+            egui::Event::PointerGone => true,
+            egui::Event::WindowFocused(false) => true,
+            egui::Event::PointerMoved(pos) => !rect.contains(*pos),
+            _ => false,
+        };
+        if boundary {
+            flush(&mut out, &mut budget, run_alt, &mut steps);
+            line.reset();
+            point.reset();
+            *previous_alt = None;
+            run_alt = None;
+            continue;
+        }
+        if let egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+            ..
+        } = event
+        {
+            if modifiers.ctrl || modifiers.shift || inline_host {
+                flush(&mut out, &mut budget, run_alt, &mut steps);
+                line.reset();
+                point.reset();
+                *previous_alt = None;
+                run_alt = None;
+                continue;
+            }
+            if *previous_alt != Some(modifiers.alt) {
+                flush(&mut out, &mut budget, run_alt, &mut steps);
+                line.reset();
+                point.reset();
+                *previous_alt = Some(modifiers.alt);
+                run_alt = *previous_alt;
+            }
+            steps = match unit {
+                egui::MouseWheelUnit::Line => bounded_line_wheel_accumulate(line, steps, delta.y),
+                egui::MouseWheelUnit::Point => {
+                    bounded_point_wheel_accumulate(point, steps, delta.y, line_height)
+                }
+                egui::MouseWheelUnit::Page => {
+                    bounded_wheel_step_accumulate(steps, delta.y, rows.max(1))
+                }
+            };
+        }
+    }
+    flush(&mut out, &mut budget, run_alt, &mut steps);
+    if *previous_alt != Some(frame_alt) {
+        line.reset();
+        point.reset();
+        *previous_alt = Some(frame_alt);
+    }
+    out
 }
 
 fn captured_release_button(
@@ -3233,7 +3329,9 @@ impl TerminalApp {
             mouse_line_wheel: jterm_core::wheel::WheelAccumulator::default(),
             mouse_point_wheel: jterm_core::wheel::WheelAccumulator::default(),
             mouse_wheel_alt_screen: None,
-            alternate_scroll_wheel: jterm_core::wheel::WheelAccumulator::default(),
+            mouse_wheel_alt_modifier: None,
+            mouse_wheel_session_id: None,
+            alternate_scroll_wheel: crate::alternate_scroll::AlternateScrollWheel::default(),
             terminal_mouse_capture: None,
             last_terminal_mouse_motion: None,
             font_zoom: font_zoom::FontZoom::default(),
@@ -6201,6 +6299,9 @@ impl eframe::App for TerminalApp {
             raw_input.hovered_files.clear();
             return;
         }
+        // Preserve only route-relevant ordered events before font zoom removes
+        // Ctrl+wheel, together with the real frame-start pointer position.
+        self.alternate_scroll_wheel.capture_frame(self.last_pointer_pos, &raw_input.events);
         // Remove Ctrl+wheel before egui creates global zoom or scroll velocity.
         self.font_zoom
             .collect(&mut raw_input.events, raw_input.focused);
@@ -6946,7 +7047,6 @@ impl eframe::App for TerminalApp {
         // 当搜索面板或配置面板打开时，不处理普通键盘输入（面板会处理输入）
         // 复用缓冲区减少内存分配
         self.keyboard_input_buffer.clear();
-        let mut alternate_scroll_owns_wheel = false;
         if !terminal_input_blocked || semantic_paste_claims_rest {
             let (
                 keyboard_enhancement_flags,
@@ -6991,82 +7091,90 @@ impl eframe::App for TerminalApp {
                 meta_sends_escape && ctx.input(|input| input.modifiers.alt),
                 &terminal_keyboard_events,
             );
-            if pointer_over_active_terminal
-                && !ctx.input(|input| input.modifiers.shift || input.modifiers.ctrl)
-            {
-                let (
-                    alt_screen,
-                    alternate_scroll,
-                    mouse_enabled,
-                    application_cursor_keys,
-                    mouse_rows,
-                ) = {
-                    let terminal = session.terminal.lock();
-                    (
-                        terminal.is_alt_buffer_active(),
-                        terminal.is_alternate_scroll(),
-                        session.purpose != crate::session::SessionPurpose::RetainedCommand
-                            && terminal.is_mouse_enabled(),
-                        terminal.is_application_cursor_keys(),
-                        terminal.get_dimensions().1,
-                    )
-                };
-                if should_send_alternate_scroll(
-                    alt_screen,
-                    alternate_scroll,
-                    mouse_enabled,
-                    false,
-                    true,
-                ) {
-                    alternate_scroll_owns_wheel = true;
-                    let line_h = input_renderer.line_height.max(1.0);
-                    let mut steps: isize = 0;
-                    ctx.input(|input| {
-                        for event in &input.events {
-                            if let egui::Event::MouseWheel {
-                                unit,
-                                delta,
-                                modifiers,
-                                ..
-                            } = event
-                            {
-                                if modifiers.ctrl || modifiers.shift {
-                                    continue;
-                                }
-                                match unit {
-                                    egui::MouseWheelUnit::Line => {
-                                        steps = bounded_line_wheel_accumulate(
-                                            &mut self.alternate_scroll_wheel,
-                                            steps,
-                                            delta.y,
-                                        );
-                                    }
-                                    egui::MouseWheelUnit::Page => {
-                                        steps = bounded_wheel_step_accumulate(
-                                            steps,
-                                            delta.y,
-                                            mouse_rows.max(1),
-                                        );
-                                    }
-                                    egui::MouseWheelUnit::Point => {
-                                        steps = bounded_point_wheel_accumulate(
-                                            &mut self.alternate_scroll_wheel,
-                                            steps,
-                                            delta.y,
-                                            line_h,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    });
-                    self.keyboard_input_buffer
-                        .extend(alternate_scroll_cursor_bytes(
-                            steps,
-                            application_cursor_keys,
-                        ));
+
+        }
+
+        // Disarm on every ineligible frame, not only while keyboard input is
+        // enabled. Pointer/modifier/UI gaps must not lend a fraction to later input.
+        let wheel_renderer = active_pane_renderer_idx
+            .and_then(|index| self.pane_renderers.get(index))
+            .unwrap_or(&self.renderer);
+        let line_height = wheel_renderer.line_height.max(1.0);
+        let wheel_ui_allowed =
+            !terminal_input_blocked && !terminal_pointer_input_blocked;
+        let wheel_snapshot = if wheel_ui_allowed {
+            let terminal = session.terminal.lock();
+            let eligible = should_send_alternate_scroll(
+                terminal.is_alt_buffer_active(),
+                terminal.is_alternate_scroll(),
+                terminal.is_mouse_enabled(),
+                false,
+                true,
+            ) && session.purpose != crate::session::SessionPurpose::RetainedCommand;
+            eligible
+                .then(|| {
+                    terminal.alternate_scroll_generation().map(|generation| {
+                        (
+                            generation,
+                            terminal.get_dimensions().1,
+                            terminal.keyboard_enhancement_flags(),
+                            terminal.is_report_all_keys_enabled(),
+                            terminal.is_application_cursor_keys(),
+                        )
+                    })
+                })
+                .flatten()
+        } else {
+            None
+        };
+        let route = wheel_snapshot.map(|(generation, ..)| {
+            (
+                active_session_id.as_str(),
+                generation,
+                line_height.to_bits(),
+            )
+        });
+        let mouse_rows = wheel_snapshot.map_or(1, |(_, rows, ..)| rows);
+        let frame_override = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
+        let steps = self.alternate_scroll_wheel.collect_frame(
+            route,
+            active_terminal_content_rect,
+            pointer_over_active_terminal,
+            frame_override,
+            |acc, steps, unit, delta| match unit {
+                egui::MouseWheelUnit::Line => bounded_line_wheel_accumulate(acc, steps, delta.y),
+                egui::MouseWheelUnit::Point => {
+                    bounded_point_wheel_accumulate(acc, steps, delta.y, line_height)
+                }
+                egui::MouseWheelUnit::Page => {
+                    acc.reset();
+                    bounded_wheel_step_accumulate(steps, delta.y, mouse_rows.max(1))
+                }
+            },
+        );
+        let alternate_scroll_owns_wheel =
+            steps != 0 || (route.is_some() && pointer_over_active_terminal && !frame_override);
+        if steps != 0 {
+            // Revalidate only when a whole pulse exists. Idle frames do not
+            // allocate arrow sequences or borrow an encoder unnecessarily.
+            if let Some((generation, _, flags, report_all, app_cursor)) = wheel_snapshot {
+                if session.terminal.lock().alternate_scroll_generation() == Some(generation) {
+                    if let Some(bytes) = crate::ui::alternate_scroll_arrow_bytes(
+                        steps > 0,
+                        flags,
+                        report_all,
+                        app_cursor,
+                    ) {
+                        self.keyboard_input_buffer.extend(
+                            bytes.repeat(
+                                steps
+                                    .unsigned_abs()
+                                    .min(MAX_MOUSE_WHEEL_REPORTS_PER_FRAME as usize),
+                            ),
+                        );
+                    }
                 } else {
-                    self.alternate_scroll_wheel.reset();
+                    self.alternate_scroll_wheel.sync(None);
                 }
             }
         }
@@ -8125,6 +8233,7 @@ impl eframe::App for TerminalApp {
         let mouse_uses_active_projection = mouse_session_id == active_session_id
             && Arc::ptr_eq(&mouse_terminal, &session.terminal);
         let mut mouse_route_closed = false;
+        let raw_wheel_frame = self.alternate_scroll_wheel.take_tracking_events();
         let lossy_mouse_reports: Vec<Vec<u8>> = if (!sequence_reports_to_app
             || !pointer_routes_to_terminal
             || (terminal_pointer_input_blocked && reported_capture_release.is_none()))
@@ -8133,6 +8242,8 @@ impl eframe::App for TerminalApp {
             self.mouse_line_wheel.reset();
             self.mouse_point_wheel.reset();
             self.mouse_wheel_alt_screen = None;
+            self.mouse_wheel_alt_modifier = None;
+            self.mouse_wheel_session_id = None;
             Vec::new()
         } else {
             let terminal = mouse_terminal.lock();
@@ -8140,6 +8251,8 @@ impl eframe::App for TerminalApp {
                 self.mouse_line_wheel.reset();
                 self.mouse_point_wheel.reset();
                 self.mouse_wheel_alt_screen = None;
+            self.mouse_wheel_alt_modifier = None;
+            self.mouse_wheel_session_id = None;
                 // The application disabled mouse reporting while a sequence was
                 // active. An unaccepted press can be retired, but a release
                 // already encoded behind backpressure must still follow its
@@ -8155,10 +8268,15 @@ impl eframe::App for TerminalApp {
             } else {
                 let mut reports = Vec::new();
                 let alt_screen = terminal.is_alt_buffer();
+                if self.mouse_wheel_session_id.as_deref() != Some(mouse_session_id.as_str()) {
+                    self.mouse_line_wheel.reset();self.mouse_point_wheel.reset();self.mouse_wheel_alt_modifier=None;
+                    self.mouse_wheel_session_id=Some(mouse_session_id.clone());
+                }
                 if self.mouse_wheel_alt_screen != Some(alt_screen) {
                     if self.mouse_wheel_alt_screen.is_some() {
                         self.mouse_line_wheel.reset();
                         self.mouse_point_wheel.reset();
+                        self.mouse_wheel_alt_modifier=None;
                     }
                     self.mouse_wheel_alt_screen = Some(alt_screen);
                 }
@@ -8194,61 +8312,13 @@ impl eframe::App for TerminalApp {
                 if let Some((row, col)) =
                     (!only_release).then_some(frame_route.lossy_cell).flatten()
                 {
-                    // 处理鼠标滚轮（当启用鼠标报告时）
-                    let line_h = line_height.max(1.0);
-                    let mut discrete_scroll_steps: isize = 0;
-
-                    ctx.input(|i| {
-                        for event in &i.events {
-                            if let egui::Event::MouseWheel {
-                                unit,
-                                delta,
-                                modifiers,
-                                ..
-                            } = event
-                            {
-                                if modifiers.ctrl || inline_cli_host_wheel {
-                                    continue;
-                                }
-                                match unit {
-                                    egui::MouseWheelUnit::Line => {
-                                        discrete_scroll_steps = bounded_line_wheel_accumulate(
-                                            &mut self.mouse_line_wheel,
-                                            discrete_scroll_steps,
-                                            delta.y,
-                                        );
-                                    }
-                                    egui::MouseWheelUnit::Page => {
-                                        discrete_scroll_steps = bounded_wheel_step_accumulate(
-                                            discrete_scroll_steps,
-                                            delta.y,
-                                            mouse_rows.max(1),
-                                        );
-                                    }
-                                    egui::MouseWheelUnit::Point => {
-                                        discrete_scroll_steps = bounded_point_wheel_accumulate(
-                                            &mut self.mouse_point_wheel,
-                                            discrete_scroll_steps,
-                                            delta.y,
-                                            line_h,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    });
-
-                    let total_scroll_steps = discrete_scroll_steps.clamp(
-                        -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
-                        MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
-                    );
-                    if total_scroll_steps != 0 {
-                        let button = if total_scroll_steps > 0 { 64 } else { 65 };
-
-                        for _ in 0..total_scroll_steps.unsigned_abs() {
-                            if let Some(report) = terminal.get_mouse_report(button, col, row) {
-                                reports.push(report);
-                            }
+                    let runs = raw_wheel_frame.as_ref().map(|(_,events)| mouse_wheel_runs(
+                        &mut self.mouse_line_wheel,&mut self.mouse_point_wheel,&mut self.mouse_wheel_alt_modifier,
+                        events,content_rect,line_height.max(1.0),mouse_rows,inline_cli_host_wheel,ctx.input(|input|input.modifiers.alt))).unwrap_or_default();
+                    for (alt,steps) in runs {
+                        let button=(if steps>0 {64} else {65}) | if alt {8} else {0};
+                        for _ in 0..steps.unsigned_abs() {
+                            if let Some(report)=terminal.get_mouse_report(button,col,row) {reports.push(report);}
                         }
                     }
 
@@ -8315,6 +8385,8 @@ impl eframe::App for TerminalApp {
                     self.mouse_line_wheel.reset();
                     self.mouse_point_wheel.reset();
                     self.mouse_wheel_alt_screen = None;
+            self.mouse_wheel_alt_modifier = None;
+            self.mouse_wheel_session_id = None;
                 }
 
                 // A release is emitted exactly once and only for a press
@@ -8348,6 +8420,7 @@ impl eframe::App for TerminalApp {
             }
         };
 
+        if let Some((_,events)) = raw_wheel_frame { self.alternate_scroll_wheel.recycle_tracking_events(events); }
         let has_mouse_input = !lossy_mouse_reports.is_empty()
             || self
                 .terminal_mouse_capture
@@ -10333,6 +10406,150 @@ mod tests {
             7
         );
         assert_eq!(bounded_point_wheel_accumulate(&mut acc, 7, 4.0, 0.0), 7);
+    }
+
+    #[test]
+    fn forwarded_alt_wheel_runs_preserve_order_fraction_and_wire_encodings() {
+        use egui::{Event, Modifiers, MouseWheelUnit, TouchPhase};
+        let event = |delta, alt| Event::MouseWheel {
+            unit: MouseWheelUnit::Line,
+            phase: TouchPhase::Move,
+            delta: egui::vec2(0.0, delta),
+            modifiers: Modifiers {
+                alt,
+                ..Default::default()
+            },
+        };
+        let mut line = jterm_core::wheel::WheelAccumulator::default();
+        let mut point = jterm_core::wheel::WheelAccumulator::default();
+        let mut alt = None;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let runs = super::mouse_wheel_runs(
+            &mut line,
+            &mut point,
+            &mut alt,
+            &[event(1.0, false), event(1.0, true), event(-1.0, false)],
+            rect,
+            14.0,
+            24,
+            false,
+            false,
+        );
+        assert_eq!(runs, vec![(false, 1), (true, 1), (false, -1)]);
+        assert_eq!(
+            super::mouse_wheel_runs(
+                &mut line,
+                &mut point,
+                &mut alt,
+                &[event(2.0, false), event(-1.0, false)],
+                rect,
+                14.0,
+                24,
+                false,
+                false
+            ),
+            vec![(false, 1)]
+        );
+        let capped = super::mouse_wheel_runs(
+            &mut line,
+            &mut point,
+            &mut alt,
+            &[event(1000.0, false), event(1000.0, true)],
+            rect,
+            14.0,
+            24,
+            false,
+            true,
+        );
+        assert_eq!(
+            capped
+                .iter()
+                .map(|(_, steps)| steps.unsigned_abs())
+                .sum::<usize>(),
+            64
+        );
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.process_input(b"\x1b[?1000;1006h");
+        let encode = |terminal: &TerminalState, runs: &[(bool, isize)]| {
+            runs.iter()
+                .flat_map(|(alt, steps)| {
+                    terminal
+                        .get_mouse_report(
+                            (if *steps > 0 { 64 } else { 65 }) | if *alt { 8 } else { 0 },
+                            1,
+                            1,
+                        )
+                        .unwrap()
+                        .repeat(steps.unsigned_abs())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            encode(&terminal, &runs),
+            b"\x1b[<64;2;2M\x1b[<72;2;2M\x1b[<65;2;2M"
+        );
+        terminal.process_input(b"\x1b[?1006l");
+        assert_eq!(
+            encode(&terminal, &runs),
+            b"\x1b[M`\"\"\x1b[Mh\"\"\x1b[Ma\"\""
+        );
+        line.reset();
+        point.reset();
+        alt = None;
+        assert!(super::mouse_wheel_runs(
+            &mut line,
+            &mut point,
+            &mut alt,
+            &[event(0.6, false), event(0.6, true)],
+            rect,
+            14.0,
+            24,
+            false,
+            true
+        )
+        .is_empty());
+        assert_eq!(
+            super::mouse_wheel_runs(
+                &mut line,
+                &mut point,
+                &mut alt,
+                &[event(0.5, true)],
+                rect,
+                14.0,
+                24,
+                false,
+                true
+            ),
+            vec![(true, 1)]
+        );
+        let mut blocked = event(0.6, true);
+        if let Event::MouseWheel { modifiers, .. } = &mut blocked {
+            modifiers.ctrl = true;
+        }
+        assert!(super::mouse_wheel_runs(
+            &mut line,
+            &mut point,
+            &mut alt,
+            &[blocked],
+            rect,
+            14.0,
+            24,
+            false,
+            true
+        )
+        .is_empty());
+        assert!(super::mouse_wheel_runs(
+            &mut line,
+            &mut point,
+            &mut alt,
+            &[event(0.6, true)],
+            rect,
+            14.0,
+            24,
+            false,
+            true
+        )
+        .is_empty());
     }
 
     #[test]

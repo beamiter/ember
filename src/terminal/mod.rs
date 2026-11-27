@@ -586,6 +586,7 @@ pub struct TerminalState {
     pub dirty_region: DirtyRegion,
 
     // P4 优化：行版本化追踪
+    alternate_scroll_generation: Option<u64>,
     pub grid_version: u64, // 全局网格版本号
     chat_pending_submit: Option<u64>,
     // A main-screen takeover stays native for this foreground command.

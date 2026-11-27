@@ -5899,13 +5899,29 @@ mod tests {
     #[test]
     fn hidden_logic_wiring_keeps_the_hook_state_only() {
         let main = include_str!("main.rs");
-        let hook = main
-            .split("    fn logic(")
-            .nth(1)
+        let function = main
+            .split_once("    fn logic(")
             .expect("root App logic hook")
-            .split("    fn ui(")
-            .next()
-            .expect("next UI method");
+            .1;
+        let body = function.split_once('{').expect("hook body").1;
+        let mut depth = 1usize;
+        let end = body
+            .char_indices()
+            .find_map(|(index, ch)| {
+                if ch == '{' {
+                    depth += 1;
+                }
+                if ch == '}' {
+                    depth -= 1;
+                }
+                (depth == 0).then_some(index)
+            })
+            .expect("balanced hook body");
+        let hook = &body[..end];
+        assert!(
+            !hook.contains("fn logic_only"),
+            "hidden-pump hook is a separate method"
+        );
         assert!(hook.contains("self.observe_organism_visibility(ctx);"));
         assert!(!hook.contains("request_repaint"));
         assert!(!hook.contains("render_"));

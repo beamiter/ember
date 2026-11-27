@@ -72,6 +72,7 @@ impl TerminalState {
             osc5522: Default::default(),
             kitty_graphics,
             dirty_region,
+            alternate_scroll_generation: Some(1),
             grid_version: 1,
             // IMPORTANT: row_versions must match grid.rows(), not the parameter 'rows'
             // This ensures dirty tracking works correctly even with scrollback

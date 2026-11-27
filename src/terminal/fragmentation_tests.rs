@@ -778,11 +778,38 @@ fn historical_legacy_parser_migration_recorded_oracle() {
     }
 }
 
-/// Independent original semantic-dispatch oracle; separate from the scanner
-/// and structural migration baselines, which must remain unchanged.
+#[derive(Clone, Copy)]
+enum SemanticExpectation {
+    Captured,
+    Inert,
+    RestoreInitialPen,
+}
+
+fn semantic_csi_expectation(command: u8, prefix: &str, params: &str) -> SemanticExpectation {
+    use SemanticExpectation::*;
+    match (prefix, command, params) {
+        ("", b'u', _) => RestoreInitialPen,
+        // The captured setup has six rows. These DECSTBM commands leave
+        // the existing margins intact after clipping or reversing the bounds.
+        ("", b'r', "4;1" | "38:2::255:256:65535" | "41;44;49;0") => Inert,
+        // The colon group owns an invalid RGB triplet and is ignored whole.
+        ("", b'm', "38:2::255:256:65535") => Inert,
+        ("=", b'm', _) => Inert,
+        ("?", b'm', params) if params != "4" => Inert,
+        // XTFMTKEYS claims this namespace independently from HVP.
+        (">", b'f', _) => Captured,
+        (prefix, command, _) if !prefix.is_empty() && b"ABCDEFGHIZadefjk\x60".contains(&command) => {
+            Inert
+        }
+        _ => Captured,
+    }
+}
+
+/// Independent original semantic-dispatch oracle, with explicit expectations
+/// for the protocol behaviors added since the original capture.
 #[test]
 fn semantic_migration_recorded_oracle() {
-    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut cases = Vec::new();
     let setup =
         b"\x1b[2;5r\x1b[?6h\x1b[2;4H\x1b[41m\x1b[1\"q\x1b]133;A\x07\x1b]133;C;id=semantic\x07";
     let suffix = b"\x1b[6n\x1b[?6n\x1b]133;D;0;id=semantic\x07";
@@ -799,8 +826,14 @@ fn semantic_migration_recorded_oracle() {
             for prefix in ["", ">", "?", "="] {
                 let mut bytes = setup.to_vec();
                 bytes.extend(format!("\x1b[{prefix}{params}{}", *final_byte as char).as_bytes());
+                let command_end = bytes.len();
                 bytes.extend_from_slice(suffix);
-                cases.push((format!("csi-{final_byte}-{prefix}-{params}"), bytes));
+                cases.push((
+                    format!("csi-{final_byte}-{prefix}-{params}"),
+                    bytes,
+                    command_end,
+                    semantic_csi_expectation(*final_byte, prefix, params),
+                ));
             }
         }
     }
@@ -833,10 +866,11 @@ fn semantic_migration_recorded_oracle() {
         let mut combined = setup.to_vec();
         combined.extend_from_slice(bytes);
         combined.extend_from_slice(suffix);
-        cases.push((name.to_owned(), combined));
+        cases.push((name.to_owned(), combined, 0, SemanticExpectation::Captured));
     }
     let mut records = Vec::new();
-    for (name, bytes) in cases {
+    let mut expectations = Vec::new();
+    for (name, bytes, command_end, expectation) in cases {
         for cut in [0, setup.len(), bytes.len() / 2, bytes.len()] {
             let mut terminal = TerminalState::new(24, 6);
             terminal.process_input(&bytes[..cut]);
@@ -848,6 +882,12 @@ fn semantic_migration_recorded_oracle() {
                 prefix,
                 migration_fingerprints(snapshot(&terminal)),
             ));
+            // For this matrix, observed prefixes are either before the
+            // complete command or include its entire reply and suffix.
+            if !matches!(expectation, SemanticExpectation::Captured) && cut >= command_end {
+                assert_eq!(cut, bytes.len());
+            }
+            expectations.push((expectation, cut >= command_end));
         }
     }
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -863,15 +903,56 @@ fn semantic_migration_recorded_oracle() {
         file.write_all(&serde_json::to_vec(&actual).unwrap())
             .unwrap();
     } else {
-        let expected: serde_json::Value = super::oracle_fixture::decode(
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
-        )
-        .unwrap();
+        use sha2::Digest;
+        let sealed = std::fs::read(path).unwrap();
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&sealed)),
+            "0be27ed935112769bf1c632217c66274363634de08f2d5f7b81e8a79ca3f5b1b"
+        );
+        let expected =
+            super::oracle_fixture::decode(serde_json::from_slice(&sealed).unwrap()).unwrap();
         let a = actual.as_array().unwrap();
         let b = expected.as_array().unwrap();
         assert_eq!(a.len(), b.len());
-        for (actual, expected) in a.iter().zip(b) {
-            assert_eq!(actual, expected, "case {} cut {}", actual[0], actual[1]);
+        assert_eq!(a.len(), expectations.len());
+        // The sealed empty CSI q provides an inert command between exactly
+        // the same setup and suffix, and its empty first feed is initial state.
+        let control = b
+            .iter()
+            .find(|record| record[0] == "csi-113--" && record[1] == 0)
+            .expect("sealed inert CSI q control");
+        for ((actual, captured), (intent, after_command)) in a.iter().zip(b).zip(expectations) {
+            assert_eq!((&actual[0], &actual[1]), (&captured[0], &captured[1]));
+            for (slot, intent) in [
+                (
+                    2,
+                    if after_command {
+                        intent
+                    } else {
+                        SemanticExpectation::Captured
+                    },
+                ),
+                (3, intent),
+            ] {
+                let expected = match intent {
+                    SemanticExpectation::Captured => std::borrow::Cow::Borrowed(&captured[slot]),
+                    SemanticExpectation::Inert => std::borrow::Cow::Borrowed(&control[3]),
+                    SemanticExpectation::RestoreInitialPen => {
+                        let mut restored = captured[slot].clone();
+                        for lane in ["current_bg", "current_flags", "origin_mode"] {
+                            restored[lane] = control[2][lane].clone();
+                        }
+                        std::borrow::Cow::Owned(restored)
+                    }
+                };
+                assert_eq!(
+                    &actual[slot],
+                    expected.as_ref(),
+                    "case {} cut {} snapshot {slot}",
+                    actual[0],
+                    actual[1]
+                );
+            }
         }
     }
 }

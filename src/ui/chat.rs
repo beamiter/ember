@@ -220,8 +220,14 @@ fn draw_reference_composer_tools(ui: &mut Ui, rect: egui::Rect, interactive: boo
                             ui.set_width(popup::WIDTH - 2.0 * popup::PADDING - 2.0);
                             if ui.button("Open read-only observer").clicked() {
                                 ui.ctx().data_mut(|data| {
-                                    data.insert_temp(egui::Id::new("read-only-observer-request"),owner);
-                                    data.insert_temp(egui::Id::new("reference-tool-request"),"observer".to_owned());
+                                    data.insert_temp(
+                                        egui::Id::new("read-only-observer-request"),
+                                        owner,
+                                    );
+                                    data.insert_temp(
+                                        egui::Id::new("reference-tool-request"),
+                                        "observer".to_owned(),
+                                    );
                                 });
                                 ui.close();
                             }
