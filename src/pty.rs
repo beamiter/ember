@@ -27,7 +27,7 @@ mod unix_pty {
     use jterm_core::native_pty_launch::{
         launch_pty, PtyLaunch, PtyLaunchError, StartupError, StartupStage, WorkingDirectory,
     };
-    use jterm_core::pty_io::{resize_master, write_native_master, PtyWriteAttempt};
+    use jterm_core::pty_io::{resize_master_with_pixels, write_native_master, PtyWriteAttempt};
     use std::ffi::OsStr;
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
     use std::path::Path;
@@ -535,8 +535,17 @@ mod unix_pty {
         }
 
         pub fn resize(&mut self, cols: usize, rows: usize) -> Result<()> {
-            resize_master(self.master.as_fd(), cols as u16, rows as u16)
-                .map_err(|_| anyhow!("Failed to resize PTY"))
+            self.resize_with_pixels(cols, rows, (0, 0))
+        }
+
+        pub fn resize_with_pixels(
+            &mut self,
+            cols: usize,
+            rows: usize,
+            pixels: (u16, u16),
+        ) -> Result<()> {
+            resize_master_with_pixels(self.master.as_fd(), cols as u16, rows as u16, pixels)
+                .map_err(|error| anyhow!("Failed to resize PTY: {error}"))
         }
 
         #[cfg(test)]
@@ -944,6 +953,15 @@ impl jterm_core::session_actor::SessionTransport for Pty {
         Pty::resize(self, cols, rows).map_err(|error| error.to_string())
     }
 
+    fn resize_with_pixels(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        pixels: (u16, u16),
+    ) -> std::result::Result<(), String> {
+        Pty::resize_with_pixels(self, cols, rows, pixels).map_err(|error| error.to_string())
+    }
+
     fn is_alive(&mut self) -> bool {
         Pty::is_alive(self)
     }
@@ -1036,6 +1054,37 @@ pub use windows_pty::Pty;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn measured_native_resize_changes_pixels_for_the_existing_grid() {
+        use super::Pty;
+
+        let argv = ["/bin/sh".to_owned(), "-c".to_owned(), "read -r line".to_owned()];
+        let mut pty = Pty::new_with_cwd(80, 24, None, None, None, Some(&argv)).unwrap();
+        let read_size = |pty: &Pty| {
+            let mut size = libc::winsize {
+                ws_row: 0,
+                ws_col: 0,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            // The live PTY owns the descriptor for this read.
+            assert_eq!(
+                unsafe { libc::ioctl(pty.master_fd(), libc::TIOCGWINSZ, &mut size) },
+                0,
+            );
+            (size.ws_col, size.ws_row, size.ws_xpixel, size.ws_ypixel)
+        };
+
+        assert_eq!(read_size(&pty), (80, 24, 0, 0));
+        pty.resize_with_pixels(80, 24, (674, 403)).unwrap();
+        assert_eq!(read_size(&pty), (80, 24, 674, 403));
+        pty.resize_with_pixels(80, 24, (1348, 806)).unwrap();
+        assert_eq!(read_size(&pty), (80, 24, 1348, 806));
+        pty.resize(80, 24).unwrap();
+        assert_eq!(read_size(&pty), (80, 24, 0, 0));
+    }
+
     #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
 

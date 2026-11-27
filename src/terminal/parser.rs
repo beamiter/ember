@@ -226,13 +226,24 @@ impl super::TerminalState {
         use jterm_engine::native_window_ops::{
             apply_native_window_op, NativeWindowGeometry, NativeWindowPixels,
         };
-        let (width, height) = self.kitty_graphics.cell_size_pixels();
+        let columns = self.vt.screen.grid.row_len();
+        let rows = self.vt.screen.grid.rows();
+        let pixels = match self.pty_window_pixels.filter(|size| size.grid == (columns, rows)) {
+            Some(size) => NativeWindowPixels::Viewport {
+                width: size.pixels.0.into(),
+                height: size.pixels.1.into(),
+            },
+            None => {
+                let (width, height) = self.kitty_graphics.cell_size_pixels();
+                NativeWindowPixels::Cell { width, height }
+            }
+        };
         apply_native_window_op(
             params,
             NativeWindowGeometry {
-                columns: self.vt.screen.grid.row_len(),
-                rows: self.vt.screen.grid.rows(),
-                pixels: NativeWindowPixels::Cell { width, height },
+                columns,
+                rows,
+                pixels,
             },
             &mut self.titles,
             jterm_engine::titles::TitleState::reportable_title,

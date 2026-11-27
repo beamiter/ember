@@ -4811,6 +4811,23 @@ impl TerminalRenderer {
         clamp_terminal_dimensions(cols, rows)
     }
 
+    /// Measure the complete text grid in physical pixels.
+    #[allow(dead_code)] // Called by the native application renderer.
+    pub(crate) fn grid_pixels(
+        &self,
+        (cols, rows): (usize, usize),
+        pixels_per_point: f32,
+    ) -> Option<(u16, u16)> {
+        let extent = |cells, cell: f32| {
+            let pixels = cells as f64 * f64::from(cell) * f64::from(pixels_per_point);
+            if !pixels.is_finite() || pixels <= 0.0 {
+                return None;
+            }
+            Some(pixels.round().clamp(1.0, f64::from(u16::MAX)) as u16)
+        };
+        Some((extent(cols, self.char_width)?, extent(rows, self.line_height)?))
+    }
+
     /// 在指定矩形内渲染（用于多窗格模式）
     // Rendering a pane needs the terminal model plus its transient overlays and geometry.
     #[allow(clippy::too_many_arguments)]

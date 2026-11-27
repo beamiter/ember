@@ -2812,6 +2812,7 @@ impl TerminalApp {
         )
         .0;
         let (cols, rows) = self.renderer.grid_dimensions(single_pty_rect.size());
+        let pixels_per_point = ctx.pixels_per_point();
         crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
 
         // 单窗格才按整窗口尺寸 resize 活跃会话;多窗格时各窗格在下方
@@ -2823,6 +2824,7 @@ impl TerminalApp {
             session.resize_terminal(
                 &mut terminal.lock(),
                 (cols, rows),
+                self.renderer.grid_pixels((cols, rows), pixels_per_point),
                 self.force_resize_session,
                 ctx,
             );
@@ -2912,8 +2914,8 @@ impl TerminalApp {
                     tools_height,
                 )
                 .0;
-                let (pane_cols, pane_rows) =
-                    self.pane_renderers[pane_idx].grid_dimensions(pty_rect.size());
+                let (pane_cols, pane_rows) = renderer.grid_dimensions(pty_rect.size());
+                let pane_pixels = renderer.grid_pixels((pane_cols, pane_rows), pixels_per_point);
                 if let Some(session) = self.session_manager.get_session_mut(session_idx) {
                     let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                     let terminal_arc = std::sync::Arc::clone(&session.terminal);
@@ -2921,6 +2923,7 @@ impl TerminalApp {
                     session.resize_terminal(
                         &mut terminal_guard,
                         (pane_cols, pane_rows),
+                        pane_pixels,
                         false,
                         ctx,
                     );

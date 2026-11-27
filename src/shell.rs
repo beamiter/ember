@@ -252,12 +252,22 @@ impl ShellSession {
         }
     }
 
+    #[allow(dead_code)] // Row/column resize remains available to library callers.
     pub fn resize(&self, cols: usize, rows: usize) -> Result<(), String> {
+        self.resize_with_pixels(cols, rows, (0, 0))
+    }
+
+    pub(crate) fn resize_with_pixels(
+        &self,
+        cols: usize,
+        rows: usize,
+        pixels: (u16, u16),
+    ) -> Result<(), String> {
         let view = self.view.lock();
         if !view.attached() {
             return Err("Terminal view is detached".into());
         }
-        self.actor.resize(cols, rows)
+        self.actor.resize_with_pixels(cols, rows, pixels)
     }
 
     pub fn get_child_pid(&self) -> i32 {
@@ -384,6 +394,7 @@ mod tests {
             Err(ShellWriteError::Closed)
         ));
         assert!(shell.resize(20, 10).is_err());
+        assert!(shell.resize_with_pixels(80, 24, (800, 480)).is_err());
         let detached = shell.view_ticket();
         let absent_sender = shell.write_sender();
         shell.write_protocol(b"PROTO").unwrap();

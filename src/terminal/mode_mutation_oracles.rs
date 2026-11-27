@@ -334,10 +334,16 @@ fn corpus() -> Vec<(String, Vec<u8>)> {
     ))
     .unwrap()
 }
-fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
+fn for_each_case(mut visit: impl FnMut(String, Snapshot, bool)) {
     for seed in 0..4 {
-        visit(format!("seed_{seed}"), snapshot(&seeded(seed)));
+        visit(format!("seed_{seed}"), snapshot(&seeded(seed)), false);
         for (id, data) in corpus() {
+            // Byte count at which the bounded scanner rejects these two malformed CSI forms.
+            let rejected_after = match data.as_slice() {
+                b"\x1b[!6h" => 4,
+                b"\x1b[?6?7h" => 5,
+                _ => usize::MAX,
+            };
             // Whole feed, every single split, and byte-at-a-time. Snapshot every feed.
             let mut partitions = vec![vec![data.len()], (1..=data.len()).collect()];
             partitions.extend((1..data.len()).map(|at| vec![at, data.len()]));
@@ -352,6 +358,7 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
                     visit(
                         format!("seed_{seed}_{id}_partition_{partition}_feed_{feed}"),
                         snapshot(&t),
+                        end >= rejected_after,
                     );
                 }
             }
@@ -361,7 +368,7 @@ fn for_each_case(mut visit: impl FnMut(String, Snapshot)) {
 #[test]
 #[ignore = "explicit original production capture, stdout only"]
 fn print_mode_mutation_baseline() {
-    for_each_case(|key, lanes| {
+    for_each_case(|key, lanes, _| {
         println!(
             "\nMODE_BASELINE\t{}",
             serde_json::to_string(&(key, lanes)).unwrap()
@@ -388,14 +395,22 @@ fn mode_mutation_original_production_golden() {
         encoded
     };
     let expected: Captured = serde_json::from_value(decoded).unwrap();
+    let ground_parser = &expected.values[expected.cases["seed_0"]["parser"]];
     let mut seen = 0;
-    for_each_case(|key, got| {
+    for_each_case(|key, got, rejected| {
         let lanes = expected.cases.get(&key).expect("missing captured case");
         assert_eq!(lanes.len(), got.len(), "{key}: lane count");
         for (lane, index) in lanes {
+            // Once the illegal byte arrives, the bounded scanner discards the
+            // frame without buffering it or observing a terminal operation.
+            let reference = match (rejected, lane.as_str()) {
+                (true, "parser") => ground_parser.as_str(),
+                (true, "chat_native_takeover_sequence") => "None",
+                _ => expected.values.get(*index).expect("invalid captured index"),
+            };
             assert_eq!(
                 got.get(lane).expect("missing actual lane"),
-                expected.values.get(*index).expect("invalid captured index"),
+                reference,
                 "{key}: {lane}"
             );
         }

@@ -320,6 +320,7 @@ impl super::TerminalState {
                 )
                 .expect("fixed Ember parser limits are valid"),
             ),
+            pty_window_pixels: None,
             host_context,
             scrollback: RetainedHistory::default(),
             selection: None,
@@ -1310,6 +1311,7 @@ impl super::TerminalState {
         let rows = self.vt.screen.grid.rows();
         let max_scrollback = self.max_scrollback;
         let cell_size = self.kitty_graphics.cell_size_pixels();
+        let pty_window_pixels = self.pty_window_pixels;
         // Theme colours belong to the app, not to the program that sent RIS.
         let default_colors = self.colors.defaults();
         let next_raw_row_id = self.next_raw_row_id;
@@ -1333,6 +1335,7 @@ impl super::TerminalState {
             self.sync_output_clock.clone(),
         );
         self.vt.protocol.take_rendition_stack_from(&mut previous_protocol);
+        self.pty_window_pixels = pty_window_pixels;
         self.host_window_focused = host_window_focused;
         self.watch = watch;
         self.alternate_scroll_generation = wheel_generation;

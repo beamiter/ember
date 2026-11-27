@@ -44,6 +44,7 @@ impl TerminalState {
             )
             .expect("fixed Ember parser limits are valid")),
 
+            pty_window_pixels: None,
             host_context,
             scrollback: RetainedHistory::default(),
             selection: None,

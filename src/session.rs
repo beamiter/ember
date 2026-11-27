@@ -1,5 +1,7 @@
 use crate::shell::ShellSession;
-use crate::terminal::{ProjectedViewport, ProjectionPolicy, ProjectionViewState, TerminalState};
+use crate::terminal::{
+    ProjectedViewport, ProjectionPolicy, ProjectionViewState, PtyWindowPixels, TerminalState,
+};
 use parking_lot::Mutex as ParkingMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -275,14 +277,21 @@ impl Session {
         &mut self,
         terminal: &mut TerminalState,
         target: (usize, usize),
+        pixels: Option<(u16, u16)>,
         force: bool,
         ctx: &eframe::egui::Context,
     ) {
-        if !self.shell.view_attached(){return;}
         let previous = (terminal.vt.screen.grid.row_len(), terminal.vt.screen.grid.rows());
         let changed = target != previous;
-        if !changed && !force {
+        let window_pixels = pixels.map(|pixels| PtyWindowPixels { grid: target, pixels });
+        if !changed
+            && !force
+            && (window_pixels == terminal.pty_window_pixels || self.shell.output_finished())
+        {
             self.terminal_presentation.resize_target = None;
+            return;
+        }
+        if !self.shell.view_attached() {
             return;
         }
         let inline_agent = changed
@@ -291,14 +300,21 @@ impl Session {
                 || crate::session_manager::get_foreground_command(self.get_shell_pid())
                     .as_deref()
                     .is_some_and(crate::immersive_command::reading_agent_command));
-        let now = Instant::now();
-        if inline_agent && !force && self.terminal_presentation.defer_resize(target, now, ctx) {
+        if inline_agent
+            && !force
+            && self.terminal_presentation.defer_resize(target, Instant::now(), ctx)
+        {
             return;
         }
         self.terminal_presentation.resize_target = None;
-        terminal.on_resize(target.0, target.1);
-        if self.shell.resize(target.0, target.1).is_ok() && inline_agent {
-            self.terminal_presentation.repaint = Some(ResizeRepaint::new(Instant::now()));
+        if changed || force {
+            terminal.on_resize(target.0, target.1);
+        }
+        if self.shell.resize_with_pixels(target.0, target.1, pixels.unwrap_or((0, 0))).is_ok() {
+            terminal.pty_window_pixels = window_pixels;
+            if inline_agent {
+                self.terminal_presentation.repaint = Some(ResizeRepaint::new(Instant::now()));
+            }
         }
     }
 

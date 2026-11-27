@@ -7628,6 +7628,27 @@ fn xtwinops_reports_the_cell_size_in_pixels() {
     assert_eq!(terminal.output_buffer.as_slice(), b"\x1b[6;18;9t");
 }
 
+#[test]
+fn xtwinops_reports_installed_grid_pixels_and_preserves_them_on_ris() {
+    let mut terminal = TerminalState::new(8, 5);
+    terminal.kitty_graphics.set_cell_size_pixels(9, 13);
+    terminal.pty_window_pixels = Some(super::PtyWindowPixels {
+        grid: (8, 5),
+        pixels: (101, 67),
+    });
+    let expected = b"\x1b[4;67;101t\x1b[6;13;13t\x1b[8;5;8t";
+    terminal.process_input(b"\x1b[14t\x1b[16t\x1b[18t");
+    assert_eq!(terminal.output_buffer.as_slice(), expected);
+    terminal.output_buffer.clear();
+    terminal.process_input(b"\x1bc\x1b[14t\x1b[16t\x1b[18t");
+    assert_eq!(terminal.output_buffer.as_slice(), expected);
+
+    terminal.output_buffer.clear();
+    terminal.on_resize(9, 5);
+    terminal.process_input(b"\x1b[14t");
+    assert_eq!(terminal.output_buffer.as_slice(), b"\x1b[4;65;81t");
+}
+
 /// A TUI's cursor shape belongs to the alternate screen it ran on.
 #[test]
 fn leaving_the_alternate_screen_restores_the_cursor_shape() {

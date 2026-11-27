@@ -523,9 +523,17 @@ type PendingPasteGrant = jterm_engine::osc5522::PendingPasteGrant<std::time::Ins
 
 pub use jterm_engine::colors::{ColorState, DynamicColorPalette, TerminalDefaultColors};
 
+/// Physical text-area measurement successfully installed on the owning PTY.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PtyWindowPixels {
+    pub grid: (usize, usize),
+    pub pixels: (u16, u16),
+}
+
 pub struct TerminalState {
     /// Live VT storage and drawing state; history and host effects remain here.
     pub vt: jterm_engine::native_terminal::NativeTerminal,
+    pub(crate) pty_window_pixels: Option<PtyWindowPixels>,
     host_context: TerminalHostContext,
     #[cfg(test)]
     search_source_epoch: u64,
