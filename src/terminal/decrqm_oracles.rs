@@ -297,11 +297,11 @@ fn decrqm_frozen_lookup_exhaustive() {
                 } else {
                     t.vt.protocol.modes_mut().remove(&mode);
                 }
-                // X10 and reverse-wrap were unsupported in the frozen
-                // extraction baseline. Their current Boolean state is checked
-                // independently; every other private mode keeps that oracle.
+                // X10, UK NRCS, and reverse-wrap were unsupported in the
+                // frozen baseline. Check their current Boolean state and keep
+                // every other private mode under the original oracle.
                 let private_expected = match mode {
-                    9 | 45 => {
+                    9 | 42 | 45 => {
                         if stored {
                             1
                         } else {
@@ -338,4 +338,16 @@ fn supported_x10_and_reverse_wrap_queries_follow_actual_wire_order() {
     // Ember's inherited DECRQM surface answers only the first parameter.
     terminal.process_input(b"\x1b[?9;45;9$p");
     assert_eq!(terminal.get_output(), b"\x1b[?9;2$y");
+}
+
+#[test]
+fn uk_nrcs_queries_follow_set_reset_and_saved_mode_on_the_wire() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(
+        b"\x1b[?42$p\x1b[?42h\x1b[?42$p\x1b[?42s\x1b[?42l\x1b[?42$p\x1b[?42r\x1b[?42$p",
+    );
+    assert_eq!(
+        terminal.get_output(),
+        b"\x1b[?42;2$y\x1b[?42;1$y\x1b[?42;2$y\x1b[?42;1$y"
+    );
 }

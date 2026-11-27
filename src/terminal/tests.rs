@@ -3937,13 +3937,16 @@ fn decrqss_reports_decscl() {
 }
 
 #[test]
-fn primary_and_secondary_device_attributes_are_reported() {
+fn device_attributes_are_reported_in_query_order() {
     let mut terminal = TerminalState::new(8, 2);
 
     terminal.process_input(b"\x1b[7c\x1b[>123");
     assert_eq!(terminal.get_output(), b"\x1b[?65;1;9c");
     terminal.process_input(b"c\x1b[?c\x1b[=c\x1b[$c\x1b[>$c\x1b[5n");
-    assert_eq!(terminal.get_output(), b"\x1b[>1;7802;0c\x1b[0n");
+    assert_eq!(
+        terminal.get_output(),
+        b"\x1b[>1;7802;0c\x1bP!|00000000\x1b\\\x1b[0n"
+    );
 }
 
 #[test]
