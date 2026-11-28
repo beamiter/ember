@@ -7696,6 +7696,17 @@ impl TerminalRenderer {
                         continue;
                     }
 
+                    if effective_keyboard_flags & 0b1001 != 0 {
+                        if let Some(report) = jterm_engine::input::encode_kitty_named_press(
+                            normalized_key(*key),
+                            normalized_modifiers(*modifiers),
+                            effective_keyboard_flags,
+                        ) {
+                            input.extend_from_slice(&report);
+                            continue;
+                        }
+                    }
+
                     // Skip Kitty encoding for alphanumeric when there's a corresponding Text event
                     // (Text event already sent the correct character with proper shift/caps handling)
                     if text_from_events
@@ -9906,7 +9917,52 @@ mod tests {
             false,
             &events,
         );
-        assert_eq!(bytes, b"\r\x1b[57411;5u\x1b[57414u\x1b[57406;129;55u");
+        assert_eq!(bytes, b"\x1b[13u\x1b[57411;5u\x1b[57414u\x1b[57406;129;55u");
+    }
+
+    #[test]
+    fn kitty_named_keys_keep_their_order_beside_text_in_the_same_batch() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let press = |key| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let events = [
+            egui::Event::Text("A".into()),
+            press(egui::Key::F3),
+            press(egui::Key::ArrowUp),
+            press(egui::Key::Enter),
+            press(egui::Key::Tab),
+            press(egui::Key::Backspace),
+            egui::Event::Text("b".into()),
+        ];
+        let mut input = Vec::new();
+        renderer.handle_keyboard_input_with_keypad(
+            &[],
+            &mut input,
+            &std::collections::HashSet::new(),
+            false,
+            8,
+            true,
+            0,
+            0,
+            true,
+            false,
+            false,
+            true,
+            false,
+            &events,
+        );
+        assert_eq!(input, b"A\x1b[13~\x1b[A\x1b[13u\x1b[9u\x1b[127ub");
     }
 
     #[test]
