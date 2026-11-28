@@ -660,6 +660,20 @@ pub struct KeyEvent {
     pub(crate) platform_specific: platform_impl::KeyEventExtra,
 }
 
+impl KeyEvent {
+    /// The Num Lock state when this key event was translated, where available.
+    pub fn num_lock_active(&self) -> Option<bool> {
+        #[cfg(any(x11_platform, wayland_platform))]
+        {
+            Some(self.platform_specific.num_lock)
+        }
+        #[cfg(not(any(x11_platform, wayland_platform)))]
+        {
+            None
+        }
+    }
+}
+
 /// Describes keyboard modifiers event.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Modifiers {

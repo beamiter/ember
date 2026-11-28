@@ -23,3 +23,9 @@ script retains the original redirection command and adds a raw PTY-byte oracle.
 
 Run dependency regressions explicitly with:
 cargo test -p egui-winit --lib ember_keyboard_fallback_tests --locked
+
+## Native keypad annotations
+
+The converter records the physical keypad position with the Key and Text
+events emitted for one unmodified press. The annotations travel with that
+raw input batch. The logical key and numeric text are still available to the UI.

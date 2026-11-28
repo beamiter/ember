@@ -3,7 +3,7 @@
 Upstream: emilk/egui, crates/eframe at revision 4c1f2fae95475a40e524884ebb298bcb1714b08e, version 0.36.1.
 Official crates.io archive SHA256: 2afc0cbcdb6896b7bfb1dbbebaf7b9af9635ff38fd01e89bdd0174c1717b1857. This matches the original Ember lockfile and verified archive.
 
-All 35 original files (538,493 content bytes) are preserved. Apache-2.0 and MIT licenses were retrieved from the exact upstream revision because the published archive omits the root license files. UPSTREAM_INTEGRITY.json records every original and local file hash; only four upstream files differ.
+All 35 original files (538,493 content bytes) are preserved. Apache-2.0 and MIT licenses were retrieved from the exact upstream revision because the published archive omits the root license files. UPSTREAM_INTEGRITY.json records every original and local file hash.
 
 ## Local change
 
@@ -30,3 +30,10 @@ The original native-key hook and web path are unchanged. Integrity hashes were
 updated for these scoped changes. Full Linux Ember cargo check passed for both
 compiled renderer paths; prior keyboard runtime results above are historical,
 not new Eva migration/physical visibility evidence.
+
+## Native keypad input batches
+
+Glow and WGPU deliver the converter's keypad annotations through
+`App::raw_input_hook_with_keypad`. The offsets include any pending raw input
+prepended by eframe. Logic-only ticks carry their normal raw input to the next
+UI pass, and keypad annotations apply to the visible batch that produced them.

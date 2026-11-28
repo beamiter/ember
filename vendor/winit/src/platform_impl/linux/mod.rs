@@ -666,6 +666,7 @@ impl Window {
 pub struct KeyEventExtra {
     pub text_with_all_modifiers: Option<SmolStr>,
     pub key_without_modifiers: Key,
+    pub num_lock: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

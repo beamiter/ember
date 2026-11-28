@@ -640,6 +640,20 @@ fn pty_text_payload(text: &str) -> Option<String> {
     (!filtered.is_empty()).then_some(filtered)
 }
 
+/// A physical keypad press matched to the terminal's admitted input batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoutedKeypad {
+    pub event: usize,
+    pub text: Option<usize>,
+    pub encoding: KeypadEncoding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeypadEncoding {
+    Application([u8; 3]),
+    Center,
+}
+
 /// Text belongs to this key only until another text-producing input begins.
 /// Use the OS character, rather than guessing a US-layout shifted digit.
 fn paired_printable_key_text(events: &[egui::Event], key_index: usize) -> Option<(usize, char)> {
@@ -7538,6 +7552,42 @@ impl TerminalRenderer {
         alt_held: bool,
         events: &[egui::Event],
     ) {
+        self.handle_keyboard_input_with_keypad(
+            &[],
+            input,
+            consumed_keys,
+            suppress_text_events,
+            keyboard_enhancement_flags,
+            report_all_keys_mode,
+            xterm_modify_other_keys,
+            xterm_format_other_keys,
+            application_cursor_keys,
+            backarrow_mode,
+            alt_screen,
+            meta_sends_escape,
+            alt_held,
+            events,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_keyboard_input_with_keypad(
+        &self,
+        keypad: &[RoutedKeypad],
+        input: &mut Vec<u8>,
+        consumed_keys: &std::collections::HashSet<&str>,
+        suppress_text_events: bool,
+        keyboard_enhancement_flags: u16,
+        report_all_keys_mode: bool,
+        xterm_modify_other_keys: u16,
+        xterm_format_other_keys: u16,
+        application_cursor_keys: bool,
+        backarrow_mode: bool,
+        alt_screen: bool,
+        meta_sends_escape: bool,
+        alt_held: bool,
+        events: &[egui::Event],
+    ) {
         let report_all_keys = report_all_keys_mode || (keyboard_enhancement_flags & 0b1000) != 0;
         let effective_keyboard_flags = if report_all_keys_mode {
             keyboard_enhancement_flags | 0b1000
@@ -7561,10 +7611,28 @@ impl TerminalRenderer {
         }
 
         let mut encoded_text_index = None;
+        let keypad = if suppress_text_events || effective_keyboard_flags != 0 {
+            &[]
+        } else {
+            keypad
+        };
+        let mut keypad = keypad.iter().peekable();
         for (event_index, event) in events.iter().enumerate() {
+            let keypad_press = if keypad.peek().is_some_and(|press| press.event == event_index) {
+                keypad.next()
+            } else {
+                None
+            };
             match event {
                 egui::Event::Text(text) => {
                     if suppress_text_events || encoded_text_index == Some(event_index) {
+                        continue;
+                    }
+                    if let Some(RoutedKeypad {
+                        encoding: KeypadEncoding::Application(sequence),
+                        ..
+                    }) = keypad_press {
+                        input.extend_from_slice(sequence);
                         continue;
                     }
                     if let Some(filtered) = pty_text_payload(text) {
@@ -7592,6 +7660,14 @@ impl TerminalRenderer {
                     }
                     let consumed_name = consumed_key_name(*key, *modifiers);
                     if !consumed_name.is_empty() && consumed_keys.contains(consumed_name.as_str()) {
+                        continue;
+                    }
+                    if let Some(press) = keypad_press {
+                        match press.encoding {
+                            KeypadEncoding::Application(sequence) => input.extend_from_slice(&sequence),
+                            KeypadEncoding::Center => input.extend_from_slice(b"\x1b[E"),
+                        }
+                        encoded_text_index = press.text;
                         continue;
                     }
 
@@ -9692,6 +9768,56 @@ mod tests {
             );
             assert_eq!(bytes, [expected]);
         }
+    }
+
+    #[test]
+    fn keypad_encoding_keeps_order_and_consumes_only_its_paired_text() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let press = |key| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let events = [
+            egui::Event::Text("before".into()),
+            press(egui::Key::Enter),
+            press(egui::Key::Enter),
+            press(egui::Key::Plus),
+            egui::Event::Text("+".into()),
+            egui::Event::Text("+".into()),
+            egui::Event::Text("*".into()),
+            egui::Event::Ime(egui::ImeEvent::Commit("你".into())),
+        ];
+        let keypad = [
+            RoutedKeypad { event: 2, text: None, encoding: KeypadEncoding::Application(*b"\x1bOM") },
+            RoutedKeypad { event: 3, text: Some(4), encoding: KeypadEncoding::Application(*b"\x1bOk") },
+            RoutedKeypad { event: 6, text: None, encoding: KeypadEncoding::Application(*b"\x1bOj") },
+        ];
+        let encode = |events: &[egui::Event], keypad: &[RoutedKeypad], composing, consumed| {
+            let mut bytes = Vec::new();
+            renderer.handle_keyboard_input_with_keypad(
+                keypad, &mut bytes, consumed, composing, 0, false, 0, 0, false, false,
+                false, true, false, events,
+            );
+            bytes
+        };
+        let empty = std::collections::HashSet::new();
+        assert_eq!(encode(&events, &keypad, false, &empty), "before\r\x1bOM\x1bOk+\x1bOj你".as_bytes());
+        assert_eq!(encode(&events, &keypad, true, &empty), "\r\r你".as_bytes());
+        let plus = consumed_key_name(egui::Key::Plus, egui::Modifiers::NONE);
+        let consumed = std::collections::HashSet::from([plus.as_str()]);
+        assert_eq!(
+            encode(&events, &keypad, false, &consumed),
+            "before\r\x1bOM++\x1bOj你".as_bytes()
+        );
     }
 
     #[test]

@@ -1867,7 +1867,7 @@ impl TerminalApp {
 
     /// One owner spans keyboard admission, the actual PTY writer, and the
     /// channel reply. A tab change cannot retarget the action or its suffix.
-    pub(crate) fn advance_vim9_deferred_input(&mut self, ctx: &egui::Context) {
+    pub(crate) fn advance_vim9_deferred_input(&mut self, ctx: &egui::Context) -> bool {
         let active = self.session_manager.sessions()[self.session_manager.active_index()]
             .metadata
             .session_id
@@ -1947,7 +1947,8 @@ impl TerminalApp {
                 }
             }
         }
-        if !replay.is_empty() {
+        let replayed = !replay.is_empty();
+        if replayed {
             ctx.input_mut(|input| {
                 let mut events = replay.clone();
                 events.append(&mut input.events);
@@ -1956,6 +1957,7 @@ impl TerminalApp {
             replay.append(&mut self.frame_events);
             self.frame_events = replay;
         }
+        replayed
     }
 
     pub(crate) fn vim9_buffer_font_size(&self) -> f32 {

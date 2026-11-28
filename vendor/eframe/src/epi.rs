@@ -288,6 +288,18 @@ pub trait App {
     /// This function does not return a value. Any changes to the input should be made directly to `_raw_input`.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {}
 
+    /// Prepare a native UI input batch with its physical keypad annotations.
+    /// Annotations index the raw events as they enter this hook.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn raw_input_hook_with_keypad(
+        &mut self,
+        ctx: &egui::Context,
+        raw_input: &mut egui::RawInput,
+        _keypad: Vec<egui_winit::NativeKeypadEvent>,
+    ) {
+        self.raw_input_hook(ctx, raw_input);
+    }
+
     /// Request exact producer publication and compositor scene evidence for a
     /// native frame. Unsupported platforms/backends yield no callback.
     #[cfg(not(target_arch = "wasm32"))]

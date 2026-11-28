@@ -50,6 +50,7 @@ mod local_preview;
 mod local_preview_panel;
 mod local_reference;
 mod native_enter;
+mod native_keypad;
 mod navigation_drawer;
 #[cfg(unix)]
 mod notebook;
@@ -3388,6 +3389,7 @@ impl TerminalApp {
             last_terminal_mouse_motion: None,
             font_zoom: font_zoom::FontZoom::default(),
             frame_events: Vec::new(),
+            frame_keypad: Default::default(),
             paste_key_state: Default::default(),
             keyboard_input_buffer: Vec::new(),
             adaptive_frame_budget: 65536, // 初始值 64KB
@@ -6342,6 +6344,18 @@ impl eframe::App for TerminalApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
+    fn raw_input_hook_with_keypad(
+        &mut self,
+        ctx: &egui::Context,
+        raw_input: &mut egui::RawInput,
+        keypad: Vec<eframe::NativeKeypadEvent>,
+    ) {
+        if raw_input.viewport_id == egui::ViewportId::ROOT {
+            self.frame_keypad = native_keypad::FrameKeypad::capture(raw_input, keypad);
+        }
+        self.raw_input_hook(ctx, raw_input);
+    }
+
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if raw_input.viewport_id != egui::ViewportId::ROOT {
             // Child viewers have no keyboard, drop, scroll or global zoom authority.
@@ -6508,6 +6522,7 @@ impl eframe::App for TerminalApp {
 
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if root_ui.ctx().viewport_id()!=egui::ViewportId::ROOT {return;}
+        let mut frame_keypad = std::mem::take(&mut self.frame_keypad);
         // eframe 0.35 起将原来的 App::update 拆成了 `logic` 和 `ui` 两段:
         // 这里把整个 update 的逻辑迁到 ui 中。许多下游代码(viewport 命令、输入查询、重绘请求)
         // 仍需要 &Context,从 root_ui 上 clone 一份(Arc 引用计数,几乎零成本)即可,
@@ -6638,7 +6653,10 @@ impl eframe::App for TerminalApp {
             .eva
             .route_card_shortcut(ctx, &mut self.frame_events);
         self.discard_stale_frame_ime();
-        self.advance_vim9_deferred_input(ctx);
+        if self.advance_vim9_deferred_input(ctx) {
+            // Replayed input belongs to a different native batch.
+            frame_keypad = Default::default();
+        }
         app::input::guard_prompt_fill_enter(
             ctx,
             &mut self.prompt_fill_enter_down,
@@ -7111,6 +7129,7 @@ impl eframe::App for TerminalApp {
                 xterm_modify_other_keys,
                 xterm_format_other_keys,
                 application_cursor_keys,
+                application_keypad,
                 backarrow_mode,
                 alt_screen,
                 meta_sends_escape,
@@ -7122,6 +7141,7 @@ impl eframe::App for TerminalApp {
                     terminal.xterm_modify_other_keys(),
                     terminal.xterm_format_other_keys(),
                     terminal.is_application_cursor_keys(),
+                    terminal.is_application_keypad(),
                     terminal.backarrow_mode(),
                     terminal.is_alt_buffer_active(),
                     terminal.is_meta_sends_escape(),
@@ -7133,8 +7153,13 @@ impl eframe::App for TerminalApp {
             let input_renderer = active_pane_renderer_idx
                 .and_then(|index| self.pane_renderers.get(index))
                 .unwrap_or(&self.renderer);
-            input_renderer.handle_keyboard_input(
-                ctx,
+            let keypad = if has_preedit || keyboard_enhancement_flags != 0 || report_all_keys_mode {
+                Vec::new()
+            } else {
+                frame_keypad.route(&terminal_keyboard_events, application_keypad)
+            };
+            input_renderer.handle_keyboard_input_with_keypad(
+                &keypad,
                 &mut self.keyboard_input_buffer,
                 &consumed_keys_refs,
                 has_preedit,

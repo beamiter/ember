@@ -191,6 +191,7 @@ impl KeyContext<'_> {
         state: ElementState,
         repeat: bool,
     ) -> KeyEvent {
+        let num_lock = self.state.modifiers().num_lock;
         let mut event =
             KeyEventResults::new(self, keycode, !repeat && state == ElementState::Pressed);
         let physical_key = keymap::raw_keycode_to_physicalkey(keycode);
@@ -199,7 +200,8 @@ impl KeyContext<'_> {
         let (key_without_modifiers, _) = event.key_without_modifiers();
         let text_with_all_modifiers = event.text_with_all_modifiers();
 
-        let platform_specific = KeyEventExtra { text_with_all_modifiers, key_without_modifiers };
+        let platform_specific =
+            KeyEventExtra { text_with_all_modifiers, key_without_modifiers, num_lock };
 
         KeyEvent { physical_key, logical_key, text, location, state, repeat, platform_specific }
     }
