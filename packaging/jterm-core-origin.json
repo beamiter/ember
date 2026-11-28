@@ -1,7 +1,7 @@
 {
-  "published_core_commit": "35515940985ff9d91305d8590765ed85d395f7bf",
-  "published_core_tree": "cd176ce8b01437715ebd68c3b096a3891fd15fb2",
-  "archive_sha256": "9f371da1ba18ec695a49f9ad1454852a6f96ce78611e4f60ee73ea4d640bfece",
+  "published_core_commit": "b60a61fb948ea62361cc41d10e871f2b53060515",
+  "published_core_tree": "425fa162851dfff53ca1399a9e8ea78a4776ce2a",
+  "archive_sha256": "4d10e5c9b7d4341494a6137dc2813b75eb66e0375fc3c29ec98d54a1e1b32c88",
   "archive_members": 571,
   "archive_files": 520,
   "omitted_paths": 67,
