@@ -297,11 +297,10 @@ fn decrqm_frozen_lookup_exhaustive() {
                 } else {
                     t.vt.protocol.modes_mut().remove(&mode);
                 }
-                // X10, UK NRCS, and reverse-wrap were unsupported in the
-                // frozen baseline. Check their current Boolean state and keep
-                // every other private mode under the original oracle.
+                // X10, UK NRCS, reverse-wrap, and DECBKM were unsupported
+                // in the frozen baseline. Check their current Boolean state.
                 let private_expected = match mode {
-                    9 | 42 | 45 => {
+                    9 | 42 | 45 | 67 => {
                         if stored {
                             1
                         } else {

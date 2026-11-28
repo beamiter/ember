@@ -1,6 +1,9 @@
 //! Captured original production vertical-motion observations.
 use super::*;
+use jterm_engine::grid::{ScrollbackContent, ScrollbackLine};
+use jterm_engine::screen::{RegionMutation, RemovedRow};
 use std::collections::BTreeMap;
+use std::fmt;
 type Snapshot = BTreeMap<String, String>;
 fn snapshot(t: &TerminalState) -> Snapshot {
     let mut out = super::super::alternate_parity_tests::snapshot(t);
@@ -141,8 +144,13 @@ fn omit_default_archive_debug_fields(detail: &str) -> String {
             }
         }
         const COUNT: &[u8] = b", reflow_wide_count: ";
-        let replacement = if bytes[index..].starts_with(b", archive_flags: 0, cols:") {
-            Some((b", archive_flags: 0, cols:".len(), ", cols:"))
+        const FLAGS: &[u8] = b", archive_flags: ";
+        let replacement = if let Some(value) = bytes[index..].strip_prefix(FLAGS) {
+            // Bit 4 is the ASCII lookup hint derived from the archived text.
+            [b"0, cols:".as_slice(), b"16, cols:"]
+                .into_iter()
+                .find(|field| value.starts_with(field))
+                .map(|field| (FLAGS.len() + field.len(), ", cols:"))
         } else if bytes[index..].starts_with(COUNT)
             && preceding_wide_list.is_some_and(|(end, _)| end == index)
         {
@@ -175,6 +183,57 @@ fn omit_default_archive_debug_fields(detail: &str) -> String {
     }
     output.push_str(&detail[copied..]);
     output
+}
+
+struct ArchiveDebug<'a>(&'a ScrollbackLine);
+
+impl fmt::Debug for ArchiveDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let detail = format!("{:?}", self.0);
+        if let Some((_, suffix)) = detail
+            .strip_prefix("ScrollbackLine { data: InlinePlain(")
+            .and_then(|inline| inline.split_once("), is_wrapped: "))
+        {
+            if let ScrollbackContent::Plain(text, trailing) = self.0.content() {
+                return write!(
+                    formatter,
+                    "ScrollbackLine {{ data: Plain({text:?}, {trailing}), is_wrapped: {suffix}"
+                );
+            }
+        }
+        formatter.write_str(&detail)
+    }
+}
+
+struct RemovedRowDebug<'a>(&'a RemovedRow);
+
+impl fmt::Debug for RemovedRowDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemovedRow")
+            .field("original_row", &self.0.original_row)
+            .field("row_id", &self.0.row_id)
+            .field("captured", &self.0.captured.as_ref().map(ArchiveDebug))
+            .finish()
+    }
+}
+
+struct RegionDebug<'a>(&'a RegionMutation);
+
+impl fmt::Debug for RegionDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let effect = self.0;
+        let removed: Vec<_> = effect.removed.iter().map(RemovedRowDebug).collect();
+        formatter
+            .debug_struct("RegionMutation")
+            .field("direction", &effect.direction)
+            .field("top", &effect.top)
+            .field("bottom", &effect.bottom)
+            .field("count", &effect.count)
+            .field("removed", &removed)
+            .field("dirty_rows", &effect.dirty_rows)
+            .finish()
+    }
 }
 
 // Reconstruct the immutable corpus's capture partition policy, not terminal
@@ -288,11 +347,17 @@ fn independently_expected_rejected_single_row_margin(
     Some(expected)
 }
 
+pub(in crate::terminal) fn observe_identity(t: &TerminalState, effect: &RegionMutation) {
+    if TRACE.with(|slot| slot.borrow().is_some()) {
+        observe(t, "identity", format!("{:?}", RegionDebug(effect)));
+    }
+}
+
 pub(in crate::terminal) fn observe(t: &TerminalState, event: &str, detail: String) {
     TRACE.with(|slot| {
         if let Some(trace) = slot.borrow_mut().as_mut() {
             // The frozen identity trace predates the archived row flags.
-            // Omit their default values and keep non-default flags visible.
+            // Preserve metadata that records additional row state.
             let detail = if event == "identity" {
                 omit_default_archive_debug_fields(
                     &detail

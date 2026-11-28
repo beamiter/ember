@@ -581,9 +581,9 @@ pub(crate) fn alternate_scroll_arrow_bytes(
     } else {
         egui::Key::ArrowDown
     };
-    let flags = flags | if report_all { 8 } else { 0 };
-    if let Some(bytes) = kitty_encode_key_event(key, egui::Modifiers::NONE, flags) {
-        return Some(bytes.into_bytes());
+    let flags = flags | if report_all { KITTY_REPORT_ALL_KEYS } else { 0 };
+    if let Some(bytes) = kitty_named_key_press(key, egui::Modifiers::NONE, flags) {
+        return Some(bytes);
     }
     key_to_terminal_sequence(key, egui::Modifiers::NONE, app_cursor, false)
         .map(|bytes| bytes.as_bytes().to_vec())
@@ -811,6 +811,21 @@ fn consumed_key_name(key: egui::Key, modifiers: egui::Modifiers) -> String {
         _ => return String::new(),
     });
     parts.join("+")
+}
+
+fn kitty_named_key_press(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+    flags: u16,
+) -> Option<Vec<u8>> {
+    let modifiers = normalized_modifiers(modifiers);
+    kitty_named_report(normalized_key(key), modifiers, flags)?.encode(
+        KittyEventType::Press,
+        modifiers,
+        KeyboardLocks::default(),
+        flags,
+        None,
+    )
 }
 
 fn kitty_encode_key_event(
@@ -7831,15 +7846,11 @@ impl TerminalRenderer {
                     }
 
                     if kitty_active {
-                        let modifiers = normalized_modifiers(*modifiers);
-                        let report = kitty_named_report(
-                            normalized_key(*key),
-                            modifiers,
+                        if let Some(report) = kitty_named_key_press(
+                            *key,
+                            *modifiers,
                             effective_keyboard_flags,
-                        ).and_then(|report| report.encode(
-                            KittyEventType::Press, modifiers, KeyboardLocks::default(), effective_keyboard_flags, None,
-                        ));
-                        if let Some(report) = report {
+                        ) {
                             input.extend_from_slice(&report);
                             continue;
                         }
@@ -14496,7 +14507,12 @@ mod alternate_scroll_encoder_tests {
             crate::config::ScrollbarVisibility::Auto,
             crate::theme::Theme::default(),
         );
-        for flags in [0, 1, 8, 17, 25] {
+        let ctx = egui::Context::default();
+        let consumed = std::collections::HashSet::new();
+        let active_flags =
+            u16::from(KITTY_DISAMBIGUATE) | KITTY_REPORT_EVENT_TYPES | KITTY_REPORT_ALL_KEYS;
+        for (flags, report_all) in (0..=31).flat_map(|flags| [(flags, false), (flags, true)]) {
+            let kitty_active = report_all || flags & active_flags != 0;
             for app_cursor in [false, true] {
                 for up in [false, true] {
                     let key = if up {
@@ -14513,12 +14529,12 @@ mod alternate_scroll_encoder_tests {
                     };
                     let mut actual = Vec::new();
                     renderer.handle_keyboard_input(
-                        &egui::Context::default(),
+                        &ctx,
                         &mut actual,
-                        &std::collections::HashSet::new(),
+                        &consumed,
                         false,
                         flags,
-                        flags & 8 != 0,
+                        report_all,
                         2,
                         1,
                         app_cursor,
@@ -14528,9 +14544,20 @@ mod alternate_scroll_encoder_tests {
                         false,
                         &[event],
                     );
+                    let expected = match (up, app_cursor && !kitty_active) {
+                        (true, false) => b"\x1b[A",
+                        (false, false) => b"\x1b[B",
+                        (true, true) => b"\x1bOA",
+                        (false, true) => b"\x1bOB",
+                    };
                     assert_eq!(
-                        alternate_scroll_arrow_bytes(up, flags, flags & 8 != 0, app_cursor),
-                        Some(actual)
+                        actual, expected,
+                        "native {flags}/{report_all}/{app_cursor}/{up}"
+                    );
+                    assert_eq!(
+                        alternate_scroll_arrow_bytes(up, flags, report_all, app_cursor).as_deref(),
+                        Some(expected.as_slice()),
+                        "wheel {flags}/{report_all}/{app_cursor}/{up}"
                     );
                 }
             }

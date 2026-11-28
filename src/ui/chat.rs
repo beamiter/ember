@@ -1450,12 +1450,12 @@ mod tests {
         let sequence = terminal.command_records().back().unwrap().sequence;
         let submit = ChatInputAction::Submit { sequence };
         assert_eq!(renderer.chat_action_bytes(&ctx, &terminal, submit), b"\r");
-        terminal.process_input(b"\x1b[>8u");
+        terminal.process_input(b"\x1b[>1u");
+        assert_eq!(renderer.chat_action_bytes(&ctx, &terminal, submit), b"\r");
+        terminal.process_input(b"\x1b[<u\x1b[>8u");
         assert_eq!(terminal.keyboard_enhancement_flags(), 8);
-        let encoded = renderer.chat_action_bytes(&ctx, &terminal, submit);
-        // Ember's existing named-Enter encoder remains CR in this mode; Chat
-        // must follow that same path rather than invent a second protocol.
-        assert_eq!(encoded, b"\r");
+        // Report-all encodes Enter as CSI 13 u. Run requires a single byte.
+        assert_eq!(renderer.chat_action_bytes(&ctx, &terminal, submit), b"\x1b[13u");
         terminal.process_input(b"\r\n\x1b]133;C\x07");
         assert!(renderer
             .chat_action_bytes(&ctx, &terminal, submit)

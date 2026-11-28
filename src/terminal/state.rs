@@ -1085,7 +1085,7 @@ impl super::TerminalState {
         #[cfg(test)]
         region_ops_oracles::observe(self, effect);
         #[cfg(test)]
-        super::parser::vertical_motion_oracles::observe(self, "identity", format!("{:?}", effect));
+        super::parser::vertical_motion_oracles::observe_identity(self, effect);
         for removed in &effect.removed {
             if removed.captured.is_none() {
                 self.forget_output_provenance_for_raw_row(removed.row_id);
