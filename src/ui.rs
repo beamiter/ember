@@ -506,7 +506,7 @@ fn normalized_key(key: egui::Key) -> jterm_engine::input::Key {
     }
 }
 
-fn normalized_modifiers(modifiers: egui::Modifiers) -> jterm_engine::input::Modifiers {
+pub(crate) fn normalized_modifiers(modifiers: egui::Modifiers) -> jterm_engine::input::Modifiers {
     jterm_engine::input::Modifiers {
         shift: modifiers.shift,
         alt: modifiers.alt,
@@ -629,7 +629,7 @@ fn legacy_function_key_sequence(
     )
 }
 
-fn pty_text_payload(text: &str) -> Option<String> {
+pub(crate) fn pty_text_payload(text: &str) -> Option<String> {
     let filtered: String = text
         .chars()
         .filter(|character| {
@@ -641,17 +641,29 @@ fn pty_text_payload(text: &str) -> Option<String> {
 }
 
 /// A physical keypad press matched to the terminal's admitted input batch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutedKeypad {
     pub event: usize,
     pub text: Option<usize>,
     pub encoding: KeypadEncoding,
+    pub before_event: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeypadEncoding {
     Application([u8; 3]),
     Center,
+    Kitty(Vec<u8>),
+}
+
+impl KeypadEncoding {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Application(sequence) => sequence,
+            Self::Center => b"\x1b[E",
+            Self::Kitty(report) => report,
+        }
+    }
 }
 
 /// Text belongs to this key only until another text-producing input begins.
@@ -7594,14 +7606,22 @@ impl TerminalRenderer {
         } else {
             keyboard_enhancement_flags
         };
+        let keypad = if suppress_text_events { &[] } else { keypad };
 
         // Collect Text events to detect Caps Lock state.
         // egui doesn't expose Caps Lock in Modifiers, but Text events reflect
         // the actual character produced by the OS (including Caps Lock).
         let mut text_from_events: Option<String> = None;
         if report_all_keys {
-            for evt in events {
+            for (index, evt) in events.iter().enumerate() {
                 if let egui::Event::Text(t) = evt {
+                    if keypad.iter().any(|press| {
+                        matches!(press.encoding, KeypadEncoding::Kitty(_))
+                            && (press.text == Some(index)
+                                || (!press.before_event && press.event == index))
+                    }) {
+                        continue;
+                    }
                     if let Some(filtered) = pty_text_payload(t) {
                         text_from_events = Some(filtered);
                         break;
@@ -7611,13 +7631,19 @@ impl TerminalRenderer {
         }
 
         let mut encoded_text_index = None;
-        let keypad = if suppress_text_events || effective_keyboard_flags != 0 {
-            &[]
-        } else {
-            keypad
-        };
-        let mut keypad = keypad.iter().peekable();
+        let mut keypad = keypad
+            .iter()
+            .filter(|press| match press.encoding {
+                KeypadEncoding::Kitty(_) => effective_keyboard_flags & 0b1001 != 0,
+                _ => effective_keyboard_flags == 0,
+            })
+            .peekable();
         for (event_index, event) in events.iter().enumerate() {
+            while let Some(press) =
+                keypad.next_if(|press| press.before_event && press.event == event_index)
+            {
+                input.extend_from_slice(press.encoding.bytes());
+            }
             let keypad_press = if keypad.peek().is_some_and(|press| press.event == event_index) {
                 keypad.next()
             } else {
@@ -7628,11 +7654,8 @@ impl TerminalRenderer {
                     if suppress_text_events || encoded_text_index == Some(event_index) {
                         continue;
                     }
-                    if let Some(RoutedKeypad {
-                        encoding: KeypadEncoding::Application(sequence),
-                        ..
-                    }) = keypad_press {
-                        input.extend_from_slice(sequence);
+                    if let Some(press) = keypad_press {
+                        input.extend_from_slice(press.encoding.bytes());
                         continue;
                     }
                     if let Some(filtered) = pty_text_payload(text) {
@@ -7660,13 +7683,15 @@ impl TerminalRenderer {
                     }
                     let consumed_name = consumed_key_name(*key, *modifiers);
                     if !consumed_name.is_empty() && consumed_keys.contains(consumed_name.as_str()) {
+                        if let Some(press) =
+                            keypad_press.filter(|press| matches!(press.encoding, KeypadEncoding::Kitty(_)))
+                        {
+                            encoded_text_index = press.text;
+                        }
                         continue;
                     }
                     if let Some(press) = keypad_press {
-                        match press.encoding {
-                            KeypadEncoding::Application(sequence) => input.extend_from_slice(&sequence),
-                            KeypadEncoding::Center => input.extend_from_slice(b"\x1b[E"),
-                        }
+                        input.extend_from_slice(press.encoding.bytes());
                         encoded_text_index = press.text;
                         continue;
                     }
@@ -7776,6 +7801,9 @@ impl TerminalRenderer {
                 }
                 _ => {}
             }
+        }
+        for press in keypad.filter(|press| press.before_event && press.event == events.len()) {
+            input.extend_from_slice(press.encoding.bytes());
         }
     }
 }
@@ -9797,9 +9825,9 @@ mod tests {
             egui::Event::Ime(egui::ImeEvent::Commit("你".into())),
         ];
         let keypad = [
-            RoutedKeypad { event: 2, text: None, encoding: KeypadEncoding::Application(*b"\x1bOM") },
-            RoutedKeypad { event: 3, text: Some(4), encoding: KeypadEncoding::Application(*b"\x1bOk") },
-            RoutedKeypad { event: 6, text: None, encoding: KeypadEncoding::Application(*b"\x1bOj") },
+            RoutedKeypad { event: 2, text: None, encoding: KeypadEncoding::Application(*b"\x1bOM"), before_event: false },
+            RoutedKeypad { event: 3, text: Some(4), encoding: KeypadEncoding::Application(*b"\x1bOk"), before_event: false },
+            RoutedKeypad { event: 6, text: None, encoding: KeypadEncoding::Application(*b"\x1bOj"), before_event: false },
         ];
         let encode = |events: &[egui::Event], keypad: &[RoutedKeypad], composing, consumed| {
             let mut bytes = Vec::new();
@@ -9818,6 +9846,67 @@ mod tests {
             encode(&events, &keypad, false, &consumed),
             "before\r\x1bOM++\x1bOj你".as_bytes()
         );
+    }
+
+    #[test]
+    fn kitty_keypad_reports_at_the_native_position_and_consumes_its_text() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let press = |key| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let events = [
+            press(egui::Key::Enter),
+            press(egui::Key::Enter),
+            egui::Event::Text("7".into()),
+        ];
+        let reports = [
+            RoutedKeypad {
+                event: 1,
+                text: None,
+                encoding: KeypadEncoding::Kitty(b"\x1b[57411;5u".to_vec()),
+                before_event: true,
+            },
+            RoutedKeypad {
+                event: 1,
+                text: None,
+                encoding: KeypadEncoding::Kitty(b"\x1b[57414u".to_vec()),
+                before_event: false,
+            },
+            RoutedKeypad {
+                event: 2,
+                text: None,
+                encoding: KeypadEncoding::Kitty(b"\x1b[57406;129;55u".to_vec()),
+                before_event: false,
+            },
+        ];
+        let mut bytes = Vec::new();
+        renderer.handle_keyboard_input_with_keypad(
+            &reports,
+            &mut bytes,
+            &std::collections::HashSet::new(),
+            false,
+            24,
+            true,
+            0,
+            0,
+            false,
+            false,
+            false,
+            true,
+            false,
+            &events,
+        );
+        assert_eq!(bytes, b"\r\x1b[57411;5u\x1b[57414u\x1b[57406;129;55u");
     }
 
     #[test]

@@ -137,13 +137,15 @@ pub struct State {
 }
 
 /// Native keypad identity paired with the events emitted for one key press.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct NativeKeypadEvent {
     pub key_code: winit::keyboard::KeyCode,
     pub first_event: usize,
     pub event_count: usize,
     pub numeric_layer: bool,
     pub center: bool,
+    pub logical_key: winit::keyboard::Key,
+    pub modifiers: egui::Modifiers,
 }
 
 impl State {
@@ -1110,8 +1112,8 @@ impl State {
             }
         }
         let event_count = self.egui_input.events.len() - first_event;
-        if pressed && !self.modifiers.any() && event_count != 0
-            && let Some(keypad) = native_keypad_event(event, first_event, event_count)
+        if pressed
+            && let Some(keypad) = native_keypad_event(event, first_event, event_count, self.modifiers)
         {
             self.keypad_events.push(keypad);
         }
@@ -1876,6 +1878,7 @@ fn native_keypad_event(
     event: &winit::event::KeyEvent,
     first_event: usize,
     event_count: usize,
+    modifiers: egui::Modifiers,
 ) -> Option<NativeKeypadEvent> {
     use winit::keyboard::{Key, KeyCode::*, NamedKey, PhysicalKey};
     let PhysicalKey::Code(key_code) = event.physical_key else {
@@ -1897,6 +1900,8 @@ fn native_keypad_event(
             .unwrap_or(numeric_position && matches!(event.logical_key, Key::Character(_))),
         center: key_code == Numpad5
             && matches!(event.logical_key, Key::Named(NamedKey::Clear) | Key::Unidentified(_)),
+        logical_key: event.logical_key.clone(),
+        modifiers,
     })
 }
 

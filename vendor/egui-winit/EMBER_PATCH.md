@@ -26,6 +26,7 @@ cargo test -p egui-winit --lib ember_keyboard_fallback_tests --locked
 
 ## Native keypad annotations
 
-The converter records the physical keypad position with the Key and Text
-events emitted for one unmodified press. The annotations travel with that
-raw input batch. The logical key and numeric text are still available to the UI.
+The converter records the physical keypad position, logical key and modifiers
+alongside the events emitted for one press. When conversion produces no Key or
+Text event, the annotation records the position between GUI events. The
+existing raw input callback preserves this position for the terminal.

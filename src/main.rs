@@ -7153,10 +7153,14 @@ impl eframe::App for TerminalApp {
             let input_renderer = active_pane_renderer_idx
                 .and_then(|index| self.pane_renderers.get(index))
                 .unwrap_or(&self.renderer);
-            let keypad = if has_preedit || keyboard_enhancement_flags != 0 || report_all_keys_mode {
+            let keypad = if has_preedit {
                 Vec::new()
             } else {
-                frame_keypad.route(&terminal_keyboard_events, application_keypad)
+                frame_keypad.route(
+                    &terminal_keyboard_events,
+                    application_keypad,
+                    keyboard_enhancement_flags,
+                )
             };
             input_renderer.handle_keyboard_input_with_keypad(
                 &keypad,
