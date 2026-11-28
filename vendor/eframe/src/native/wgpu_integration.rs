@@ -634,7 +634,7 @@ impl WgpuWinitRunning<'_> {
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
-        let (viewport_ui_cb, raw_input, keypad, is_visible, show_ui) = {
+        let (viewport_ui_cb, raw_input, keyboard, is_visible, show_ui) = {
             profiling::scope!("Prepare");
             let mut shared_lock = shared.borrow_mut();
 
@@ -688,7 +688,7 @@ impl WgpuWinitRunning<'_> {
             let Some(egui_winit) = egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
             };
-            let (mut raw_input, keypad) = egui_winit.take_egui_input_with_keypad(window);
+            let (mut raw_input, keyboard) = egui_winit.take_egui_input_with_keyboard(window);
 
             let show_ui = is_visible || is_viewport_or_descendant_visible(viewports, viewport_id);
 
@@ -702,7 +702,7 @@ impl WgpuWinitRunning<'_> {
 
             painter.handle_screenshots(&mut raw_input.events);
 
-            (viewport_ui_cb, raw_input, keypad, is_visible, show_ui)
+            (viewport_ui_cb, raw_input, keyboard, is_visible, show_ui)
         };
 
         if !show_ui {
@@ -763,7 +763,7 @@ impl WgpuWinitRunning<'_> {
         // Runs the update, which could call immediate viewports,
         // so make sure we hold no locks here!
         let full_output =
-            integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input, keypad);
+            integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input, keyboard);
 
         // ------------------------------------------------------------
 

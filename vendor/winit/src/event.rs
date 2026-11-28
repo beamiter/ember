@@ -661,6 +661,30 @@ pub struct KeyEvent {
 }
 
 impl KeyEvent {
+    /// The logical key with modifiers removed, where the platform provides it.
+    pub fn unmodified_key(&self) -> Option<&keyboard::Key> {
+        #[cfg(any(windows_platform, macos_platform, x11_platform, wayland_platform, orbital_platform))]
+        {
+            Some(&self.platform_specific.key_without_modifiers)
+        }
+        #[cfg(not(any(windows_platform, macos_platform, x11_platform, wayland_platform, orbital_platform)))]
+        {
+            None
+        }
+    }
+
+    /// The Caps Lock state when this key event was translated, where available.
+    pub fn caps_lock_active(&self) -> Option<bool> {
+        #[cfg(any(x11_platform, wayland_platform))]
+        {
+            Some(self.platform_specific.caps_lock)
+        }
+        #[cfg(not(any(x11_platform, wayland_platform)))]
+        {
+            None
+        }
+    }
+
     /// The Num Lock state when this key event was translated, where available.
     pub fn num_lock_active(&self) -> Option<bool> {
         #[cfg(any(x11_platform, wayland_platform))]

@@ -8,6 +8,9 @@ use crate::terminal::{
 };
 use crate::theme::ThemeExt as _;
 use egui::{Color32, FontId, Response, Ui, Vec2};
+use jterm_engine::input::{
+    encode_kitty_text_press, KeyboardLocks, KITTY_DISAMBIGUATE, KITTY_REPORT_ALL_KEYS,
+};
 use lru::LruCache;
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
@@ -437,7 +440,7 @@ pub(crate) fn is_modifier_only_key(key: egui::Key) -> bool {
 }
 
 // Keep GUI and platform aliases at the edge; the engine sees logical keys.
-fn normalized_key(key: egui::Key) -> jterm_engine::input::Key {
+pub(crate) fn normalized_key(key: egui::Key) -> jterm_engine::input::Key {
     use jterm_engine::input::Key;
     match key {
         egui::Key::ArrowUp => Key::ArrowUp,
@@ -629,39 +632,46 @@ fn legacy_function_key_sequence(
     )
 }
 
-pub(crate) fn pty_text_payload(text: &str) -> Option<String> {
-    let filtered: String = text
-        .chars()
-        .filter(|character| {
-            !character.is_control()
-                && !jterm_core::review_input::is_visual_spoofing_character(*character)
-        })
-        .collect();
-    (!filtered.is_empty()).then_some(filtered)
+pub(crate) fn pty_text_payload(text: &str) -> Option<Cow<'_, str>> {
+    fn allowed(character: char) -> bool {
+        !character.is_control()
+            && !jterm_core::review_input::is_visual_spoofing_character(character)
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let Some(first_filtered) = text.find(|character| !allowed(character)) else {
+        return Some(Cow::Borrowed(text));
+    };
+    let mut filtered = String::from(&text[..first_filtered]);
+    filtered.extend(text[first_filtered..].chars().filter(|&character| allowed(character)));
+    (!filtered.is_empty()).then_some(Cow::Owned(filtered))
 }
 
-/// A physical keypad press matched to the terminal's admitted input batch.
+/// A native press matched to the terminal's admitted input batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RoutedKeypad {
+pub struct RoutedKeyPress {
     pub event: usize,
     pub text: Option<usize>,
-    pub encoding: KeypadEncoding,
+    pub encoding: NativeKeyEncoding,
     pub before_event: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KeypadEncoding {
+pub enum NativeKeyEncoding {
     Application([u8; 3]),
     Center,
     Kitty(Vec<u8>),
+    SuppressText,
 }
 
-impl KeypadEncoding {
+impl NativeKeyEncoding {
     fn bytes(&self) -> &[u8] {
         match self {
             Self::Application(sequence) => sequence,
             Self::Center => b"\x1b[E",
             Self::Kitty(report) => report,
+            Self::SuppressText => b"",
         }
     }
 }
@@ -7564,7 +7574,7 @@ impl TerminalRenderer {
         alt_held: bool,
         events: &[egui::Event],
     ) {
-        self.handle_keyboard_input_with_keypad(
+        self.handle_keyboard_input_with_native_keys(
             &[],
             input,
             consumed_keys,
@@ -7583,9 +7593,9 @@ impl TerminalRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn handle_keyboard_input_with_keypad(
+    pub fn handle_keyboard_input_with_native_keys(
         &self,
-        keypad: &[RoutedKeypad],
+        native_keys: &[RoutedKeyPress],
         input: &mut Vec<u8>,
         consumed_keys: &std::collections::HashSet<&str>,
         suppress_text_events: bool,
@@ -7600,52 +7610,35 @@ impl TerminalRenderer {
         alt_held: bool,
         events: &[egui::Event],
     ) {
-        let report_all_keys = report_all_keys_mode || (keyboard_enhancement_flags & 0b1000) != 0;
+        let report_all_keys =
+            report_all_keys_mode || (keyboard_enhancement_flags & KITTY_REPORT_ALL_KEYS) != 0;
         let effective_keyboard_flags = if report_all_keys_mode {
-            keyboard_enhancement_flags | 0b1000
+            keyboard_enhancement_flags | KITTY_REPORT_ALL_KEYS
         } else {
             keyboard_enhancement_flags
         };
-        let keypad = if suppress_text_events { &[] } else { keypad };
-
-        // Collect Text events to detect Caps Lock state.
-        // egui doesn't expose Caps Lock in Modifiers, but Text events reflect
-        // the actual character produced by the OS (including Caps Lock).
-        let mut text_from_events: Option<String> = None;
-        if report_all_keys {
-            for (index, evt) in events.iter().enumerate() {
-                if let egui::Event::Text(t) = evt {
-                    if keypad.iter().any(|press| {
-                        matches!(press.encoding, KeypadEncoding::Kitty(_))
-                            && (press.text == Some(index)
-                                || (!press.before_event && press.event == index))
-                    }) {
-                        continue;
-                    }
-                    if let Some(filtered) = pty_text_payload(t) {
-                        text_from_events = Some(filtered);
-                        break;
-                    }
-                }
-            }
-        }
+        let native_keys = if suppress_text_events { &[] } else { native_keys };
+        let kitty_active = effective_keyboard_flags
+            & (KITTY_REPORT_ALL_KEYS | u16::from(KITTY_DISAMBIGUATE))
+            != 0;
 
         let mut encoded_text_index = None;
-        let mut keypad = keypad
+        let mut native_keys = native_keys
             .iter()
             .filter(|press| match press.encoding {
-                KeypadEncoding::Kitty(_) => effective_keyboard_flags & 0b1001 != 0,
+                NativeKeyEncoding::Kitty(_) => kitty_active,
+                NativeKeyEncoding::SuppressText => report_all_keys,
                 _ => effective_keyboard_flags == 0,
             })
             .peekable();
         for (event_index, event) in events.iter().enumerate() {
             while let Some(press) =
-                keypad.next_if(|press| press.before_event && press.event == event_index)
+                native_keys.next_if(|press| press.before_event && press.event == event_index)
             {
                 input.extend_from_slice(press.encoding.bytes());
             }
-            let keypad_press = if keypad.peek().is_some_and(|press| press.event == event_index) {
-                keypad.next()
+            let native_press = if native_keys.peek().is_some_and(|press| press.event == event_index) {
+                native_keys.next()
             } else {
                 None
             };
@@ -7654,15 +7647,27 @@ impl TerminalRenderer {
                     if suppress_text_events || encoded_text_index == Some(event_index) {
                         continue;
                     }
-                    if let Some(press) = keypad_press {
+                    if let Some(press) = native_press {
                         input.extend_from_slice(press.encoding.bytes());
                         continue;
                     }
                     if let Some(filtered) = pty_text_payload(text) {
-                        if meta_sends_escape && alt_held && !report_all_keys {
-                            input.push(0x1b);
+                        if report_all_keys {
+                            if let Some(report) = encode_kitty_text_press(
+                                None,
+                                Default::default(),
+                                KeyboardLocks::default(),
+                                effective_keyboard_flags,
+                                Some(&filtered),
+                            ) {
+                                input.extend_from_slice(&report);
+                            }
+                        } else {
+                            if meta_sends_escape && alt_held {
+                                input.push(0x1b);
+                            }
+                            input.extend_from_slice(filtered.as_bytes());
                         }
-                        input.extend(filtered.as_bytes());
                     }
                 }
                 egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
@@ -7683,20 +7688,20 @@ impl TerminalRenderer {
                     }
                     let consumed_name = consumed_key_name(*key, *modifiers);
                     if !consumed_name.is_empty() && consumed_keys.contains(consumed_name.as_str()) {
-                        if let Some(press) =
-                            keypad_press.filter(|press| matches!(press.encoding, KeypadEncoding::Kitty(_)))
+                        if let Some(press) = native_press
+                            .filter(|press| matches!(press.encoding, NativeKeyEncoding::Kitty(_)))
                         {
                             encoded_text_index = press.text;
                         }
                         continue;
                     }
-                    if let Some(press) = keypad_press {
+                    if let Some(press) = native_press {
                         input.extend_from_slice(press.encoding.bytes());
                         encoded_text_index = press.text;
                         continue;
                     }
 
-                    if effective_keyboard_flags & 0b1001 != 0 {
+                    if kitty_active {
                         if let Some(report) = jterm_engine::input::encode_kitty_named_press(
                             normalized_key(*key),
                             normalized_modifiers(*modifiers),
@@ -7707,31 +7712,17 @@ impl TerminalRenderer {
                         }
                     }
 
-                    // Skip Kitty encoding for alphanumeric when there's a corresponding Text event
-                    // (Text event already sent the correct character with proper shift/caps handling)
-                    if text_from_events
-                        .as_ref()
-                        .is_some_and(|t| t.len() == 1 && t.as_bytes()[0].is_ascii_alphanumeric())
+                    if suppress_text_events
+                        && report_all_keys
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && !modifiers.command
+                        && matches!(normalized_key(*key), jterm_engine::input::Key::Character(_))
                     {
                         continue;
                     }
-
-                    // Detect Caps Lock: if Text event has an uppercase letter but
-                    // Shift is not pressed, Caps Lock must be active.
-                    let caps_lock = text_from_events.as_ref().is_some_and(|t| {
-                        t.len() == 1 && t.as_bytes()[0].is_ascii_uppercase() && !modifiers.shift
-                    });
-                    let effective_modifiers = if caps_lock {
-                        egui::Modifiers {
-                            shift: true,
-                            ..*modifiers
-                        }
-                    } else {
-                        *modifiers
-                    };
-
                     if let Some(encoded) =
-                        kitty_encode_key_event(*key, effective_modifiers, effective_keyboard_flags)
+                        kitty_encode_key_event(*key, *modifiers, effective_keyboard_flags)
                     {
                         input.extend(encoded.as_bytes());
                         continue;
@@ -7754,7 +7745,7 @@ impl TerminalRenderer {
                         .flatten();
                     if let Some(encoded) = xterm_encode_modify_other_keys(
                         *key,
-                        effective_modifiers,
+                        *modifiers,
                         xterm_modify_other_keys,
                         xterm_format_other_keys,
                         report_all_keys_mode,
@@ -7768,7 +7759,7 @@ impl TerminalRenderer {
                     // Handle normal key sequences
                     let seq = key_to_terminal_sequence(
                         *key,
-                        effective_modifiers,
+                        *modifiers,
                         application_cursor_keys,
                         backarrow_mode,
                     );
@@ -7813,7 +7804,7 @@ impl TerminalRenderer {
                 _ => {}
             }
         }
-        for press in keypad.filter(|press| press.before_event && press.event == events.len()) {
+        for press in native_keys.filter(|press| press.before_event && press.event == events.len()) {
             input.extend_from_slice(press.encoding.bytes());
         }
     }
@@ -9836,13 +9827,13 @@ mod tests {
             egui::Event::Ime(egui::ImeEvent::Commit("你".into())),
         ];
         let keypad = [
-            RoutedKeypad { event: 2, text: None, encoding: KeypadEncoding::Application(*b"\x1bOM"), before_event: false },
-            RoutedKeypad { event: 3, text: Some(4), encoding: KeypadEncoding::Application(*b"\x1bOk"), before_event: false },
-            RoutedKeypad { event: 6, text: None, encoding: KeypadEncoding::Application(*b"\x1bOj"), before_event: false },
+            RoutedKeyPress { event: 2, text: None, encoding: NativeKeyEncoding::Application(*b"\x1bOM"), before_event: false },
+            RoutedKeyPress { event: 3, text: Some(4), encoding: NativeKeyEncoding::Application(*b"\x1bOk"), before_event: false },
+            RoutedKeyPress { event: 6, text: None, encoding: NativeKeyEncoding::Application(*b"\x1bOj"), before_event: false },
         ];
-        let encode = |events: &[egui::Event], keypad: &[RoutedKeypad], composing, consumed| {
+        let encode = |events: &[egui::Event], keypad: &[RoutedKeyPress], composing, consumed| {
             let mut bytes = Vec::new();
-            renderer.handle_keyboard_input_with_keypad(
+            renderer.handle_keyboard_input_with_native_keys(
                 keypad, &mut bytes, consumed, composing, 0, false, 0, 0, false, false,
                 false, true, false, events,
             );
@@ -9881,27 +9872,27 @@ mod tests {
             egui::Event::Text("7".into()),
         ];
         let reports = [
-            RoutedKeypad {
+            RoutedKeyPress {
                 event: 1,
                 text: None,
-                encoding: KeypadEncoding::Kitty(b"\x1b[57411;5u".to_vec()),
+                encoding: NativeKeyEncoding::Kitty(b"\x1b[57411;5u".to_vec()),
                 before_event: true,
             },
-            RoutedKeypad {
+            RoutedKeyPress {
                 event: 1,
                 text: None,
-                encoding: KeypadEncoding::Kitty(b"\x1b[57414u".to_vec()),
+                encoding: NativeKeyEncoding::Kitty(b"\x1b[57414u".to_vec()),
                 before_event: false,
             },
-            RoutedKeypad {
+            RoutedKeyPress {
                 event: 2,
                 text: None,
-                encoding: KeypadEncoding::Kitty(b"\x1b[57406;129;55u".to_vec()),
+                encoding: NativeKeyEncoding::Kitty(b"\x1b[57406;129;55u".to_vec()),
                 before_event: false,
             },
         ];
         let mut bytes = Vec::new();
-        renderer.handle_keyboard_input_with_keypad(
+        renderer.handle_keyboard_input_with_native_keys(
             &reports,
             &mut bytes,
             &std::collections::HashSet::new(),
@@ -9944,25 +9935,42 @@ mod tests {
             press(egui::Key::Tab),
             press(egui::Key::Backspace),
             egui::Event::Text("b".into()),
+            egui::Event::Ime(egui::ImeEvent::Commit("你".into())),
         ];
-        let mut input = Vec::new();
-        renderer.handle_keyboard_input_with_keypad(
-            &[],
-            &mut input,
-            &std::collections::HashSet::new(),
-            false,
-            8,
-            true,
-            0,
-            0,
-            true,
-            false,
-            false,
-            true,
-            false,
-            &events,
+        let encode = |events: &[egui::Event], flags, composing| {
+            let mut input = Vec::new();
+            renderer.handle_keyboard_input_with_native_keys(
+                &[],
+                &mut input,
+                &std::collections::HashSet::new(),
+                composing,
+                flags,
+                true,
+                0,
+                0,
+                true,
+                false,
+                false,
+                true,
+                false,
+                events,
+            );
+            input
+        };
+        assert_eq!(
+            encode(&events, 8, false),
+            "\x1b[0u\x1b[13~\x1b[A\x1b[13u\x1b[9u\x1b[127u\x1b[0u你".as_bytes()
         );
-        assert_eq!(input, b"A\x1b[13~\x1b[A\x1b[13u\x1b[9u\x1b[127ub");
+        assert_eq!(
+            encode(&events, 24, false),
+            "\x1b[0;;65u\x1b[13~\x1b[A\x1b[13u\x1b[9u\x1b[127u\x1b[0;;98u你".as_bytes()
+        );
+        let composing_events = [
+            press(egui::Key::A),
+            egui::Event::Text("a".into()),
+            events.last().unwrap().clone(),
+        ];
+        assert_eq!(encode(&composing_events, 24, true), "你".as_bytes());
     }
 
     #[test]

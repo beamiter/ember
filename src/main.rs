@@ -3389,7 +3389,7 @@ impl TerminalApp {
             last_terminal_mouse_motion: None,
             font_zoom: font_zoom::FontZoom::default(),
             frame_events: Vec::new(),
-            frame_keypad: Default::default(),
+            frame_keyboard: Default::default(),
             paste_key_state: Default::default(),
             keyboard_input_buffer: Vec::new(),
             adaptive_frame_budget: 65536, // 初始值 64KB
@@ -6344,14 +6344,18 @@ impl eframe::App for TerminalApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn raw_input_hook_with_keypad(
+    fn raw_input_hook_with_keyboard(
         &mut self,
         ctx: &egui::Context,
         raw_input: &mut egui::RawInput,
-        keypad: Vec<eframe::NativeKeypadEvent>,
+        keyboard: eframe::NativeKeyboardAnnotations,
     ) {
         if raw_input.viewport_id == egui::ViewportId::ROOT {
-            self.frame_keypad = native_keypad::FrameKeypad::capture(raw_input, keypad);
+            self.frame_keyboard = if !keyboard.events.is_empty() && !self.block_chrome_owns_keyboard(ctx) {
+                native_keypad::FrameKeyboard::capture(raw_input, keyboard)
+            } else {
+                Default::default()
+            };
         }
         self.raw_input_hook(ctx, raw_input);
     }
@@ -6522,7 +6526,7 @@ impl eframe::App for TerminalApp {
 
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if root_ui.ctx().viewport_id()!=egui::ViewportId::ROOT {return;}
-        let mut frame_keypad = std::mem::take(&mut self.frame_keypad);
+        let mut frame_keyboard = std::mem::take(&mut self.frame_keyboard);
         // eframe 0.35 起将原来的 App::update 拆成了 `logic` 和 `ui` 两段:
         // 这里把整个 update 的逻辑迁到 ui 中。许多下游代码(viewport 命令、输入查询、重绘请求)
         // 仍需要 &Context,从 root_ui 上 clone 一份(Arc 引用计数,几乎零成本)即可,
@@ -6655,7 +6659,7 @@ impl eframe::App for TerminalApp {
         self.discard_stale_frame_ime();
         if self.advance_vim9_deferred_input(ctx) {
             // Replayed input belongs to a different native batch.
-            frame_keypad = Default::default();
+            frame_keyboard = Default::default();
         }
         app::input::guard_prompt_fill_enter(
             ctx,
@@ -6723,6 +6727,9 @@ impl eframe::App for TerminalApp {
             || workflow_picker_owned_input
             || vim9_dialog_owned_input;
 
+        if !frame_keyboard.is_empty() && self.block_chrome_owns_keyboard(ctx) {
+            frame_keyboard = Default::default();
+        }
         let (keybinding_requested_close, selection_postdates_terminal_input, accepted_ime_input) =
             self.handle_keybindings(
                 ctx,
@@ -7153,17 +7160,17 @@ impl eframe::App for TerminalApp {
             let input_renderer = active_pane_renderer_idx
                 .and_then(|index| self.pane_renderers.get(index))
                 .unwrap_or(&self.renderer);
-            let keypad = if has_preedit {
-                Vec::new()
+            let native_keys = if has_preedit {
+                Default::default()
             } else {
-                frame_keypad.route(
+                frame_keyboard.route(
                     &terminal_keyboard_events,
                     application_keypad,
                     keyboard_enhancement_flags,
                 )
             };
-            input_renderer.handle_keyboard_input_with_keypad(
-                &keypad,
+            input_renderer.handle_keyboard_input_with_native_keys(
+                &native_keys,
                 &mut self.keyboard_input_buffer,
                 &consumed_keys_refs,
                 has_preedit,

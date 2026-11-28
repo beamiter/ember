@@ -14,8 +14,9 @@ The native Vim buffer window smoke injects a complete X11 notch, checks exactly
 three source rows and traces intermediate GUI pixel positions. This patch can
 be removed after upgrading to an upstream release with equivalent behavior.
 
-## Num Lock in native keyboard events
+## Layout and lock state in native keyboard events
 
-XKB snapshots its cached Num Lock state into each translated key event.
-`KeyEvent::num_lock_active` exposes that snapshot on X11 and Wayland. Ember
-uses the event's lock state when encoding application-keypad input.
+`KeyEvent::unmodified_key` borrows the layout key with modifiers removed
+on platforms that provide it. XKB snapshots Caps Lock and Num Lock once
+per key event. Ember uses those snapshots to encode Kitty input on X11
+and Wayland.

@@ -666,6 +666,7 @@ impl Window {
 pub struct KeyEventExtra {
     pub text_with_all_modifiers: Option<SmolStr>,
     pub key_without_modifiers: Key,
+    pub caps_lock: bool,
     pub num_lock: bool,
 }
 

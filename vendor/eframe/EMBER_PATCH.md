@@ -31,9 +31,11 @@ updated for these scoped changes. Full Linux Ember cargo check passed for both
 compiled renderer paths; prior keyboard runtime results above are historical,
 not new Eva migration/physical visibility evidence.
 
-## Native keypad input batches
+## Native keyboard input batches
 
-Glow and WGPU deliver the converter's keypad annotations through
-`App::raw_input_hook_with_keypad`. The offsets include any pending raw input
-prepended by eframe. Logic-only ticks carry their normal raw input to the next
-UI pass, and keypad annotations apply to the visible batch that produced them.
+Glow and WGPU deliver the converter's ordered printable and keypad
+annotations through `App::raw_input_hook_with_keyboard`. The offsets
+include any raw input prepended by eframe. Logic-only ticks carry their
+raw input to the next UI pass. Native annotations describe the visible
+batch that produced them. Apps using the earlier keypad hook still
+receive their keypad annotations.

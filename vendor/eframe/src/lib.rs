@@ -166,7 +166,9 @@ mod epi;
 // Re-export everything in `epi` so `eframe` users don't have to care about what `epi` is:
 pub use epi::*;
 #[cfg(not(target_arch = "wasm32"))]
-pub use egui_winit::NativeKeypadEvent;
+pub use egui_winit::{
+    NativeKeyEvent, NativeKeyboardAnnotations, NativeKeypadEvent, NativeTextKeyEvent,
+};
 
 pub(crate) mod stopwatch;
 

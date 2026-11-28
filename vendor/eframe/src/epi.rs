@@ -300,6 +300,17 @@ pub trait App {
         self.raw_input_hook(ctx, raw_input);
     }
 
+    /// Prepare a native UI input batch with ordered keyboard annotations.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn raw_input_hook_with_keyboard(
+        &mut self,
+        ctx: &egui::Context,
+        raw_input: &mut egui::RawInput,
+        keyboard: egui_winit::NativeKeyboardAnnotations,
+    ) {
+        self.raw_input_hook_with_keypad(ctx, raw_input, keyboard.into_keypads());
+    }
+
     /// Request exact producer publication and compositor scene evidence for a
     /// native frame. Unsupported platforms/backends yield no callback.
     #[cfg(not(target_arch = "wasm32"))]

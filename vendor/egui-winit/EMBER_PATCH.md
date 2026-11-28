@@ -6,7 +6,7 @@ upstream commit 4c1f2fae95475a40e524884ebb298bcb1714b08e.
 UPSTREAM_INTEGRITY.json lists the original archive's file hashes. Root licenses
 are retained from that same upstream commit already vendored with eframe.
 
-Only src/lib.rs is behaviorally changed. Keyboard resolution now refuses a
+Keyboard resolution in src/lib.rs refuses a
 control/navigation/function physical-key fallback when the logical key is a
 known printable Character that egui cannot name. Such text keeps its normal Text
 event. Physical printable keys remain available for non-Latin shortcut layouts;
@@ -24,9 +24,11 @@ script retains the original redirection command and adds a raw PTY-byte oracle.
 Run dependency regressions explicitly with:
 cargo test -p egui-winit --lib ember_keyboard_fallback_tests --locked
 
-## Native keypad annotations
+## Native keyboard annotations
 
-The converter records the physical keypad position, logical key and modifiers
-alongside the events emitted for one press. When conversion produces no Key or
-Text event, the annotation records the position between GUI events. The
-existing raw input callback preserves this position for the terminal.
+The converter records keypad identity and printable layout keys alongside
+the events emitted for each press. Each printable annotation carries its
+unmodified key, shifted key, physical position, modifiers and lock state.
+Presses without a GUI Key or Text event retain their position between events.
+The native raw input callback carries the annotations in hardware event
+order. The SmallVec dependency keeps ordinary batches inline.

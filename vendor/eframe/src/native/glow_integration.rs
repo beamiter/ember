@@ -601,7 +601,7 @@ impl GlowWinitRunning<'_> {
             }
         }
 
-        let (raw_input, keypad, viewport_ui_cb, is_visible, show_ui) = {
+        let (raw_input, keyboard, viewport_ui_cb, is_visible, show_ui) = {
             let mut glutin = self.glutin.borrow_mut();
             let egui_ctx = glutin.egui_ctx.clone();
             let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
@@ -617,7 +617,7 @@ impl GlowWinitRunning<'_> {
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
             };
-            let (mut raw_input, keypad) = egui_winit.take_egui_input_with_keypad(window);
+            let (mut raw_input, keyboard) = egui_winit.take_egui_input_with_keyboard(window);
             let viewport_ui_cb = viewport.viewport_ui_cb.clone();
 
             let show_ui =
@@ -632,7 +632,7 @@ impl GlowWinitRunning<'_> {
                 .map(|(id, viewport)| (*id, viewport.info.clone()))
                 .collect();
 
-            (raw_input, keypad, viewport_ui_cb, is_visible, show_ui)
+            (raw_input, keyboard, viewport_ui_cb, is_visible, show_ui)
         };
 
         if !show_ui {
@@ -734,7 +734,7 @@ impl GlowWinitRunning<'_> {
 
         let full_output =
             self.integration
-                .update(self.app.as_mut(), viewport_ui_cb.as_deref(), raw_input, keypad);
+                .update(self.app.as_mut(), viewport_ui_cb.as_deref(), raw_input, keyboard);
 
         // ------------------------------------------------------------
 

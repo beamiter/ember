@@ -288,9 +288,9 @@ impl EpiIntegration {
         app: &mut dyn epi::App,
         viewport_ui_cb: Option<&DeferredViewportUiCallback>,
         raw_input: egui::RawInput,
-        keypad: Vec<egui_winit::NativeKeypadEvent>,
+        keyboard: egui_winit::NativeKeyboardAnnotations,
     ) -> egui::FullOutput {
-        let raw_input = self.prepare_raw_input(app, raw_input, keypad);
+        let raw_input = self.prepare_raw_input(app, raw_input, keyboard);
 
         let close_requested = raw_input.viewport().close_requested();
 
@@ -336,7 +336,7 @@ impl EpiIntegration {
         app: &mut dyn epi::App,
         raw_input: egui::RawInput,
     ) -> egui::LogicOutput {
-        let raw_input = self.prepare_raw_input(app, raw_input, Vec::new());
+        let raw_input = self.prepare_raw_input(app, raw_input, Default::default());
 
         let close_requested = raw_input.viewport().close_requested();
 
@@ -364,17 +364,15 @@ impl EpiIntegration {
         &mut self,
         app: &mut dyn epi::App,
         new_input: egui::RawInput,
-        mut keypad: Vec<egui_winit::NativeKeypadEvent>,
+        mut keyboard: egui_winit::NativeKeyboardAnnotations,
     ) -> egui::RawInput {
         let mut raw_input = std::mem::take(&mut self.pending_raw_input);
-        for event in &mut keypad {
-            event.first_event += raw_input.events.len();
-        }
+        keyboard.offset_by(raw_input.events.len());
         raw_input.append(new_input); // The new input wins where they overlap
 
         raw_input.time = Some(self.beginning.elapsed().as_secs_f64());
 
-        app.raw_input_hook_with_keypad(&self.egui_ctx, &mut raw_input, keypad);
+        app.raw_input_hook_with_keyboard(&self.egui_ctx, &mut raw_input, keyboard);
 
         raw_input
     }

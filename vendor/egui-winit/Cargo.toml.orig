@@ -63,6 +63,7 @@ egui = { workspace = true, default-features = false }
 log.workspace = true
 profiling.workspace = true
 raw-window-handle.workspace = true
+smallvec = "1.15"
 web-time.workspace = true
 winit = { workspace = true, default-features = false }
 

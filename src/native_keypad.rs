@@ -1,26 +1,38 @@
-//! Keep physical keypad identity through the terminal's ordered input filters.
+//! Match native key presses to the input that survives terminal ownership filters.
 use crate::ui::{
-    is_modifier_only_key, normalized_modifiers, pty_text_payload, KeypadEncoding, RoutedKeypad,
+    is_modifier_only_key, normalized_key, normalized_modifiers, pty_text_payload,
+    NativeKeyEncoding, RoutedKeyPress,
 };
-use eframe::NativeKeypadEvent;
+use eframe::{NativeKeyEvent, NativeKeyboardAnnotations, NativeTextKeyEvent};
 use egui::Event;
-use jterm_engine::input::{encode_kitty_keypad_press, Key, KeypadKey};
+use jterm_engine::input::{
+    encode_kitty_keypad_press, encode_kitty_text_press, Key, KeyboardLocks, KeypadKey,
+    KittyTextKey, KITTY_DISAMBIGUATE, KITTY_REPORT_ALL_KEYS, KITTY_REPORT_ASSOCIATED_TEXT,
+};
+use smallvec::SmallVec;
 use winit::keyboard::{Key as NativeKey, KeyCode, NamedKey};
 
 #[derive(Default)]
-pub(crate) struct FrameKeypad(Vec<KeypadPress>);
+pub(crate) struct FrameKeyboard(SmallVec<[NativePress; 4]>);
 
-struct KeypadPress {
-    anchor: KeypadAnchor,
+struct NativePress {
+    anchor: PressAnchor,
     text: Option<EventPosition>,
-    position: KeypadKey,
-    center: bool,
-    num_locked: bool,
-    logical: Key,
-    modifiers: egui::Modifiers,
+    kind: PressKind,
 }
 
-enum KeypadAnchor {
+enum PressKind {
+    Keypad {
+        position: KeypadKey,
+        center: bool,
+        num_locked: bool,
+        logical: Key,
+        modifiers: egui::Modifiers,
+    },
+    Text(NativeTextKeyEvent),
+}
+
+enum PressAnchor {
     Event(EventPosition),
     Gap {
         left: Option<EventPosition>,
@@ -29,14 +41,28 @@ enum KeypadAnchor {
 }
 
 struct EventPosition {
-    event: Event,
+    identity: EventIdentity,
     ordinal: usize,
     occurrences: usize,
 }
 
-impl FrameKeypad {
-    pub fn capture(input: &egui::RawInput, native: Vec<NativeKeypadEvent>) -> Self {
-        if !input.focused || native.is_empty() {
+enum EventIdentity {
+    Key {
+        key: egui::Key,
+        physical_key: Option<egui::Key>,
+        pressed: bool,
+        modifiers: egui::Modifiers,
+    },
+    Text(SmallVec<[u8; 8]>),
+}
+
+impl FrameKeyboard {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn capture(input: &egui::RawInput, native: NativeKeyboardAnnotations) -> Self {
+        if !input.focused || native.events.is_empty() {
             return Self::default();
         }
         let events = &input.events;
@@ -46,34 +72,37 @@ impl FrameKeypad {
             .map_or(0, |last| last + 1);
         Self(
             native
+                .events
                 .into_iter()
                 .filter_map(|native| {
-                    if native.first_event < focus_start {
+                    let (first, count) = native.event_range();
+                    if first < focus_start {
                         return None;
                     }
-                    let first = native.first_event;
-                    let group = events.get(first..first.checked_add(native.event_count)?)?;
+                    let group = events.get(first..first.checked_add(count)?)?;
                     let (anchor, text) = match group {
-                        [] => (KeypadAnchor::gap(events, first)?, None),
+                        [] => (PressAnchor::gap(events, first)?, None),
                         [Event::Key { pressed: true, .. }] | [Event::Text(_)] => (
-                            KeypadAnchor::Event(EventPosition::capture(events, first)),
+                            PressAnchor::Event(EventPosition::capture(events, first)?),
                             None,
                         ),
                         [Event::Key { pressed: true, .. }, Event::Text(_)] => (
-                            KeypadAnchor::Event(EventPosition::capture(events, first)),
-                            Some(EventPosition::capture(events, first + 1)),
+                            PressAnchor::Event(EventPosition::capture(events, first)?),
+                            Some(EventPosition::capture(events, first + 1)?),
                         ),
                         _ => return None,
                     };
-                    Some(KeypadPress {
-                        anchor,
-                        text,
-                        position: keypad_position(native.key_code)?,
-                        center: native.center,
-                        num_locked: native.numeric_layer,
-                        logical: keypad_logical_key(&native.logical_key),
-                        modifiers: native.modifiers,
-                    })
+                    let kind = match native {
+                        NativeKeyEvent::Keypad(native) => PressKind::Keypad {
+                            position: keypad_position(native.key_code)?,
+                            center: native.center,
+                            num_locked: native.numeric_layer,
+                            logical: keypad_logical_key(&native.logical_key),
+                            modifiers: native.modifiers,
+                        },
+                        NativeKeyEvent::Text(native) => PressKind::Text(native),
+                    };
+                    Some(NativePress { anchor, text, kind })
                 })
                 .collect(),
         )
@@ -83,72 +112,152 @@ impl FrameKeypad {
         self,
         events: &[Event],
         application: bool,
-        keyboard_flags: u16,
-    ) -> Vec<RoutedKeypad> {
-        let mut routed = Vec::with_capacity(self.0.len());
+        flags: u16,
+    ) -> SmallVec<[RoutedKeyPress; 4]> {
+        let mut routed = SmallVec::<[RoutedKeyPress; 4]>::new();
+        let report_all = flags & KITTY_REPORT_ALL_KEYS != 0;
+        let report_associated = report_all && flags & KITTY_REPORT_ASSOCIATED_TEXT != 0;
         for press in self.0 {
-            let before_event = matches!(&press.anchor, KeypadAnchor::Gap { .. });
+            if !report_all && matches!(press.kind, PressKind::Text(_)) {
+                continue;
+            }
+            let before_event = matches!(&press.anchor, PressAnchor::Gap { .. });
+            let text = press.text.as_ref().and_then(|text| text.locate(events));
             let Some(event) = press.anchor.locate(events) else {
+                if let (true, Some(event)) = (report_all, text) {
+                    // A host filter took the key. Its surviving text still
+                    // belongs to that press and must not become a new report.
+                    routed.push(RoutedKeyPress {
+                        event,
+                        text: None,
+                        encoding: NativeKeyEncoding::SuppressText,
+                        before_event: false,
+                    });
+                }
                 continue;
             };
-            let text = match press.text {
-                Some(text) if text.locate(events) == Some(event + 1) => Some(event + 1),
-                Some(_) => continue,
-                None => None,
-            };
-            let encoding = if keyboard_flags & 0b1001 != 0 {
-                let associated = if !before_event && keyboard_flags & 0b11000 == 0b11000 {
-                    match events.get(text.unwrap_or(event)) {
-                        Some(Event::Text(value)) => pty_text_payload(value),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                let Some(report) = encode_kitty_keypad_press(
-                    press.position,
-                    press.logical,
-                    normalized_modifiers(press.modifiers),
-                    press.num_locked,
-                    keyboard_flags,
-                    associated.as_deref(),
-                ) else {
-                    continue;
-                };
-                KeypadEncoding::Kitty(report)
-            } else if keyboard_flags == 0
-                && !before_event
-                && !press.num_locked
-                && !press.modifiers.any()
-            {
-                if application {
-                    let Some(sequence) = press.position.application_sequence() else {
-                        continue;
-                    };
-                    KeypadEncoding::Application(sequence)
-                } else if press.center {
-                    KeypadEncoding::Center
-                } else {
-                    continue;
+            if press.text.is_some() && text != Some(event + 1) {
+                continue;
+            }
+            let associated = if report_associated && !before_event {
+                match events.get(text.unwrap_or(event)) {
+                    Some(Event::Text(value)) => pty_text_payload(value),
+                    _ => None,
                 }
             } else {
+                None
+            };
+            let Some(encoding) =
+                press
+                    .kind
+                    .encode(application, flags, before_event, associated.as_deref())
+            else {
                 continue;
             };
-            routed.push(RoutedKeypad {
+            routed.push(RoutedKeyPress {
                 event,
                 text,
                 encoding,
                 before_event,
             });
         }
+        // Stable sorting preserves hardware order when several presses
+        // produced no GUI event at the same position.
         routed.sort_by_key(|press| (press.event, !press.before_event));
         routed
     }
 }
 
-impl KeypadAnchor {
+impl PressKind {
+    fn encode(
+        self,
+        application: bool,
+        flags: u16,
+        before_event: bool,
+        text: Option<&str>,
+    ) -> Option<NativeKeyEncoding> {
+        let (position, center, num_locked, logical, modifiers) = match self {
+            Self::Text(native) => {
+                let mut modifiers = normalized_modifiers(native.modifiers);
+                modifiers.super_key = native.super_key;
+                // XKB supplies printable strings even for Alt/Super
+                // shortcuts. Those presses have no associated input text.
+                let text = if cfg!(target_os = "linux") && (modifiers.alt || modifiers.super_key) {
+                    None
+                } else {
+                    text
+                };
+                return encode_kitty_text_press(
+                    Some(KittyTextKey {
+                        base: native.base,
+                        shifted: native.shifted,
+                        base_layout: native.physical_key.and_then(base_layout_char),
+                    }),
+                    modifiers,
+                    KeyboardLocks {
+                        caps_lock: native.caps_lock,
+                        num_lock: native.num_lock,
+                    },
+                    flags,
+                    text,
+                )
+                .map(NativeKeyEncoding::Kitty);
+            }
+            Self::Keypad {
+                position,
+                center,
+                num_locked,
+                logical,
+                modifiers,
+            } => (position, center, num_locked, logical, modifiers),
+        };
+        if flags & (KITTY_REPORT_ALL_KEYS | u16::from(KITTY_DISAMBIGUATE)) != 0 {
+            return encode_kitty_keypad_press(
+                position,
+                logical,
+                normalized_modifiers(modifiers),
+                num_locked,
+                flags,
+                text,
+            )
+            .map(NativeKeyEncoding::Kitty);
+        }
+        if flags != 0 || before_event || num_locked || modifiers.any() {
+            None
+        } else if application {
+            position
+                .application_sequence()
+                .map(NativeKeyEncoding::Application)
+        } else {
+            center.then_some(NativeKeyEncoding::Center)
+        }
+    }
+}
+
+fn base_layout_char(key: egui::Key) -> Option<char> {
+    Some(match key {
+        egui::Key::Space => ' ',
+        egui::Key::Comma => ',',
+        egui::Key::Period => '.',
+        egui::Key::Semicolon => ';',
+        egui::Key::Backslash => '\\',
+        egui::Key::Slash => '/',
+        egui::Key::OpenBracket => '[',
+        egui::Key::CloseBracket => ']',
+        egui::Key::Backtick => '`',
+        egui::Key::Quote => '\'',
+        egui::Key::Minus => '-',
+        egui::Key::Equals => '=',
+        other => match normalized_key(other) {
+            Key::Character(ch) => ch,
+            _ => return None,
+        },
+    })
+}
+
+impl PressAnchor {
     fn gap(events: &[Event], index: usize) -> Option<Self> {
-        // Some modified keypad symbols have no egui Key or Text event.
+        // Some modified printable or keypad keys have no egui Key or Text event.
         // Anchor their position to surviving neighbors without adding an
         // input event to the widgets or copying arbitrary text or paste data.
         let left = match events[..index]
@@ -197,39 +306,87 @@ fn gap_ignores(event: &Event) -> bool {
 impl EventPosition {
     fn neighbor(events: &[Event], index: usize) -> Option<Self> {
         match events.get(index)? {
-            Event::Key { .. } => Some(Self::capture(events, index)),
-            Event::Text(text) if text.len() <= 4 => Some(Self::capture(events, index)),
+            Event::Key { .. } => Self::capture(events, index),
+            Event::Text(text) if text.len() <= 4 => Self::capture(events, index),
             _ => None,
         }
     }
 
-    fn capture(events: &[Event], index: usize) -> Self {
-        let event = &events[index];
+    fn capture(events: &[Event], index: usize) -> Option<Self> {
+        let identity = match &events[index] {
+            &Event::Key {
+                key,
+                physical_key,
+                pressed,
+                modifiers,
+                ..
+            } => EventIdentity::Key {
+                key,
+                physical_key,
+                pressed,
+                modifiers,
+            },
+            Event::Text(text) => EventIdentity::Text(SmallVec::from_slice(text.as_bytes())),
+            _ => return None,
+        };
         let ordinal = events[..index]
             .iter()
-            .filter(|other| same_event(event, other))
+            .filter(|other| identity.matches(other))
             .count();
         let occurrences = events[index..]
             .iter()
-            .filter(|other| same_event(event, other))
+            .filter(|other| identity.matches(other))
             .count()
             + ordinal;
-        Self {
-            event: event.clone(),
+        Some(Self {
+            identity,
             ordinal,
             occurrences,
-        }
+        })
     }
 
     fn locate(&self, events: &[Event]) -> Option<usize> {
         let mut candidates = events
             .iter()
             .enumerate()
-            .filter_map(|(index, event)| same_event(&self.event, event).then_some(index));
+            .filter_map(|(index, event)| self.identity.matches(event).then_some(index));
         let index = candidates.nth(self.ordinal)?;
-        // GUI filters can consume a logical Enter shared by two physical keys.
-        // Keep the physical identity when occurrence order still identifies it.
+        // If a filter changed the number of identical events, their ordinal
+        // no longer identifies which physical press survived.
         (self.ordinal + 1 + candidates.count() == self.occurrences).then_some(index)
+    }
+}
+
+impl EventIdentity {
+    fn matches(&self, event: &Event) -> bool {
+        match (self, event) {
+            (
+                Self::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    modifiers,
+                },
+                Event::Key {
+                    key: other_key,
+                    physical_key: other_physical_key,
+                    pressed: other_pressed,
+                    modifiers: other_modifiers,
+                    ..
+                },
+            ) => {
+                // egui computes repeat after the native event was annotated.
+                (key, physical_key, pressed, modifiers)
+                    == (
+                        other_key,
+                        other_physical_key,
+                        other_pressed,
+                        other_modifiers,
+                    )
+            }
+            (Self::Text(bytes), Event::Text(text)) => bytes.as_slice() == text.as_bytes(),
+            _ => false,
+        }
     }
 }
 
@@ -251,32 +408,6 @@ fn keypad_logical_key(key: &NativeKey) -> Key {
             .next()
             .map_or(Key::Unidentified, Key::Character),
         _ => Key::Unidentified,
-    }
-}
-
-fn same_event(left: &Event, right: &Event) -> bool {
-    if let (
-        Event::Key {
-            key: left_key,
-            physical_key: left_physical,
-            pressed: left_pressed,
-            modifiers: left_modifiers,
-            ..
-        },
-        Event::Key {
-            key: right_key,
-            physical_key: right_physical,
-            pressed: right_pressed,
-            modifiers: right_modifiers,
-            ..
-        },
-    ) = (left, right)
-    {
-        // egui computes repeat after the native converter records the event.
-        (left_key, left_physical, left_pressed, left_modifiers)
-            == (right_key, right_physical, right_pressed, right_modifiers)
-    } else {
-        left == right
     }
 }
 
@@ -307,7 +438,17 @@ fn keypad_position(code: KeyCode) -> Option<KeypadKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::NativeKeypadEvent;
     use egui::{Key, Modifiers};
+
+    fn capture_keypads(input: &egui::RawInput, keys: Vec<NativeKeypadEvent>) -> FrameKeyboard {
+        FrameKeyboard::capture(
+            input,
+            NativeKeyboardAnnotations {
+                events: keys.into_iter().map(NativeKeyEvent::Keypad).collect(),
+            },
+        )
+    }
 
     fn key(key: Key) -> Event {
         Event::Key {
@@ -342,13 +483,13 @@ mod tests {
         if let Event::Key { repeat, .. } = &mut events[1] {
             *repeat = true;
         }
-        let batch = || FrameKeypad::capture(&raw, vec![native(KeyCode::NumpadEnter, 1, 1)]);
+        let batch = || capture_keypads(&raw, vec![native(KeyCode::NumpadEnter, 1, 1)]);
         assert_eq!(
-            batch().route(events, true, 0),
-            [RoutedKeypad {
+            batch().route(events, true, 0).as_slice(),
+            &[RoutedKeyPress {
                 event: 1,
                 text: None,
-                encoding: KeypadEncoding::Application(*b"\x1bOM"),
+                encoding: NativeKeyEncoding::Application(*b"\x1bOM"),
                 before_event: false,
             }]
         );
@@ -366,13 +507,13 @@ mod tests {
             ],
             ..Default::default()
         };
-        let batch = || FrameKeypad::capture(&raw, vec![native(KeyCode::NumpadAdd, 0, 2)]);
+        let batch = || capture_keypads(&raw, vec![native(KeyCode::NumpadAdd, 0, 2)]);
         assert_eq!(
-            batch().route(&raw.events, true, 0),
-            [RoutedKeypad {
+            batch().route(&raw.events, true, 0).as_slice(),
+            &[RoutedKeyPress {
                 event: 0,
                 text: Some(1),
-                encoding: KeypadEncoding::Application(*b"\x1bOk"),
+                encoding: NativeKeyEncoding::Application(*b"\x1bOk"),
                 before_event: false,
             }]
         );
@@ -399,16 +540,16 @@ mod tests {
         digit.numeric_layer = true;
         let mut center = native(KeyCode::Numpad5, 5, 1);
         center.center = true;
-        let batch = FrameKeypad::capture(
+        let batch = capture_keypads(
             &raw,
             vec![native(KeyCode::NumpadEnter, 0, 1), digit, center],
         );
         assert_eq!(
-            batch.route(&raw.events, false, 0),
-            [RoutedKeypad {
+            batch.route(&raw.events, false, 0).as_slice(),
+            &[RoutedKeyPress {
                 event: 5,
                 text: None,
-                encoding: KeypadEncoding::Center,
+                encoding: NativeKeyEncoding::Center,
                 before_event: false,
             }]
         );
@@ -430,14 +571,14 @@ mod tests {
         let mut multiply = native(KeyCode::NumpadMultiply, 3, 0);
         multiply.logical_key = NativeKey::Character("*".into());
         multiply.modifiers = Modifiers::CTRL;
-        let batch = || FrameKeypad::capture(&raw, vec![multiply.clone()]);
+        let batch = || capture_keypads(&raw, vec![multiply.clone()]);
         let filtered = [key(Key::Enter), key(Key::Home)];
         assert_eq!(
-            batch().route(&filtered, true, 1),
-            [RoutedKeypad {
+            batch().route(&filtered, true, 1).as_slice(),
+            &[RoutedKeyPress {
                 event: 1,
                 text: None,
-                encoding: KeypadEncoding::Kitty(b"\x1b[57411;5u".to_vec()),
+                encoding: NativeKeyEncoding::Kitty(b"\x1b[57411;5u".to_vec()),
                 before_event: true,
             }]
         );
@@ -455,16 +596,97 @@ mod tests {
         let mut digit = native(KeyCode::Numpad7, 0, 2);
         digit.logical_key = NativeKey::Character("7".into());
         digit.numeric_layer = true;
-        let batch = || FrameKeypad::capture(&raw, vec![digit.clone()]);
+        let batch = || capture_keypads(&raw, vec![digit.clone()]);
         assert!(batch().route(&raw.events, true, 1).is_empty());
         assert_eq!(
-            batch().route(&raw.events, true, 24),
-            [RoutedKeypad {
+            batch().route(&raw.events, true, 24).as_slice(),
+            &[RoutedKeyPress {
                 event: 0,
                 text: Some(1),
-                encoding: KeypadEncoding::Kitty(b"\x1b[57406;129;55u".to_vec()),
+                encoding: NativeKeyEncoding::Kitty(b"\x1b[57406;129;55u".to_vec()),
                 before_event: false,
             }]
         );
+    }
+
+    #[test]
+    fn kitty_projection_pairs_printable_text_with_its_own_press() {
+        let raw = egui::RawInput {
+            focused: true,
+            events: vec![
+                key(Key::A),
+                Event::Text("A".into()),
+                key(Key::F3),
+                Event::Text("A".into()),
+                key(Key::Num3),
+                Event::Text("#".into()),
+            ],
+            ..Default::default()
+        };
+        let a = NativeTextKeyEvent {
+            first_event: 0,
+            event_count: 2,
+            base: 'a',
+            shifted: None,
+            physical_key: Some(Key::A),
+            modifiers: Modifiers::NONE,
+            super_key: false,
+            caps_lock: true,
+            num_lock: false,
+        };
+        let hash = NativeTextKeyEvent {
+            first_event: 4,
+            base: '3',
+            shifted: Some('#'),
+            physical_key: Some(Key::Num3),
+            modifiers: Modifiers::SHIFT,
+            caps_lock: false,
+            ..a
+        };
+        let capture = || {
+            FrameKeyboard::capture(
+                &raw,
+                NativeKeyboardAnnotations {
+                    events: smallvec::smallvec![
+                        NativeKeyEvent::Text(a),
+                        NativeKeyEvent::Text(hash)
+                    ],
+                },
+            )
+        };
+        let flags = 4 | KITTY_REPORT_ALL_KEYS | KITTY_REPORT_ASSOCIATED_TEXT;
+        let shifted = |event| RoutedKeyPress {
+            event,
+            text: Some(event + 1),
+            encoding: NativeKeyEncoding::Kitty(b"\x1b[51:35;2;35u".to_vec()),
+            before_event: false,
+        };
+        assert_eq!(
+            capture().route(&raw.events, false, flags).as_slice(),
+            &[
+                RoutedKeyPress {
+                    event: 0,
+                    text: Some(1),
+                    encoding: NativeKeyEncoding::Kitty(b"\x1b[97;65;65u".to_vec()),
+                    before_event: false,
+                },
+                shifted(4),
+            ],
+        );
+        // A filter claimed Key(A). Suppress its Text(A) only, keeping the
+        // independent Text(A) and the later shifted digit in their places.
+        assert_eq!(
+            capture().route(&raw.events[1..], false, flags).as_slice(),
+            &[
+                RoutedKeyPress {
+                    event: 0,
+                    text: None,
+                    encoding: NativeKeyEncoding::SuppressText,
+                    before_event: false,
+                },
+                shifted(3),
+            ],
+        );
+        assert!(capture().route(&raw.events, false, 1).is_empty());
     }
 }

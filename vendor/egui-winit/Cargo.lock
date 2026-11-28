@@ -712,6 +712,7 @@ dependencies = [
  "profiling",
  "raw-window-handle",
  "serde",
+ "smallvec",
  "smithay-clipboard",
  "wayland-cursor",
  "web-time",

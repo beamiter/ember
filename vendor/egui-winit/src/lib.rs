@@ -19,6 +19,7 @@ pub use egui;
 #[cfg(feature = "accesskit")]
 use egui::accesskit;
 use egui::{Pos2, Rect, Theme, Vec2, ViewportBuilder, ViewportCommand, ViewportId, ViewportInfo};
+use smallvec::SmallVec;
 pub use winit;
 
 pub mod clipboard;
@@ -88,13 +89,14 @@ pub struct State {
     viewport_id: ViewportId,
     start_time: web_time::Instant,
     egui_input: egui::RawInput,
-    keypad_events: Vec<NativeKeypadEvent>,
+    native_keyboard: NativeKeyboardAnnotations,
 
     /// The current modifier state.
     ///
     /// We keep a copy so we can stamp
     /// it onto per-event `modifiers` fields and emit [`egui::Event::ModifiersChanged`].
     modifiers: egui::Modifiers,
+    super_key: bool,
     pressed_key_identity: PressedKeyIdentity,
 
     pointer_pos_in_points: Option<egui::Pos2>,
@@ -148,6 +150,65 @@ pub struct NativeKeypadEvent {
     pub modifiers: egui::Modifiers,
 }
 
+/// Native layout and modifier state for one printable key press.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeTextKeyEvent {
+    pub first_event: usize,
+    pub event_count: usize,
+    pub base: char,
+    pub shifted: Option<char>,
+    pub physical_key: Option<egui::Key>,
+    pub modifiers: egui::Modifiers,
+    pub super_key: bool,
+    pub caps_lock: bool,
+    pub num_lock: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum NativeKeyEvent {
+    Keypad(NativeKeypadEvent),
+    Text(NativeTextKeyEvent),
+}
+
+impl NativeKeyEvent {
+    /// The range of GUI events emitted by this hardware press.
+    pub fn event_range(&self) -> (usize, usize) {
+        match self {
+            Self::Keypad(event) => (event.first_event, event.event_count),
+            Self::Text(event) => (event.first_event, event.event_count),
+        }
+    }
+}
+
+/// Ordered press annotations indexed into the corresponding raw input batch.
+#[derive(Default)]
+pub struct NativeKeyboardAnnotations {
+    pub events: SmallVec<[NativeKeyEvent; 4]>,
+}
+
+impl NativeKeyboardAnnotations {
+    /// Adjust the raw event positions when earlier events are prepended.
+    pub fn offset_by(&mut self, count: usize) {
+        for event in &mut self.events {
+            match event {
+                NativeKeyEvent::Keypad(event) => event.first_event += count,
+                NativeKeyEvent::Text(event) => event.first_event += count,
+            }
+        }
+    }
+
+    /// Extract annotations for users of the keypad-only input callback.
+    pub fn into_keypads(self) -> Vec<NativeKeypadEvent> {
+        self.events
+            .into_iter()
+            .filter_map(|event| match event {
+                NativeKeyEvent::Keypad(event) => Some(event),
+                NativeKeyEvent::Text(_) => None,
+            })
+            .collect()
+    }
+}
+
 impl State {
     /// Construct a new instance
     pub fn new(
@@ -172,8 +233,9 @@ impl State {
                 .unwrap_or_else(web_time::Instant::now),
             egui_ctx,
             egui_input,
-            keypad_events: Vec::new(),
+            native_keyboard: NativeKeyboardAnnotations::default(),
             modifiers: egui::Modifiers::default(),
+            super_key: false,
             pressed_key_identity: PressedKeyIdentity::default(),
             pointer_pos_in_points: None,
             any_pointer_button_down: false,
@@ -303,7 +365,7 @@ impl State {
             .or_default()
             .native_pixels_per_point = Some(window.scale_factor() as f32);
 
-        self.keypad_events.clear();
+        self.native_keyboard.events.clear();
         self.egui_input.take()
     }
 
@@ -313,8 +375,17 @@ impl State {
         &mut self,
         window: &Window,
     ) -> (egui::RawInput, Vec<NativeKeypadEvent>) {
-        let keypad = std::mem::take(&mut self.keypad_events);
-        (self.take_egui_input(window), keypad)
+        let (input, native) = self.take_egui_input_with_keyboard(window);
+        (input, native.into_keypads())
+    }
+
+    /// Take raw input with annotations tying keypad and printable presses to their GUI events.
+    pub fn take_egui_input_with_keyboard(
+        &mut self,
+        window: &Window,
+    ) -> (egui::RawInput, NativeKeyboardAnnotations) {
+        let native = std::mem::take(&mut self.native_keyboard);
+        (self.take_egui_input(window), native)
     }
 
     /// Call this when there is a new event.
@@ -525,6 +596,7 @@ impl State {
                 self.modifiers.alt = alt;
                 self.modifiers.ctrl = ctrl;
                 self.modifiers.shift = shift;
+                self.super_key = super_;
                 self.modifiers.mac_cmd = cfg!(target_os = "macos") && super_;
                 self.modifiers.command = if cfg!(target_os = "macos") {
                     super_
@@ -1111,11 +1183,21 @@ impl State {
                 }
             }
         }
-        let event_count = self.egui_input.events.len() - first_event;
-        if pressed
-            && let Some(keypad) = native_keypad_event(event, first_event, event_count, self.modifiers)
-        {
-            self.keypad_events.push(keypad);
+        if pressed {
+            let event_count = self.egui_input.events.len() - first_event;
+            if let Some(keypad) = native_keypad_event(event, first_event, event_count, self.modifiers)
+            {
+                self.native_keyboard.events.push(NativeKeyEvent::Keypad(keypad));
+            } else if let Some(text) = native_text_key_event(
+                event,
+                first_event,
+                event_count,
+                physical_key,
+                self.modifiers,
+                self.super_key,
+            ) {
+                self.native_keyboard.events.push(NativeKeyEvent::Text(text));
+            }
         }
     }
 
@@ -1903,6 +1985,47 @@ fn native_keypad_event(
         logical_key: event.logical_key.clone(),
         modifiers,
     })
+}
+
+fn native_text_key_event(
+    event: &winit::event::KeyEvent,
+    first_event: usize,
+    event_count: usize,
+    physical_key: Option<egui::Key>,
+    modifiers: egui::Modifiers,
+    super_key: bool,
+) -> Option<NativeTextKeyEvent> {
+    use winit::keyboard::{Key, NamedKey};
+
+    if !matches!(
+        event.logical_key,
+        Key::Character(_) | Key::Named(NamedKey::Space) | Key::Unidentified(_)
+    ) {
+        return None;
+    }
+    let base = printable_key_char(event.unmodified_key()?)?;
+    let shifted = if modifiers.shift {
+        printable_key_char(&event.logical_key)
+    } else {
+        None
+    };
+    Some(NativeTextKeyEvent {
+        first_event,
+        event_count,
+        base,
+        shifted,
+        physical_key,
+        modifiers,
+        super_key,
+        caps_lock: event.caps_lock_active().unwrap_or_default(),
+        num_lock: event.num_lock_active().unwrap_or_default(),
+    })
+}
+
+fn printable_key_char(key: &winit::keyboard::Key) -> Option<char> {
+    let mut chars = key.to_text()?.chars();
+    let first = chars.next()?;
+    (chars.next().is_none() && !first.is_control() && is_printable_char(first)).then_some(first)
 }
 
 fn key_from_key_code(key: winit::keyboard::KeyCode) -> Option<egui::Key> {
