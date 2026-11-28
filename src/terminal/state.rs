@@ -4401,8 +4401,13 @@ impl super::TerminalState {
         self.vt.protocol.modes().contains(&1)
     }
 
+    #[allow(dead_code)] // Public mode accessor for library callers.
     pub fn is_application_keypad(&self) -> bool {
         self.vt.protocol.modes().contains(&66)
+    }
+
+    pub fn backarrow_mode(&self) -> bool {
+        self.vt.protocol.modes().contains(&67)
     }
 
     pub fn alternate_scroll_generation(&self) -> Option<u64> { self.alternate_scroll_generation }

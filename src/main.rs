@@ -7111,7 +7111,7 @@ impl eframe::App for TerminalApp {
                 xterm_modify_other_keys,
                 xterm_format_other_keys,
                 application_cursor_keys,
-                _application_keypad,
+                backarrow_mode,
                 alt_screen,
                 meta_sends_escape,
             ) = {
@@ -7122,7 +7122,7 @@ impl eframe::App for TerminalApp {
                     terminal.xterm_modify_other_keys(),
                     terminal.xterm_format_other_keys(),
                     terminal.is_application_cursor_keys(),
-                    terminal.is_application_keypad(),
+                    terminal.backarrow_mode(),
                     terminal.is_alt_buffer_active(),
                     terminal.is_meta_sends_escape(),
                 )
@@ -7143,6 +7143,7 @@ impl eframe::App for TerminalApp {
                 xterm_modify_other_keys,
                 xterm_format_other_keys,
                 application_cursor_keys,
+                backarrow_mode,
                 alt_screen,
                 meta_sends_escape,
                 meta_sends_escape && ctx.input(|input| input.modifiers.alt),

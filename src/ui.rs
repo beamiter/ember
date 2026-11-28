@@ -519,6 +519,7 @@ fn key_to_terminal_sequence(
     key: egui::Key,
     modifiers: egui::Modifiers,
     application_cursor_keys: bool,
+    backarrow_mode: bool,
 ) -> Option<Cow<'static, str>> {
     // The functional-key family carries its modifiers as a CSI parameter, so it
     // must be encoded before the guard below: returning None there is what used
@@ -538,7 +539,9 @@ fn key_to_terminal_sequence(
     match key {
         egui::Key::Enter => Some(Cow::Borrowed("\r")),
         egui::Key::Escape => Some(Cow::Borrowed("\x1b")),
-        egui::Key::Backspace => Some(Cow::Borrowed("\x7f")), // Send DEL (0x7f)
+        egui::Key::Backspace => Some(Cow::Borrowed(
+            jterm_engine::input::legacy_backspace_sequence(backarrow_mode, false),
+        )),
         egui::Key::Tab => {
             if modifiers.shift {
                 Some(Cow::Borrowed("\x1b[Z")) // Shift+Tab -> backtab (CSI Z)
@@ -577,7 +580,7 @@ pub(crate) fn alternate_scroll_arrow_bytes(
     if let Some(bytes) = kitty_encode_key_event(key, egui::Modifiers::NONE, flags) {
         return Some(bytes.into_bytes());
     }
-    key_to_terminal_sequence(key, egui::Modifiers::NONE, app_cursor)
+    key_to_terminal_sequence(key, egui::Modifiers::NONE, app_cursor, false)
         .map(|bytes| bytes.as_bytes().to_vec())
 }
 
@@ -7529,6 +7532,7 @@ impl TerminalRenderer {
         xterm_modify_other_keys: u16,
         xterm_format_other_keys: u16,
         application_cursor_keys: bool,
+        backarrow_mode: bool,
         alt_screen: bool,
         meta_sends_escape: bool,
         alt_held: bool,
@@ -7654,6 +7658,7 @@ impl TerminalRenderer {
                         *key,
                         effective_modifiers,
                         application_cursor_keys,
+                        backarrow_mode,
                     );
 
                     if let Some(s) = seq {
@@ -9459,11 +9464,11 @@ mod tests {
         let modifiers = egui::Modifiers::default();
 
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::ArrowUp, modifiers, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::ArrowUp, modifiers, false, false).as_deref(),
             Some("\x1b[A")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::ArrowDown, modifiers, true).as_deref(),
+            key_to_terminal_sequence(egui::Key::ArrowDown, modifiers, true, false).as_deref(),
             Some("\x1bOB")
         );
     }
@@ -9490,50 +9495,50 @@ mod tests {
 
         // Word-wise cursor motion: the whole point of the parameter.
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::ArrowLeft, ctrl, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::ArrowLeft, ctrl, false, false).as_deref(),
             Some("\x1b[1;5D")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::ArrowRight, ctrl, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::ArrowRight, ctrl, false, false).as_deref(),
             Some("\x1b[1;5C")
         );
         // DECCKM must not change the modified form.
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::ArrowLeft, ctrl, true).as_deref(),
+            key_to_terminal_sequence(egui::Key::ArrowLeft, ctrl, true, false).as_deref(),
             Some("\x1b[1;5D")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::Home, ctrl_shift, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::Home, ctrl_shift, false, false).as_deref(),
             Some("\x1b[1;6H")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::End, shift, true).as_deref(),
+            key_to_terminal_sequence(egui::Key::End, shift, true, false).as_deref(),
             Some("\x1b[1;2F")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::PageDown, alt, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::PageDown, alt, false, false).as_deref(),
             Some("\x1b[6;3~")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::Delete, ctrl, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::Delete, ctrl, false, false).as_deref(),
             Some("\x1b[3;5~")
         );
         // F1-F4 leave SS3 behind as soon as a modifier is held; F5+ keeps the
         // tilde form with its own numeric code.
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::F1, ctrl_shift, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::F1, ctrl_shift, false, false).as_deref(),
             Some("\x1b[1;6P")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::F4, alt, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::F4, alt, false, false).as_deref(),
             Some("\x1b[1;3S")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::F5, shift, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::F5, shift, false, false).as_deref(),
             Some("\x1b[15;2~")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::F12, ctrl, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::F12, ctrl, false, false).as_deref(),
             Some("\x1b[24;5~")
         );
     }
@@ -9547,11 +9552,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::PageUp, shift, false),
+            key_to_terminal_sequence(egui::Key::PageUp, shift, false, false),
             None
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::PageDown, shift, false),
+            key_to_terminal_sequence(egui::Key::PageDown, shift, false, false),
             None
         );
 
@@ -9563,11 +9568,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::PageUp, ctrl_shift, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::PageUp, ctrl_shift, false, false).as_deref(),
             Some("\x1b[5;6~")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::PageUp, egui::Modifiers::default(), false)
+            key_to_terminal_sequence(egui::Key::PageUp, egui::Modifiers::default(), false, false)
                 .as_deref(),
             Some("\x1b[5~")
         );
@@ -9603,12 +9608,12 @@ mod tests {
 
         for (key, normal, application) in expected {
             assert_eq!(
-                key_to_terminal_sequence(*key, none, false).as_deref(),
+                key_to_terminal_sequence(*key, none, false, false).as_deref(),
                 Some(*normal),
                 "{key:?} in normal cursor mode"
             );
             assert_eq!(
-                key_to_terminal_sequence(*key, none, true).as_deref(),
+                key_to_terminal_sequence(*key, none, true, false).as_deref(),
                 Some(*application),
                 "{key:?} in application cursor mode"
             );
@@ -9623,11 +9628,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::Enter, none, false).as_deref(),
+            key_to_terminal_sequence(egui::Key::Enter, none, false, false).as_deref(),
             Some("\r")
         );
-        assert!(key_to_terminal_sequence(egui::Key::Enter, ctrl, false).is_none());
-        assert!(key_to_terminal_sequence(egui::Key::Backspace, ctrl, false).is_none());
+        assert!(key_to_terminal_sequence(egui::Key::Enter, ctrl, false, false).is_none());
+        assert!(key_to_terminal_sequence(egui::Key::Backspace, ctrl, false, false).is_none());
         assert_eq!(
             key_to_terminal_sequence(
                 egui::Key::Tab,
@@ -9635,11 +9640,58 @@ mod tests {
                     shift: true,
                     ..Default::default()
                 },
-                false
+                false,
+                false,
             )
             .as_deref(),
             Some("\x1b[Z")
         );
+    }
+
+    #[test]
+    fn backarrow_mode_reaches_the_native_keyboard_handler() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let ctx = egui::Context::default();
+        let mut terminal = TerminalState::new(12, 3);
+        let events = [egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        for (packet, expected, report) in [
+            (b"\x1b[?67h", 8, b"\x1b[?67;1$y"),
+            (b"\x1b[?67l", 127, b"\x1b[?67;2$y"),
+        ] {
+            terminal.process_input(packet);
+            terminal.process_input(b"\x1b[?67$p");
+            assert_eq!(terminal.get_output(), report);
+            let mut bytes = Vec::new();
+            renderer.handle_keyboard_input(
+                &ctx,
+                &mut bytes,
+                &std::collections::HashSet::new(),
+                false,
+                0,
+                false,
+                0,
+                0,
+                false,
+                terminal.backarrow_mode(),
+                false,
+                true,
+                false,
+                &events,
+            );
+            assert_eq!(bytes, [expected]);
+        }
     }
 
     #[test]
@@ -9678,6 +9730,7 @@ mod tests {
                             false,
                             0,
                             0,
+                            false,
                             false,
                             alt_screen,
                             true,
@@ -9749,6 +9802,7 @@ mod tests {
                                         format,
                                         false,
                                         false,
+                                        false,
                                         true,
                                         modifiers.alt,
                                         std::slice::from_ref(&event),
@@ -9804,6 +9858,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             true,
             false,
             std::slice::from_ref(&ctrl_left),
@@ -9844,6 +9899,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             true,
             false,
             std::slice::from_ref(&ctrl_shift_c),
@@ -9860,6 +9916,7 @@ mod tests {
             false,
             0,
             0,
+            false,
             false,
             false,
             true,
@@ -9887,6 +9944,7 @@ mod tests {
             false,
             0,
             0,
+            false,
             false,
             false,
             true,
@@ -9923,6 +9981,7 @@ mod tests {
                 false,
                 modify,
                 format,
+                false,
                 false,
                 false,
                 true,
@@ -10047,6 +10106,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             true,
             false,
             &events,
@@ -10079,6 +10139,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             true,
             false,
             &events,
@@ -10109,6 +10170,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             true,
             true,
             &events,
@@ -10125,6 +10187,7 @@ mod tests {
             false,
             0,
             0,
+            false,
             false,
             false,
             false,
@@ -14006,6 +14069,7 @@ mod alternate_scroll_encoder_tests {
                         2,
                         1,
                         app_cursor,
+                        false,
                         true,
                         true,
                         false,
