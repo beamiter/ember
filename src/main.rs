@@ -111,7 +111,7 @@ fn widen_native_window_id(value: impl Into<u64>) -> u64 {
 use crate::glass_shell::BoundedPanel as _;
 use crate::theme::ThemeExt as _;
 use app::events::{
-    normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
+    restore_missing_image_paste_key_event,
     semantic_paste_modifiers, semantic_shortcut_modifiers, should_restore_terminal_shortcut_event,
 };
 use app::mouse::{MouseMotion, MouseReportSpace};
@@ -3390,6 +3390,7 @@ impl TerminalApp {
             font_zoom: font_zoom::FontZoom::default(),
             frame_events: Vec::new(),
             frame_keyboard: Default::default(),
+            kitty_keyboard: Default::default(),
             paste_key_state: Default::default(),
             keyboard_input_buffer: Vec::new(),
             adaptive_frame_budget: 65536, // 初始值 64KB
@@ -6351,8 +6352,17 @@ impl eframe::App for TerminalApp {
         keyboard: eframe::NativeKeyboardAnnotations,
     ) {
         if raw_input.viewport_id == egui::ViewportId::ROOT {
+            if !raw_input.focused
+                || raw_input.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(false)))
+            {
+                self.kitty_keyboard.clear();
+            }
             self.frame_keyboard = if !keyboard.events.is_empty() && !self.block_chrome_owns_keyboard(ctx) {
-                native_keypad::FrameKeyboard::capture(raw_input, keyboard)
+                native_keypad::FrameKeyboard::capture(
+                    raw_input,
+                    keyboard,
+                    self.kitty_keyboard.has_held_keys(),
+                )
             } else {
                 Default::default()
             };
@@ -6463,7 +6473,7 @@ impl eframe::App for TerminalApp {
         // control bytes, while still preventing egui's default text-edit shortcut behavior.
         let restore_shortcuts = should_restore_terminal_shortcut_event(ctx, shortcut_modifiers);
 
-        normalize_terminal_shortcut_events(
+        self.frame_keyboard.normalize_clipboard_shortcuts(
             &mut raw_input.events,
             shortcut_modifiers,
             restore_shortcuts,
@@ -6485,6 +6495,7 @@ impl eframe::App for TerminalApp {
     fn logic_only(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.logic(ctx, frame);
         if ctx.viewport_id() != egui::ViewportId::ROOT { return; }
+        self.kitty_keyboard.clear();
         // No UI pass runs: never replay the last frame's keyboard/IME events,
         // resize the PTY, publish a fake presentation, or touch observer input.
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
@@ -6660,6 +6671,7 @@ impl eframe::App for TerminalApp {
         if self.advance_vim9_deferred_input(ctx) {
             // Replayed input belongs to a different native batch.
             frame_keyboard = Default::default();
+            self.kitty_keyboard.clear();
         }
         app::input::guard_prompt_fill_enter(
             ctx,
@@ -6729,12 +6741,14 @@ impl eframe::App for TerminalApp {
 
         if !frame_keyboard.is_empty() && self.block_chrome_owns_keyboard(ctx) {
             frame_keyboard = Default::default();
+            self.kitty_keyboard.clear();
         }
         let (keybinding_requested_close, selection_postdates_terminal_input, accepted_ime_input) =
             self.handle_keybindings(
                 ctx,
                 ui_input_blocked || overlay_owned_input,
                 terminal_input_blocked || overlay_owned_input,
+                &frame_keyboard,
             );
         if keybinding_requested_close {
             return;
@@ -7129,6 +7143,7 @@ impl eframe::App for TerminalApp {
         // 当搜索面板或配置面板打开时，不处理普通键盘输入（面板会处理输入）
         // 复用缓冲区减少内存分配
         self.keyboard_input_buffer.clear();
+        let mut held_keys = ui::HeldKittyKeys::default();
         if !terminal_input_blocked || semantic_paste_claims_rest {
             let (
                 keyboard_enhancement_flags,
@@ -7169,8 +7184,15 @@ impl eframe::App for TerminalApp {
                     keyboard_enhancement_flags,
                 )
             };
-            input_renderer.handle_keyboard_input_with_native_keys(
+            held_keys = self.kitty_keyboard.begin_batch(
+                &active_session_id,
+                keyboard_enhancement_flags,
+                alt_screen,
+                window_focused && !has_preedit,
+            );
+            input_renderer.encode_native_keyboard_input(
                 &native_keys,
+                &mut held_keys,
                 &mut self.keyboard_input_buffer,
                 &consumed_keys_refs,
                 has_preedit,
@@ -7186,6 +7208,8 @@ impl eframe::App for TerminalApp {
                 &terminal_keyboard_events,
             );
 
+        } else {
+            self.kitty_keyboard.clear();
         }
 
         // Disarm on every ineligible frame, not only while keyboard input is
@@ -7308,6 +7332,13 @@ impl eframe::App for TerminalApp {
         }
         let accepted_terminal_input =
             keyboard_input_accepted || accepted_ime_input || accepted_paste_input;
+        if (!has_keyboard_input || keyboard_input_accepted)
+            && !terminal_write_error.as_ref().is_some_and(|error| !error.is_backpressure())
+        {
+            self.kitty_keyboard.admit_batch(held_keys);
+        } else {
+            self.kitty_keyboard.clear();
+        }
         if accepted_terminal_input || has_cursor_move_input {
             self.organism.accepted_input(&active_session_id);
         }

@@ -26,9 +26,10 @@ cargo test -p egui-winit --lib ember_keyboard_fallback_tests --locked
 
 ## Native keyboard annotations
 
-The converter records keypad identity and printable layout keys alongside
-the events emitted for each press. Each printable annotation carries its
-unmodified key, shifted key, physical position, modifiers and lock state.
-Presses without a GUI Key or Text event retain their position between events.
-The native raw input callback carries the annotations in hardware event
-order. The SmallVec dependency keeps ordinary batches inline.
+The converter records physical press, repeat, and release events alongside
+the GUI events they produced. Printable annotations carry the layout key,
+its shifted value, and the physical position. All phases carry event-time
+modifier state. A modifier's own event includes that side's transition
+while retaining the other side when held. Synthetic focus events are
+excluded. Physical events without a GUI Key or Text retain their position
+between events. The SmallVec dependency keeps ordinary batches inline.

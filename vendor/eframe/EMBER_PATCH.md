@@ -33,9 +33,9 @@ not new Eva migration/physical visibility evidence.
 
 ## Native keyboard input batches
 
-Glow and WGPU deliver the converter's ordered printable and keypad
-annotations through `App::raw_input_hook_with_keyboard`. The offsets
+Glow and WGPU deliver the converter's ordered physical key events through
+`App::raw_input_hook_with_keyboard`. The offsets
 include any raw input prepended by eframe. Logic-only ticks carry their
 raw input to the next UI pass. Native annotations describe the visible
 batch that produced them. Apps using the earlier keypad hook still
-receive their keypad annotations.
+receive their press annotations for the keypad.

@@ -631,9 +631,10 @@ struct OrderedKeyBatch {
 /// configurable binding up front. Commands and unbound block-context keys must
 /// be interleaved: batching commands first reverses `[Enter, Ctrl+Up]` into
 /// "select, then recall" and `[Up, Ctrl+Up]` into "select, then move".
-fn ordered_key_presses(
+fn ordered_key_presses_with_releases(
     events: &[egui::Event],
     bindings: &keybindings::KeyBindings,
+    held_releases: &[usize],
 ) -> OrderedKeyBatch {
     let mut batch = OrderedKeyBatch::default();
     let mut terminal_input_before = false;
@@ -641,6 +642,7 @@ fn ordered_key_presses(
     let mut ime_commits_before = Vec::new();
 
     for (event_index, event) in events.iter().enumerate() {
+        terminal_input_before |= held_releases.contains(&event_index);
         match event {
             egui::Event::Key {
                 key,
@@ -694,6 +696,34 @@ fn ordered_key_presses(
     batch.trailing_terminal_input = terminal_input_before;
     batch.trailing_ime_commits = ime_commits_before;
     batch
+}
+
+#[cfg(test)]
+fn ordered_key_presses(
+    events: &[egui::Event],
+    bindings: &keybindings::KeyBindings,
+) -> OrderedKeyBatch {
+    ordered_key_presses_with_releases(events, bindings, &[])
+}
+
+#[cfg(test)]
+#[test]
+fn kitty_release_orders_a_later_ime_commit_only_when_held() {
+    let events = [
+        egui::Event::Key {
+            key: egui::Key::F3,
+            physical_key: Some(egui::Key::F3),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::Ime(egui::ImeEvent::Commit("你".into())),
+    ];
+    let bindings = keybindings::KeyBindings::default_bindings();
+    let held = ordered_key_presses_with_releases(&events, &bindings, &[0]);
+    let ordinary = ordered_key_presses_with_releases(&events, &bindings, &[]);
+    assert!(!ime_commit_can_queue_now(false, &held.trailing_ime_commits[0]));
+    assert!(ime_commit_can_queue_now(false, &ordinary.trailing_ime_commits[0]));
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2803,6 +2833,7 @@ impl TerminalApp {
         ctx: &egui::Context,
         ui_input_blocked: bool,
         terminal_input_blocked: bool,
+        frame_keyboard: &crate::native_keypad::FrameKeyboard,
     ) -> (bool, bool, bool) {
         if self.window_close_confirmation.is_some() {
             self.claim_enter_for_prompt_recall();
@@ -2865,7 +2896,27 @@ impl TerminalApp {
             return (false, false, false);
         }
 
-        let batch = ordered_key_presses(&self.frame_events, &self.keybindings);
+        let (kitty_flags, held_releases) = if !terminal_input_blocked
+            && (self.kitty_keyboard.has_held_keys() || frame_keyboard.has_modifier_press())
+        {
+            let session = self.session_manager.get_active_session_mut();
+            let (flags, alternate_screen) = {
+                let terminal = session.terminal.lock();
+                (terminal.keyboard_enhancement_flags(), terminal.is_alt_buffer_active())
+            };
+            let releases = if self.kitty_keyboard.targets(
+                &session.metadata.session_id, flags, alternate_screen,
+            ) {
+                frame_keyboard.held_release_positions(&self.frame_events, &self.kitty_keyboard)
+            } else {
+                Default::default()
+            };
+            (flags, releases)
+        } else {
+            (0, Default::default())
+        };
+        let batch =
+            ordered_key_presses_with_releases(&self.frame_events, &self.keybindings, &held_releases);
         let mut terminal_input_seen = false;
         let mut selection_postdates_terminal_input = false;
         let mut accepted_ime_input = false;
@@ -3030,9 +3081,9 @@ impl TerminalApp {
                 // selection action before it is older and must be cleared once
                 // the bytes are accepted; a later selection action can set the
                 // bit again.
-                // Bare physical modifier presses cannot produce terminal bytes.
-                // Preserve their events/state and any older real-input barrier.
-                if !crate::ui::is_modifier_only_key(press.key) {
+                if !crate::ui::is_modifier_only_key(press.key)
+                    || kitty_flags & jterm_engine::input::KITTY_REPORT_ALL_KEYS != 0
+                {
                     terminal_input_seen = true;
                     selection_postdates_terminal_input = false;
                 }

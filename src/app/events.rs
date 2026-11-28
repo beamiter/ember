@@ -161,6 +161,24 @@ pub fn normalize_terminal_shortcut_events(
     preserve_paste_event: bool,
     ui_owns_clipboard: bool,
 ) {
+    normalize_terminal_shortcut_events_with_origin(
+        events,
+        modifiers,
+        restore_shortcuts,
+        preserve_paste_event,
+        ui_owns_clipboard,
+        |_, _| {},
+    );
+}
+
+pub(crate) fn normalize_terminal_shortcut_events_with_origin(
+    events: &mut Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+    restore_shortcuts: bool,
+    preserve_paste_event: bool,
+    ui_owns_clipboard: bool,
+    mut restored_key: impl FnMut(usize, usize),
+) {
     crate::debug_log!(
         "[NORMALIZE] input: {} events, restore_shortcuts={}, preserve_paste_event={}, ui_owns_clipboard={}",
         events.len(),
@@ -196,7 +214,7 @@ pub fn normalize_terminal_shortcut_events(
     let mut normalized_events = Vec::with_capacity(events.len());
     let mut event_modifiers = modifiers;
 
-    for event in events.drain(..) {
+    for (original_index, event) in events.drain(..).enumerate() {
         // One raw batch can contain several different clipboard chords. Keep
         // their event-time states separate instead of applying the first (or
         // last V release's) modifiers to every Copy/Cut/Paste in the batch.
@@ -270,6 +288,7 @@ pub fn normalize_terminal_shortcut_events(
         {
             if let Some(key_event) = shortcut_event_to_key_event(event, event_modifiers) {
                 crate::debug_log!("[NORMALIZE] converted to Key event via restore_shortcuts");
+                restored_key(original_index, normalized_events.len());
                 normalized_events.push(key_event);
             }
             continue;

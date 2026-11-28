@@ -167,7 +167,8 @@ mod epi;
 pub use epi::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use egui_winit::{
-    NativeKeyEvent, NativeKeyboardAnnotations, NativeKeypadEvent, NativeTextKeyEvent,
+    NativeKeyEvent, NativeKeyKind, NativeKeyPhase, NativeKeyboardAnnotations, NativeKeypadEvent,
+    NativeTextKeyEvent,
 };
 
 pub(crate) mod stopwatch;

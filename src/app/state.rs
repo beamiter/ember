@@ -506,6 +506,7 @@ pub struct TerminalApp {
     // 每帧事件缓存，避免多次克隆
     pub frame_events: Vec<egui::Event>,
     pub(crate) frame_keyboard: crate::native_keypad::FrameKeyboard,
+    pub(crate) kitty_keyboard: crate::native_keypad::KittyKeyboardState,
 
     /// Matches V presses (including semantic text-paste events) with releases
     /// that may arrive in a later raw-input batch.

@@ -43,7 +43,7 @@
     },
     "src/lib.rs": {
       "upstream_sha256": "3263873850b457319b8838356ea677eab23e4cac395d945604995da034eabdaa",
-      "local_sha256": "f58661f09941e86f325c71d1d3a083c63fc5a5399df07f47e1771bc03d0d5009"
+      "local_sha256": "7a387e1e7533abebd3b447b143a6b4b79c4ba02e7c0901111508c4fc503d6ee5"
     },
     "src/native/app_icon.rs": {
       "upstream_sha256": "c36644f9f1d91dfbf78ebbc4970ef26dca4328e2ee344c9145c236d66a4b9fe1",

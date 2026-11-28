@@ -9,7 +9,9 @@ use crate::terminal::{
 use crate::theme::ThemeExt as _;
 use egui::{Color32, FontId, Response, Ui, Vec2};
 use jterm_engine::input::{
-    encode_kitty_text_press, KeyboardLocks, KITTY_DISAMBIGUATE, KITTY_REPORT_ALL_KEYS,
+    encode_kitty_text_press, kitty_named_report, KeyboardLocks, KittyEventType, KittyKeyReport,
+    Modifiers as WireModifiers, KITTY_DISAMBIGUATE, KITTY_REPORT_ALL_KEYS,
+    KITTY_REPORT_EVENT_TYPES,
 };
 use lru::LruCache;
 use std::borrow::Cow;
@@ -662,17 +664,102 @@ pub enum NativeKeyEncoding {
     Application([u8; 3]),
     Center,
     Kitty(Vec<u8>),
+    Lifecycle(KittyRoutedEvent),
     SuppressText,
 }
 
-impl NativeKeyEncoding {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Self::Application(sequence) => sequence,
-            Self::Center => b"\x1b[E",
-            Self::Kitty(report) => report,
-            Self::SuppressText => b"",
+/// A report with a physical identity, admitted in raw event order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KittyRoutedEvent {
+    pub physical_key: winit::keyboard::PhysicalKey,
+    pub event: KittyEventType,
+    pub report: Option<KittyKeyReport>,
+    pub modifiers: WireModifiers,
+    pub locks: KeyboardLocks,
+    pub associates_text: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct HeldKittyKeys(smallvec::SmallVec<[(winit::keyboard::PhysicalKey, KittyKeyReport); 8]>);
+
+impl HeldKittyKeys {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn contains(&self, physical: winit::keyboard::PhysicalKey) -> bool {
+        self.0.iter().any(|(key, _)| *key == physical)
+    }
+}
+
+impl KittyRoutedEvent {
+    fn append(
+        &self,
+        input: &mut Vec<u8>,
+        held: &mut HeldKittyKeys,
+        flags: u16,
+        text: Option<&str>,
+    ) -> bool {
+        let held_index = held.0.iter().position(|(physical, _)| *physical == self.physical_key);
+        let report = match self.event {
+            KittyEventType::Press => {
+                let Some(report) = self.report else { return false };
+                if let Some(index) = held_index {
+                    held.0[index].1 = report;
+                } else if matches!(self.physical_key, winit::keyboard::PhysicalKey::Code(_)) {
+                    held.0.push((self.physical_key, report));
+                }
+                report
+            }
+            KittyEventType::Repeat => {
+                let Some(repeat) = self.report else { return false };
+                let Some(index) = held_index else {
+                    // A shortcut, focus change or old mode can own the press.
+                    return true;
+                };
+                held.0[index].1.with_repeat_alternate(repeat)
+            }
+            KittyEventType::Release => {
+                let Some(index) = held_index else { return true };
+                held.0.swap_remove(index).1
+            }
+        };
+        if let Some(bytes) = report.encode(self.event, self.modifiers, self.locks, flags, text) {
+            input.extend_from_slice(&bytes);
         }
+        true
+    }
+}
+
+impl RoutedKeyPress {
+    fn append(
+        &self,
+        input: &mut Vec<u8>,
+        held: &mut HeldKittyKeys,
+        flags: u16,
+        events: &[egui::Event],
+    ) -> bool {
+        match &self.encoding {
+            NativeKeyEncoding::Application(sequence) => input.extend_from_slice(sequence),
+            NativeKeyEncoding::Center => input.extend_from_slice(b"\x1b[E"),
+            NativeKeyEncoding::Kitty(report) => input.extend_from_slice(report),
+            NativeKeyEncoding::SuppressText => {}
+            NativeKeyEncoding::Lifecycle(key) => {
+                let text = if key.associates_text
+                    && !self.before_event
+                    && flags & jterm_engine::input::KITTY_REPORT_ASSOCIATED_TEXT != 0
+                {
+                    match events.get(self.text.unwrap_or(self.event)) {
+                        Some(egui::Event::Text(text)) => pty_text_payload(text),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                return key.append(input, held, flags, text.as_deref());
+            }
+        }
+        true
     }
 }
 
@@ -7610,6 +7697,45 @@ impl TerminalRenderer {
         alt_held: bool,
         events: &[egui::Event],
     ) {
+        let mut held = HeldKittyKeys::default();
+        self.encode_native_keyboard_input(
+            native_keys,
+            &mut held,
+            input,
+            consumed_keys,
+            suppress_text_events,
+            keyboard_enhancement_flags,
+            report_all_keys_mode,
+            xterm_modify_other_keys,
+            xterm_format_other_keys,
+            application_cursor_keys,
+            backarrow_mode,
+            alt_screen,
+            meta_sends_escape,
+            alt_held,
+            events,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_native_keyboard_input(
+        &self,
+        native_keys: &[RoutedKeyPress],
+        held: &mut HeldKittyKeys,
+        input: &mut Vec<u8>,
+        consumed_keys: &std::collections::HashSet<&str>,
+        suppress_text_events: bool,
+        keyboard_enhancement_flags: u16,
+        report_all_keys_mode: bool,
+        xterm_modify_other_keys: u16,
+        xterm_format_other_keys: u16,
+        application_cursor_keys: bool,
+        backarrow_mode: bool,
+        alt_screen: bool,
+        meta_sends_escape: bool,
+        alt_held: bool,
+        events: &[egui::Event],
+    ) {
         let report_all_keys =
             report_all_keys_mode || (keyboard_enhancement_flags & KITTY_REPORT_ALL_KEYS) != 0;
         let effective_keyboard_flags = if report_all_keys_mode {
@@ -7619,14 +7745,14 @@ impl TerminalRenderer {
         };
         let native_keys = if suppress_text_events { &[] } else { native_keys };
         let kitty_active = effective_keyboard_flags
-            & (KITTY_REPORT_ALL_KEYS | u16::from(KITTY_DISAMBIGUATE))
+            & (KITTY_REPORT_ALL_KEYS | KITTY_REPORT_EVENT_TYPES | u16::from(KITTY_DISAMBIGUATE))
             != 0;
 
         let mut encoded_text_index = None;
         let mut native_keys = native_keys
             .iter()
             .filter(|press| match press.encoding {
-                NativeKeyEncoding::Kitty(_) => kitty_active,
+                NativeKeyEncoding::Kitty(_) | NativeKeyEncoding::Lifecycle(_) => kitty_active,
                 NativeKeyEncoding::SuppressText => report_all_keys,
                 _ => effective_keyboard_flags == 0,
             })
@@ -7635,7 +7761,7 @@ impl TerminalRenderer {
             while let Some(press) =
                 native_keys.next_if(|press| press.before_event && press.event == event_index)
             {
-                input.extend_from_slice(press.encoding.bytes());
+                press.append(input, held, effective_keyboard_flags, events);
             }
             let native_press = if native_keys.peek().is_some_and(|press| press.event == event_index) {
                 native_keys.next()
@@ -7647,8 +7773,7 @@ impl TerminalRenderer {
                     if suppress_text_events || encoded_text_index == Some(event_index) {
                         continue;
                     }
-                    if let Some(press) = native_press {
-                        input.extend_from_slice(press.encoding.bytes());
+                    if native_press.is_some_and(|press| press.append(input, held, effective_keyboard_flags, events)) {
                         continue;
                     }
                     if let Some(filtered) = pty_text_payload(text) {
@@ -7681,32 +7806,40 @@ impl TerminalRenderer {
                     modifiers,
                     ..
                 } => {
-                    if is_modifier_only_key(*key)
-                        || viewport_owns_page_key(*key, *modifiers, alt_screen)
+                    if viewport_owns_page_key(*key, *modifiers, alt_screen)
+                        || (native_press.is_none() && is_modifier_only_key(*key))
                     {
                         continue;
                     }
                     let consumed_name = consumed_key_name(*key, *modifiers);
                     if !consumed_name.is_empty() && consumed_keys.contains(consumed_name.as_str()) {
                         if let Some(press) = native_press
-                            .filter(|press| matches!(press.encoding, NativeKeyEncoding::Kitty(_)))
+                            .filter(|press| matches!(press.encoding, NativeKeyEncoding::Kitty(_) | NativeKeyEncoding::Lifecycle(_)))
                         {
                             encoded_text_index = press.text;
                         }
                         continue;
                     }
                     if let Some(press) = native_press {
-                        input.extend_from_slice(press.encoding.bytes());
-                        encoded_text_index = press.text;
+                        if press.append(input, held, effective_keyboard_flags, events) {
+                            encoded_text_index = press.text;
+                            continue;
+                        }
+                    }
+                    if is_modifier_only_key(*key) {
                         continue;
                     }
 
                     if kitty_active {
-                        if let Some(report) = jterm_engine::input::encode_kitty_named_press(
+                        let modifiers = normalized_modifiers(*modifiers);
+                        let report = kitty_named_report(
                             normalized_key(*key),
-                            normalized_modifiers(*modifiers),
+                            modifiers,
                             effective_keyboard_flags,
-                        ) {
+                        ).and_then(|report| report.encode(
+                            KittyEventType::Press, modifiers, KeyboardLocks::default(), effective_keyboard_flags, None,
+                        ));
+                        if let Some(report) = report {
                             input.extend_from_slice(&report);
                             continue;
                         }
@@ -7801,11 +7934,16 @@ impl TerminalRenderer {
                         }
                     }
                 }
+                egui::Event::Key { pressed: false, .. } => {
+                    if let Some(press) = native_press {
+                        press.append(input, held, effective_keyboard_flags, events);
+                    }
+                }
                 _ => {}
             }
         }
         for press in native_keys.filter(|press| press.before_event && press.event == events.len()) {
-            input.extend_from_slice(press.encoding.bytes());
+            press.append(input, held, effective_keyboard_flags, events);
         }
     }
 }
@@ -9971,6 +10109,42 @@ mod tests {
             events.last().unwrap().clone(),
         ];
         assert_eq!(encode(&composing_events, 24, true), "你".as_bytes());
+    }
+
+    #[test]
+    fn kitty_release_uses_only_an_admitted_physical_press() {
+        use jterm_engine::input::Key;
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        let mut held = HeldKittyKeys::default();
+        let mut bytes = Vec::new();
+        let modifiers = WireModifiers::default();
+        let press = KittyRoutedEvent {
+            physical_key: PhysicalKey::Code(KeyCode::F3),
+            event: KittyEventType::Press,
+            report: kitty_named_report(Key::F3, modifiers, 10),
+            modifiers,
+            locks: KeyboardLocks::default(),
+            associates_text: false,
+        };
+        let release = KittyRoutedEvent {
+            event: KittyEventType::Release,
+            report: None,
+            ..press.clone()
+        };
+        let repeat = KittyRoutedEvent {
+            event: KittyEventType::Repeat,
+            report: kitty_named_report(Key::F2, modifiers, 10),
+            ..press.clone()
+        };
+        release.append(&mut bytes, &mut held, 10, None);
+        repeat.append(&mut bytes, &mut held, 10, None);
+        assert!(bytes.is_empty());
+        press.append(&mut bytes, &mut held, 10, None);
+        repeat.append(&mut bytes, &mut held, 10, None);
+        release.append(&mut bytes, &mut held, 10, None);
+        release.append(&mut bytes, &mut held, 10, None);
+        assert_eq!(bytes, b"\x1b[13~\x1b[13;1:2~\x1b[13;1:3~");
+        assert!(held.is_empty());
     }
 
     #[test]
